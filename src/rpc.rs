@@ -28,7 +28,11 @@ pub enum RpcError {
     /// The socket closed or went silent. Streams should resubscribe from their last sequence.
     Disconnected(String),
     /// The server ran the request and it failed.
-    Failed { tag: String, message: String, error_tag: Option<String> },
+    Failed {
+        tag: String,
+        message: String,
+        error_tag: Option<String>,
+    },
     Protocol(String),
 }
 
@@ -54,8 +58,14 @@ impl From<RpcError> for anyhow::Error {
 }
 
 enum Pending {
-    Unary { tag: String, reply: oneshot::Sender<Result<Value, RpcError>> },
-    Stream { tag: String, items: mpsc::UnboundedSender<Result<Value, RpcError>> },
+    Unary {
+        tag: String,
+        reply: oneshot::Sender<Result<Value, RpcError>>,
+    },
+    Stream {
+        tag: String,
+        items: mpsc::UnboundedSender<Result<Value, RpcError>>,
+    },
 }
 
 type PendingMap = Arc<Mutex<HashMap<String, Pending>>>;
@@ -83,15 +93,21 @@ impl RpcStream {
 
 impl Drop for RpcStream {
     fn drop(&mut self) {
-        let _ = self.outgoing.send(json!({"_tag": "Interrupt", "requestId": self.request_id, "interruptors": []}));
+        let _ = self
+            .outgoing
+            .send(json!({"_tag": "Interrupt", "requestId": self.request_id, "interruptors": []}));
     }
 }
 
 impl RpcClient {
     pub async fn connect(api: &Api) -> Result<RpcClient> {
         let ticket = api.websocket_ticket().await?;
-        let ws_origin = api.origin.replacen("https://", "wss://", 1).replacen("http://", "ws://", 1);
-        let url = format!("{ws_origin}/ws?wsTicket={ticket}&{PROTOCOL_QUERY_PARAM}={PROTOCOL_VERSION}");
+        let ws_origin = api
+            .origin
+            .replacen("https://", "wss://", 1)
+            .replacen("http://", "ws://", 1);
+        let url =
+            format!("{ws_origin}/ws?wsTicket={ticket}&{PROTOCOL_QUERY_PARAM}={PROTOCOL_VERSION}");
         Self::connect_url(&url).await
     }
 
@@ -159,7 +175,11 @@ impl RpcClient {
             }
         });
 
-        Ok(RpcClient { outgoing, pending, next_id: Arc::new(AtomicU64::new(1)) })
+        Ok(RpcClient {
+            outgoing,
+            pending,
+            next_id: Arc::new(AtomicU64::new(1)),
+        })
     }
 
     /// True once the connection task has exited.
@@ -169,21 +189,37 @@ impl RpcClient {
 
     fn request(&self, id: &str, tag: &str, payload: Value) -> Result<(), RpcError> {
         self.outgoing
-            .send(json!({"_tag": "Request", "id": id, "tag": tag, "payload": payload, "headers": []}))
+            .send(
+                json!({"_tag": "Request", "id": id, "tag": tag, "payload": payload, "headers": []}),
+            )
             .map_err(|_| RpcError::Disconnected("connection closed".into()))
     }
 
-    pub async fn call(&self, tag: &str, payload: Value, timeout: Duration) -> Result<Value, RpcError> {
+    pub async fn call(
+        &self,
+        tag: &str,
+        payload: Value,
+        timeout: Duration,
+    ) -> Result<Value, RpcError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
         let (reply, response) = oneshot::channel();
-        self.pending.lock().await.insert(id.clone(), Pending::Unary { tag: tag.to_string(), reply });
+        self.pending.lock().await.insert(
+            id.clone(),
+            Pending::Unary {
+                tag: tag.to_string(),
+                reply,
+            },
+        );
         self.request(&id, tag, payload)?;
         match tokio::time::timeout(timeout, response).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(RpcError::Disconnected("connection closed".into())),
             Err(_) => {
                 self.pending.lock().await.remove(&id);
-                Err(RpcError::Disconnected(format!("T3 did not answer {tag} within {} seconds", timeout.as_secs())))
+                Err(RpcError::Disconnected(format!(
+                    "T3 did not answer {tag} within {} seconds",
+                    timeout.as_secs()
+                )))
             }
         }
     }
@@ -191,9 +227,19 @@ impl RpcClient {
     pub async fn stream(&self, tag: &str, payload: Value) -> Result<RpcStream, RpcError> {
         let id = self.next_id.fetch_add(1, Ordering::Relaxed).to_string();
         let (items, receiver) = mpsc::unbounded_channel();
-        self.pending.lock().await.insert(id.clone(), Pending::Stream { tag: tag.to_string(), items });
+        self.pending.lock().await.insert(
+            id.clone(),
+            Pending::Stream {
+                tag: tag.to_string(),
+                items,
+            },
+        );
         self.request(&id, tag, payload)?;
-        Ok(RpcStream { items: receiver, request_id: id, outgoing: self.outgoing.clone() })
+        Ok(RpcStream {
+            items: receiver,
+            request_id: id,
+            outgoing: self.outgoing.clone(),
+        })
     }
 }
 
@@ -207,7 +253,12 @@ async fn handle_message(message: Value, pending: &PendingMap, ack: &mpsc::Unboun
         Some("Chunk") => {
             let map = pending.lock().await;
             if let Some(Pending::Stream { items, .. }) = map.get(&request_id) {
-                for value in message.get("values").and_then(Value::as_array).into_iter().flatten() {
+                for value in message
+                    .get("values")
+                    .and_then(Value::as_array)
+                    .into_iter()
+                    .flatten()
+                {
                     let _ = items.send(Ok(value.clone()));
                 }
             }
@@ -216,12 +267,18 @@ async fn handle_message(message: Value, pending: &PendingMap, ack: &mpsc::Unboun
             let _ = ack.send(json!({"_tag": "Ack", "requestId": request_id}));
         }
         Some("Exit") => {
-            let Some(entry) = pending.lock().await.remove(&request_id) else { return };
+            let Some(entry) = pending.lock().await.remove(&request_id) else {
+                return;
+            };
             let exit = message.get("exit").cloned().unwrap_or(Value::Null);
             let success = exit.get("_tag").and_then(Value::as_str) == Some("Success");
             match entry {
                 Pending::Unary { tag, reply } => {
-                    let result = if success { Ok(exit.get("value").cloned().unwrap_or(Value::Null)) } else { Err(failure(&tag, &exit)) };
+                    let result = if success {
+                        Ok(exit.get("value").cloned().unwrap_or(Value::Null))
+                    } else {
+                        Err(failure(&tag, &exit))
+                    };
                     let _ = reply.send(result);
                 }
                 Pending::Stream { tag, items } => {
@@ -232,7 +289,11 @@ async fn handle_message(message: Value, pending: &PendingMap, ack: &mpsc::Unboun
             }
         }
         Some("Defect") | Some("ClientProtocolError") => {
-            let detail = message.get("defect").or_else(|| message.get("error")).cloned().unwrap_or(Value::Null);
+            let detail = message
+                .get("defect")
+                .or_else(|| message.get("error"))
+                .cloned()
+                .unwrap_or(Value::Null);
             for (_, entry) in pending.lock().await.drain() {
                 let error = RpcError::Protocol(detail.to_string());
                 match entry {
@@ -251,18 +312,39 @@ async fn handle_message(message: Value, pending: &PendingMap, ack: &mpsc::Unboun
 
 /// Reads the most useful message out of an encoded Effect `Exit` failure.
 fn failure(tag: &str, exit: &Value) -> RpcError {
-    let reasons = exit.get("cause").and_then(Value::as_array).cloned().unwrap_or_default();
-    let fail = reasons.iter().find(|r| r.get("_tag").and_then(Value::as_str) == Some("Fail")).and_then(|r| r.get("error"));
-    let defect = reasons.iter().find(|r| r.get("_tag").and_then(Value::as_str) == Some("Die")).and_then(|r| r.get("defect"));
-    let text = |v: Option<&Value>, key: &str| v.and_then(|v| v.get(key)).and_then(Value::as_str).map(str::to_string);
+    let reasons = exit
+        .get("cause")
+        .and_then(Value::as_array)
+        .cloned()
+        .unwrap_or_default();
+    let fail = reasons
+        .iter()
+        .find(|r| r.get("_tag").and_then(Value::as_str) == Some("Fail"))
+        .and_then(|r| r.get("error"));
+    let defect = reasons
+        .iter()
+        .find(|r| r.get("_tag").and_then(Value::as_str) == Some("Die"))
+        .and_then(|r| r.get("defect"));
+    let text = |v: Option<&Value>, key: &str| {
+        v.and_then(|v| v.get(key))
+            .and_then(Value::as_str)
+            .map(str::to_string)
+    };
     let base = text(fail, "detail")
         .or_else(|| text(fail, "message"))
         .or_else(|| defect.and_then(Value::as_str).map(str::to_string))
         .unwrap_or_else(|| format!("T3 rejected {tag}."));
-    let cause = fail.and_then(|f| f.get("cause")).and_then(|c| c.get("message")).and_then(Value::as_str);
+    let cause = fail
+        .and_then(|f| f.get("cause"))
+        .and_then(|c| c.get("message"))
+        .and_then(Value::as_str);
     let message = match cause {
         Some(cause) if !base.contains(cause) => format!("{base}: {cause}"),
         _ => base,
     };
-    RpcError::Failed { tag: tag.to_string(), message, error_tag: text(fail, "_tag") }
+    RpcError::Failed {
+        tag: tag.to_string(),
+        message,
+        error_tag: text(fail, "_tag"),
+    }
 }

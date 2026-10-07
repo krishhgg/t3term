@@ -29,14 +29,19 @@ fn collection_for(event_type: &str) -> Option<&'static str> {
 
 fn upsert(array: &mut Vec<Value>, entity: Value) {
     let id = entity.get("id").cloned();
-    match array.iter_mut().find(|existing| id.is_some() && existing.get("id") == id.as_ref()) {
+    match array
+        .iter_mut()
+        .find(|existing| id.is_some() && existing.get("id") == id.as_ref())
+    {
         Some(existing) => *existing = entity,
         None => array.push(entity),
     }
 }
 
 fn array_mut<'a>(object: &'a mut Map<String, Value>, key: &str) -> &'a mut Vec<Value> {
-    let slot = object.entry(key).or_insert_with(|| Value::Array(Vec::new()));
+    let slot = object
+        .entry(key)
+        .or_insert_with(|| Value::Array(Vec::new()));
     if !slot.is_array() {
         *slot = Value::Array(Vec::new());
     }
@@ -72,7 +77,10 @@ impl ThreadState {
     fn replace(&mut self, snapshot: &Value) -> Option<()> {
         let projection = snapshot.get("projection")?.as_object()?.clone();
         projection.get("thread")?.get("id")?.as_str()?;
-        self.sequence = snapshot.get("snapshotSequence").and_then(Value::as_u64).unwrap_or(0);
+        self.sequence = snapshot
+            .get("snapshotSequence")
+            .and_then(Value::as_u64)
+            .unwrap_or(0);
         self.projection = projection;
         Some(())
     }
@@ -94,9 +102,17 @@ impl ThreadState {
                     return Applied::Duplicate;
                 }
                 self.sequence = sequence;
-                let Some(event) = item.get("event") else { return Applied::Ignored };
-                let event_type = event.get("type").and_then(Value::as_str).unwrap_or_default().to_string();
-                let Some(payload) = event.get("payload").cloned() else { return Applied::Event(event_type) };
+                let Some(event) = item.get("event") else {
+                    return Applied::Ignored;
+                };
+                let event_type = event
+                    .get("type")
+                    .and_then(Value::as_str)
+                    .unwrap_or_default()
+                    .to_string();
+                let Some(payload) = event.get("payload").cloned() else {
+                    return Applied::Event(event_type);
+                };
                 if event_type.starts_with("thread.") {
                     self.projection.insert("thread".into(), payload);
                 } else if let Some(key) = collection_for(&event_type) {
@@ -117,13 +133,20 @@ impl ThreadState {
         let thread_id = self.thread_id().to_string();
         let visible = array_mut(&mut self.projection, "visibleTurnItems");
         let id = item.get("id");
-        if let Some(entry) = visible.iter_mut().find(|e| e.get("item").and_then(|i| i.get("id")) == id) {
+        if let Some(entry) = visible
+            .iter_mut()
+            .find(|e| e.get("item").and_then(|i| i.get("id")) == id)
+        {
             if let Some(object) = entry.as_object_mut() {
                 object.insert("item".into(), item.clone());
             }
             return;
         }
-        let position = visible.iter().filter_map(|e| e.get("position").and_then(Value::as_u64)).max().map_or(0, |p| p + 1);
+        let position = visible
+            .iter()
+            .filter_map(|e| e.get("position").and_then(Value::as_u64))
+            .max()
+            .map_or(0, |p| p + 1);
         visible.push(serde_json::json!({
             "position": position,
             "visibility": "local",
@@ -138,11 +161,18 @@ impl ThreadState {
     }
 
     pub fn thread_id(&self) -> &str {
-        self.thread().get("id").and_then(Value::as_str).unwrap_or_default()
+        self.thread()
+            .get("id")
+            .and_then(Value::as_str)
+            .unwrap_or_default()
     }
 
     pub fn list(&self, key: &str) -> &[Value] {
-        self.projection.get(key).and_then(Value::as_array).map(Vec::as_slice).unwrap_or(&[])
+        self.projection
+            .get(key)
+            .and_then(Value::as_array)
+            .map(Vec::as_slice)
+            .unwrap_or(&[])
     }
 
     /// Turn items in display order. Falls back to `turnItems` by ordinal when the server sent no visible list.
@@ -159,12 +189,17 @@ impl ThreadState {
     }
 
     pub fn run(&self, run_id: &str) -> Option<&Value> {
-        self.list("runs").iter().find(|r| r.get("id").and_then(Value::as_str) == Some(run_id))
+        self.list("runs")
+            .iter()
+            .find(|r| r.get("id").and_then(Value::as_str) == Some(run_id))
     }
 
     /// The run working right now, if any.
     pub fn active_run(&self) -> Option<&Value> {
-        self.list("runs").iter().filter(|r| is_active_status(status(r))).max_by_key(|r| ordinal(r))
+        self.list("runs")
+            .iter()
+            .filter(|r| is_active_status(status(r)))
+            .max_by_key(|r| ordinal(r))
     }
 
     pub fn latest_run(&self) -> Option<&Value> {
@@ -173,7 +208,10 @@ impl ThreadState {
 
     pub fn run_for_message(&self, message_id: &str) -> Option<&Value> {
         let runs = self.list("runs");
-        if let Some(run) = runs.iter().find(|r| r.get("userMessageId").and_then(Value::as_str) == Some(message_id)) {
+        if let Some(run) = runs
+            .iter()
+            .find(|r| r.get("userMessageId").and_then(Value::as_str) == Some(message_id))
+        {
             return Some(run);
         }
         let run_id = self
@@ -186,17 +224,26 @@ impl ThreadState {
     }
 
     pub fn pending_requests(&self) -> Vec<&Value> {
-        self.list("runtimeRequests").iter().filter(|r| r.get("status").and_then(Value::as_str) == Some("pending")).collect()
+        self.list("runtimeRequests")
+            .iter()
+            .filter(|r| r.get("status").and_then(Value::as_str) == Some("pending"))
+            .collect()
     }
 
     /// The turn item that shows a runtime request to the user, which carries its prompt and options.
     pub fn request_item(&self, request_id: &str) -> Option<&Value> {
-        self.list("turnItems").iter().rev().find(|i| i.get("requestId").and_then(Value::as_str) == Some(request_id))
+        self.list("turnItems")
+            .iter()
+            .rev()
+            .find(|i| i.get("requestId").and_then(Value::as_str) == Some(request_id))
     }
 }
 
 pub fn status(entity: &Value) -> &str {
-    entity.get("status").and_then(Value::as_str).unwrap_or_default()
+    entity
+        .get("status")
+        .and_then(Value::as_str)
+        .unwrap_or_default()
 }
 
 fn ordinal(entity: &Value) -> u64 {
@@ -208,7 +255,10 @@ pub fn is_active_status(status: &str) -> bool {
 }
 
 pub fn is_terminal_status(status: &str) -> bool {
-    matches!(status, "completed" | "interrupted" | "failed" | "cancelled" | "rolled_back")
+    matches!(
+        status,
+        "completed" | "interrupted" | "failed" | "cancelled" | "rolled_back"
+    )
 }
 
 /// Projects and threads, kept current from `orchestration.subscribeShell`.
@@ -222,12 +272,53 @@ pub struct ShellState {
 
 impl ShellState {
     pub fn from_snapshot(snapshot: &Value) -> ShellState {
-        let list = |key: &str| snapshot.get(key).and_then(Value::as_array).cloned().unwrap_or_default();
+        let list = |key: &str| {
+            snapshot
+                .get(key)
+                .and_then(Value::as_array)
+                .cloned()
+                .unwrap_or_default()
+        };
         ShellState {
-            sequence: snapshot.get("snapshotSequence").and_then(Value::as_u64).unwrap_or(0),
-            projects: list("projects").into_iter().filter(|p| p.get("deletedAt").is_none_or(Value::is_null)).collect(),
+            sequence: snapshot
+                .get("snapshotSequence")
+                .and_then(Value::as_u64)
+                .unwrap_or(0),
+            projects: list("projects")
+                .into_iter()
+                .filter(|p| p.get("deletedAt").is_none_or(Value::is_null))
+                .collect(),
             threads: list("threads"),
             synchronized: false,
+        }
+    }
+
+    /// An enrichment snapshot only refreshes repository identity; its thread list is empty by design.
+    fn apply_enrichment(&mut self, snapshot: &Value, roots: &[Value]) {
+        let candidates = snapshot
+            .get("projects")
+            .and_then(Value::as_array)
+            .cloned()
+            .unwrap_or_default();
+        for project in &mut self.projects {
+            let Some(candidate) = candidates.iter().find(|c| c.get("id") == project.get("id"))
+            else {
+                continue;
+            };
+            if candidate.get("workspaceRoot") != project.get("workspaceRoot") {
+                continue;
+            }
+            let resolved = roots
+                .iter()
+                .any(|r| Some(r) == project.get("workspaceRoot"));
+            let identity = candidate
+                .get("repositoryIdentity")
+                .cloned()
+                .unwrap_or(Value::Null);
+            let missing = project.get("repositoryIdentity").is_none_or(Value::is_null);
+            if resolved || (missing && !identity.is_null()) {
+                project["repositoryIdentity"] = identity;
+            }
         }
     }
 
@@ -239,7 +330,16 @@ impl ShellState {
                 return Applied::Synchronized;
             }
             "snapshot" => {
-                let Some(snapshot) = item.get("snapshot") else { return Applied::Ignored };
+                let Some(snapshot) = item.get("snapshot") else {
+                    return Applied::Ignored;
+                };
+                if let Some(roots) = item
+                    .get("resolvedRepositoryIdentityRoots")
+                    .and_then(Value::as_array)
+                {
+                    self.apply_enrichment(snapshot, roots);
+                    return Applied::Event("enrichment".into());
+                }
                 let synchronized = self.synchronized;
                 *self = ShellState::from_snapshot(snapshot);
                 self.synchronized = synchronized;
@@ -261,10 +361,13 @@ impl ShellState {
             }
             "project.removed" => {
                 let id = item.get("projectId").and_then(Value::as_str);
-                self.projects.retain(|p| p.get("id").and_then(Value::as_str) != id);
+                self.projects
+                    .retain(|p| p.get("id").and_then(Value::as_str) != id);
             }
             "thread.updated" => {
-                let Some(thread) = item.get("thread").cloned() else { return Applied::Ignored };
+                let Some(thread) = item.get("thread").cloned() else {
+                    return Applied::Ignored;
+                };
                 if item.get("location").and_then(Value::as_str) == Some("archive") {
                     let id = id_of(&thread);
                     self.threads.retain(|t| id_of(t) != id);
@@ -274,7 +377,8 @@ impl ShellState {
             }
             "thread.removed" => {
                 let id = item.get("threadId").and_then(Value::as_str);
-                self.threads.retain(|t| t.get("id").and_then(Value::as_str) != id);
+                self.threads
+                    .retain(|t| t.get("id").and_then(Value::as_str) != id);
             }
             _ => return Applied::Ignored,
         }
@@ -311,10 +415,19 @@ mod tests {
         assert_eq!(state.apply(&snapshot()), Applied::Snapshot);
         let delta = |text: &str| json!({"id": "i2", "type": "assistant_message", "ordinal": 1, "text": text, "streaming": true});
 
-        assert_eq!(state.apply(&event(11, "turn-item.updated", delta("Hel"))), Applied::Event("turn-item.updated".into()));
-        assert_eq!(state.apply(&event(12, "turn-item.updated", delta("Hello"))), Applied::Event("turn-item.updated".into()));
+        assert_eq!(
+            state.apply(&event(11, "turn-item.updated", delta("Hel"))),
+            Applied::Event("turn-item.updated".into())
+        );
+        assert_eq!(
+            state.apply(&event(12, "turn-item.updated", delta("Hello"))),
+            Applied::Event("turn-item.updated".into())
+        );
         // A reconnect replays from the last sequence the client confirmed; overlap must not double-apply.
-        assert_eq!(state.apply(&event(12, "turn-item.updated", delta("stale"))), Applied::Duplicate);
+        assert_eq!(
+            state.apply(&event(12, "turn-item.updated", delta("stale"))),
+            Applied::Duplicate
+        );
 
         let items = state.items();
         assert_eq!(items.len(), 2);
@@ -325,14 +438,30 @@ mod tests {
     #[test]
     fn tracks_runs_and_pending_requests() {
         let mut state = ThreadState::from_snapshot(&snapshot()).unwrap();
-        state.apply(&event(11, "run.created", json!({"id": "r2", "ordinal": 2, "status": "running", "userMessageId": "m2"})));
-        state.apply(&event(12, "runtime-request.updated", json!({"id": "q1", "status": "pending", "kind": "command"})));
+        state.apply(&event(
+            11,
+            "run.created",
+            json!({"id": "r2", "ordinal": 2, "status": "running", "userMessageId": "m2"}),
+        ));
+        state.apply(&event(
+            12,
+            "runtime-request.updated",
+            json!({"id": "q1", "status": "pending", "kind": "command"}),
+        ));
         assert_eq!(state.active_run().unwrap()["id"], "r2");
         assert_eq!(state.run_for_message("m2").unwrap()["id"], "r2");
         assert_eq!(state.pending_requests().len(), 1);
 
-        state.apply(&event(13, "runtime-request.updated", json!({"id": "q1", "status": "resolved", "kind": "command"})));
-        state.apply(&event(14, "run.updated", json!({"id": "r2", "ordinal": 2, "status": "completed", "userMessageId": "m2"})));
+        state.apply(&event(
+            13,
+            "runtime-request.updated",
+            json!({"id": "q1", "status": "resolved", "kind": "command"}),
+        ));
+        state.apply(&event(
+            14,
+            "run.updated",
+            json!({"id": "r2", "ordinal": 2, "status": "completed", "userMessageId": "m2"}),
+        ));
         assert!(state.pending_requests().is_empty());
         assert!(state.active_run().is_none());
     }
@@ -340,9 +469,16 @@ mod tests {
     #[test]
     fn thread_events_replace_the_thread_and_unknown_events_still_advance() {
         let mut state = ThreadState::from_snapshot(&snapshot()).unwrap();
-        state.apply(&event(11, "thread.metadata-updated", json!({"id": "t1", "title": "Renamed"})));
+        state.apply(&event(
+            11,
+            "thread.metadata-updated",
+            json!({"id": "t1", "title": "Renamed"}),
+        ));
         assert_eq!(state.thread()["title"], "Renamed");
-        assert_eq!(state.apply(&event(12, "brand-new.event", json!({}))), Applied::Event("brand-new.event".into()));
+        assert_eq!(
+            state.apply(&event(12, "brand-new.event", json!({}))),
+            Applied::Event("brand-new.event".into())
+        );
         assert_eq!(state.sequence, 12);
     }
 
@@ -357,7 +493,25 @@ mod tests {
         shell.apply(&json!({"kind": "thread.updated", "sequence": 6, "location": "active", "thread": {"id": "t2"}}));
         shell.apply(&json!({"kind": "thread.updated", "sequence": 7, "location": "archive", "thread": {"id": "t1"}}));
         assert_eq!(shell.apply(&json!({"kind": "thread.removed", "sequence": 7, "location": "active", "threadId": "t2"})), Applied::Duplicate);
-        let ids: Vec<_> = shell.threads.iter().map(|t| t["id"].as_str().unwrap()).collect();
+        let ids: Vec<_> = shell
+            .threads
+            .iter()
+            .map(|t| t["id"].as_str().unwrap())
+            .collect();
         assert_eq!(ids, vec!["t2"]);
+    }
+
+    #[test]
+    fn enrichment_snapshot_keeps_threads_and_sequence() {
+        let mut shell = ShellState::default();
+        shell.apply(&json!({"kind": "snapshot", "snapshot": {
+            "snapshotSequence": 5, "projects": [{"id": "p1", "workspaceRoot": "/r"}], "threads": [{"id": "t1"}]
+        }}));
+        shell.apply(&json!({"kind": "snapshot", "resolvedRepositoryIdentityRoots": ["/r"], "snapshot": {
+            "snapshotSequence": 9, "projects": [{"id": "p1", "workspaceRoot": "/r", "repositoryIdentity": {"name": "r"}}], "threads": []
+        }}));
+        assert_eq!(shell.threads.len(), 1);
+        assert_eq!(shell.sequence, 5);
+        assert_eq!(shell.projects[0]["repositoryIdentity"]["name"], "r");
     }
 }

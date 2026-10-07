@@ -17,10 +17,19 @@ pub struct Api {
 
 impl Api {
     pub fn new(runtime: &Runtime, token: &str) -> Self {
-        Self { origin: runtime.origin.clone(), token: token.to_string(), http: reqwest::Client::new() }
+        Self {
+            origin: runtime.origin.clone(),
+            token: token.to_string(),
+            http: reqwest::Client::new(),
+        }
     }
 
-    pub async fn request(&self, method: reqwest::Method, path: &str, body: Option<&Value>) -> Result<Value> {
+    pub async fn request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<&Value>,
+    ) -> Result<Value> {
         let mut request = self
             .http
             .request(method.clone(), format!("{}{}", self.origin, path))
@@ -31,26 +40,46 @@ impl Api {
         if let Some(body) = body {
             request = request.json(body);
         }
-        let response = request
-            .send()
-            .await
-            .map_err(|e| err_exit("T3_REQUEST_FAILED", exit::UNAVAILABLE, format!("{method} {path} failed: {e}")))?;
+        let response = request.send().await.map_err(|e| {
+            err_exit(
+                "T3_REQUEST_FAILED",
+                exit::UNAVAILABLE,
+                format!("{method} {path} failed: {e}"),
+            )
+        })?;
         let status = response.status();
         let text = response.text().await.unwrap_or_default();
         if status == reqwest::StatusCode::NOT_FOUND {
-            return Err(err_exit("T3_NOT_FOUND", exit::NOT_FOUND, format!("T3 has nothing at {path}.")));
+            return Err(err_exit(
+                "T3_NOT_FOUND",
+                exit::NOT_FOUND,
+                format!("T3 has nothing at {path}."),
+            ));
         }
         if !status.is_success() {
             let detail = serde_json::from_str::<Value>(&text)
                 .ok()
-                .and_then(|v| v.get("message").or_else(|| v.get("error")).and_then(Value::as_str).map(str::to_string))
+                .and_then(|v| {
+                    v.get("message")
+                        .or_else(|| v.get("error"))
+                        .and_then(Value::as_str)
+                        .map(str::to_string)
+                })
                 .unwrap_or_else(|| text.chars().take(200).collect());
-            return Err(err("T3_API_ERROR", format!("T3 returned HTTP {status} for {method} {path}: {detail}")));
+            return Err(err(
+                "T3_API_ERROR",
+                format!("T3 returned HTTP {status} for {method} {path}: {detail}"),
+            ));
         }
         if text.is_empty() {
             return Ok(Value::Null);
         }
-        serde_json::from_str(&text).map_err(|_| err("T3_API_ERROR", format!("T3 sent unreadable JSON for {path}.")))
+        serde_json::from_str(&text).map_err(|_| {
+            err(
+                "T3_API_ERROR",
+                format!("T3 sent unreadable JSON for {path}."),
+            )
+        })
     }
 
     pub async fn get(&self, path: &str) -> Result<Value> {

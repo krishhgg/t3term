@@ -6,6 +6,7 @@
 use std::fmt;
 use std::path::{Path, PathBuf};
 use std::process::Stdio;
+use std::sync::Mutex;
 use std::time::Duration;
 
 use anyhow::{Context, Result};
@@ -55,7 +56,11 @@ pub fn resolve_t3_command(runtime: &Runtime) -> Result<T3Command> {
     if let Ok(configured) = std::env::var("T3TERM_T3_COMMAND") {
         let mut parts = configured.split_whitespace().map(str::to_string);
         let program = parts.next().context("T3TERM_T3_COMMAND is empty")?;
-        return Ok(T3Command { program: program.into(), args_prefix: parts.collect(), electron_as_node: false });
+        return Ok(T3Command {
+            program: program.into(),
+            args_prefix: parts.collect(),
+            electron_as_node: false,
+        });
     }
     let pid = runtime.pid.ok_or_else(|| {
         err_exit(
@@ -68,7 +73,9 @@ pub fn resolve_t3_command(runtime: &Runtime) -> Result<T3Command> {
         err_exit(
             "T3_AUTH_UNAVAILABLE",
             exit::UNAVAILABLE,
-            format!("Could not locate the `t3` command of server process {pid}. Set T3TERM_T3_COMMAND."),
+            format!(
+                "Could not locate the `t3` command of server process {pid}. Set T3TERM_T3_COMMAND."
+            ),
         )
     })
 }
@@ -76,16 +83,28 @@ pub fn resolve_t3_command(runtime: &Runtime) -> Result<T3Command> {
 #[cfg(target_os = "linux")]
 fn server_process_command(pid: u32) -> Option<T3Command> {
     let raw = std::fs::read(format!("/proc/{pid}/cmdline")).ok()?;
-    let argv: Vec<String> =
-        raw.split(|b| *b == 0).filter(|s| !s.is_empty()).map(|s| String::from_utf8_lossy(s).into_owned()).collect();
+    let argv: Vec<String> = raw
+        .split(|b| *b == 0)
+        .filter(|s| !s.is_empty())
+        .map(|s| String::from_utf8_lossy(s).into_owned())
+        .collect();
     let entry = argv.iter().find(|arg| arg.ends_with(SERVER_ENTRY_SUFFIX))?;
-    let program = std::fs::read_link(format!("/proc/{pid}/exe")).ok().unwrap_or_else(|| argv[0].clone().into());
-    Some(T3Command { program, args_prefix: vec![entry.clone()], electron_as_node: true })
+    let program = std::fs::read_link(format!("/proc/{pid}/exe"))
+        .ok()
+        .unwrap_or_else(|| argv[0].clone().into());
+    Some(T3Command {
+        program,
+        args_prefix: vec![entry.clone()],
+        electron_as_node: true,
+    })
 }
 
 #[cfg(not(target_os = "linux"))]
 fn server_process_command(pid: u32) -> Option<T3Command> {
-    let output = std::process::Command::new("ps").args(["-o", "command=", "-p", &pid.to_string()]).output().ok()?;
+    let output = std::process::Command::new("ps")
+        .args(["-o", "command=", "-p", &pid.to_string()])
+        .output()
+        .ok()?;
     parse_ps_command(String::from_utf8_lossy(&output.stdout).trim())
 }
 
@@ -95,7 +114,9 @@ fn parse_ps_command(line: &str) -> Option<T3Command> {
         let app = Path::new(&line[..index + 4]);
         let name = app.file_stem()?.to_str()?;
         let program = app.join("Contents/MacOS").join(name);
-        let entry = app.join("Contents/Resources/app.asar").join(SERVER_ENTRY_SUFFIX);
+        let entry = app
+            .join("Contents/Resources/app.asar")
+            .join(SERVER_ENTRY_SUFFIX);
         return Some(T3Command {
             program,
             args_prefix: vec![entry.to_string_lossy().into_owned()],
@@ -105,7 +126,11 @@ fn parse_ps_command(line: &str) -> Option<T3Command> {
     let mut tokens = line.split_whitespace();
     let program = tokens.next()?;
     let entry = tokens.find(|token| token.ends_with("bin.mjs"))?;
-    Some(T3Command { program: program.into(), args_prefix: vec![entry.to_string()], electron_as_node: false })
+    Some(T3Command {
+        program: program.into(),
+        args_prefix: vec![entry.to_string()],
+        electron_as_node: false,
+    })
 }
 
 #[derive(Deserialize)]
@@ -119,13 +144,14 @@ struct Issued {
 pub struct Session {
     pub id: String,
     token: String,
-    command: T3Command,
-    t3_home: PathBuf,
 }
 
 impl fmt::Debug for Session {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
-        f.debug_struct("Session").field("id", &self.id).field("token", &"<redacted>").finish()
+        f.debug_struct("Session")
+            .field("id", &self.id)
+            .field("token", &"<redacted>")
+            .finish()
     }
 }
 
@@ -137,7 +163,18 @@ impl Session {
     pub async fn issue(runtime: &Runtime, scopes: &[Scope], ttl: &str) -> Result<Session> {
         let command = resolve_t3_command(runtime)?;
         let mut issue = tokio::process::Command::from(command.command());
-        issue.args(["auth", "session", "issue", "--json", "--ttl", ttl, "--label", "t3term", "--subject", "t3term"]);
+        issue.args([
+            "auth",
+            "session",
+            "issue",
+            "--json",
+            "--ttl",
+            ttl,
+            "--label",
+            "t3term",
+            "--subject",
+            "t3term",
+        ]);
         for scope in scopes {
             issue.args(["--scope", scope.as_str()]);
         }
@@ -145,35 +182,89 @@ impl Session {
         issue.stdin(Stdio::null()).kill_on_drop(true);
         let output = tokio::time::timeout(Duration::from_secs(90), issue.output())
             .await
-            .map_err(|_| err("T3_AUTH_FAILED", "`t3 auth session issue` did not finish within 90 seconds."))?
+            .map_err(|_| {
+                err(
+                    "T3_AUTH_FAILED",
+                    "`t3 auth session issue` did not finish within 90 seconds.",
+                )
+            })?
             .with_context(|| format!("could not start {}", command.program.display()))?;
         if !output.status.success() {
             return Err(err(
                 "T3_AUTH_FAILED",
                 format!(
                     "`t3 auth session issue` failed: {}",
-                    String::from_utf8_lossy(&output.stderr).lines().last().unwrap_or("no output")
+                    String::from_utf8_lossy(&output.stderr)
+                        .lines()
+                        .last()
+                        .unwrap_or("no output")
                 ),
             ));
         }
-        let issued: Issued = serde_json::from_slice(&output.stdout)
-            .map_err(|_| err("T3_AUTH_FAILED", "`t3 auth session issue` returned an unreadable credential."))?;
-        Ok(Session { id: issued.session_id, token: issued.token, command, t3_home: runtime.t3_home.clone() })
+        let issued: Issued = serde_json::from_slice(&output.stdout).map_err(|_| {
+            err(
+                "T3_AUTH_FAILED",
+                "`t3 auth session issue` returned an unreadable credential.",
+            )
+        })?;
+        LIVE.lock().unwrap_or_else(|e| e.into_inner()).push((
+            issued.session_id.clone(),
+            command.clone(),
+            runtime.t3_home.clone(),
+        ));
+        Ok(Session {
+            id: issued.session_id,
+            token: issued.token,
+        })
+    }
+}
+
+/// Sessions this process issued and has not revoked. Background tasks can keep a `Session` alive
+/// past the end of `main`, so the binary revokes whatever is left here before it exits.
+static LIVE: Mutex<Vec<(String, T3Command, PathBuf)>> = Mutex::new(Vec::new());
+
+fn revoke_command(id: &str, command: &T3Command, t3_home: &Path) -> std::process::Command {
+    let mut revoke = command.command();
+    revoke
+        .args(["auth", "session", "revoke", id, "--base-dir"])
+        .arg(t3_home)
+        .stdin(Stdio::null())
+        .stdout(Stdio::null())
+        .stderr(Stdio::null());
+    revoke
+}
+
+fn take_live(id: Option<&str>) -> Vec<(String, T3Command, PathBuf)> {
+    let mut live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    match id {
+        Some(id) => live
+            .iter()
+            .position(|(live_id, ..)| live_id == id)
+            .map(|i| vec![live.remove(i)])
+            .unwrap_or_default(),
+        None => std::mem::take(&mut *live),
+    }
+}
+
+/// Revokes every session still open and waits up to three seconds for the revocations.
+pub fn revoke_all_sessions() {
+    let mut children: Vec<_> = take_live(None)
+        .iter()
+        .filter_map(|(id, command, home)| revoke_command(id, command, home).spawn().ok())
+        .collect();
+    let deadline = std::time::Instant::now() + Duration::from_secs(3);
+    while !children.is_empty() && std::time::Instant::now() < deadline {
+        children.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
+        std::thread::sleep(Duration::from_millis(20));
     }
 }
 
 impl Drop for Session {
     fn drop(&mut self) {
-        // Spawn without waiting: the revoke outlives this process if it is exiting.
-        let _ = self
-            .command
-            .command()
-            .args(["auth", "session", "revoke", &self.id, "--base-dir"])
-            .arg(&self.t3_home)
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .spawn();
+        for (id, command, home) in take_live(Some(&self.id)) {
+            // Not awaited: a spawned revoke finishes even if this process exits first.
+            let _ = revoke_command(&id, &command, &home).spawn();
+        }
     }
 }
 
@@ -185,18 +276,27 @@ mod tests {
     fn parses_mac_app_server_command_with_spaces() {
         let line = "/Applications/T3 Code (Nightly).app/Contents/MacOS/T3 Code (Nightly) --require /Applications/T3 Code (Nightly).app/Contents/Resources/app.asar/apps/desktop/dist-electron/compileCache.cjs /Applications/T3 Code (Nightly).app/Contents/Resources/app.asar/apps/server/dist/bin.mjs --bootstrap-fd 3";
         let command = parse_ps_command(line).unwrap();
-        assert_eq!(command.program, PathBuf::from("/Applications/T3 Code (Nightly).app/Contents/MacOS/T3 Code (Nightly)"));
+        assert_eq!(
+            command.program,
+            PathBuf::from("/Applications/T3 Code (Nightly).app/Contents/MacOS/T3 Code (Nightly)")
+        );
         assert_eq!(
             command.args_prefix,
-            vec!["/Applications/T3 Code (Nightly).app/Contents/Resources/app.asar/apps/server/dist/bin.mjs"]
+            vec![
+                "/Applications/T3 Code (Nightly).app/Contents/Resources/app.asar/apps/server/dist/bin.mjs"
+            ]
         );
         assert!(command.electron_as_node);
     }
 
     #[test]
     fn parses_standalone_node_server_command() {
-        let command = parse_ps_command("/usr/local/bin/node /opt/t3/apps/server/dist/bin.mjs serve").unwrap();
+        let command =
+            parse_ps_command("/usr/local/bin/node /opt/t3/apps/server/dist/bin.mjs serve").unwrap();
         assert_eq!(command.program, PathBuf::from("/usr/local/bin/node"));
-        assert_eq!(command.args_prefix, vec!["/opt/t3/apps/server/dist/bin.mjs"]);
+        assert_eq!(
+            command.args_prefix,
+            vec!["/opt/t3/apps/server/dist/bin.mjs"]
+        );
     }
 }

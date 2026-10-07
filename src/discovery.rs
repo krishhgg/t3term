@@ -74,7 +74,9 @@ pub fn t3_home() -> PathBuf {
 }
 
 pub fn home_dir() -> PathBuf {
-    std::env::var_os("HOME").map(PathBuf::from).unwrap_or_else(|| PathBuf::from("."))
+    std::env::var_os("HOME")
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("."))
 }
 
 fn read_runtime_state(path: &Path) -> Option<RuntimeState> {
@@ -83,8 +85,16 @@ fn read_runtime_state(path: &Path) -> Option<RuntimeState> {
 }
 
 async fn fetch_descriptor(http: &reqwest::Client, origin: &str) -> Option<Descriptor> {
-    let url = format!("{}/.well-known/t3/environment", origin.trim_end_matches('/'));
-    let response = http.get(url).timeout(Duration::from_millis(2500)).send().await.ok()?;
+    let url = format!(
+        "{}/.well-known/t3/environment",
+        origin.trim_end_matches('/')
+    );
+    let response = http
+        .get(url)
+        .timeout(Duration::from_millis(2500))
+        .send()
+        .await
+        .ok()?;
     if !response.status().is_success() {
         return None;
     }
@@ -102,12 +112,22 @@ pub async fn discover() -> Result<Runtime> {
     let home = t3_home();
     let mut candidates = Vec::new();
     if let Ok(origin) = std::env::var("T3TERM_ORIGIN") {
-        candidates.push(Candidate { origin, state_dir: None, pid: None });
+        candidates.push(Candidate {
+            origin,
+            state_dir: None,
+            pid: None,
+        });
     }
     for dir in ["userdata", "dev"] {
         let state_dir = home.join(dir);
-        let Some(state) = read_runtime_state(&state_dir.join("server-runtime.json")) else { continue };
-        let candidate = Candidate { origin: state.origin, state_dir: Some(state_dir), pid: Some(state.pid) };
+        let Some(state) = read_runtime_state(&state_dir.join("server-runtime.json")) else {
+            continue;
+        };
+        let candidate = Candidate {
+            origin: state.origin,
+            state_dir: Some(state_dir),
+            pid: Some(state.pid),
+        };
         match candidates.iter_mut().find(|c| c.origin == candidate.origin) {
             // Keep an explicit origin first but learn its pid, which auth needs.
             Some(existing) => *existing = candidate,
@@ -117,7 +137,9 @@ pub async fn discover() -> Result<Runtime> {
 
     let http = reqwest::Client::new();
     for candidate in candidates {
-        let Some(descriptor) = fetch_descriptor(&http, &candidate.origin).await else { continue };
+        let Some(descriptor) = fetch_descriptor(&http, &candidate.origin).await else {
+            continue;
+        };
         return Ok(Runtime {
             origin: candidate.origin.trim_end_matches('/').to_string(),
             t3_home: home,
@@ -126,12 +148,17 @@ pub async fn discover() -> Result<Runtime> {
             environment_id: descriptor.environment_id,
             label: descriptor.label,
             server_version: descriptor.server_version,
-            protocol_version: descriptor.orchestration_protocol_version.and_then(|v| v.as_u64()),
+            protocol_version: descriptor
+                .orchestration_protocol_version
+                .and_then(|v| v.as_u64()),
         });
     }
     Err(err_exit(
         "T3_SERVER_UNAVAILABLE",
         exit::UNAVAILABLE,
-        format!("No running T3 Code server was found under {}. Start T3 Code and retry.", home.display()),
+        format!(
+            "No running T3 Code server was found under {}. Start T3 Code and retry.",
+            home.display()
+        ),
     ))
 }

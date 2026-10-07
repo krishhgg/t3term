@@ -28,7 +28,10 @@ async fn recv(socket: &mut Socket) -> Value {
 }
 
 async fn send(socket: &mut Socket, value: Value) {
-    socket.send(Message::Text(value.to_string().into())).await.unwrap();
+    socket
+        .send(Message::Text(value.to_string().into()))
+        .await
+        .unwrap();
 }
 
 fn delta(sequence: u64, text: &str) -> Value {
@@ -89,7 +92,11 @@ async fn watcher_resumes_after_a_dropped_socket_without_duplicating_items() {
     let mut state = ThreadState::default();
     let mut reconnects = 0;
     while !state.synchronized {
-        match tokio::time::timeout(Duration::from_secs(5), events.recv()).await.expect("watch event").expect("open") {
+        match tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("watch event")
+            .expect("open")
+        {
             WatchEvent::Item(item) => {
                 state.apply(&item);
             }
@@ -100,7 +107,11 @@ async fn watcher_resumes_after_a_dropped_socket_without_duplicating_items() {
     assert_eq!(reconnects, 1);
     assert_eq!(state.sequence, 13);
     let items = state.items();
-    assert_eq!(items.len(), 2, "one user and one assistant item, no duplicates");
+    assert_eq!(
+        items.len(),
+        2,
+        "one user and one assistant item, no duplicates"
+    );
     assert_eq!(items[1]["text"], "Hello world");
     drop(events);
     server.abort();
@@ -120,11 +131,23 @@ async fn unary_call_reports_the_server_failure_message() {
         tokio::time::sleep(Duration::from_secs(1)).await;
     });
     let rpc = RpcClient::connect_url(&url).await.unwrap();
-    let error = rpc.call("orchestration.dispatchCommand", json!({}), Duration::from_secs(5)).await.unwrap_err();
+    let error = rpc
+        .call(
+            "orchestration.dispatchCommand",
+            json!({}),
+            Duration::from_secs(5),
+        )
+        .await
+        .unwrap_err();
     match error {
-        RpcError::Failed { message, error_tag, .. } => {
+        RpcError::Failed {
+            message, error_tag, ..
+        } => {
             assert_eq!(message, "Thread is busy");
-            assert_eq!(error_tag.as_deref(), Some("OrchestrationV2DispatchCommandError"));
+            assert_eq!(
+                error_tag.as_deref(),
+                Some("OrchestrationV2DispatchCommandError")
+            );
         }
         other => panic!("unexpected {other:?}"),
     }

@@ -21,7 +21,11 @@ pub struct T3Error {
 
 impl T3Error {
     pub fn new(code: &'static str, message: impl Into<String>) -> Self {
-        Self { code, message: message.into(), exit_code: exit::FAILURE }
+        Self {
+            code,
+            message: message.into(),
+            exit_code: exit::FAILURE,
+        }
     }
 
     pub fn exit(mut self, exit_code: i32) -> Self {

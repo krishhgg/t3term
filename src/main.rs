@@ -15,7 +15,11 @@ use t3term::projection::{Applied, ThreadState, is_active_status, is_terminal_sta
 use t3term::transcript;
 
 #[derive(Parser)]
-#[command(name = "t3term", version, about = "Terminal client for T3 Code (orchestrator V2). Run with no command to open the TUI.")]
+#[command(
+    name = "t3term",
+    version,
+    about = "Terminal client for T3 Code (orchestrator V2). Run with no command to open the TUI."
+)]
 struct Cli {
     /// Print machine-readable JSON instead of text.
     #[arg(long, global = true)]
@@ -121,7 +125,10 @@ impl DecisionArg {
 fn main() {
     let cli = Cli::parse();
     let json_mode = cli.json;
-    let runtime = tokio::runtime::Builder::new_multi_thread().enable_all().build().expect("tokio runtime");
+    let runtime = tokio::runtime::Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("tokio runtime");
     let code = runtime.block_on(async move {
         // Racing Ctrl-C lets destructors run, which revokes the session.
         tokio::select! {
@@ -133,6 +140,8 @@ fn main() {
         }
     });
     runtime.shutdown_timeout(Duration::from_millis(200));
+    // Watcher tasks may still hold the client, so revoke explicitly rather than rely on Drop.
+    t3term::auth::revoke_all_sessions();
     std::process::exit(code);
 }
 
@@ -142,7 +151,10 @@ fn report(error: &anyhow::Error, json_mode: bool) -> i32 {
         None => ("ERROR", exit::FAILURE),
     };
     if json_mode {
-        println!("{}", json!({"ok": false, "error": {"code": code, "message": error.to_string()}}));
+        println!(
+            "{}",
+            json!({"ok": false, "error": {"code": code, "message": error.to_string()}})
+        );
     } else {
         eprintln!("t3term: {error} [{code}]");
     }
@@ -150,7 +162,10 @@ fn report(error: &anyhow::Error, json_mode: bool) -> i32 {
 }
 
 fn print_json(value: &Value) {
-    println!("{}", serde_json::to_string_pretty(value).unwrap_or_default());
+    println!(
+        "{}",
+        serde_json::to_string_pretty(value).unwrap_or_default()
+    );
 }
 
 async fn connect(scopes: &[Scope], ttl: &str) -> Result<Arc<Client>> {
@@ -165,7 +180,11 @@ async fn run(cli: Cli) -> Result<i32> {
     match cli.command.unwrap_or(Command::Tui) {
         Command::Tui => {
             if !std::io::stdout().is_terminal() {
-                return Err(err_exit("NOT_A_TERMINAL", exit::USAGE, "The TUI needs a terminal. Use a subcommand; see --help."));
+                return Err(err_exit(
+                    "NOT_A_TERMINAL",
+                    exit::USAGE,
+                    "The TUI needs a terminal. Use a subcommand; see --help.",
+                ));
             }
             let client = connect(OPERATE, "12h").await?;
             t3term::tui::run(client).await?;
@@ -179,12 +198,21 @@ async fn run(cli: Cli) -> Result<i32> {
                 print_json(&json!({"ok": true, "projects": shell.projects}));
             } else {
                 for project in &shell.projects {
-                    println!("{}  {}  {}", short(&project["id"]), text(&project["title"]), text(&project["workspaceRoot"]));
+                    println!(
+                        "{}  {}  {}",
+                        short(&project["id"]),
+                        text(&project["title"]),
+                        text(&project["workspaceRoot"])
+                    );
                 }
             }
             Ok(0)
         }
-        Command::Threads { project, limit, all } => {
+        Command::Threads {
+            project,
+            limit,
+            all,
+        } => {
             let client = connect(READ, "10m").await?;
             let shell = client.shell().await?;
             let project_id = match project {
@@ -193,17 +221,32 @@ async fn run(cli: Cli) -> Result<i32> {
                     shell
                         .projects
                         .iter()
-                        .find(|p| p["id"].as_str() == Some(&query) || p["title"].as_str() == Some(&query))
+                        .find(|p| {
+                            p["id"].as_str() == Some(&query) || p["title"].as_str() == Some(&query)
+                        })
                         .and_then(|p| p["id"].as_str().map(str::to_string))
-                        .ok_or_else(|| err_exit("PROJECT_NOT_FOUND", exit::NOT_FOUND, format!("No project matches {query}.")))?,
+                        .ok_or_else(|| {
+                            err_exit(
+                                "PROJECT_NOT_FOUND",
+                                exit::NOT_FOUND,
+                                format!("No project matches {query}."),
+                            )
+                        })?,
                 ),
             };
-            let titles: HashMap<&str, &str> =
-                shell.projects.iter().filter_map(|p| Some((p["id"].as_str()?, p["title"].as_str().unwrap_or("")))).collect();
+            let titles: HashMap<&str, &str> = shell
+                .projects
+                .iter()
+                .filter_map(|p| Some((p["id"].as_str()?, p["title"].as_str().unwrap_or(""))))
+                .collect();
             let mut threads: Vec<&Value> = shell
                 .threads
                 .iter()
-                .filter(|t| project_id.as_deref().is_none_or(|id| t["projectId"].as_str() == Some(id)))
+                .filter(|t| {
+                    project_id
+                        .as_deref()
+                        .is_none_or(|id| t["projectId"].as_str() == Some(id))
+                })
                 .filter(|t| all || t["lineage"]["parentThreadId"].is_null())
                 .collect();
             threads.sort_by(|a, b| text(&b["updatedAt"]).cmp(text(&a["updatedAt"])));
@@ -212,7 +255,10 @@ async fn run(cli: Cli) -> Result<i32> {
                 print_json(&json!({"ok": true, "threads": threads}));
             } else {
                 for thread in threads {
-                    let project = titles.get(thread["projectId"].as_str().unwrap_or("")).copied().unwrap_or("");
+                    let project = titles
+                        .get(thread["projectId"].as_str().unwrap_or(""))
+                        .copied()
+                        .unwrap_or("");
                     println!(
                         "{}  {:<10} {:<20.20} {}",
                         short(&thread["id"]),
@@ -224,12 +270,18 @@ async fn run(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
-        Command::Read { thread, last, reasoning } => {
+        Command::Read {
+            thread,
+            last,
+            reasoning,
+        } => {
             let client = connect(READ, "10m").await?;
             let id = resolve_thread(&client, &thread).await?;
             let state = client.thread(&id, false).await?;
             if json_mode {
-                print_json(&json!({"ok": true, "snapshotSequence": state.sequence, "projection": state.projection}));
+                print_json(
+                    &json!({"ok": true, "snapshotSequence": state.sequence, "projection": state.projection}),
+                );
             } else {
                 println!("# {}  ({})", text(&state.thread()["title"]), id);
                 print!("{}", transcript::plain_text(&state, last, reasoning));
@@ -249,7 +301,9 @@ async fn run(cli: Cli) -> Result<i32> {
                             println!("{item}");
                         } else {
                             match applied {
-                                Applied::Snapshot => eprintln!("snapshot at sequence {}", state.sequence),
+                                Applied::Snapshot => {
+                                    eprintln!("snapshot at sequence {}", state.sequence)
+                                }
                                 Applied::Synchronized => eprintln!("live"),
                                 Applied::Event(kind) => println!("{} {kind}", state.sequence),
                                 Applied::Duplicate | Applied::Ignored => {}
@@ -257,14 +311,23 @@ async fn run(cli: Cli) -> Result<i32> {
                         }
                     }
                     WatchEvent::Reconnecting { reason, retry_in } => {
-                        eprintln!("connection lost ({reason}); retrying in {}ms", retry_in.as_millis())
+                        eprintln!(
+                            "connection lost ({reason}); retrying in {}ms",
+                            retry_in.as_millis()
+                        )
                     }
                     WatchEvent::Failed(message) => return Err(err("WATCH_FAILED", message)),
                 }
             }
             Ok(0)
         }
-        Command::Send { thread, prompt, wait, timeout, if_busy } => {
+        Command::Send {
+            thread,
+            prompt,
+            wait,
+            timeout,
+            if_busy,
+        } => {
             let prompt = match prompt {
                 Some(prompt) => prompt,
                 None => {
@@ -285,23 +348,48 @@ async fn run(cli: Cli) -> Result<i32> {
             let receipt = client.send_message(&state, &prompt, if_busy).await?;
             if !wait {
                 if json_mode {
-                    print_json(&json!({"ok": true, "threadId": id, "messageId": receipt.message_id, "dispatchMode": receipt.dispatch_mode, "sequence": receipt.sequence}));
+                    print_json(
+                        &json!({"ok": true, "threadId": id, "messageId": receipt.message_id, "dispatchMode": receipt.dispatch_mode, "sequence": receipt.sequence}),
+                    );
                 } else {
                     println!("sent {} ({})", receipt.message_id, receipt.dispatch_mode);
                 }
                 return Ok(0);
             }
-            wait_for_reply(&client, &id, state, &receipt.message_id, Duration::from_secs(timeout), json_mode).await
+            wait_for_reply(
+                &client,
+                &id,
+                state,
+                &receipt.message_id,
+                Duration::from_secs(timeout),
+                json_mode,
+            )
+            .await
         }
         Command::Wait { thread, timeout } => {
             let client = connect(READ, &format!("{}m", timeout / 60 + 10)).await?;
             let id = resolve_thread(&client, &thread).await?;
             let state = client.thread(&id, true).await?;
             let run = state.active_run().or_else(|| state.latest_run());
-            let Some(message_id) = run.and_then(|r| r["userMessageId"].as_str()).map(str::to_string) else {
-                return Err(err_exit("THREAD_IDLE", exit::REJECTED, "The thread has no turns."));
+            let Some(message_id) = run
+                .and_then(|r| r["userMessageId"].as_str())
+                .map(str::to_string)
+            else {
+                return Err(err_exit(
+                    "THREAD_IDLE",
+                    exit::REJECTED,
+                    "The thread has no turns.",
+                ));
             };
-            wait_for_reply(&client, &id, state, &message_id, Duration::from_secs(timeout), json_mode).await
+            wait_for_reply(
+                &client,
+                &id,
+                state,
+                &message_id,
+                Duration::from_secs(timeout),
+                json_mode,
+            )
+            .await
         }
         Command::Requests { thread } => {
             let client = connect(READ, "10m").await?;
@@ -322,21 +410,40 @@ async fn run(cli: Cli) -> Result<i32> {
                 println!("No pending requests.");
             } else {
                 for request in &requests {
-                    println!("{}  {}  {}", text(&request["id"]), text(&request["kind"]), text(&request["prompt"]));
+                    println!(
+                        "{}  {}  {}",
+                        text(&request["id"]),
+                        text(&request["kind"]),
+                        text(&request["prompt"])
+                    );
                 }
             }
             Ok(0)
         }
-        Command::Approve { thread, request, decision } => {
+        Command::Approve {
+            thread,
+            request,
+            decision,
+        } => {
             let client = connect(OPERATE, "10m").await?;
             let id = resolve_thread(&client, &thread).await?;
             let state = client.thread(&id, true).await?;
-            let pending: Vec<&Value> = state.pending_requests().into_iter().filter(|r| r["kind"] != "user_input").collect();
+            let pending: Vec<&Value> = state
+                .pending_requests()
+                .into_iter()
+                .filter(|r| r["kind"] != "user_input")
+                .collect();
             let request_id = match request {
                 Some(request) => request,
                 None => match pending.as_slice() {
                     [only] => only["id"].as_str().unwrap_or_default().to_string(),
-                    [] => return Err(err_exit("NO_PENDING_REQUEST", exit::NOT_FOUND, "The thread has no pending approval.")),
+                    [] => {
+                        return Err(err_exit(
+                            "NO_PENDING_REQUEST",
+                            exit::NOT_FOUND,
+                            "The thread has no pending approval.",
+                        ));
+                    }
                     _ => {
                         return Err(err_exit(
                             "AMBIGUOUS_REQUEST",
@@ -348,7 +455,9 @@ async fn run(cli: Cli) -> Result<i32> {
             };
             let sequence = client.respond(&id, &request_id, decision.wire()).await?;
             if json_mode {
-                print_json(&json!({"ok": true, "requestId": request_id, "decision": decision.wire(), "sequence": sequence}));
+                print_json(
+                    &json!({"ok": true, "requestId": request_id, "decision": decision.wire(), "sequence": sequence}),
+                );
             } else {
                 println!("{} {request_id}", decision.wire());
             }
@@ -358,7 +467,13 @@ async fn run(cli: Cli) -> Result<i32> {
             let client = connect(OPERATE, "10m").await?;
             let id = resolve_thread(&client, &thread).await?;
             let state = client.thread(&id, true).await?;
-            let run = state.active_run().ok_or_else(|| err_exit("THREAD_IDLE", exit::REJECTED, "The thread has no running turn."))?;
+            let run = state.active_run().ok_or_else(|| {
+                err_exit(
+                    "THREAD_IDLE",
+                    exit::REJECTED,
+                    "The thread has no running turn.",
+                )
+            })?;
             let run_id = run["id"].as_str().unwrap_or_default().to_string();
             client.interrupt(&id, &run_id).await?;
             if json_mode {
@@ -382,26 +497,47 @@ fn short(value: &Value) -> &str {
 }
 
 fn is_uuid(id: &str) -> bool {
-    id.len() == 36 && id.chars().all(|c| c == '-' || c.is_ascii_hexdigit()) && id.matches('-').count() == 4
+    id.len() == 36
+        && id.chars().all(|c| c == '-' || c.is_ascii_hexdigit())
+        && id.matches('-').count() == 4
 }
 
 /// Accepts a full id, a unique id prefix, or an exact title.
 async fn resolve_thread(client: &Client, query: &str) -> Result<String> {
     let shell = client.shell().await?;
-    if is_uuid(query) || shell.threads.iter().any(|t| t["id"].as_str() == Some(query)) {
+    if is_uuid(query)
+        || shell
+            .threads
+            .iter()
+            .any(|t| t["id"].as_str() == Some(query))
+    {
         // Archived threads are not in the shell but can still be read by id.
         return Ok(query.to_string());
     }
     let matches: Vec<&str> = shell
         .threads
         .iter()
-        .filter(|t| t["id"].as_str().is_some_and(|id| id.starts_with(query)) || t["title"].as_str() == Some(query))
+        .filter(|t| {
+            t["id"].as_str().is_some_and(|id| id.starts_with(query))
+                || t["title"].as_str() == Some(query)
+        })
         .filter_map(|t| t["id"].as_str())
         .collect();
     match matches.as_slice() {
         [only] => Ok(only.to_string()),
-        [] => Err(err_exit("THREAD_NOT_FOUND", exit::NOT_FOUND, format!("No active thread matches {query}."))),
-        _ => Err(err_exit("AMBIGUOUS_THREAD", exit::USAGE, format!("{} threads match {query}; use more of the id.", matches.len()))),
+        [] => Err(err_exit(
+            "THREAD_NOT_FOUND",
+            exit::NOT_FOUND,
+            format!("No active thread matches {query}."),
+        )),
+        _ => Err(err_exit(
+            "AMBIGUOUS_THREAD",
+            exit::USAGE,
+            format!(
+                "{} threads match {query}; use more of the id.",
+                matches.len()
+            ),
+        )),
     }
 }
 
@@ -441,32 +577,53 @@ async fn wait_for_reply(
                             announced.insert("assistant".into());
                         }
                     } else if let Some(block) = transcript::describe(item) {
-                        let settled = !matches!(block.status.as_str(), "running" | "pending" | "idle");
-                        if settled && !matches!(block.kind, transcript::BlockKind::Reasoning | transcript::BlockKind::User) && announced.insert(item_id) {
+                        let settled =
+                            !matches!(block.status.as_str(), "running" | "pending" | "idle");
+                        if settled
+                            && !matches!(
+                                block.kind,
+                                transcript::BlockKind::Reasoning | transcript::BlockKind::User
+                            )
+                            && announced.insert(item_id)
+                        {
                             eprintln!("\n· {}", block.header);
                         }
                     }
                 }
             }
             let needs_person = state.pending_requests().iter().any(|r| {
-                state.request_item(r["id"].as_str().unwrap_or_default()).and_then(|i| i["runId"].as_str()) == Some(run_id)
-            }) || (is_active_status(status(&run)) && !state.pending_requests().is_empty());
+                state
+                    .request_item(r["id"].as_str().unwrap_or_default())
+                    .and_then(|i| i["runId"].as_str())
+                    == Some(run_id)
+            }) || (is_active_status(status(&run))
+                && !state.pending_requests().is_empty());
             let finished = is_terminal_status(status(&run));
             if needs_person || finished {
-                let outcome = if needs_person { "needs-attention" } else { status(&run) };
+                let outcome = if needs_person {
+                    "needs-attention"
+                } else {
+                    status(&run)
+                };
                 let reply: String = state
                     .items()
                     .into_iter()
-                    .filter(|i| i["runId"].as_str() == Some(run_id) && i["type"] == "assistant_message")
+                    .filter(|i| {
+                        i["runId"].as_str() == Some(run_id) && i["type"] == "assistant_message"
+                    })
                     .filter_map(|i| i["text"].as_str())
                     .collect::<Vec<_>>()
                     .join("\n\n");
                 if json_mode {
-                    print_json(&json!({"ok": true, "threadId": thread_id, "messageId": message_id, "runId": run_id, "outcome": outcome, "reply": reply}));
+                    print_json(
+                        &json!({"ok": true, "threadId": thread_id, "messageId": message_id, "runId": run_id, "outcome": outcome, "reply": reply}),
+                    );
                 } else {
                     println!();
                     if needs_person {
-                        eprintln!("The turn is waiting for approval. Run `t3term requests {thread_id}`.");
+                        eprintln!(
+                            "The turn is waiting for approval. Run `t3term requests {thread_id}`."
+                        );
                     } else if outcome != "completed" {
                         eprintln!("The turn ended: {outcome}");
                     }
@@ -484,7 +641,9 @@ async fn wait_for_reply(
                 return Err(err_exit(
                     "THREAD_WAIT_TIMEOUT",
                     exit::TIMEOUT,
-                    format!("The message was sent ({message_id}), but the turn did not finish in time. Do not resend it."),
+                    format!(
+                        "The message was sent ({message_id}), but the turn did not finish in time. Do not resend it."
+                    ),
                 ));
             }
             Ok(None) => return Err(err("WATCH_FAILED", "The thread subscription ended.")),
@@ -507,7 +666,10 @@ async fn doctor(json_mode: bool) -> Result<i32> {
     let runtime = match discovery::discover().await {
         Ok(runtime) => runtime,
         Err(error) => {
-            checks.insert("server".into(), json!({"ok": false, "message": error.to_string()}));
+            checks.insert(
+                "server".into(),
+                json!({"ok": false, "message": error.to_string()}),
+            );
             return finish_doctor(checks, false, json_mode);
         }
     };
@@ -518,9 +680,15 @@ async fn doctor(json_mode: bool) -> Result<i32> {
         return finish_doctor(checks, false, json_mode);
     }
     match t3term::auth::resolve_t3_command(&runtime) {
-        Ok(command) => checks.insert("t3Command".into(), json!({"ok": true, "program": command.program})),
+        Ok(command) => checks.insert(
+            "t3Command".into(),
+            json!({"ok": true, "program": command.program}),
+        ),
         Err(error) => {
-            checks.insert("t3Command".into(), json!({"ok": false, "message": error.to_string()}));
+            checks.insert(
+                "t3Command".into(),
+                json!({"ok": false, "message": error.to_string()}),
+            );
             return finish_doctor(checks, false, json_mode);
         }
     };
@@ -528,7 +696,10 @@ async fn doctor(json_mode: bool) -> Result<i32> {
     match Client::connect(READ, "5m").await {
         Err(error) => {
             ok = false;
-            checks.insert("auth".into(), json!({"ok": false, "message": error.to_string()}));
+            checks.insert(
+                "auth".into(),
+                json!({"ok": false, "message": error.to_string()}),
+            );
         }
         Ok(client) => {
             checks.insert("auth".into(), json!({"ok": true, "scopes": ["orchestration:read"], "ms": started.elapsed().as_millis()}));
