@@ -1,0 +1,52 @@
+{
+  "method": "V*I from Apple's battery IORegistry mV/mA properties. Six readings over about 25s. Hardware gauge can lag/smooth. Whole-machine estimate including display and all apps. T3 and research agents active; no A/B energy inference.",
+  "summary": {
+    "median_discharge_watts": 26.42353,
+    "min_discharge_watts": 26.42353,
+    "max_discharge_watts": 26.42353
+  },
+  "samples": [
+    {
+      "timestamp_utc": "2026-10-07T22:14:28.116558+00:00",
+      "millivolts": 12523,
+      "milliamps_signed": -2110,
+      "estimated_discharge_watts": 26.42353,
+      "external_power": false
+    },
+    {
+      "timestamp_utc": "2026-10-07T22:14:33.148317+00:00",
+      "millivolts": 12523,
+      "milliamps_signed": -2110,
+      "estimated_discharge_watts": 26.42353,
+      "external_power": false
+    },
+    {
+      "timestamp_utc": "2026-10-07T22:14:38.182142+00:00",
+      "millivolts": 12523,
+      "milliamps_signed": -2110,
+      "estimated_discharge_watts": 26.42353,
+      "external_power": false
+    },
+    {
+      "timestamp_utc": "2026-10-07T22:14:43.211501+00:00",
+      "millivolts": 12523,
+      "milliamps_signed": -2110,
+      "estimated_discharge_watts": 26.42353,
+      "external_power": false
+    },
+    {
+      "timestamp_utc": "2026-10-07T22:14:48.237679+00:00",
+      "millivolts": 12523,
+      "milliamps_signed": -2110,
+      "estimated_discharge_watts": 26.42353,
+      "external_power": false
+    },
+    {
+      "timestamp_utc": "2026-10-07T22:14:53.269202+00:00",
+      "millivolts": 12523,
+      "milliamps_signed": -2110,
+      "estimated_discharge_watts": 26.42353,
+      "external_power": false
+    }
+  ]
+}

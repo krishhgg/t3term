@@ -1,1 +1,4 @@
 /target
+/benchmarks/bin/
+/benchmarks/ratatui_probe/target/
+__pycache__/

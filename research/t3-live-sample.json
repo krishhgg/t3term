@@ -1,0 +1,3946 @@
+{
+  "timestamp_utc": "2026-10-07T22:08:47.115659+00:00",
+  "app_root_pid": 66334,
+  "server_pid": 66740,
+  "note": "Active research session with three agents. CPU is cumulative time delta, 100%=one core. RSS sums include shared pages. New/exited processes excluded from CPU deltas. No wattage measured.",
+  "summary": {
+    "desktop_ui_and_helpers": {
+      "cpu_percent_one_core": 16.589779322924418,
+      "mean_rss_mib": 1018.3571428571429,
+      "min_rss_mib": 955.875,
+      "max_rss_mib": 1046.46875,
+      "stable_process_count": 5
+    },
+    "server": {
+      "cpu_percent_one_core": 2.7759790102104756,
+      "mean_rss_mib": 347.18080357142856,
+      "min_rss_mib": 326.34375,
+      "max_rss_mib": 353.203125,
+      "stable_process_count": 1
+    },
+    "providers_and_server_children": {
+      "cpu_percent_one_core": 9.782021274074966,
+      "mean_rss_mib": 4857.895089285715,
+      "min_rss_mib": 4829.875,
+      "max_rss_mib": 4915.953125,
+      "stable_process_count": 58
+    }
+  },
+  "samples": [
+    {
+      "elapsed_seconds": 0.02993387501919642,
+      "processes": [
+        {
+          "pid": 6345,
+          "ppid": 66740,
+          "cpu_seconds": 5.41,
+          "rss_kib": 384944,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6381,
+          "ppid": 6345,
+          "cpu_seconds": 0.62,
+          "rss_kib": 96720,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6383,
+          "ppid": 6345,
+          "cpu_seconds": 0.0,
+          "rss_kib": 8656,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6388,
+          "ppid": 6345,
+          "cpu_seconds": 0.62,
+          "rss_kib": 97264,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6472,
+          "ppid": 6388,
+          "cpu_seconds": 0.29,
+          "rss_kib": 105840,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6498,
+          "ppid": 6381,
+          "cpu_seconds": 0.32,
+          "rss_kib": 85088,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64099,
+          "ppid": 66740,
+          "cpu_seconds": 1.89,
+          "rss_kib": 357040,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64105,
+          "ppid": 66740,
+          "cpu_seconds": 2.46,
+          "rss_kib": 378096,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64156,
+          "ppid": 64105,
+          "cpu_seconds": 0.62,
+          "rss_kib": 97264,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64157,
+          "ppid": 64099,
+          "cpu_seconds": 0.62,
+          "rss_kib": 98384,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64158,
+          "ppid": 64105,
+          "cpu_seconds": 0.0,
+          "rss_kib": 8576,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64159,
+          "ppid": 64099,
+          "cpu_seconds": 0.0,
+          "rss_kib": 8592,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64160,
+          "ppid": 64105,
+          "cpu_seconds": 0.6,
+          "rss_kib": 97360,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64161,
+          "ppid": 64099,
+          "cpu_seconds": 0.6,
+          "rss_kib": 97792,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64297,
+          "ppid": 64156,
+          "cpu_seconds": 0.31,
+          "rss_kib": 82320,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64323,
+          "ppid": 64157,
+          "cpu_seconds": 0.27,
+          "rss_kib": 84240,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64348,
+          "ppid": 64161,
+          "cpu_seconds": 0.3,
+          "rss_kib": 105136,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64401,
+          "ppid": 64160,
+          "cpu_seconds": 0.32,
+          "rss_kib": 105344,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64590,
+          "ppid": 67509,
+          "cpu_seconds": 0.04,
+          "rss_kib": 51376,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64591,
+          "ppid": 67509,
+          "cpu_seconds": 0.01,
+          "rss_kib": 8576,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64592,
+          "ppid": 67509,
+          "cpu_seconds": 0.08,
+          "rss_kib": 19696,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64599,
+          "ppid": 64590,
+          "cpu_seconds": 0.07,
+          "rss_kib": 19472,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 66334,
+          "ppid": 1,
+          "cpu_seconds": 18.01,
+          "rss_kib": 256144,
+          "command": "T3 Code (Nightly)",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66338,
+          "ppid": 66334,
+          "cpu_seconds": 63.56,
+          "rss_kib": 130192,
+          "command": "T3 Code (Nightly) Helper",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66339,
+          "ppid": 66334,
+          "cpu_seconds": 1.37,
+          "rss_kib": 57184,
+          "command": "T3 Code (Nightly) Helper",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66739,
+          "ppid": 66334,
+          "cpu_seconds": 124.87,
+          "rss_kib": 581120,
+          "command": "T3 Code (Nightly) Helper (Renderer)",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66740,
+          "ppid": 66334,
+          "cpu_seconds": 34.16,
+          "rss_kib": 334176,
+          "command": "T3 Code (Nightly)",
+          "group": "server"
+        },
+        {
+          "pid": 67146,
+          "ppid": 66740,
+          "cpu_seconds": 3.98,
+          "rss_kib": 14544,
+          "command": "t3-resource-monitor",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67412,
+          "ppid": 66740,
+          "cpu_seconds": 0.02,
+          "rss_kib": 29056,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67509,
+          "ppid": 67412,
+          "cpu_seconds": 10.67,
+          "rss_kib": 330384,
+          "command": "codex",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67826,
+          "ppid": 66740,
+          "cpu_seconds": 2.6,
+          "rss_kib": 38976,
+          "command": "cloudflared",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67961,
+          "ppid": 72520,
+          "cpu_seconds": 0.01,
+          "rss_kib": 2960,
+          "command": "zsh",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67968,
+          "ppid": 67961,
+          "cpu_seconds": 0.0,
+          "rss_kib": 1136,
+          "command": "time",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67969,
+          "ppid": 67968,
+          "cpu_seconds": 0.15,
+          "rss_kib": 56880,
+          "command": "swift-test",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68044,
+          "ppid": 67509,
+          "cpu_seconds": 0.08,
+          "rss_kib": 15744,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68045,
+          "ppid": 67509,
+          "cpu_seconds": 0.03,
+          "rss_kib": 39744,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68046,
+          "ppid": 67509,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6544,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68105,
+          "ppid": 67969,
+          "cpu_seconds": 2.05,
+          "rss_kib": 62176,
+          "command": "xctest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68211,
+          "ppid": 68045,
+          "cpu_seconds": 0.07,
+          "rss_kib": 14416,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 69954,
+          "ppid": 66334,
+          "cpu_seconds": 0.49,
+          "rss_kib": 40336,
+          "command": "T3 Code (Nightly) Helper",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 70046,
+          "ppid": 67509,
+          "cpu_seconds": 0.52,
+          "rss_kib": 37088,
+          "command": "codex-code-mode-host",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70519,
+          "ppid": 67509,
+          "cpu_seconds": 0.04,
+          "rss_kib": 37232,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70520,
+          "ppid": 67509,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6544,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70521,
+          "ppid": 67509,
+          "cpu_seconds": 0.07,
+          "rss_kib": 13520,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70577,
+          "ppid": 70519,
+          "cpu_seconds": 0.08,
+          "rss_kib": 13280,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72520,
+          "ppid": 66740,
+          "cpu_seconds": 8.89,
+          "rss_kib": 313552,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72538,
+          "ppid": 72520,
+          "cpu_seconds": 0.62,
+          "rss_kib": 80384,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72539,
+          "ppid": 72520,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6992,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72540,
+          "ppid": 72520,
+          "cpu_seconds": 0.62,
+          "rss_kib": 79104,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72572,
+          "ppid": 72540,
+          "cpu_seconds": 0.28,
+          "rss_kib": 84800,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72598,
+          "ppid": 72538,
+          "cpu_seconds": 0.27,
+          "rss_kib": 67824,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 73060,
+          "ppid": 67509,
+          "cpu_seconds": 0.04,
+          "rss_kib": 18896,
+          "command": "Python",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 73079,
+          "ppid": 68105,
+          "cpu_seconds": 0.0,
+          "rss_kib": 2160,
+          "command": "bash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 73081,
+          "ppid": 73079,
+          "cpu_seconds": 0.0,
+          "rss_kib": 1536,
+          "command": "bash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 73082,
+          "ppid": 73081,
+          "cpu_seconds": 0.0,
+          "rss_kib": 32,
+          "command": "bash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 73084,
+          "ppid": 73060,
+          "cpu_seconds": 0.0,
+          "rss_kib": 1872,
+          "command": "ps",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75562,
+          "ppid": 66740,
+          "cpu_seconds": 6.61,
+          "rss_kib": 309056,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75580,
+          "ppid": 75562,
+          "cpu_seconds": 0.58,
+          "rss_kib": 85488,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75581,
+          "ppid": 75562,
+          "cpu_seconds": 0.0,
+          "rss_kib": 7184,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75582,
+          "ppid": 75562,
+          "cpu_seconds": 0.58,
+          "rss_kib": 84720,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75610,
+          "ppid": 75582,
+          "cpu_seconds": 0.3,
+          "rss_kib": 89568,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75636,
+          "ppid": 75580,
+          "cpu_seconds": 0.24,
+          "rss_kib": 64160,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81786,
+          "ppid": 66740,
+          "cpu_seconds": 5.66,
+          "rss_kib": 297312,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81804,
+          "ppid": 81786,
+          "cpu_seconds": 0.58,
+          "rss_kib": 58672,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81805,
+          "ppid": 81786,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6656,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81806,
+          "ppid": 81786,
+          "cpu_seconds": 0.59,
+          "rss_kib": 60688,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81901,
+          "ppid": 81806,
+          "cpu_seconds": 0.23,
+          "rss_kib": 55408,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81927,
+          "ppid": 81804,
+          "cpu_seconds": 0.23,
+          "rss_kib": 51728,
+          "command": "node",
+          "group": "providers_and_server_children"
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 5.064731042017229,
+      "processes": [
+        {
+          "pid": 6345,
+          "ppid": 66740,
+          "cpu_seconds": 5.47,
+          "rss_kib": 384976,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6381,
+          "ppid": 6345,
+          "cpu_seconds": 0.62,
+          "rss_kib": 96720,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6383,
+          "ppid": 6345,
+          "cpu_seconds": 0.0,
+          "rss_kib": 8656,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6388,
+          "ppid": 6345,
+          "cpu_seconds": 0.62,
+          "rss_kib": 97264,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6472,
+          "ppid": 6388,
+          "cpu_seconds": 0.29,
+          "rss_kib": 105840,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6498,
+          "ppid": 6381,
+          "cpu_seconds": 0.32,
+          "rss_kib": 85088,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64099,
+          "ppid": 66740,
+          "cpu_seconds": 1.91,
+          "rss_kib": 357008,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64105,
+          "ppid": 66740,
+          "cpu_seconds": 2.58,
+          "rss_kib": 379136,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64156,
+          "ppid": 64105,
+          "cpu_seconds": 0.62,
+          "rss_kib": 97264,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64157,
+          "ppid": 64099,
+          "cpu_seconds": 0.62,
+          "rss_kib": 98384,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64158,
+          "ppid": 64105,
+          "cpu_seconds": 0.0,
+          "rss_kib": 8576,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64159,
+          "ppid": 64099,
+          "cpu_seconds": 0.0,
+          "rss_kib": 8592,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64160,
+          "ppid": 64105,
+          "cpu_seconds": 0.6,
+          "rss_kib": 97360,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64161,
+          "ppid": 64099,
+          "cpu_seconds": 0.6,
+          "rss_kib": 97792,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64297,
+          "ppid": 64156,
+          "cpu_seconds": 0.31,
+          "rss_kib": 82320,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64323,
+          "ppid": 64157,
+          "cpu_seconds": 0.27,
+          "rss_kib": 84240,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64348,
+          "ppid": 64161,
+          "cpu_seconds": 0.3,
+          "rss_kib": 105136,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64401,
+          "ppid": 64160,
+          "cpu_seconds": 0.32,
+          "rss_kib": 105344,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64590,
+          "ppid": 67509,
+          "cpu_seconds": 0.04,
+          "rss_kib": 51376,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64591,
+          "ppid": 67509,
+          "cpu_seconds": 0.01,
+          "rss_kib": 8576,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64592,
+          "ppid": 67509,
+          "cpu_seconds": 0.08,
+          "rss_kib": 19696,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64599,
+          "ppid": 64590,
+          "cpu_seconds": 0.07,
+          "rss_kib": 19472,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 66334,
+          "ppid": 1,
+          "cpu_seconds": 18.03,
+          "rss_kib": 256320,
+          "command": "T3 Code (Nightly)",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66338,
+          "ppid": 66334,
+          "cpu_seconds": 63.77,
+          "rss_kib": 131024,
+          "command": "T3 Code (Nightly) Helper",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66339,
+          "ppid": 66334,
+          "cpu_seconds": 1.38,
+          "rss_kib": 57184,
+          "command": "T3 Code (Nightly) Helper",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66739,
+          "ppid": 66334,
+          "cpu_seconds": 125.46,
+          "rss_kib": 580896,
+          "command": "T3 Code (Nightly) Helper (Renderer)",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66740,
+          "ppid": 66334,
+          "cpu_seconds": 34.49,
+          "rss_kib": 348512,
+          "command": "T3 Code (Nightly)",
+          "group": "server"
+        },
+        {
+          "pid": 67146,
+          "ppid": 66740,
+          "cpu_seconds": 3.99,
+          "rss_kib": 14592,
+          "command": "t3-resource-monitor",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67412,
+          "ppid": 66740,
+          "cpu_seconds": 0.02,
+          "rss_kib": 29056,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67509,
+          "ppid": 67412,
+          "cpu_seconds": 10.76,
+          "rss_kib": 330528,
+          "command": "codex",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67826,
+          "ppid": 66740,
+          "cpu_seconds": 2.61,
+          "rss_kib": 38976,
+          "command": "cloudflared",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67961,
+          "ppid": 72520,
+          "cpu_seconds": 0.01,
+          "rss_kib": 2960,
+          "command": "zsh",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67968,
+          "ppid": 67961,
+          "cpu_seconds": 0.0,
+          "rss_kib": 1136,
+          "command": "time",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67969,
+          "ppid": 67968,
+          "cpu_seconds": 0.15,
+          "rss_kib": 56880,
+          "command": "swift-test",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68044,
+          "ppid": 67509,
+          "cpu_seconds": 0.08,
+          "rss_kib": 15744,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68045,
+          "ppid": 67509,
+          "cpu_seconds": 0.03,
+          "rss_kib": 39744,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68046,
+          "ppid": 67509,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6544,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68105,
+          "ppid": 67969,
+          "cpu_seconds": 2.11,
+          "rss_kib": 62224,
+          "command": "xctest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68211,
+          "ppid": 68045,
+          "cpu_seconds": 0.07,
+          "rss_kib": 14416,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 69954,
+          "ppid": 66334,
+          "cpu_seconds": 0.49,
+          "rss_kib": 40336,
+          "command": "T3 Code (Nightly) Helper",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 70046,
+          "ppid": 67509,
+          "cpu_seconds": 0.53,
+          "rss_kib": 36768,
+          "command": "codex-code-mode-host",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70519,
+          "ppid": 67509,
+          "cpu_seconds": 0.04,
+          "rss_kib": 37232,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70520,
+          "ppid": 67509,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6544,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70521,
+          "ppid": 67509,
+          "cpu_seconds": 0.07,
+          "rss_kib": 13520,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70577,
+          "ppid": 70519,
+          "cpu_seconds": 0.08,
+          "rss_kib": 13280,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72520,
+          "ppid": 66740,
+          "cpu_seconds": 8.94,
+          "rss_kib": 313552,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72538,
+          "ppid": 72520,
+          "cpu_seconds": 0.62,
+          "rss_kib": 80384,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72539,
+          "ppid": 72520,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6992,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72540,
+          "ppid": 72520,
+          "cpu_seconds": 0.62,
+          "rss_kib": 79104,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72572,
+          "ppid": 72540,
+          "cpu_seconds": 0.28,
+          "rss_kib": 84800,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72598,
+          "ppid": 72538,
+          "cpu_seconds": 0.27,
+          "rss_kib": 67824,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 73060,
+          "ppid": 67509,
+          "cpu_seconds": 0.04,
+          "rss_kib": 19376,
+          "command": "Python",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 73294,
+          "ppid": 6345,
+          "cpu_seconds": 0.01,
+          "rss_kib": 2960,
+          "command": "zsh",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 73525,
+          "ppid": 68105,
+          "cpu_seconds": 0.01,
+          "rss_kib": 2400,
+          "command": "bash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 73659,
+          "ppid": 73525,
+          "cpu_seconds": 0.0,
+          "rss_kib": 1616,
+          "command": "bash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 73660,
+          "ppid": 73659,
+          "cpu_seconds": 0.0,
+          "rss_kib": 32,
+          "command": "bash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 73661,
+          "ppid": 73525,
+          "cpu_seconds": 0.0,
+          "rss_kib": 1120,
+          "command": "sleep",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 73667,
+          "ppid": 73294,
+          "cpu_seconds": 0.01,
+          "rss_kib": 4272,
+          "command": "git",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 73668,
+          "ppid": 73667,
+          "cpu_seconds": 0.0,
+          "rss_kib": 3904,
+          "command": "git",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 73669,
+          "ppid": 73668,
+          "cpu_seconds": 0.01,
+          "rss_kib": 7920,
+          "command": "git-remote-https",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 73670,
+          "ppid": 73060,
+          "cpu_seconds": 0.0,
+          "rss_kib": 1888,
+          "command": "ps",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75562,
+          "ppid": 66740,
+          "cpu_seconds": 6.62,
+          "rss_kib": 308880,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75580,
+          "ppid": 75562,
+          "cpu_seconds": 0.58,
+          "rss_kib": 85488,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75581,
+          "ppid": 75562,
+          "cpu_seconds": 0.0,
+          "rss_kib": 7184,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75582,
+          "ppid": 75562,
+          "cpu_seconds": 0.58,
+          "rss_kib": 84720,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75610,
+          "ppid": 75582,
+          "cpu_seconds": 0.3,
+          "rss_kib": 89568,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75636,
+          "ppid": 75580,
+          "cpu_seconds": 0.24,
+          "rss_kib": 64160,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81786,
+          "ppid": 66740,
+          "cpu_seconds": 5.69,
+          "rss_kib": 297376,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81804,
+          "ppid": 81786,
+          "cpu_seconds": 0.58,
+          "rss_kib": 58672,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81805,
+          "ppid": 81786,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6656,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81806,
+          "ppid": 81786,
+          "cpu_seconds": 0.59,
+          "rss_kib": 60688,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81901,
+          "ppid": 81806,
+          "cpu_seconds": 0.23,
+          "rss_kib": 55408,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81927,
+          "ppid": 81804,
+          "cpu_seconds": 0.23,
+          "rss_kib": 51728,
+          "command": "node",
+          "group": "providers_and_server_children"
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 10.102141375013161,
+      "processes": [
+        {
+          "pid": 6345,
+          "ppid": 66740,
+          "cpu_seconds": 5.61,
+          "rss_kib": 385312,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6381,
+          "ppid": 6345,
+          "cpu_seconds": 0.62,
+          "rss_kib": 96720,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6383,
+          "ppid": 6345,
+          "cpu_seconds": 0.0,
+          "rss_kib": 8656,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6388,
+          "ppid": 6345,
+          "cpu_seconds": 0.62,
+          "rss_kib": 97264,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6472,
+          "ppid": 6388,
+          "cpu_seconds": 0.29,
+          "rss_kib": 105840,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6498,
+          "ppid": 6381,
+          "cpu_seconds": 0.32,
+          "rss_kib": 85088,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64099,
+          "ppid": 66740,
+          "cpu_seconds": 1.98,
+          "rss_kib": 357184,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64105,
+          "ppid": 66740,
+          "cpu_seconds": 2.67,
+          "rss_kib": 380192,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64156,
+          "ppid": 64105,
+          "cpu_seconds": 0.62,
+          "rss_kib": 97264,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64157,
+          "ppid": 64099,
+          "cpu_seconds": 0.62,
+          "rss_kib": 98384,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64158,
+          "ppid": 64105,
+          "cpu_seconds": 0.0,
+          "rss_kib": 8576,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64159,
+          "ppid": 64099,
+          "cpu_seconds": 0.0,
+          "rss_kib": 8592,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64160,
+          "ppid": 64105,
+          "cpu_seconds": 0.6,
+          "rss_kib": 97360,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64161,
+          "ppid": 64099,
+          "cpu_seconds": 0.6,
+          "rss_kib": 97792,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64297,
+          "ppid": 64156,
+          "cpu_seconds": 0.31,
+          "rss_kib": 82320,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64323,
+          "ppid": 64157,
+          "cpu_seconds": 0.27,
+          "rss_kib": 84240,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64348,
+          "ppid": 64161,
+          "cpu_seconds": 0.3,
+          "rss_kib": 105136,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64401,
+          "ppid": 64160,
+          "cpu_seconds": 0.32,
+          "rss_kib": 105344,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64590,
+          "ppid": 67509,
+          "cpu_seconds": 0.04,
+          "rss_kib": 51376,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64591,
+          "ppid": 67509,
+          "cpu_seconds": 0.01,
+          "rss_kib": 8576,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64592,
+          "ppid": 67509,
+          "cpu_seconds": 0.08,
+          "rss_kib": 19696,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64599,
+          "ppid": 64590,
+          "cpu_seconds": 0.07,
+          "rss_kib": 19472,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 66334,
+          "ppid": 1,
+          "cpu_seconds": 18.06,
+          "rss_kib": 256112,
+          "command": "T3 Code (Nightly)",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66338,
+          "ppid": 66334,
+          "cpu_seconds": 63.95,
+          "rss_kib": 125600,
+          "command": "T3 Code (Nightly) Helper",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66339,
+          "ppid": 66334,
+          "cpu_seconds": 1.39,
+          "rss_kib": 57200,
+          "command": "T3 Code (Nightly) Helper",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66739,
+          "ppid": 66334,
+          "cpu_seconds": 125.79,
+          "rss_kib": 581088,
+          "command": "T3 Code (Nightly) Helper (Renderer)",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66740,
+          "ppid": 66334,
+          "cpu_seconds": 34.61,
+          "rss_kib": 360416,
+          "command": "T3 Code (Nightly)",
+          "group": "server"
+        },
+        {
+          "pid": 67146,
+          "ppid": 66740,
+          "cpu_seconds": 4.0,
+          "rss_kib": 14640,
+          "command": "t3-resource-monitor",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67412,
+          "ppid": 66740,
+          "cpu_seconds": 0.02,
+          "rss_kib": 29056,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67509,
+          "ppid": 67412,
+          "cpu_seconds": 10.77,
+          "rss_kib": 330528,
+          "command": "codex",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67826,
+          "ppid": 66740,
+          "cpu_seconds": 2.61,
+          "rss_kib": 38976,
+          "command": "cloudflared",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67961,
+          "ppid": 72520,
+          "cpu_seconds": 0.01,
+          "rss_kib": 2960,
+          "command": "zsh",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67968,
+          "ppid": 67961,
+          "cpu_seconds": 0.0,
+          "rss_kib": 1136,
+          "command": "time",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67969,
+          "ppid": 67968,
+          "cpu_seconds": 0.15,
+          "rss_kib": 56880,
+          "command": "swift-test",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68044,
+          "ppid": 67509,
+          "cpu_seconds": 0.08,
+          "rss_kib": 15744,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68045,
+          "ppid": 67509,
+          "cpu_seconds": 0.03,
+          "rss_kib": 39744,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68046,
+          "ppid": 67509,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6544,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68105,
+          "ppid": 67969,
+          "cpu_seconds": 2.23,
+          "rss_kib": 62560,
+          "command": "xctest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68211,
+          "ppid": 68045,
+          "cpu_seconds": 0.07,
+          "rss_kib": 14416,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 69954,
+          "ppid": 66334,
+          "cpu_seconds": 0.49,
+          "rss_kib": 40336,
+          "command": "T3 Code (Nightly) Helper",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 70046,
+          "ppid": 67509,
+          "cpu_seconds": 0.53,
+          "rss_kib": 36768,
+          "command": "codex-code-mode-host",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70519,
+          "ppid": 67509,
+          "cpu_seconds": 0.04,
+          "rss_kib": 37232,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70520,
+          "ppid": 67509,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6544,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70521,
+          "ppid": 67509,
+          "cpu_seconds": 0.07,
+          "rss_kib": 13520,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70577,
+          "ppid": 70519,
+          "cpu_seconds": 0.08,
+          "rss_kib": 13280,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72520,
+          "ppid": 66740,
+          "cpu_seconds": 9.04,
+          "rss_kib": 313952,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72538,
+          "ppid": 72520,
+          "cpu_seconds": 0.62,
+          "rss_kib": 80384,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72539,
+          "ppid": 72520,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6992,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72540,
+          "ppid": 72520,
+          "cpu_seconds": 0.62,
+          "rss_kib": 79104,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72572,
+          "ppid": 72540,
+          "cpu_seconds": 0.28,
+          "rss_kib": 84800,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72598,
+          "ppid": 72538,
+          "cpu_seconds": 0.27,
+          "rss_kib": 67824,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 73060,
+          "ppid": 67509,
+          "cpu_seconds": 0.05,
+          "rss_kib": 19920,
+          "command": "Python",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 74686,
+          "ppid": 6345,
+          "cpu_seconds": 0.01,
+          "rss_kib": 2944,
+          "command": "zsh",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 74687,
+          "ppid": 74686,
+          "cpu_seconds": 0.03,
+          "rss_kib": 41680,
+          "command": "gh",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 74691,
+          "ppid": 68105,
+          "cpu_seconds": 0.0,
+          "rss_kib": 2160,
+          "command": "bash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 74693,
+          "ppid": 74691,
+          "cpu_seconds": 0.0,
+          "rss_kib": 1536,
+          "command": "bash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 74694,
+          "ppid": 74693,
+          "cpu_seconds": 0.0,
+          "rss_kib": 32,
+          "command": "bash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 74696,
+          "ppid": 73060,
+          "cpu_seconds": 0.0,
+          "rss_kib": 1888,
+          "command": "ps",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75562,
+          "ppid": 66740,
+          "cpu_seconds": 6.62,
+          "rss_kib": 308928,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75580,
+          "ppid": 75562,
+          "cpu_seconds": 0.58,
+          "rss_kib": 85488,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75581,
+          "ppid": 75562,
+          "cpu_seconds": 0.0,
+          "rss_kib": 7184,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75582,
+          "ppid": 75562,
+          "cpu_seconds": 0.58,
+          "rss_kib": 84720,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75610,
+          "ppid": 75582,
+          "cpu_seconds": 0.3,
+          "rss_kib": 89568,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75636,
+          "ppid": 75580,
+          "cpu_seconds": 0.24,
+          "rss_kib": 64160,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81786,
+          "ppid": 66740,
+          "cpu_seconds": 5.71,
+          "rss_kib": 297392,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81804,
+          "ppid": 81786,
+          "cpu_seconds": 0.58,
+          "rss_kib": 58672,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81805,
+          "ppid": 81786,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6656,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81806,
+          "ppid": 81786,
+          "cpu_seconds": 0.59,
+          "rss_kib": 60688,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81901,
+          "ppid": 81806,
+          "cpu_seconds": 0.23,
+          "rss_kib": 55408,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81927,
+          "ppid": 81804,
+          "cpu_seconds": 0.23,
+          "rss_kib": 51728,
+          "command": "node",
+          "group": "providers_and_server_children"
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 15.14988933398854,
+      "processes": [
+        {
+          "pid": 6345,
+          "ppid": 66740,
+          "cpu_seconds": 5.74,
+          "rss_kib": 385536,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6381,
+          "ppid": 6345,
+          "cpu_seconds": 0.62,
+          "rss_kib": 96720,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6383,
+          "ppid": 6345,
+          "cpu_seconds": 0.0,
+          "rss_kib": 8656,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6388,
+          "ppid": 6345,
+          "cpu_seconds": 0.62,
+          "rss_kib": 97264,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6472,
+          "ppid": 6388,
+          "cpu_seconds": 0.29,
+          "rss_kib": 105840,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6498,
+          "ppid": 6381,
+          "cpu_seconds": 0.32,
+          "rss_kib": 85088,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64099,
+          "ppid": 66740,
+          "cpu_seconds": 2.02,
+          "rss_kib": 357216,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64105,
+          "ppid": 66740,
+          "cpu_seconds": 2.69,
+          "rss_kib": 380192,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64156,
+          "ppid": 64105,
+          "cpu_seconds": 0.62,
+          "rss_kib": 97264,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64157,
+          "ppid": 64099,
+          "cpu_seconds": 0.62,
+          "rss_kib": 98384,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64158,
+          "ppid": 64105,
+          "cpu_seconds": 0.0,
+          "rss_kib": 8576,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64159,
+          "ppid": 64099,
+          "cpu_seconds": 0.0,
+          "rss_kib": 8592,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64160,
+          "ppid": 64105,
+          "cpu_seconds": 0.6,
+          "rss_kib": 97360,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64161,
+          "ppid": 64099,
+          "cpu_seconds": 0.6,
+          "rss_kib": 97792,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64297,
+          "ppid": 64156,
+          "cpu_seconds": 0.31,
+          "rss_kib": 82320,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64323,
+          "ppid": 64157,
+          "cpu_seconds": 0.27,
+          "rss_kib": 84240,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64348,
+          "ppid": 64161,
+          "cpu_seconds": 0.3,
+          "rss_kib": 105136,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64401,
+          "ppid": 64160,
+          "cpu_seconds": 0.32,
+          "rss_kib": 105344,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64590,
+          "ppid": 67509,
+          "cpu_seconds": 0.04,
+          "rss_kib": 51376,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64591,
+          "ppid": 67509,
+          "cpu_seconds": 0.01,
+          "rss_kib": 8576,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64592,
+          "ppid": 67509,
+          "cpu_seconds": 0.08,
+          "rss_kib": 19696,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64599,
+          "ppid": 64590,
+          "cpu_seconds": 0.07,
+          "rss_kib": 19472,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 66334,
+          "ppid": 1,
+          "cpu_seconds": 18.06,
+          "rss_kib": 256304,
+          "command": "T3 Code (Nightly)",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66338,
+          "ppid": 66334,
+          "cpu_seconds": 63.95,
+          "rss_kib": 120480,
+          "command": "T3 Code (Nightly) Helper",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66339,
+          "ppid": 66334,
+          "cpu_seconds": 1.39,
+          "rss_kib": 57200,
+          "command": "T3 Code (Nightly) Helper",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66739,
+          "ppid": 66334,
+          "cpu_seconds": 126.02,
+          "rss_kib": 513040,
+          "command": "T3 Code (Nightly) Helper (Renderer)",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66740,
+          "ppid": 66334,
+          "cpu_seconds": 34.7,
+          "rss_kib": 361120,
+          "command": "T3 Code (Nightly)",
+          "group": "server"
+        },
+        {
+          "pid": 67146,
+          "ppid": 66740,
+          "cpu_seconds": 4.01,
+          "rss_kib": 14704,
+          "command": "t3-resource-monitor",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67412,
+          "ppid": 66740,
+          "cpu_seconds": 0.02,
+          "rss_kib": 29056,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67509,
+          "ppid": 67412,
+          "cpu_seconds": 10.79,
+          "rss_kib": 330512,
+          "command": "codex",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67826,
+          "ppid": 66740,
+          "cpu_seconds": 2.62,
+          "rss_kib": 38976,
+          "command": "cloudflared",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67961,
+          "ppid": 72520,
+          "cpu_seconds": 0.01,
+          "rss_kib": 2960,
+          "command": "zsh",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67968,
+          "ppid": 67961,
+          "cpu_seconds": 0.0,
+          "rss_kib": 1136,
+          "command": "time",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67969,
+          "ppid": 67968,
+          "cpu_seconds": 0.15,
+          "rss_kib": 56880,
+          "command": "swift-test",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68044,
+          "ppid": 67509,
+          "cpu_seconds": 0.08,
+          "rss_kib": 15744,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68045,
+          "ppid": 67509,
+          "cpu_seconds": 0.03,
+          "rss_kib": 39744,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68046,
+          "ppid": 67509,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6544,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68105,
+          "ppid": 67969,
+          "cpu_seconds": 2.31,
+          "rss_kib": 62656,
+          "command": "xctest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68211,
+          "ppid": 68045,
+          "cpu_seconds": 0.07,
+          "rss_kib": 14416,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 69954,
+          "ppid": 66334,
+          "cpu_seconds": 0.49,
+          "rss_kib": 40336,
+          "command": "T3 Code (Nightly) Helper",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 70046,
+          "ppid": 67509,
+          "cpu_seconds": 0.53,
+          "rss_kib": 36736,
+          "command": "codex-code-mode-host",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70519,
+          "ppid": 67509,
+          "cpu_seconds": 0.04,
+          "rss_kib": 37232,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70520,
+          "ppid": 67509,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6544,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70521,
+          "ppid": 67509,
+          "cpu_seconds": 0.07,
+          "rss_kib": 13520,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70577,
+          "ppid": 70519,
+          "cpu_seconds": 0.08,
+          "rss_kib": 13280,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72520,
+          "ppid": 66740,
+          "cpu_seconds": 9.08,
+          "rss_kib": 313968,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72538,
+          "ppid": 72520,
+          "cpu_seconds": 0.62,
+          "rss_kib": 80384,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72539,
+          "ppid": 72520,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6992,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72540,
+          "ppid": 72520,
+          "cpu_seconds": 0.62,
+          "rss_kib": 79104,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72572,
+          "ppid": 72540,
+          "cpu_seconds": 0.28,
+          "rss_kib": 84800,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72598,
+          "ppid": 72538,
+          "cpu_seconds": 0.27,
+          "rss_kib": 67824,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 73060,
+          "ppid": 67509,
+          "cpu_seconds": 0.05,
+          "rss_kib": 19968,
+          "command": "Python",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75322,
+          "ppid": 68105,
+          "cpu_seconds": 0.01,
+          "rss_kib": 2192,
+          "command": "bash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75338,
+          "ppid": 75322,
+          "cpu_seconds": 0.0,
+          "rss_kib": 32,
+          "command": "bash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75339,
+          "ppid": 73060,
+          "cpu_seconds": 0.0,
+          "rss_kib": 1888,
+          "command": "ps",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75562,
+          "ppid": 66740,
+          "cpu_seconds": 6.68,
+          "rss_kib": 310496,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75580,
+          "ppid": 75562,
+          "cpu_seconds": 0.58,
+          "rss_kib": 85488,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75581,
+          "ppid": 75562,
+          "cpu_seconds": 0.0,
+          "rss_kib": 7184,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75582,
+          "ppid": 75562,
+          "cpu_seconds": 0.58,
+          "rss_kib": 84720,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75610,
+          "ppid": 75582,
+          "cpu_seconds": 0.3,
+          "rss_kib": 89568,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75636,
+          "ppid": 75580,
+          "cpu_seconds": 0.24,
+          "rss_kib": 64160,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81786,
+          "ppid": 66740,
+          "cpu_seconds": 5.74,
+          "rss_kib": 297408,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81804,
+          "ppid": 81786,
+          "cpu_seconds": 0.58,
+          "rss_kib": 58672,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81805,
+          "ppid": 81786,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6656,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81806,
+          "ppid": 81786,
+          "cpu_seconds": 0.59,
+          "rss_kib": 60688,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81901,
+          "ppid": 81806,
+          "cpu_seconds": 0.23,
+          "rss_kib": 55408,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81927,
+          "ppid": 81804,
+          "cpu_seconds": 0.23,
+          "rss_kib": 51728,
+          "command": "node",
+          "group": "providers_and_server_children"
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 20.19440720899729,
+      "processes": [
+        {
+          "pid": 6345,
+          "ppid": 66740,
+          "cpu_seconds": 5.76,
+          "rss_kib": 385520,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6381,
+          "ppid": 6345,
+          "cpu_seconds": 0.62,
+          "rss_kib": 96720,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6383,
+          "ppid": 6345,
+          "cpu_seconds": 0.0,
+          "rss_kib": 8656,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6388,
+          "ppid": 6345,
+          "cpu_seconds": 0.62,
+          "rss_kib": 97264,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6472,
+          "ppid": 6388,
+          "cpu_seconds": 0.29,
+          "rss_kib": 105840,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6498,
+          "ppid": 6381,
+          "cpu_seconds": 0.32,
+          "rss_kib": 85088,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64099,
+          "ppid": 66740,
+          "cpu_seconds": 2.07,
+          "rss_kib": 359136,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64105,
+          "ppid": 66740,
+          "cpu_seconds": 2.69,
+          "rss_kib": 380144,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64156,
+          "ppid": 64105,
+          "cpu_seconds": 0.62,
+          "rss_kib": 97264,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64157,
+          "ppid": 64099,
+          "cpu_seconds": 0.62,
+          "rss_kib": 98384,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64158,
+          "ppid": 64105,
+          "cpu_seconds": 0.0,
+          "rss_kib": 8576,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64159,
+          "ppid": 64099,
+          "cpu_seconds": 0.0,
+          "rss_kib": 8592,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64160,
+          "ppid": 64105,
+          "cpu_seconds": 0.6,
+          "rss_kib": 97360,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64161,
+          "ppid": 64099,
+          "cpu_seconds": 0.6,
+          "rss_kib": 97792,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64297,
+          "ppid": 64156,
+          "cpu_seconds": 0.31,
+          "rss_kib": 82320,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64323,
+          "ppid": 64157,
+          "cpu_seconds": 0.27,
+          "rss_kib": 84240,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64348,
+          "ppid": 64161,
+          "cpu_seconds": 0.3,
+          "rss_kib": 105136,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64401,
+          "ppid": 64160,
+          "cpu_seconds": 0.32,
+          "rss_kib": 105344,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64590,
+          "ppid": 67509,
+          "cpu_seconds": 0.04,
+          "rss_kib": 51376,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64591,
+          "ppid": 67509,
+          "cpu_seconds": 0.01,
+          "rss_kib": 8576,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64592,
+          "ppid": 67509,
+          "cpu_seconds": 0.08,
+          "rss_kib": 19696,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64599,
+          "ppid": 64590,
+          "cpu_seconds": 0.07,
+          "rss_kib": 19472,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 66334,
+          "ppid": 1,
+          "cpu_seconds": 18.07,
+          "rss_kib": 255744,
+          "command": "T3 Code (Nightly)",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66338,
+          "ppid": 66334,
+          "cpu_seconds": 63.95,
+          "rss_kib": 120480,
+          "command": "T3 Code (Nightly) Helper",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66339,
+          "ppid": 66334,
+          "cpu_seconds": 1.39,
+          "rss_kib": 57200,
+          "command": "T3 Code (Nightly) Helper",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66739,
+          "ppid": 66334,
+          "cpu_seconds": 126.24,
+          "rss_kib": 505056,
+          "command": "T3 Code (Nightly) Helper (Renderer)",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66740,
+          "ppid": 66334,
+          "cpu_seconds": 34.76,
+          "rss_kib": 361152,
+          "command": "T3 Code (Nightly)",
+          "group": "server"
+        },
+        {
+          "pid": 67146,
+          "ppid": 66740,
+          "cpu_seconds": 4.02,
+          "rss_kib": 14736,
+          "command": "t3-resource-monitor",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67412,
+          "ppid": 66740,
+          "cpu_seconds": 0.02,
+          "rss_kib": 29056,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67509,
+          "ppid": 67412,
+          "cpu_seconds": 10.87,
+          "rss_kib": 330720,
+          "command": "codex",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67826,
+          "ppid": 66740,
+          "cpu_seconds": 2.63,
+          "rss_kib": 38976,
+          "command": "cloudflared",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67961,
+          "ppid": 72520,
+          "cpu_seconds": 0.01,
+          "rss_kib": 2960,
+          "command": "zsh",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67968,
+          "ppid": 67961,
+          "cpu_seconds": 0.0,
+          "rss_kib": 1136,
+          "command": "time",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67969,
+          "ppid": 67968,
+          "cpu_seconds": 0.15,
+          "rss_kib": 56880,
+          "command": "swift-test",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68044,
+          "ppid": 67509,
+          "cpu_seconds": 0.08,
+          "rss_kib": 15744,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68045,
+          "ppid": 67509,
+          "cpu_seconds": 0.03,
+          "rss_kib": 39744,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68046,
+          "ppid": 67509,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6544,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68105,
+          "ppid": 67969,
+          "cpu_seconds": 2.45,
+          "rss_kib": 62736,
+          "command": "xctest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68211,
+          "ppid": 68045,
+          "cpu_seconds": 0.07,
+          "rss_kib": 14416,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 69954,
+          "ppid": 66334,
+          "cpu_seconds": 0.49,
+          "rss_kib": 40336,
+          "command": "T3 Code (Nightly) Helper",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 70046,
+          "ppid": 67509,
+          "cpu_seconds": 0.54,
+          "rss_kib": 36224,
+          "command": "codex-code-mode-host",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70519,
+          "ppid": 67509,
+          "cpu_seconds": 0.04,
+          "rss_kib": 37232,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70520,
+          "ppid": 67509,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6544,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70521,
+          "ppid": 67509,
+          "cpu_seconds": 0.07,
+          "rss_kib": 13520,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70577,
+          "ppid": 70519,
+          "cpu_seconds": 0.08,
+          "rss_kib": 13280,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72520,
+          "ppid": 66740,
+          "cpu_seconds": 9.12,
+          "rss_kib": 313840,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72538,
+          "ppid": 72520,
+          "cpu_seconds": 0.62,
+          "rss_kib": 80384,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72539,
+          "ppid": 72520,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6992,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72540,
+          "ppid": 72520,
+          "cpu_seconds": 0.62,
+          "rss_kib": 79104,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72572,
+          "ppid": 72540,
+          "cpu_seconds": 0.28,
+          "rss_kib": 84800,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72598,
+          "ppid": 72538,
+          "cpu_seconds": 0.27,
+          "rss_kib": 67824,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 73060,
+          "ppid": 67509,
+          "cpu_seconds": 0.05,
+          "rss_kib": 19984,
+          "command": "Python",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75562,
+          "ppid": 66740,
+          "cpu_seconds": 6.68,
+          "rss_kib": 310496,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75580,
+          "ppid": 75562,
+          "cpu_seconds": 0.58,
+          "rss_kib": 85488,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75581,
+          "ppid": 75562,
+          "cpu_seconds": 0.0,
+          "rss_kib": 7184,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75582,
+          "ppid": 75562,
+          "cpu_seconds": 0.58,
+          "rss_kib": 84720,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75610,
+          "ppid": 75582,
+          "cpu_seconds": 0.3,
+          "rss_kib": 89568,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75636,
+          "ppid": 75580,
+          "cpu_seconds": 0.24,
+          "rss_kib": 64160,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75914,
+          "ppid": 68105,
+          "cpu_seconds": 0.0,
+          "rss_kib": 2160,
+          "command": "bash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75916,
+          "ppid": 75914,
+          "cpu_seconds": 0.0,
+          "rss_kib": 1536,
+          "command": "bash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75917,
+          "ppid": 75916,
+          "cpu_seconds": 0.0,
+          "rss_kib": 32,
+          "command": "bash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75919,
+          "ppid": 73060,
+          "cpu_seconds": 0.0,
+          "rss_kib": 1888,
+          "command": "ps",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81786,
+          "ppid": 66740,
+          "cpu_seconds": 5.76,
+          "rss_kib": 297424,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81804,
+          "ppid": 81786,
+          "cpu_seconds": 0.58,
+          "rss_kib": 58672,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81805,
+          "ppid": 81786,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6656,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81806,
+          "ppid": 81786,
+          "cpu_seconds": 0.59,
+          "rss_kib": 60688,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81901,
+          "ppid": 81806,
+          "cpu_seconds": 0.23,
+          "rss_kib": 55408,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81927,
+          "ppid": 81804,
+          "cpu_seconds": 0.23,
+          "rss_kib": 51728,
+          "command": "node",
+          "group": "providers_and_server_children"
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 25.248959042015485,
+      "processes": [
+        {
+          "pid": 6345,
+          "ppid": 66740,
+          "cpu_seconds": 5.79,
+          "rss_kib": 385472,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6381,
+          "ppid": 6345,
+          "cpu_seconds": 0.62,
+          "rss_kib": 96720,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6383,
+          "ppid": 6345,
+          "cpu_seconds": 0.0,
+          "rss_kib": 8656,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6388,
+          "ppid": 6345,
+          "cpu_seconds": 0.62,
+          "rss_kib": 97264,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6472,
+          "ppid": 6388,
+          "cpu_seconds": 0.29,
+          "rss_kib": 105840,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6498,
+          "ppid": 6381,
+          "cpu_seconds": 0.32,
+          "rss_kib": 85088,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64099,
+          "ppid": 66740,
+          "cpu_seconds": 2.24,
+          "rss_kib": 373408,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64105,
+          "ppid": 66740,
+          "cpu_seconds": 2.7,
+          "rss_kib": 380144,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64156,
+          "ppid": 64105,
+          "cpu_seconds": 0.62,
+          "rss_kib": 97264,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64157,
+          "ppid": 64099,
+          "cpu_seconds": 0.62,
+          "rss_kib": 98384,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64158,
+          "ppid": 64105,
+          "cpu_seconds": 0.0,
+          "rss_kib": 8576,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64159,
+          "ppid": 64099,
+          "cpu_seconds": 0.0,
+          "rss_kib": 8592,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64160,
+          "ppid": 64105,
+          "cpu_seconds": 0.6,
+          "rss_kib": 97360,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64161,
+          "ppid": 64099,
+          "cpu_seconds": 0.6,
+          "rss_kib": 97792,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64297,
+          "ppid": 64156,
+          "cpu_seconds": 0.31,
+          "rss_kib": 82320,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64323,
+          "ppid": 64157,
+          "cpu_seconds": 0.27,
+          "rss_kib": 84240,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64348,
+          "ppid": 64161,
+          "cpu_seconds": 0.3,
+          "rss_kib": 105136,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64401,
+          "ppid": 64160,
+          "cpu_seconds": 0.32,
+          "rss_kib": 105344,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64590,
+          "ppid": 67509,
+          "cpu_seconds": 0.04,
+          "rss_kib": 51376,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64591,
+          "ppid": 67509,
+          "cpu_seconds": 0.01,
+          "rss_kib": 8576,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64592,
+          "ppid": 67509,
+          "cpu_seconds": 0.08,
+          "rss_kib": 19696,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64599,
+          "ppid": 64590,
+          "cpu_seconds": 0.07,
+          "rss_kib": 19472,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 66334,
+          "ppid": 1,
+          "cpu_seconds": 18.17,
+          "rss_kib": 259904,
+          "command": "T3 Code (Nightly)",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66338,
+          "ppid": 66334,
+          "cpu_seconds": 64.35,
+          "rss_kib": 137040,
+          "command": "T3 Code (Nightly) Helper",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66339,
+          "ppid": 66334,
+          "cpu_seconds": 1.4,
+          "rss_kib": 57200,
+          "command": "T3 Code (Nightly) Helper",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66739,
+          "ppid": 66334,
+          "cpu_seconds": 127.5,
+          "rss_kib": 577008,
+          "command": "T3 Code (Nightly) Helper (Renderer)",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66740,
+          "ppid": 66334,
+          "cpu_seconds": 34.88,
+          "rss_kib": 361536,
+          "command": "T3 Code (Nightly)",
+          "group": "server"
+        },
+        {
+          "pid": 67146,
+          "ppid": 66740,
+          "cpu_seconds": 4.04,
+          "rss_kib": 14784,
+          "command": "t3-resource-monitor",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67412,
+          "ppid": 66740,
+          "cpu_seconds": 0.02,
+          "rss_kib": 29056,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67509,
+          "ppid": 67412,
+          "cpu_seconds": 10.91,
+          "rss_kib": 330832,
+          "command": "codex",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67826,
+          "ppid": 66740,
+          "cpu_seconds": 2.64,
+          "rss_kib": 38976,
+          "command": "cloudflared",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67961,
+          "ppid": 72520,
+          "cpu_seconds": 0.01,
+          "rss_kib": 2960,
+          "command": "zsh",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67968,
+          "ppid": 67961,
+          "cpu_seconds": 0.0,
+          "rss_kib": 1136,
+          "command": "time",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67969,
+          "ppid": 67968,
+          "cpu_seconds": 0.15,
+          "rss_kib": 56880,
+          "command": "swift-test",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68044,
+          "ppid": 67509,
+          "cpu_seconds": 0.08,
+          "rss_kib": 15744,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68045,
+          "ppid": 67509,
+          "cpu_seconds": 0.03,
+          "rss_kib": 39744,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68046,
+          "ppid": 67509,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6544,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68105,
+          "ppid": 67969,
+          "cpu_seconds": 2.51,
+          "rss_kib": 62768,
+          "command": "xctest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68211,
+          "ppid": 68045,
+          "cpu_seconds": 0.07,
+          "rss_kib": 14416,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 69954,
+          "ppid": 66334,
+          "cpu_seconds": 0.49,
+          "rss_kib": 40432,
+          "command": "T3 Code (Nightly) Helper",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 70046,
+          "ppid": 67509,
+          "cpu_seconds": 0.54,
+          "rss_kib": 37584,
+          "command": "codex-code-mode-host",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70519,
+          "ppid": 67509,
+          "cpu_seconds": 0.04,
+          "rss_kib": 37232,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70520,
+          "ppid": 67509,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6544,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70521,
+          "ppid": 67509,
+          "cpu_seconds": 0.07,
+          "rss_kib": 13520,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70577,
+          "ppid": 70519,
+          "cpu_seconds": 0.08,
+          "rss_kib": 13280,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72520,
+          "ppid": 66740,
+          "cpu_seconds": 9.18,
+          "rss_kib": 314048,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72538,
+          "ppid": 72520,
+          "cpu_seconds": 0.62,
+          "rss_kib": 80384,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72539,
+          "ppid": 72520,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6992,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72540,
+          "ppid": 72520,
+          "cpu_seconds": 0.62,
+          "rss_kib": 79104,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72572,
+          "ppid": 72540,
+          "cpu_seconds": 0.28,
+          "rss_kib": 84800,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72598,
+          "ppid": 72538,
+          "cpu_seconds": 0.27,
+          "rss_kib": 67824,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 73060,
+          "ppid": 67509,
+          "cpu_seconds": 0.05,
+          "rss_kib": 20032,
+          "command": "Python",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75562,
+          "ppid": 66740,
+          "cpu_seconds": 6.75,
+          "rss_kib": 311120,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75580,
+          "ppid": 75562,
+          "cpu_seconds": 0.58,
+          "rss_kib": 85488,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75581,
+          "ppid": 75562,
+          "cpu_seconds": 0.0,
+          "rss_kib": 7184,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75582,
+          "ppid": 75562,
+          "cpu_seconds": 0.58,
+          "rss_kib": 84720,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75610,
+          "ppid": 75582,
+          "cpu_seconds": 0.3,
+          "rss_kib": 89568,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75636,
+          "ppid": 75580,
+          "cpu_seconds": 0.24,
+          "rss_kib": 64160,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 76157,
+          "ppid": 68105,
+          "cpu_seconds": 0.02,
+          "rss_kib": 2416,
+          "command": "bash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 76253,
+          "ppid": 76157,
+          "cpu_seconds": 0.0,
+          "rss_kib": 1600,
+          "command": "bash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 76254,
+          "ppid": 76253,
+          "cpu_seconds": 0.02,
+          "rss_kib": 2128,
+          "command": "bash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 76314,
+          "ppid": 76157,
+          "cpu_seconds": 0.0,
+          "rss_kib": 1120,
+          "command": "sleep",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 76316,
+          "ppid": 76254,
+          "cpu_seconds": 0.0,
+          "rss_kib": 1120,
+          "command": "sleep",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 76317,
+          "ppid": 73060,
+          "cpu_seconds": 0.0,
+          "rss_kib": 1888,
+          "command": "ps",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81786,
+          "ppid": 66740,
+          "cpu_seconds": 5.85,
+          "rss_kib": 297456,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81804,
+          "ppid": 81786,
+          "cpu_seconds": 0.58,
+          "rss_kib": 58672,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81805,
+          "ppid": 81786,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6656,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81806,
+          "ppid": 81786,
+          "cpu_seconds": 0.59,
+          "rss_kib": 60688,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81901,
+          "ppid": 81806,
+          "cpu_seconds": 0.23,
+          "rss_kib": 55408,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81927,
+          "ppid": 81804,
+          "cpu_seconds": 0.23,
+          "rss_kib": 51728,
+          "command": "node",
+          "group": "providers_and_server_children"
+        }
+      ]
+    },
+    {
+      "elapsed_seconds": 30.289528666995466,
+      "processes": [
+        {
+          "pid": 6345,
+          "ppid": 66740,
+          "cpu_seconds": 5.85,
+          "rss_kib": 386000,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6381,
+          "ppid": 6345,
+          "cpu_seconds": 0.62,
+          "rss_kib": 96720,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6383,
+          "ppid": 6345,
+          "cpu_seconds": 0.0,
+          "rss_kib": 8656,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6388,
+          "ppid": 6345,
+          "cpu_seconds": 0.62,
+          "rss_kib": 97264,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6472,
+          "ppid": 6388,
+          "cpu_seconds": 0.29,
+          "rss_kib": 105840,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 6498,
+          "ppid": 6381,
+          "cpu_seconds": 0.32,
+          "rss_kib": 85088,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64099,
+          "ppid": 66740,
+          "cpu_seconds": 2.39,
+          "rss_kib": 381968,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64105,
+          "ppid": 66740,
+          "cpu_seconds": 2.72,
+          "rss_kib": 380560,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64156,
+          "ppid": 64105,
+          "cpu_seconds": 0.62,
+          "rss_kib": 97264,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64157,
+          "ppid": 64099,
+          "cpu_seconds": 0.62,
+          "rss_kib": 98384,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64158,
+          "ppid": 64105,
+          "cpu_seconds": 0.0,
+          "rss_kib": 8576,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64159,
+          "ppid": 64099,
+          "cpu_seconds": 0.0,
+          "rss_kib": 8592,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64160,
+          "ppid": 64105,
+          "cpu_seconds": 0.6,
+          "rss_kib": 97360,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64161,
+          "ppid": 64099,
+          "cpu_seconds": 0.6,
+          "rss_kib": 97792,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64297,
+          "ppid": 64156,
+          "cpu_seconds": 0.31,
+          "rss_kib": 82320,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64323,
+          "ppid": 64157,
+          "cpu_seconds": 0.27,
+          "rss_kib": 84240,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64348,
+          "ppid": 64161,
+          "cpu_seconds": 0.3,
+          "rss_kib": 105136,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64401,
+          "ppid": 64160,
+          "cpu_seconds": 0.32,
+          "rss_kib": 105344,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64590,
+          "ppid": 67509,
+          "cpu_seconds": 0.04,
+          "rss_kib": 51376,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64591,
+          "ppid": 67509,
+          "cpu_seconds": 0.01,
+          "rss_kib": 8576,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64592,
+          "ppid": 67509,
+          "cpu_seconds": 0.08,
+          "rss_kib": 19696,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 64599,
+          "ppid": 64590,
+          "cpu_seconds": 0.07,
+          "rss_kib": 19472,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 66334,
+          "ppid": 1,
+          "cpu_seconds": 18.28,
+          "rss_kib": 260512,
+          "command": "T3 Code (Nightly)",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66338,
+          "ppid": 66334,
+          "cpu_seconds": 64.7,
+          "rss_kib": 133152,
+          "command": "T3 Code (Nightly) Helper",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66339,
+          "ppid": 66334,
+          "cpu_seconds": 1.41,
+          "rss_kib": 57216,
+          "command": "T3 Code (Nightly) Helper",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66739,
+          "ppid": 66334,
+          "cpu_seconds": 128.44,
+          "rss_kib": 579488,
+          "command": "T3 Code (Nightly) Helper (Renderer)",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 66740,
+          "ppid": 66334,
+          "cpu_seconds": 35.0,
+          "rss_kib": 361680,
+          "command": "T3 Code (Nightly)",
+          "group": "server"
+        },
+        {
+          "pid": 67146,
+          "ppid": 66740,
+          "cpu_seconds": 4.05,
+          "rss_kib": 14864,
+          "command": "t3-resource-monitor",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67412,
+          "ppid": 66740,
+          "cpu_seconds": 0.02,
+          "rss_kib": 29056,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67509,
+          "ppid": 67412,
+          "cpu_seconds": 10.98,
+          "rss_kib": 330976,
+          "command": "codex",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67826,
+          "ppid": 66740,
+          "cpu_seconds": 2.64,
+          "rss_kib": 38976,
+          "command": "cloudflared",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67961,
+          "ppid": 72520,
+          "cpu_seconds": 0.01,
+          "rss_kib": 2960,
+          "command": "zsh",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67968,
+          "ppid": 67961,
+          "cpu_seconds": 0.0,
+          "rss_kib": 1136,
+          "command": "time",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 67969,
+          "ppid": 67968,
+          "cpu_seconds": 0.15,
+          "rss_kib": 56880,
+          "command": "swift-test",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68044,
+          "ppid": 67509,
+          "cpu_seconds": 0.08,
+          "rss_kib": 15744,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68045,
+          "ppid": 67509,
+          "cpu_seconds": 0.03,
+          "rss_kib": 39744,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68046,
+          "ppid": 67509,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6544,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68105,
+          "ppid": 67969,
+          "cpu_seconds": 2.59,
+          "rss_kib": 62832,
+          "command": "xctest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 68211,
+          "ppid": 68045,
+          "cpu_seconds": 0.07,
+          "rss_kib": 14416,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 69954,
+          "ppid": 66334,
+          "cpu_seconds": 0.49,
+          "rss_kib": 40384,
+          "command": "T3 Code (Nightly) Helper",
+          "group": "desktop_ui_and_helpers"
+        },
+        {
+          "pid": 70046,
+          "ppid": 67509,
+          "cpu_seconds": 0.55,
+          "rss_kib": 36752,
+          "command": "codex-code-mode-host",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70519,
+          "ppid": 67509,
+          "cpu_seconds": 0.04,
+          "rss_kib": 37232,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70520,
+          "ppid": 67509,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6544,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70521,
+          "ppid": 67509,
+          "cpu_seconds": 0.07,
+          "rss_kib": 13520,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 70577,
+          "ppid": 70519,
+          "cpu_seconds": 0.08,
+          "rss_kib": 13280,
+          "command": "node_repl",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72520,
+          "ppid": 66740,
+          "cpu_seconds": 9.28,
+          "rss_kib": 323904,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72538,
+          "ppid": 72520,
+          "cpu_seconds": 0.62,
+          "rss_kib": 80384,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72539,
+          "ppid": 72520,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6992,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72540,
+          "ppid": 72520,
+          "cpu_seconds": 0.62,
+          "rss_kib": 79104,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72572,
+          "ppid": 72540,
+          "cpu_seconds": 0.28,
+          "rss_kib": 84800,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 72598,
+          "ppid": 72538,
+          "cpu_seconds": 0.27,
+          "rss_kib": 67824,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 73060,
+          "ppid": 67509,
+          "cpu_seconds": 0.06,
+          "rss_kib": 20048,
+          "command": "Python",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75562,
+          "ppid": 66740,
+          "cpu_seconds": 6.76,
+          "rss_kib": 311120,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75580,
+          "ppid": 75562,
+          "cpu_seconds": 0.58,
+          "rss_kib": 85488,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75581,
+          "ppid": 75562,
+          "cpu_seconds": 0.0,
+          "rss_kib": 7184,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75582,
+          "ppid": 75562,
+          "cpu_seconds": 0.58,
+          "rss_kib": 84720,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75610,
+          "ppid": 75582,
+          "cpu_seconds": 0.3,
+          "rss_kib": 89568,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 75636,
+          "ppid": 75580,
+          "cpu_seconds": 0.24,
+          "rss_kib": 64160,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 76995,
+          "ppid": 64105,
+          "cpu_seconds": 0.01,
+          "rss_kib": 2960,
+          "command": "zsh",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 77073,
+          "ppid": 68105,
+          "cpu_seconds": 0.0,
+          "rss_kib": 2320,
+          "command": "bash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 77077,
+          "ppid": 76995,
+          "cpu_seconds": 0.03,
+          "rss_kib": 42032,
+          "command": "gh",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 77078,
+          "ppid": 76995,
+          "cpu_seconds": 0.0,
+          "rss_kib": 1136,
+          "command": "head",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 77123,
+          "ppid": 73060,
+          "cpu_seconds": 0.0,
+          "rss_kib": 1904,
+          "command": "ps",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81786,
+          "ppid": 66740,
+          "cpu_seconds": 5.87,
+          "rss_kib": 297456,
+          "command": "claude",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81804,
+          "ppid": 81786,
+          "cpu_seconds": 0.58,
+          "rss_kib": 58672,
+          "command": "context7-mcp --api-key ctx7sk-***",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81805,
+          "ppid": 81786,
+          "cpu_seconds": 0.0,
+          "rss_kib": 6656,
+          "command": "tokenstash",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81806,
+          "ppid": 81786,
+          "cpu_seconds": 0.59,
+          "rss_kib": 60688,
+          "command": "mcp@latest",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81901,
+          "ppid": 81806,
+          "cpu_seconds": 0.23,
+          "rss_kib": 55408,
+          "command": "node",
+          "group": "providers_and_server_children"
+        },
+        {
+          "pid": 81927,
+          "ppid": 81804,
+          "cpu_seconds": 0.23,
+          "rss_kib": 51728,
+          "command": "node",
+          "group": "providers_and_server_children"
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,10 @@
+{
+  "observed_date": "2026-10-07",
+  "source": "Activity Monitor Energy pane read via native UI before benchmarks",
+  "app": "T3 Code (Nightly)",
+  "energy_impact_snapshot": 13.3,
+  "12hr_power_score": 710.44,
+  "app_nap": false,
+  "preventing_sleep": false,
+  "note": "Both are relative scores, not W, Wh, battery percent or a controlled app comparison. Child rows updated separately and are not summed."
+}

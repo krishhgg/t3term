@@ -1,0 +1,433 @@
+{
+  "method": "Ratatui 0.30.2 TestBackend, release build, 160x50 cells, two panels. 200 unchanged draws per run, 5 randomized repeats for each mode/history size. Full-history clones all lines into a scrolled Paragraph; viewport clones only the last 48 visible lines. Identical final screen hashes asserted. Idle experiment: 120ms sleep-and-draw loop versus a blocking channel, 5 seconds, 3 repeats, same screen. CPU time includes process setup, retained history, /usr/bin/time and teardown. No TTY output, terminal emulator, markdown, RPC or energy measurement. This is an algorithm experiment, not a benchmark of tria or the OpenTUI fork.",
+  "render_summary": [
+    {
+      "mode": "full-history",
+      "history": 1000,
+      "median_draw_us": 230.72083500000002,
+      "min_draw_us": 218.50291500000003,
+      "max_draw_us": 290.20604,
+      "peak_rss_mib": 3.6875
+    },
+    {
+      "mode": "viewport",
+      "history": 1000,
+      "median_draw_us": 187.54979000000003,
+      "min_draw_us": 185.86604,
+      "max_draw_us": 229.951045,
+      "peak_rss_mib": 3.453125
+    },
+    {
+      "mode": "full-history",
+      "history": 10000,
+      "median_draw_us": 663.15979,
+      "min_draw_us": 581.094585,
+      "max_draw_us": 747.7750000000001,
+      "peak_rss_mib": 8.46875
+    },
+    {
+      "mode": "viewport",
+      "history": 10000,
+      "median_draw_us": 192.67791499999998,
+      "min_draw_us": 186.97478999999998,
+      "max_draw_us": 196.78541500000003,
+      "peak_rss_mib": 6.140625
+    },
+    {
+      "mode": "full-history",
+      "history": 50000,
+      "median_draw_us": 2257.06375,
+      "min_draw_us": 2174.134585,
+      "max_draw_us": 2664.4647950000003,
+      "peak_rss_mib": 29.6875
+    },
+    {
+      "mode": "viewport",
+      "history": 50000,
+      "median_draw_us": 188.25374999999997,
+      "min_draw_us": 185.24021000000002,
+      "max_draw_us": 193.50521,
+      "peak_rss_mib": 18.125
+    }
+  ],
+  "idle_summary": [
+    {
+      "mode": "idle-poll",
+      "draws_after_initial": 41,
+      "elapsed_ms": 5088.175833,
+      "whole_process_cpu_ms": 12.66600000000026,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "idle-events",
+      "draws_after_initial": 0,
+      "elapsed_ms": 5005.017334,
+      "whole_process_cpu_ms": 4.070999999999769,
+      "voluntary_context_switches": 2
+    }
+  ],
+  "render_raw": [
+    {
+      "mode": "viewport",
+      "history": 1000,
+      "draws": 200,
+      "elapsed_ms": 45.990209,
+      "screen_checksum": 18056495878419005139,
+      "cpu_ms": 46.074000000000005,
+      "peak_rss_mib": 3.484375,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "full-history",
+      "history": 10000,
+      "draws": 200,
+      "elapsed_ms": 144.137584,
+      "screen_checksum": 886850631938626355,
+      "cpu_ms": 136.961,
+      "peak_rss_mib": 8.5,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "full-history",
+      "history": 10000,
+      "draws": 200,
+      "elapsed_ms": 149.555,
+      "screen_checksum": 886850631938626355,
+      "cpu_ms": 142.604,
+      "peak_rss_mib": 8.46875,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "full-history",
+      "history": 50000,
+      "draws": 200,
+      "elapsed_ms": 532.892959,
+      "screen_checksum": 9474894872808719475,
+      "cpu_ms": 505.093,
+      "peak_rss_mib": 29.6875,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "viewport",
+      "history": 1000,
+      "draws": 200,
+      "elapsed_ms": 37.509958000000005,
+      "screen_checksum": 18056495878419005139,
+      "cpu_ms": 39.968,
+      "peak_rss_mib": 3.421875,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "viewport",
+      "history": 10000,
+      "draws": 200,
+      "elapsed_ms": 38.570583,
+      "screen_checksum": 886850631938626355,
+      "cpu_ms": 43.033999999999935,
+      "peak_rss_mib": 6.140625,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "full-history",
+      "history": 1000,
+      "draws": 200,
+      "elapsed_ms": 46.144167,
+      "screen_checksum": 18056495878419005139,
+      "cpu_ms": 48.634000000000036,
+      "peak_rss_mib": 3.6875,
+      "voluntary_context_switches": 2
+    },
+    {
+      "mode": "viewport",
+      "history": 1000,
+      "draws": 200,
+      "elapsed_ms": 37.504166999999995,
+      "screen_checksum": 18056495878419005139,
+      "cpu_ms": 40.75099999999996,
+      "peak_rss_mib": 3.484375,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "full-history",
+      "history": 1000,
+      "draws": 200,
+      "elapsed_ms": 46.9465,
+      "screen_checksum": 18056495878419005139,
+      "cpu_ms": 48.609000000000016,
+      "peak_rss_mib": 3.6875,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "viewport",
+      "history": 50000,
+      "draws": 200,
+      "elapsed_ms": 37.048042,
+      "screen_checksum": 9474894872808719475,
+      "cpu_ms": 44.13900000000004,
+      "peak_rss_mib": 18.109375,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "full-history",
+      "history": 1000,
+      "draws": 200,
+      "elapsed_ms": 58.041208,
+      "screen_checksum": 18056495878419005139,
+      "cpu_ms": 54.939,
+      "peak_rss_mib": 3.6875,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "full-history",
+      "history": 10000,
+      "draws": 200,
+      "elapsed_ms": 132.631958,
+      "screen_checksum": 886850631938626355,
+      "cpu_ms": 134.248,
+      "peak_rss_mib": 8.484375,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "viewport",
+      "history": 50000,
+      "draws": 200,
+      "elapsed_ms": 38.608041,
+      "screen_checksum": 9474894872808719475,
+      "cpu_ms": 47.07100000000011,
+      "peak_rss_mib": 18.125,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "viewport",
+      "history": 1000,
+      "draws": 200,
+      "elapsed_ms": 37.173208,
+      "screen_checksum": 18056495878419005139,
+      "cpu_ms": 39.745999999999896,
+      "peak_rss_mib": 3.421875,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "full-history",
+      "history": 50000,
+      "draws": 200,
+      "elapsed_ms": 449.793334,
+      "screen_checksum": 9474894872808719475,
+      "cpu_ms": 450.37799999999993,
+      "peak_rss_mib": 29.703125,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "full-history",
+      "history": 50000,
+      "draws": 200,
+      "elapsed_ms": 451.41274999999996,
+      "screen_checksum": 9474894872808719475,
+      "cpu_ms": 452.4780000000003,
+      "peak_rss_mib": 29.6875,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "viewport",
+      "history": 10000,
+      "draws": 200,
+      "elapsed_ms": 39.357083,
+      "screen_checksum": 886850631938626355,
+      "cpu_ms": 44.686999999999685,
+      "peak_rss_mib": 6.140625,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "viewport",
+      "history": 50000,
+      "draws": 200,
+      "elapsed_ms": 37.354334,
+      "screen_checksum": 9474894872808719475,
+      "cpu_ms": 44.829000000000285,
+      "peak_rss_mib": 18.125,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "viewport",
+      "history": 50000,
+      "draws": 200,
+      "elapsed_ms": 38.701042,
+      "screen_checksum": 9474894872808719475,
+      "cpu_ms": 46.44199999999987,
+      "peak_rss_mib": 18.15625,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "viewport",
+      "history": 10000,
+      "draws": 200,
+      "elapsed_ms": 38.305334,
+      "screen_checksum": 886850631938626355,
+      "cpu_ms": 41.81700000000002,
+      "peak_rss_mib": 6.09375,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "full-history",
+      "history": 10000,
+      "draws": 200,
+      "elapsed_ms": 116.218917,
+      "screen_checksum": 886850631938626355,
+      "cpu_ms": 119.04900000000008,
+      "peak_rss_mib": 8.4375,
+      "voluntary_context_switches": 2
+    },
+    {
+      "mode": "viewport",
+      "history": 1000,
+      "draws": 200,
+      "elapsed_ms": 37.517541,
+      "screen_checksum": 18056495878419005139,
+      "cpu_ms": 40.26499999999986,
+      "peak_rss_mib": 3.453125,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "full-history",
+      "history": 50000,
+      "draws": 200,
+      "elapsed_ms": 434.826917,
+      "screen_checksum": 9474894872808719475,
+      "cpu_ms": 436.5710000000002,
+      "peak_rss_mib": 29.703125,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "full-history",
+      "history": 1000,
+      "draws": 200,
+      "elapsed_ms": 43.700583,
+      "screen_checksum": 18056495878419005139,
+      "cpu_ms": 46.807999999999794,
+      "peak_rss_mib": 3.671875,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "full-history",
+      "history": 10000,
+      "draws": 200,
+      "elapsed_ms": 117.56316699999999,
+      "screen_checksum": 886850631938626355,
+      "cpu_ms": 118.68200000000014,
+      "peak_rss_mib": 8.4375,
+      "voluntary_context_switches": 2
+    },
+    {
+      "mode": "viewport",
+      "history": 10000,
+      "draws": 200,
+      "elapsed_ms": 38.535582999999995,
+      "screen_checksum": 886850631938626355,
+      "cpu_ms": 42.068999999999775,
+      "peak_rss_mib": 6.140625,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "full-history",
+      "history": 50000,
+      "draws": 200,
+      "elapsed_ms": 481.188125,
+      "screen_checksum": 9474894872808719475,
+      "cpu_ms": 471.301,
+      "peak_rss_mib": 29.640625,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "viewport",
+      "history": 50000,
+      "draws": 200,
+      "elapsed_ms": 37.650749999999995,
+      "screen_checksum": 9474894872808719475,
+      "cpu_ms": 45.435000000000194,
+      "peak_rss_mib": 18.109375,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "viewport",
+      "history": 10000,
+      "draws": 200,
+      "elapsed_ms": 37.394957999999995,
+      "screen_checksum": 886850631938626355,
+      "cpu_ms": 40.468999999999724,
+      "peak_rss_mib": 6.15625,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "full-history",
+      "history": 1000,
+      "draws": 200,
+      "elapsed_ms": 45.920833,
+      "screen_checksum": 18056495878419005139,
+      "cpu_ms": 47.083000000000375,
+      "peak_rss_mib": 3.703125,
+      "voluntary_context_switches": 2
+    }
+  ],
+  "idle_raw": [
+    {
+      "mode": "idle-poll",
+      "history": 10000,
+      "draws": 41,
+      "elapsed_ms": 5096.034583,
+      "screen_checksum": 886850631938626355,
+      "cpu_ms": 12.644999999999934,
+      "peak_rss_mib": 6.109375,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "idle-events",
+      "history": 10000,
+      "draws": 0,
+      "elapsed_ms": 5005.017334,
+      "screen_checksum": 886850631938626355,
+      "cpu_ms": 4.070999999999769,
+      "peak_rss_mib": 5.65625,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "idle-poll",
+      "history": 10000,
+      "draws": 41,
+      "elapsed_ms": 5083.304458,
+      "screen_checksum": 886850631938626355,
+      "cpu_ms": 12.66600000000026,
+      "peak_rss_mib": 6.109375,
+      "voluntary_context_switches": 1
+    },
+    {
+      "mode": "idle-events",
+      "history": 10000,
+      "draws": 0,
+      "elapsed_ms": 5000.361,
+      "screen_checksum": 886850631938626355,
+      "cpu_ms": 4.018999999999662,
+      "peak_rss_mib": 5.625,
+      "voluntary_context_switches": 2
+    },
+    {
+      "mode": "idle-poll",
+      "history": 10000,
+      "draws": 41,
+      "elapsed_ms": 5088.175833,
+      "screen_checksum": 886850631938626355,
+      "cpu_ms": 14.15700000000028,
+      "peak_rss_mib": 5.953125,
+      "voluntary_context_switches": 2
+    },
+    {
+      "mode": "idle-events",
+      "history": 10000,
+      "draws": 0,
+      "elapsed_ms": 5005.047667000001,
+      "screen_checksum": 886850631938626355,
+      "cpu_ms": 5.077999999999832,
+      "peak_rss_mib": 5.625,
+      "voluntary_context_switches": 3
+    }
+  ]
+}
