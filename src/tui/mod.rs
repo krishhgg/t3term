@@ -8,6 +8,7 @@ mod composer;
 mod markdown;
 mod picker;
 mod plan;
+mod scroll;
 mod sidebar;
 mod theme;
 mod unsent;
@@ -39,6 +40,7 @@ use crate::transcript::{self, BlockKind};
 use composer::Composer;
 use markdown::Styles;
 use picker::{Item, Kind, Pick};
+use scroll::Scroll;
 use sidebar::{Capabilities, Sidebar, View};
 use theme::{
     Theme, duration_label, model_display_name, monogram, now_ms, parse_iso_ms, runtime_mode_label,
@@ -213,8 +215,8 @@ struct App {
     open: Option<OpenThread>,
     focus: Focus,
     composer: Composer,
-    /// Rows scrolled up from the bottom. Zero follows new output.
-    scroll: usize,
+    /// How far the transcript is scrolled, and a plan header waiting for the next frame.
+    scroll: Scroll,
     /// Runs of tool calls the reader has opened, by the item id of the first call.
     open_bundles: HashSet<String>,
     /// The screen row of each run-of-calls row drawn, with the run it opens.
@@ -223,8 +225,6 @@ struct App {
     expanded_plans: HashSet<String>,
     /// Each plan long enough to collapse that the last frame drew, in transcript order.
     drawn_plans: Vec<plan::Drawn>,
-    /// A plan just expanded or collapsed and the row its header keeps in the next frame.
-    plan_pin: Option<(String, isize)>,
     /// The item at the top of the last frame and the row of it that was showing, so a block
     /// that grows under the reader doesn't move the text.
     anchor: Option<(String, usize)>,
@@ -308,12 +308,11 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
         open: None,
         focus: Focus::Sidebar,
         composer: Composer::default(),
-        scroll: 0,
+        scroll: Scroll::default(),
         open_bundles: HashSet::new(),
         bundle_rows: Vec::new(),
         expanded_plans: HashSet::new(),
         drawn_plans: Vec::new(),
-        plan_pin: None,
         anchor: None,
         drawn_scroll: 0,
         verbose: settings.verbose,
@@ -554,8 +553,7 @@ impl App {
         self.bundle_rows.clear();
         self.expanded_plans.clear();
         self.drawn_plans.clear();
-        self.plan_pin = None;
-        self.scroll = 0;
+        self.scroll.set(0);
         self.picker = None;
         self.focus = Focus::Composer;
         if let Some(open) = self.open.as_ref() {
@@ -638,9 +636,11 @@ impl App {
                         self.panel_scroll = self.panel_scroll.saturating_sub(1)
                     }
                     MouseEventKind::ScrollDown if inside(self.panel_area) => self.panel_scroll += 1,
-                    MouseEventKind::ScrollUp if inside(self.transcript_area) => self.scroll += 3,
+                    MouseEventKind::ScrollUp if inside(self.transcript_area) => {
+                        self.scroll.set(self.scroll.rows() + 3)
+                    }
                     MouseEventKind::ScrollDown if inside(self.transcript_area) => {
-                        self.scroll = self.scroll.saturating_sub(3)
+                        self.scroll.set(self.scroll.rows().saturating_sub(3))
                     }
                     MouseEventKind::ScrollUp if inside(self.sidebar.list) => {
                         self.sidebar.move_selection(-1)
@@ -761,11 +761,12 @@ impl App {
                 return;
             }
             KeyCode::PageUp => {
-                self.scroll += self.page();
+                self.scroll.set(self.scroll.rows() + self.page());
                 return;
             }
             KeyCode::PageDown => {
-                self.scroll = self.scroll.saturating_sub(self.page());
+                self.scroll
+                    .set(self.scroll.rows().saturating_sub(self.page()));
                 return;
             }
             _ => {}
@@ -796,13 +797,13 @@ impl App {
                     // Past the first line, the arrow scrolls the transcript instead.
                     let moved = self.composer.up();
                     if !moved {
-                        self.scroll += 1;
+                        self.scroll.set(self.scroll.rows() + 1);
                     }
                 }
                 KeyCode::Down => {
                     let moved = self.composer.down();
                     if !moved {
-                        self.scroll = self.scroll.saturating_sub(1);
+                        self.scroll.set(self.scroll.rows().saturating_sub(1));
                     }
                 }
                 _ => {}
@@ -818,10 +819,12 @@ impl App {
             },
             Focus::Transcript => match key.code {
                 KeyCode::Char('q') => self.quit = true,
-                KeyCode::Up | KeyCode::Char('k') => self.scroll += 1,
-                KeyCode::Down | KeyCode::Char('j') => self.scroll = self.scroll.saturating_sub(1),
-                KeyCode::Char('g') | KeyCode::Home => self.scroll = usize::MAX / 2,
-                KeyCode::Char('G') | KeyCode::End => self.scroll = 0,
+                KeyCode::Up | KeyCode::Char('k') => self.scroll.set(self.scroll.rows() + 1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.scroll.set(self.scroll.rows().saturating_sub(1))
+                }
+                KeyCode::Char('g') | KeyCode::Home => self.scroll.set(usize::MAX / 2),
+                KeyCode::Char('G') | KeyCode::End => self.scroll.set(0),
                 KeyCode::Char('t') => self.toggle_verbose(),
                 KeyCode::Char('p') => self.toggle_first_plan(),
                 KeyCode::Char('a') => self.respond("accept"),
@@ -844,11 +847,12 @@ impl App {
 
     /// Expands or collapses one proposed plan, as its button in the GUI does. Only this
     /// window remembers it: nothing goes to T3 or the settings file. The next frame keeps the
-    /// card's header on the row it was on, so the click doesn't move the text.
+    /// card's header on the row it was on, so the click doesn't move the text, unless a key
+    /// or the wheel moves the transcript before that frame.
     fn toggle_plan(&mut self, id: String, header: isize) {
         self.focus = Focus::Transcript;
         let row = plan::flip(&mut self.expanded_plans, &id, header);
-        self.plan_pin = Some((id, row));
+        self.scroll.pin(id, row);
     }
 
     /// `p` expands or collapses the first long plan in view, reading down from the top of the
@@ -1339,7 +1343,7 @@ impl App {
         }
         self.composer.clear();
         self.unsent.forget_composer();
-        self.scroll = 0;
+        self.scroll.set(0);
         // As in the desktop app, ultrathink applies to one message. This send takes it out of
         // the draft now, so a second message sent before this one lands doesn't reuse it.
         let mut reserved = Vec::new();
@@ -1710,8 +1714,9 @@ impl App {
         let total: usize = heights.iter().sum();
         let height = area.height as usize;
         // A plan just expanded or collapsed keeps its header on the row it had, so the click
-        // doesn't move the text, even while the view follows the bottom.
-        let pinned = self.plan_pin.take().and_then(|(id, row)| {
+        // doesn't move the text, even while the view follows the bottom. A key or the wheel
+        // that moved the transcript after the toggle has already cancelled this.
+        let pinned = self.scroll.take_pin().and_then(|(id, row)| {
             let header = self.cache.get(&id)?.toggle?.0;
             scroll_to(&blocks, &heights, &id, header, row, height)
         });
@@ -1719,7 +1724,7 @@ impl App {
         // block on screen makes it taller, and without this the text would slide away. The
         // anchor is dropped as soon as anything else moves the scroll, so keys and the wheel
         // still win, and following the bottom is untouched.
-        let anchored = if self.scroll > 0 && self.scroll == self.drawn_scroll {
+        let anchored = if self.scroll.rows() > 0 && self.scroll.rows() == self.drawn_scroll {
             self.anchor.as_ref().and_then(|(item_id, within)| {
                 scroll_to(&blocks, &heights, item_id, *within, 0, height)
             })
@@ -1727,10 +1732,11 @@ impl App {
             None
         };
         if let Some(scroll) = pinned.or(anchored) {
-            self.scroll = scroll;
+            self.scroll.set(scroll);
         }
-        self.scroll = self.scroll.min(total.saturating_sub(height));
-        let end = total - self.scroll;
+        let scroll = self.scroll.rows().min(total.saturating_sub(height));
+        self.scroll.set(scroll);
+        let end = total - scroll;
         let start = end.saturating_sub(height);
 
         // Copy only the rows in view.
@@ -1775,8 +1781,8 @@ impl App {
         self.bundle_rows = rows;
         self.drawn_plans = plans;
         frame.render_widget(Paragraph::new(lines), area);
-        if self.scroll > 0 {
-            let label = format!(" ↓ {} more ", self.scroll);
+        if scroll > 0 {
+            let label = format!(" ↓ {scroll} more ");
             let x = area.x + area.width.saturating_sub(label.width() as u16 + 1);
             frame.render_widget(
                 Paragraph::new(Line::styled(
@@ -1786,8 +1792,8 @@ impl App {
                 Rect::new(x, area.y + area.height - 1, label.width() as u16, 1),
             );
         }
-        self.anchor = anchor.filter(|_| self.scroll > 0);
-        self.drawn_scroll = self.scroll;
+        self.anchor = anchor.filter(|_| scroll > 0);
+        self.drawn_scroll = scroll;
         for (item_id, revision) in wanted {
             self.fetch_output(item_id, revision);
         }
