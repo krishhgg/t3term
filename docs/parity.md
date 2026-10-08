@@ -10,17 +10,19 @@ The desktop app has 303 features. t3term does 11 of them fully and 30 partly, an
 
 Most of that can be built. 245 features port to a terminal as they are. 42 can be done with something lost, like a background blur or a second font, which a terminal can't do. 16 can't be done in a terminal at all, and those are mostly the embedded browser, the device simulator and rendered HTML. That count assumes a plain terminal, though. Ghostty, kitty and iTerm2 can draw images, so image previews could move from "can't" to "approximate" in those.
 
-The commands tell the same story. A client can send T3's server 50 kinds of command, and t3term sends 6: send a message, interrupt, answer an approval or a question, and set the model, the permission mode and Build or Plan. The desktop app sends 30 of the other 44. The last 14 come from the server, from agents through MCP, or from older clients, so they aren't something t3term is missing. Subagents are one of those, since an agent starts them through MCP and the desktop only shows them. Past commands, the desktop also calls whole groups of API that t3term never touches: projects, git, diffs, terminals, the browser preview, PRs, scheduled tasks, providers and settings.
+The commands tell the same story. A client can send T3's server 50 kinds of command, and t3term sends 6: send a message, interrupt, answer an approval or a question, and set the model, the permission mode and Build or Plan. The desktop app sends 30 of the other 44. The last 14 come from the server, from agents through MCP, or from older clients, so they aren't something t3term is missing. Subagents are one of those. An agent starts them through MCP, and the desktop shows them in the Lineage panel as threads you can open, which is in the plan below. Past commands, the desktop also calls whole groups of API that t3term never touches: projects, git, diffs, terminals, the browser preview, PRs, scheduled tasks, providers and settings.
+
+All of orchestrator V2 is covered. Every command type the desktop sends maps to a row in the plan below, and so does every orchestration API call one of its screens makes. The commands with no row are sent by the server or by agents, such as the bookkeeping for when a subagent's result wakes its parent, so there's nothing for a client to draw.
 
 ## Why it looks older than the nightly
 
-The nightly changed its layout, and t3term still follows the older one. These are the visible differences, and the first group below covers all of them except themes.
+The nightly changed its layout, and t3term still follows the older one. These are the visible differences, and the first two groups below cover all of them except themes.
 
 - **Sidebar.** The nightly's sidebar is one inbox split into shelves: drafts on top, then Pinned, Active, Snoozed and Settled. Each row shows one status word, picked in this order: Approval, Input, Working, Waiting, Limited, Failed, Woke, Done. Working reads Goal while the agent works toward a set goal. Rows also carry a pin, a PR badge and a terminal badge. t3term shows Input or Approval, a spinner with a timer, Failed, Queued or the age, plus one toggle for settled threads.
 - **Header.** The nightly shows the project, a slash, then the thread title, and you can rename the thread from there.
 - **Messages.** Replies are headed "T3 Code". After the last message, one quiet line says the thread is settled, snoozed or just woke, with a single action next to it.
 - **Composer.** The nightly took the Build/Plan toggle and the context meter out of the default composer, and both now sit behind legacy settings. t3term still shows the Plan chip. In the nightly, queued messages and the approval or question drawer stack on top of the composer. The model controls sit at the bottom left, send is on the right, and a strip under the composer shows the host, workspace and branch.
-- **Thread details.** A card next to the conversation lists the workspace, version control, automations and related threads.
+- **Thread details.** A card next to the conversation shows the worktree, an Open in your editor button, project scripts, the branch, linked PRs with their checks, uncommitted changes, automations, and Lineage, the list of parent and subagent threads.
 - **Empty draft.** A new thread opens on "What should we build in {project}?" above the composer.
 - **Themes.** t3term has one hardcoded dark palette. The nightly has system, light and dark, plus built-in themes called t3-chat, grove, ocean, ember and iris. t3term's dark colors already match the nightly's base dark theme closely, so this one is about choice, not about wrong colors.
 
@@ -30,32 +32,36 @@ Each group is one PR, or a short series if it's big. Sizes are rough estimates f
 
 | Rank | Group | Features | Work today | Partly | Missing | Can't in a terminal | S / M / L |
 |---|---|---|---|---|---|---|---|
-| 1 | [Look like the nightly](#1-look-like-the-nightly) | 22 | 5 | 10 | 7 | 0 | 10 / 11 / 1 |
-| 2 | [Start threads](#2-start-threads) | 13 | 0 | 0 | 13 | 0 | 6 / 4 / 3 |
-| 3 | [Organize the inbox](#3-organize-the-inbox) | 16 | 0 | 2 | 14 | 0 | 10 / 6 / 0 |
-| 4 | [Queue, steering and requests](#4-queue-steering-and-requests) | 24 | 2 | 8 | 14 | 0 | 12 / 12 / 0 |
-| 5 | [Notifications](#5-notifications) | 4 | 0 | 0 | 4 | 0 | 2 / 2 / 0 |
-| 6 | [History, diffs and rewind](#6-history-diffs-and-rewind) | 21 | 0 | 3 | 18 | 0 | 5 / 15 / 1 |
-| 7 | [Composer](#7-composer) | 25 | 3 | 2 | 20 | 1 | 8 / 15 / 2 |
-| 8 | [Search, palette and navigation](#8-search-palette-and-navigation) | 4 | 0 | 1 | 3 | 0 | 1 / 3 / 0 |
-| 9 | [Git and workspaces](#9-git-and-workspaces) | 22 | 0 | 0 | 22 | 0 | 6 / 13 / 3 |
-| 10 | [Pull requests](#10-pull-requests) | 21 | 0 | 0 | 21 | 0 | 8 / 9 / 4 |
-| 11 | [Projects and files](#11-projects-and-files) | 23 | 1 | 1 | 21 | 2 | 4 / 14 / 5 |
-| 12 | [Themes and settings](#12-themes-and-settings) | 36 | 0 | 0 | 36 | 4 | 23 / 10 / 3 |
-| 13 | [Embedded terminal](#13-embedded-terminal) | 9 | 0 | 0 | 9 | 0 | 2 / 5 / 2 |
-| 14 | [Providers, automations, usage and connections](#14-providers-automations-usage-and-connections) | 26 | 0 | 3 | 23 | 0 | 3 / 6 / 17 |
-| 15 | [Browser, capture, devices and rich media](#15-browser-capture-devices-and-rich-media) | 37 | 0 | 0 | 37 | 9 | 7 / 15 / 15 |
+| 1 | [Look like the nightly](#1-look-like-the-nightly) | 19 | 5 | 8 | 6 | 0 | 9 / 9 / 1 |
+| 2 | [Thread details pane](#2-thread-details-pane) | 8 | 0 | 3 | 5 | 0 | 2 / 6 / 0 |
+| 3 | [Start threads](#3-start-threads) | 12 | 0 | 0 | 12 | 0 | 6 / 4 / 2 |
+| 4 | [Organize the inbox](#4-organize-the-inbox) | 16 | 0 | 2 | 14 | 0 | 10 / 6 / 0 |
+| 5 | [Queue, steering and requests](#5-queue-steering-and-requests) | 23 | 2 | 8 | 13 | 0 | 12 / 11 / 0 |
+| 6 | [Notifications](#6-notifications) | 4 | 0 | 0 | 4 | 0 | 2 / 2 / 0 |
+| 7 | [History, diffs and rewind](#7-history-diffs-and-rewind) | 20 | 0 | 2 | 18 | 0 | 5 / 14 / 1 |
+| 8 | [Machines](#8-machines) | 7 | 0 | 1 | 6 | 0 | 0 / 1 / 6 |
+| 9 | [Composer](#9-composer) | 25 | 3 | 2 | 20 | 1 | 8 / 15 / 2 |
+| 10 | [Search, palette and navigation](#10-search-palette-and-navigation) | 4 | 0 | 1 | 3 | 0 | 1 / 3 / 0 |
+| 11 | [Git and workspaces](#11-git-and-workspaces) | 20 | 0 | 0 | 20 | 0 | 5 / 12 / 3 |
+| 12 | [Pull requests](#12-pull-requests) | 21 | 0 | 0 | 21 | 0 | 8 / 9 / 4 |
+| 13 | [Projects and files](#13-projects-and-files) | 22 | 1 | 1 | 20 | 2 | 4 / 13 / 5 |
+| 14 | [Settings page](#14-settings-page) | 36 | 0 | 0 | 36 | 4 | 23 / 10 / 3 |
+| 15 | [Embedded terminal](#15-embedded-terminal) | 9 | 0 | 0 | 9 | 0 | 2 / 5 / 2 |
+| 16 | [Providers, automations and usage](#16-providers-automations-and-usage) | 20 | 0 | 2 | 18 | 0 | 3 / 5 / 12 |
+| 17 | [Browser, capture, devices and rich media](#17-browser-capture-devices-and-rich-media) | 37 | 0 | 0 | 37 | 9 | 7 / 15 / 15 |
 
 ### Why this order
 
 - **Look like the nightly** goes first because it's the first thing you noticed, and it's mostly redrawing data t3term already gets. Everything after it then lands in the new layout instead of the old one.
+- **Thread details pane** comes right after, because it's the other half of the nightly's thread view and it's how you'll reach subagents.
 - **Start threads** is the gap that sends you back to the desktop app every day.
 - **Organize the inbox** is how the nightly keeps the sidebar short. Without settle, snooze and pin, the list only grows.
 - **Queue, steering and requests** finishes the conversation itself, so you never need the app while a run is going.
 - **Notifications** is small, and it's what lets you close the desktop app and still find out when a thread needs you. That matters for the battery point, since the app only stops using power once it's closed.
 - **History, diffs and rewind** lets you review what an agent changed without opening the app.
+- **Machines** is big, so it sits in the middle. The connection code should still be written for several servers from the first PR on, so this group doesn't mean rewriting the groups before it.
 - **Composer**, **Search, palette and navigation**, **Git and workspaces**, **Pull requests** and **Projects and files** are whole features you reach for less often.
-- **Themes and settings** and **Providers, automations, usage and connections** are mostly things you set once. Ranking them low doesn't mean cutting them.
+- **Settings page** and **Providers, automations and usage** are mostly things you set once. Ranking them low doesn't mean cutting them.
 - **Embedded terminal** sits near the bottom because you're already in a terminal, and a tmux pane does the same job.
 - **Browser, capture, devices and rich media** is last because most of it can't run in a terminal. The part that can is opening things in your real browser and showing a text summary.
 
@@ -87,7 +93,6 @@ The sidebar shelves and status words, the header breadcrumb, the status line aft
 | Sidebar live thread/project list | Main navigation | yes | port | S |
 | Pinned/Active/Snoozed/Settled shelves | Default sidebar | partial: Active/Settled only, sorted by update time | port | M |
 | Working/monitoring shelf | Sidebar; opt-in beta setting | no | port | M |
-| Managed delegated-task status | Relationships Active/Previous, activity bar | partial: textual tool/event summaries, no managed task panel | port | M |
 | Build/Plan interaction mode | Composer/slash commands only with legacy Plan setting | yes; plan control is visible in t3term, unlike default nightly | port | S |
 | Context window meter | Composer; hidden unless legacy setting enabled | no | port | S |
 | Proposed plan reading and expansion | Timeline plan card | partial: displays plan text, no card interactions | port | S |
@@ -97,15 +102,28 @@ The sidebar shelves and status words, the header breadcrumb, the status line aft
 | Error and provider status banners | Top overlay; composer stack | partial: error text/status line, no stacked banners | port | M |
 | Context compaction/handoff markers | Timeline event rows | partial: generic system/event title only | port | S |
 | Changed-file summary in tool output | Timeline file-change rows | partial: file path and +/- statistics, no patch body | port | S |
-| View current branch/worktree binding | Composer context strip, thread details, sidebar branch | partial: branch text only, no worktree picker/status | port | S |
 | Worktree setup progress, open setup terminal | Timeline worktree setup card | no | port | M |
 | Resizable/hideable main sidebar | Workspace left edge, Mod+B | no equivalent resize/hide; fixed quarter-width clamped sidebar | port | M |
 | Right-panel surface tabs, add/close/reopen | Workspace right side | no | port for textual surfaces; browser/device tabs external | L |
 | Maximize right panel and adapt to narrow sheet | Panel controls | no | port for text panels | M |
-| Thread-details card/popover density adaptation | Conversation side, details toggle | no | approximate; details pane/dialog based on available columns | M |
 | Connection-status indicator | Sidebar/environment chrome | partial: terminal status/error line; no desktop dot/host chrome | port | S |
 
-### 2. Start threads
+### 2. Thread details pane
+
+The card from the desktop's thread view: the worktree, open in your editor, project scripts, the branch, uncommitted changes, and Lineage. Lineage lists the parent thread and every subagent as a thread you can open or stop. The TUI hides subagent threads completely today, so this is also how you'll reach them. The card's commit and PR rows fill in as the Git and Pull requests groups land.
+
+| Feature | Where it is in the app | t3term today | In a terminal | Size |
+|---|---|---|---|---|
+| Thread-details card/popover density adaptation | Conversation side, details toggle | no | approximate; details pane/dialog based on available columns | M |
+| View current branch/worktree binding | Composer context strip, thread details, sidebar branch | partial: branch text only, no worktree picker/status | port | S |
+| Git status and changed files | Details Version Control / Git action popover | no | port | M |
+| Open workspace in preferred external editor | Details Open in picker; Mod+O | no | port as external launcher | S |
+| Run configured project action/script | Details Workspace / action button | no | port | M |
+| Parent, fork, and delegated-thread navigation | Thread details Lineage | partial: CLI can include child threads; TUI filters all parented threads, including forks | port | M |
+| Managed delegated-task status | Lineage running and previous agents, activity bar | partial: textual tool/event summaries, no managed task panel | port | M |
+| Stop delegated work | Lineage stop action, main Stop | no for per-child controls | port | M |
+
+### 3. Start threads
 
 New thread in a project's main checkout, in a new worktree, or with no project. The draft screen, the background send, sending one draft to several models, and the worktree setup card with cancel, retry and work locally.
 
@@ -121,11 +139,10 @@ New thread in a project's main checkout, in a new worktree, or with no project. 
 | Cancel worktree preparation | Setup card Cancel | no | port | S |
 | Retry failed preparation | Setup failure/queue action | no | port | S |
 | Work locally instead of waiting for worktree setup | Setup card | no | port | M |
-| Host/environment selection for launch | Composer host control, details Workspace | no | port | L |
 | Default new-thread workspace mode | General/Project defaults | no | port | S |
 | Start worktree from origin | General/draft controls | no | port | S |
 
-### 3. Organize the inbox
+### 4. Organize the inbox
 
 Settle, snooze, pin and reorder, mark unread, rename and regenerate titles, archive, delete, auto-settle per thread, multi-select, undo, the project filter and copying IDs and paths. This is most of the 30 commands the desktop sends and t3term doesn't.
 
@@ -148,7 +165,7 @@ Settle, snooze, pin and reorder, mark unread, rename and regenerate titles, arch
 | Copy thread reference, ID, branch, workspace path | Thread/header menu, shortcut | no | port; terminal clipboard support varies by host | S |
 | Unpin/archive/delete confirmations | General | no | port | S |
 
-### 4. Queue, steering and requests
+### 5. Queue, steering and requests
 
 Steer from the TUI, a queue panel to inspect, edit, reorder, cancel, promote and resume queued messages, restart a turn, the missing "always allow" approval that sends `acceptAlways`, dismissing a question, secret requests, implementing a proposed plan, usage-limit recovery, and restarting or handing off an agent session.
 
@@ -175,11 +192,10 @@ Steer from the TUI, a queue panel to inspect, edit, reorder, cancel, promote and
 | Copy/download/save plan to workspace | Plan card menu | no | port; terminal file destination replaces download dialog | S |
 | Usage-limit auto-resume or snooze until reset | Limit recovery banner | no | port | M |
 | Follow-up queue/steer preference | General | partial: CLI busy option only, no saved TUI preference | port | S |
-| Stop delegated work | Relationships stop action, main Stop | no for per-child controls | port | M |
 | Provider/model context handoff | Model picker in existing conversation | partial: supported on servers advertising resolved command context; no dedicated handoff details UI | port | M |
 | Restart agent session | Command palette | no | port | S |
 
-### 5. Notifications
+### 6. Notifications
 
 Desktop notifications when a thread finishes, fails, hits a limit or needs approval or input, plus a terminal bell and an in-app notice for other threads.
 
@@ -190,7 +206,7 @@ Desktop notifications when a thread finishes, fails, hits a limit or needs appro
 | In-app notification with Open thread action | Toast while focused on another thread | no | port | S |
 | Notification sound/mode/permission configuration | Settings General Notifications | no | approximate; sound/bell and host notification permission | M |
 
-### 6. History, diffs and rewind
+### 7. History, diffs and rewind
 
 Load earlier turns, fork from a turn, merge back, parent and subagent links, turn and full-thread diffs with a file list, rewind to a turn with or without restoring files, and inline diff comments sent to the agent.
 
@@ -198,8 +214,7 @@ Load earlier turns, fork from a turn, merge back, parent and subagent links, tur
 |---|---|---|---|---|
 | Load earlier turns beyond bounded initial history | Timeline "Load earlier turns"; citation history lookup | no | port | M |
 | Fork from a conversation turn | Timeline action | no | port | M |
-| Merge conversation context back | Relationships section | no | port | M |
-| Parent, fork, and delegated-thread navigation | Thread details Relationships | partial: CLI can include child threads; TUI filters all parented threads, including forks | port | M |
+| Merge conversation context back | Lineage section | no | port | M |
 | Fold work groups/turns/attempts and lazy output | Timeline | partial: tool bundle folding and output hydration; no full turn/attempt controls | port | M |
 | Conversation minimap and jump to turn | Timeline edge/minimap | partial: PageUp/Down, g/G and transcript scrolling only | approximate; textual turn index replaces graphical minimap | M |
 | Checkpoint rewind to earlier turn | Timeline action, rewind dialog | no; checkpoint items omitted | port | M |
@@ -218,7 +233,21 @@ Load earlier turns, fork from a turn, merge back, parent and subagent links, tur
 | Collapse diffs by default | General | no | port | S |
 | Default diff layout | General | no | port | S |
 
-### 7. Composer
+### 8. Machines
+
+Running threads on other machines. In the nightly every machine runs its own T3 server, and the desktop app stays connected to all of them. You pick the machine when you start a thread, or let it pick the one with the most free CPU and memory. t3term connects to exactly one server today, the one on your Mac. So this means holding several connections at once, merging their threads into one sidebar, and pairing with remote machines over the network, SSH or T3 Connect.
+
+| Feature | Where it is in the app | t3term today | In a terminal | Size |
+|---|---|---|---|---|
+| Host/environment selection for launch | Composer host control, details Workspace | no | port | L |
+| Multiple server/environment connections, SSH and WSL | Settings Connections; host picker | partial: discovers/authenticates a server; no desktop environment management UI | port | L |
+| T3 Connect remote relay setup | Settings Connections | no | approximate; textual setup, external sign-in/pairing where needed | L |
+| Network access/Tailscale HTTPS controls | Settings Connections | no | port | L |
+| Environment icons and machine identity | Connections/appearance/sidebar | no | approximate; glyph/text/color identity | M |
+| Automatic host selection/load balancing | Environment settings/draft host selection | no | port | L |
+| GitHub sharing / publish agent activity / offline webhook holding | Connection environment settings | no | port for controls; remote relay prerequisite | L |
+
+### 9. Composer
 
 Prompt history, stash, attaching files and images by path, folding a big paste into a file, `@` file mentions, `/` commands and `$` skills, model favorites, copying a message or code block, quoting a reply back to the agent, and the composer preferences.
 
@@ -250,7 +279,7 @@ Prompt history, stash, attaching files and images by path, folding a big paste i
 | Composer collapse-on-scroll preference | General | no | port | S |
 | Send key preference | General | no | port | S |
 
-### 8. Search, palette and navigation
+### 10. Search, palette and navigation
 
 Thread search through `orchestration.searchThreads`, a command palette, numbered jumps and back and forward.
 
@@ -261,7 +290,7 @@ Thread search through `orchestration.searchThreads`, a command palette, numbered
 | App route back/forward and reopen closed view | Shortcuts | no | port | M |
 | Command palette | Mod+K | no | port | M |
 
-### 9. Git and workspaces
+### 11. Git and workspaces
 
 Git status, commit, push, create a PR, pull, branch list and switch, worktree handoff and cleanup, opening the workspace in an editor, and the source-control settings.
 
@@ -269,7 +298,6 @@ Git status, commit, push, create a PR, pull, branch list and switch, worktree ha
 |---|---|---|---|---|
 | List/switch/create branch | Branch picker | no | port | M |
 | Move current conversation into a new worktree, agent-owned handoff | Agent tool; workspace binding is visible in thread details. Direct renderer button unverified | no direct control | port | L |
-| Git status and changed files | Details Version Control / Git action popover | no | port | M |
 | Commit | Git actions | no | port | M |
 | Push | Git actions | no | port | M |
 | Commit-and-push / commit-push-PR | Git actions | no | port | M |
@@ -279,7 +307,6 @@ Git status, commit, push, create a PR, pull, branch list and switch, worktree ha
 | Resolve/checkout PR into thread workspace | PR thread dialog/branch menu | no | port | M |
 | Worktree cleanup policy/location | Settings Storage | no | port | M |
 | Delete worktree with threads / merged / unchanged cleanup | Settings Storage | no | port | M |
-| Open workspace in preferred external editor | Details Open in picker; Mod+O | no | port as external launcher | S |
 | Worktree submodule behavior | General | no | port | S |
 | Auto-pull project repositories | Source Control/Project | no | port | S |
 | Remove agent credits when merging | Source Control | no | port | S |
@@ -290,7 +317,7 @@ Git status, commit, push, create a PR, pull, branch list and switch, worktree ha
 | Bitbucket credentials | Source Control | no | port with private input | M |
 | Source-control writing style/templates/writer model | Source Control writing section | no | port | M |
 
-### 10. Pull requests
+### 12. Pull requests
 
 The PR inbox, PR detail with checks, linking and watching PRs from a thread, and the review, comment, merge and label actions.
 
@@ -318,7 +345,7 @@ The PR inbox, PR detail with checks, linking and watching PRs from a thread, and
 | Hand PR findings/check failures to agent | PR "fix findings/check" actions | no | port | M |
 | Copy PR link/number/checkout command/branch | PR header/action menu | no | port | S |
 
-### 11. Projects and files
+### 13. Projects and files
 
 Add, create, clone, rename and delete projects, project settings and actions, the file picker, content search, a file tree and file preview.
 
@@ -332,7 +359,6 @@ Add, create, clone, rename and delete projects, project settings and actions, th
 | Rename/update/delete project | Project Settings | no | port | M |
 | Project default model and permission inheritance | Project Settings | no; thread selection exists, project defaults cannot be edited | port | M |
 | Project icon/favicon and default workspace mode | Project Settings | no | approximate for icon artwork; glyph/color otherwise equivalent | M |
-| Run configured project action/script | Details Workspace / action button | no | port | M |
 | Run project-file scripts | Project action menu | no | port | M |
 | Add/edit/delete project actions and shortcuts | Project Settings/actions menu | no | port | M |
 | Project file picker | Mod+P/palette | no | port | M |
@@ -348,9 +374,9 @@ Add, create, clone, rename and delete projects, project settings and actions, th
 | File/code word wrap | Appearance/file surfaces | partial: transcript wraps, no configurable file/code wrap preference | port | S |
 | Add-project starting directory | General | no | port | S |
 
-### 12. Themes and settings
+### 14. Settings page
 
-Light and dark, the built-in themes t3-chat, grove, ocean, ember and iris, a settings screen for the server and client preferences that mean something in a terminal, and keybinding editing.
+One settings screen with the same sections as the desktop app, including light and dark, the built-in themes t3-chat, grove, ocean, ember and iris, and keybinding editing. Settings live in two places. Server settings are stored by the T3 server, so changing one in t3term changes it in the desktop app too. Client settings, like the theme and the send key, belong to each app, so t3term keeps its own. The Git, provider, connection and notification settings are listed in their own groups but go on this same screen. The four font rows can't work, because the terminal picks the font, not the app.
 
 | Feature | Where it is in the app | t3term today | In a terminal | Size |
 |---|---|---|---|---|
@@ -391,7 +417,7 @@ Light and dark, the built-in themes t3-chat, grove, ocean, ember and iris, a set
 | Nightly mobile beta notice and companion-app links/QR | One-time toast; Settings General About | no | approximate; links/copy text replace QR popover | S |
 | Rename/copy path/mute/close others/right/all tabs | Right tab context menu | no | port except media mute belongs to external browser | M |
 
-### 13. Embedded terminal
+### 15. Embedded terminal
 
 T3's server-side shells in a pane: tabs, splits, resize, clear and restart, copy, sending output to the agent, and running a code block from a reply.
 
@@ -407,9 +433,9 @@ T3's server-side shells in a pane: tabs, splits, resize, clear and restart, copy
 | Run assistant shell code in terminal | Closed shell-code block play action | no | port | M |
 | Embedded terminal font | Appearance | no | approximate; host terminal's font setting instead | S |
 
-### 14. Providers, automations, usage and connections
+### 16. Providers, automations and usage
 
-Provider setup and sign-in, scheduled tasks and webhooks, the usage page, remote environments and pairing, updates and diagnostics.
+Provider setup and sign-in, scheduled tasks and webhooks, the usage page, updates and diagnostics.
 
 | Feature | Where it is in the app | t3term today | In a terminal | Size |
 |---|---|---|---|---|
@@ -426,12 +452,6 @@ Provider setup and sign-in, scheduled tasks and webhooks, the usage page, remote
 | Interval/fixed-time schedule controls | Scheduled task dialog | no | port | M |
 | Enable/disable/run-now/delete scheduled task | Settings/task row/thread Automations | no | port | M |
 | Webhook tasks, delivery history/detail, token rotation | Scheduled task webhook sections | no | port | L |
-| Multiple server/environment connections, SSH and WSL | Settings Connections; host picker | partial: discovers/authenticates a server; no desktop environment management UI | port | L |
-| T3 Connect remote relay setup | Settings Connections | no | approximate; textual setup, external sign-in/pairing where needed | L |
-| Network access/Tailscale HTTPS controls | Settings Connections | no | port | L |
-| Environment icons and machine identity | Connections/appearance/sidebar | no | approximate; glyph/text/color identity | M |
-| Automatic host selection/load balancing | Environment settings/draft host selection | no | port | L |
-| GitHub sharing / publish agent activity / offline webhook holding | Connection environment settings | no | port for controls; remote relay prerequisite | L |
 | Desktop/server updates, stable/nightly channel and restart | Settings/update footer | no | approximate; terminal binary/server upgrade workflow replaces desktop updater | L |
 | Trace/process/server diagnostics | Settings Diagnostics | partial: Doctor is connectivity/config diagnosis, not trace/process UI | port | L |
 | Resource telemetry/history and process signals | Diagnostics resource panels | no | port for charts/tables/process actions | L |
@@ -440,7 +460,7 @@ Provider setup and sign-in, scheduled tasks and webhooks, the usage page, remote
 | Usage day/week/month/quarter selection and refresh | Usage page toolbar/shortcuts | no | port | M |
 | Usage provider configuration, rates/Cursor account usage | Settings Providers/Usage | no | port for configuration; external auth if required | M |
 
-### 15. Browser, capture, devices and rich media
+### 17. Browser, capture, devices and rich media
 
 The embedded browser, screenshots and recordings, SnapShot, simulators, and timeline items that are HTML, Mermaid or MCP apps. Most of this can't run in a terminal; the useful part is opening it in the real browser and showing a text summary.
 
