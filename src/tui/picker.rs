@@ -1,6 +1,7 @@
 //! The composer's model, effort and mode pickers. As in the desktop app, a choice stays in a
 //! draft for the thread and reaches T3 with the next message.
 
+use anyhow::Result;
 use serde_json::{Value, json};
 
 use crate::models::{self, Choice, Plan};
@@ -49,24 +50,96 @@ impl Item {
 pub struct View {
     pub selection: Value,
     pub runtime_mode: String,
+    /// `plan` only while Build and Plan are offered.
     pub interaction_mode: String,
+    /// Whether the mode menu offers Build and Plan.
+    pub offers_plan: bool,
     pub prompt_effort: Option<String>,
     /// What sending now would change.
     pub plan: Plan,
 }
 
-pub fn view(config: Option<&Value>, thread: &Value, draft: &Choice) -> View {
-    let plan = match config {
-        Some(config) if !draft.is_empty() => {
-            models::plan(config, thread, draft).unwrap_or_default()
-        }
+/// Whether the composer offers Build and Plan for a thread on `selection`, decided as the
+/// desktop's `resolveComposerInteractionMode` does in apps/web/src/components/ChatView.logic.ts:
+/// only with the legacy plan setting on, and only for a provider that shows the toggle. Before
+/// T3's model list arrives the provider is unknown, and t3term keeps offering the thread's mode
+/// rather than switching it. The desktop can't send at all then, so it never has to choose.
+pub fn offers_plan(config: Option<&Value>, selection: &Value, plan_mode_enabled: bool) -> bool {
+    plan_mode_enabled
+        && config
+            .and_then(|config| {
+                models::providers(config)
+                    .iter()
+                    .find(|provider| provider["instanceId"] == selection["instanceId"])
+            })
+            .is_none_or(|provider| provider["showInteractionModeToggle"] != false)
+}
+
+/// What sending a message now changes: the draft, checked against `config`, and the mode the
+/// desktop would send. Where Build and Plan aren't offered, that mode is Build, as in the
+/// desktop's `persistThreadSettingsForNextTurn` in ChatView.tsx. A Plan pick in the draft then
+/// waits unused, and a thread left in Plan goes back to Build with this message, so a hidden
+/// control never leaves a turn planning.
+pub fn send_plan(
+    config: Option<&Value>,
+    thread: &Value,
+    draft: &Choice,
+    plan_mode_enabled: bool,
+) -> Result<Plan> {
+    // `models::plan` checks a mode pick as Build, since whether Plan is allowed depends on the
+    // provider the draft ends up on. It still refuses a provider T3 has turned off.
+    let mut choice = draft.clone();
+    let picked = choice.interaction_mode.take();
+    choice.interaction_mode = picked.as_ref().map(|_| "default".to_string());
+    let mut plan = match config {
+        Some(config) if !choice.is_empty() => models::plan(config, thread, &choice)?,
         _ => Plan::default(),
     };
+    let selection = plan
+        .model_selection
+        .as_ref()
+        .unwrap_or(&thread["modelSelection"]);
+    let current = thread["interactionMode"].as_str().unwrap_or("default");
+    let mode = if offers_plan(config, selection, plan_mode_enabled) {
+        picked.as_deref().unwrap_or(current)
+    } else {
+        "default"
+    };
+    // Only a change is sent, so a thread already in Build gets no command.
+    plan.interaction_mode = (mode != current).then(|| mode.to_string());
+    Ok(plan)
+}
+
+/// Whether a message would change the same with or without `draft`, so the draft can go. The
+/// switch to Build that every message sends a thread left in Plan doesn't keep a draft alive.
+pub fn spent(
+    config: &Value,
+    thread: &Value,
+    draft: &Choice,
+    plan_mode_enabled: bool,
+) -> Result<bool> {
+    let with = send_plan(Some(config), thread, draft, plan_mode_enabled)?;
+    let without = send_plan(Some(config), thread, &Choice::default(), plan_mode_enabled)?;
+    Ok(with == without)
+}
+
+pub fn view(
+    config: Option<&Value>,
+    thread: &Value,
+    draft: &Choice,
+    plan_mode_enabled: bool,
+) -> View {
+    // A draft T3 would now refuse, say for a provider turned off since, shows as no draft.
+    let plan = send_plan(config, thread, draft, plan_mode_enabled)
+        .or_else(|_| send_plan(config, thread, &Choice::default(), plan_mode_enabled))
+        .unwrap_or_default();
+    let selection = plan
+        .model_selection
+        .clone()
+        .unwrap_or_else(|| thread["modelSelection"].clone());
     View {
-        selection: plan
-            .model_selection
-            .clone()
-            .unwrap_or_else(|| thread["modelSelection"].clone()),
+        offers_plan: offers_plan(config, &selection, plan_mode_enabled),
+        selection,
         runtime_mode: plan.runtime_mode.clone().unwrap_or_else(|| {
             thread["runtimeMode"]
                 .as_str()
@@ -221,7 +294,7 @@ fn mode_items(config: &Value, view: &View) -> Vec<Item> {
             pick: Pick::Mode(id.to_string()),
         });
     }
-    if provider.is_none_or(|p| p["showInteractionModeToggle"] != false) {
+    if view.offers_plan {
         items.push(heading("Plan mode"));
         for (text, on) in [("On", true), ("Off", false)] {
             items.push(Item::Entry {
