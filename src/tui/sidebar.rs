@@ -2953,6 +2953,724 @@ mod tests {
         assert!(sidebar.drew_working());
     }
 
+    // ---- the Working shelf ----
+
+    /// A thread whose run started at 11:57 and is still going, so it belongs in Working.
+    fn busy(id: &str, fields: Value) -> Value {
+        with(with(thread(id), running()), fields)
+    }
+
+    #[test]
+    fn only_busy_threads_with_nothing_for_the_user_belong_in_working() {
+        let works = |fields: Value| belongs_in_working(&with(thread("t"), fields));
+        // A run under way, in each of its live states.
+        for state in ["preparing", "queued", "starting", "running", "waiting"] {
+            let run = json!({"latestRunId": "r", "activeRunId": "r", "status": state});
+            assert!(works(run), "{state}");
+        }
+        assert!(works(running()));
+        // A live activity run outranks the thread's status, as when a wake continues the work.
+        assert!(works(
+            json!({"latestRunId": "r", "status": "failed", "activityRunStatus": "running"})
+        ));
+
+        // Stopped with background work that will wake it, which presents as idle. So does a
+        // provider thread with no run yet, and the `idle` the server sends before a first run.
+        let monitored = json!({
+            "latestRunId": "r",
+            "status": "completed",
+            "pendingBackgroundTasks": [{"taskId": "m", "kind": "monitor"}],
+        });
+        assert!(works(monitored.clone()));
+        assert!(works(json!({"activeProviderThreadId": "pt"})));
+        assert!(works(json!({"latestRunId": "r", "status": "idle"})));
+        // A command it left running, such as a dev server, doesn't hold it.
+        assert!(!works(
+            json!({"latestRunId": "r", "status": "completed", "pendingBackgroundTasks": [{"taskId": "c", "kind": "command"}]})
+        ));
+
+        // At rest, never run, or ended any other way.
+        assert!(!works(json!({})));
+        for state in [
+            "completed",
+            "interrupted",
+            "cancelled",
+            "rolled_back",
+            "failed",
+        ] {
+            assert!(
+                !works(json!({"latestRunId": "r", "status": state})),
+                "{state}"
+            );
+        }
+        // A failure outranks the background work, so the thread stays where the user sees it.
+        assert!(!works(with(monitored.clone(), json!({"status": "failed"}))));
+
+        // A request for the user keeps the thread in Active. An auth refresh isn't one.
+        for kind in [
+            "command",
+            "file-change",
+            "permission",
+            "user_input",
+            "something_new",
+        ] {
+            let asking = with(running(), json!({"pendingRuntimeRequest": {"kind": kind}}));
+            assert!(!works(asking), "{kind}");
+        }
+        assert!(works(with(
+            running(),
+            json!({"pendingRuntimeRequest": {"kind": "auth_refresh"}})
+        )));
+        assert!(!works(with(
+            monitored.clone(),
+            json!({"pendingRuntimeRequest": {"kind": "user_input"}})
+        )));
+
+        // A plan ready for a reply outranks background work once its run has settled.
+        let plan = json!({"interactionMode": "plan", "hasActionableProposedPlan": true});
+        assert!(!works(with(monitored.clone(), plan.clone())));
+        assert!(!works(with(
+            json!({"latestRunId": "r", "status": "idle"}),
+            plan.clone()
+        )));
+        // It does while an activity run other than the latest goes on, too, since the latest
+        // run has settled.
+        assert!(!works(with(
+            json!({"latestRunId": "r", "activeRunId": "r2", "status": "completed", "activityRunStatus": "running"}),
+            plan.clone()
+        )));
+        // While the run that writes the plan is going, or the active run is still the latest,
+        // the thread works.
+        assert!(works(with(running(), plan.clone())));
+        assert!(works(with(
+            json!({"latestRunId": "r", "activeRunId": "r", "status": "completed", "activityRunStatus": "running"}),
+            plan
+        )));
+        // Plan mode without a plan, or a plan outside plan mode, holds nothing back.
+        assert!(works(with(
+            monitored.clone(),
+            json!({"interactionMode": "plan", "hasActionableProposedPlan": false})
+        )));
+        assert!(works(with(
+            monitored,
+            json!({"interactionMode": "default", "hasActionableProposedPlan": true})
+        )));
+    }
+
+    #[test]
+    fn only_active_threads_fold_into_working() {
+        let lineage =
+            json!({"parentThreadId": "a", "relationshipToParent": "subagent", "rootThreadId": "a"});
+        let threads = vec![
+            busy("a", json!({})),
+            thread("rest"),
+            busy("p", json!({"pinnedAt": "2026-10-02T00:00:00.000Z"})),
+            with(snoozed("z"), running()),
+            busy("s", json!({"settledOverride": "settled"})),
+            busy(
+                "archived",
+                json!({"archivedAt": "2026-10-05T00:00:00.000Z"}),
+            ),
+            busy("sub", json!({"lineage": lineage})),
+        ];
+        let returns = Returns::default();
+        let on = shelves(&threads, ALL, now(), Some(&returns));
+        assert_eq!(ids(&on.working), ["a"]);
+        assert_eq!(ids(&on.active), ["rest"]);
+        assert_eq!(ids(&on.pinned), ["p"]);
+        assert_eq!(ids(&on.snoozed), ["z"]);
+        assert_eq!(ids(&on.settled), ["s"]);
+
+        // Off, the busy thread stays in Active.
+        let off = shelves(&threads, ALL, now(), None);
+        assert!(off.working.is_empty());
+        let mut active = ids(&off.active);
+        active.sort();
+        assert_eq!(active, ["a", "rest"]);
+
+        // Without snooze or settlement, the snoozed and settled threads are Active, so they
+        // fold away too. All three asked for their runs at once, so they go by id.
+        let none = shelves(&threads, Capabilities::default(), now(), Some(&returns));
+        assert_eq!(ids(&none.working), ["a", "s", "z"]);
+
+        // When the snooze ends, the thread comes back to Working rather than Active.
+        let mut sidebar = Sidebar::with_working(true, true);
+        sidebar.rebuild(&threads, ALL, None, now());
+        assert_eq!(sidebar.next_wake, Some(ms("2026-10-08T13:00:00.000Z")));
+        sidebar.rebuild(&threads, ALL, None, ms("2026-10-08T13:00:00.000Z"));
+        assert_eq!(sidebar.next_wake, None);
+        assert_eq!(
+            sidebar.rows,
+            [
+                heading_row(Shelf::Pinned, false),
+                card("p"),
+                heading_row(Shelf::Active, true),
+                card("rest"),
+                heading_row(Shelf::Working, true),
+                card("a"),
+                card("z"),
+            ]
+        );
+    }
+
+    #[test]
+    fn with_the_shelf_off_nothing_changes() {
+        // The threads of `active_threads_lead_with_new_and_reopened_then_arranged`, two of them
+        // busy.
+        let threads = vec![
+            with(
+                thread("a1"),
+                json!({"createdAt": "2026-10-02T00:00:00.000Z"}),
+            ),
+            with(thread("k1"), json!({"activeOrderKey": "b"})),
+            with(
+                thread("a2"),
+                json!({"createdAt": "2026-10-01T00:00:00.000Z", "unsettledAt": "2026-10-06T00:00:00.000Z"}),
+            ),
+            busy("a4", json!({"createdAt": "2026-10-04T00:00:00.000Z"})),
+            busy("k2", json!({"activeOrderKey": "a"})),
+            with(
+                thread("a3"),
+                json!({"createdAt": "2026-10-04T00:00:00.000Z"}),
+            ),
+        ];
+        let mut sidebar = Sidebar::default();
+        sidebar.rebuild(&threads, ALL, None, now());
+        let mut want = vec![heading_row(Shelf::Active, false)];
+        want.extend(["a2", "a3", "a4", "a1", "k2", "k1"].map(card));
+        assert_eq!(sidebar.rows, want);
+        assert!(!sidebar.has_working());
+        assert_eq!(sidebar.toggle_working(), None);
+        assert_eq!(sidebar.rows, want);
+        assert!(sidebar.returns.working.is_none(), "nothing observed");
+
+        // On, the busy threads leave, and Active goes by return, ignoring the arranged keys.
+        // k1 and a1 never ran, so they sort by when they were created.
+        let mut sidebar = Sidebar::with_working(true, true);
+        sidebar.rebuild(&threads, ALL, None, now());
+        let mut want = vec![heading_row(Shelf::Active, false)];
+        want.extend(["a2", "a3", "a1", "k1"].map(card));
+        want.push(heading_row(Shelf::Working, true));
+        want.extend(["a4", "k2"].map(card));
+        assert_eq!(sidebar.rows, want);
+    }
+
+    #[test]
+    fn working_lists_the_latest_send_first() {
+        // As in the nightly's test: a wake run asked for after the other thread's send doesn't
+        // move `sent-first`, and a thread an agent launched has no send, so its creation counts.
+        let sent_first = busy(
+            "sent-first",
+            json!({
+                "latestUserAuthoredMessageAt": "2026-10-08T09:00:00.000Z",
+                "latestRunRequestedAt": "2026-10-08T11:59:00.000Z",
+            }),
+        );
+        let sent_last = busy(
+            "sent-last",
+            json!({"latestUserAuthoredMessageAt": "2026-10-08T10:00:00.000Z"}),
+        );
+        let launched = busy(
+            "launched",
+            json!({"latestUserAuthoredMessageAt": null, "createdAt": "2026-10-08T08:00:00.000Z"}),
+        );
+        // A server that leaves the field out has the run's request stand in for the send.
+        let older = busy(
+            "older",
+            json!({"latestRunRequestedAt": "2026-10-08T09:30:00.000Z"}),
+        );
+        assert!(older.get("latestUserAuthoredMessageAt").is_none());
+        let mut threads = vec![launched, sent_first, older, sent_last];
+        let order = |threads: &[Value]| {
+            let returns = Returns::default();
+            let shelves = shelves(threads, ALL, now(), Some(&returns));
+            ids(&shelves.working)
+                .into_iter()
+                .map(str::to_string)
+                .collect::<Vec<_>>()
+        };
+        assert_eq!(
+            order(&threads),
+            ["sent-last", "older", "sent-first", "launched"]
+        );
+        assert_eq!(sent_ms(&threads[0]), ms("2026-10-08T08:00:00.000Z"));
+        assert_eq!(sent_ms(&threads[1]), ms("2026-10-08T09:00:00.000Z"));
+
+        // A wake that asks for another run doesn't move `sent-first`.
+        threads[1] = with(
+            threads[1].clone(),
+            json!({"latestRunRequestedAt": "2026-10-08T11:59:30.000Z"}),
+        );
+        assert_eq!(
+            order(&threads),
+            ["sent-last", "older", "sent-first", "launched"]
+        );
+        // A message the user sends does.
+        threads[1] = with(
+            threads[1].clone(),
+            json!({"latestUserAuthoredMessageAt": "2026-10-08T11:59:40.000Z"}),
+        );
+        assert_eq!(
+            order(&threads),
+            ["sent-first", "sent-last", "older", "launched"]
+        );
+        // On the older server a wake moves the thread, as it does in the GUI.
+        threads[2] = with(
+            threads[2].clone(),
+            json!({"latestRunRequestedAt": "2026-10-08T11:59:50.000Z"}),
+        );
+        assert_eq!(
+            order(&threads),
+            ["older", "sent-first", "sent-last", "launched"]
+        );
+    }
+
+    #[test]
+    fn active_lists_the_latest_return_first() {
+        // As in the nightly's test: the thread that finished last tops a newer one and a
+        // reopened one.
+        let new = with(
+            thread("new"),
+            json!({"createdAt": "2026-10-08T11:00:00.000Z"}),
+        );
+        let finished_now = with(
+            thread("old-finished-now"),
+            json!({
+                "createdAt": "2026-10-01T09:00:00.000Z",
+                "latestRunId": "r",
+                "status": "completed",
+                "latestRunRequestedAt": "2026-10-01T09:00:00.000Z",
+                "latestRunCompletedAt": "2026-10-08T11:50:00.000Z",
+            }),
+        );
+        let reopened = with(
+            thread("reopened"),
+            json!({"createdAt": "2026-10-02T09:00:00.000Z", "unsettledAt": "2026-10-08T11:30:00.000Z"}),
+        );
+        let threads = vec![new, finished_now, reopened];
+        let returns = Returns::default();
+        let shelves = shelves(&threads, ALL, now(), Some(&returns));
+        assert_eq!(
+            ids(&shelves.active),
+            ["old-finished-now", "reopened", "new"]
+        );
+
+        // A return the server doesn't stamp, seen at 11:55, tops them all.
+        let returns = Returns {
+            working: Some(HashSet::new()),
+            at: HashMap::from([("new".to_string(), ms("2026-10-08T11:55:00.000Z"))]),
+        };
+        assert_eq!(
+            returned_ms(&threads[0], &returns),
+            ms("2026-10-08T11:55:00.000Z")
+        );
+        let shelves = super::shelves(&threads, ALL, now(), Some(&returns));
+        assert_eq!(
+            ids(&shelves.active),
+            ["new", "old-finished-now", "reopened"]
+        );
+        // A run's request counts as a return too, and a finish time that doesn't parse
+        // counts as none.
+        let asked = with(
+            thread("asked"),
+            json!({"latestRunId": "r", "status": "interrupted", "latestRunRequestedAt": "2026-10-08T11:40:00.000Z", "latestRunCompletedAt": "soon"}),
+        );
+        assert_eq!(
+            returned_ms(&asked, &Returns::default()),
+            ms("2026-10-08T11:40:00.000Z")
+        );
+    }
+
+    #[test]
+    fn a_thread_is_stamped_only_when_it_is_seen_leaving_working() {
+        let at = |minute: u32| ms(&format!("2026-10-08T11:{minute:02}:00.000Z"));
+        let working = busy("a", json!({}));
+        let asking = with(
+            working.clone(),
+            json!({"pendingRuntimeRequest": {"kind": "command"}}),
+        );
+        let resting = thread("b");
+        let mut returns = Returns::default();
+
+        // The first look only notes who works, so it stamps nothing, even for a thread already
+        // waiting on the user.
+        returns.observe(&[asking.clone(), resting.clone()], at(1));
+        assert!(returns.at.is_empty());
+        returns.observe(&[working.clone(), resting.clone()], at(2));
+        assert!(
+            returns.at.is_empty(),
+            "a thread that starts working isn't a return"
+        );
+        returns.observe(&[working.clone(), resting.clone()], at(3));
+        assert!(returns.at.is_empty());
+
+        // It asks for approval partway through the run, which no server field marks.
+        returns.observe(&[asking.clone(), resting.clone()], at(4));
+        assert_eq!(returns.returned_at(&asking), Some(at(4)));
+        assert_eq!(returns.returned_at(&resting), None, "never worked");
+        // Later looks keep the first stamp, and so does working again.
+        returns.observe(&[asking.clone(), resting.clone()], at(5));
+        assert_eq!(returns.returned_at(&asking), Some(at(4)));
+        returns.observe(&[working.clone(), resting.clone()], at(6));
+        assert_eq!(returns.returned_at(&working), Some(at(4)));
+        // The next return replaces it.
+        let finished = with(
+            working.clone(),
+            json!({"status": "completed", "activeRunId": null, "activityRunStatus": null}),
+        );
+        returns.observe(&[finished.clone(), resting.clone()], at(7));
+        assert_eq!(returns.returned_at(&finished), Some(at(7)));
+
+        // A thread that goes takes its stamp with it, and coming back isn't a return.
+        returns.observe(std::slice::from_ref(&working), at(8));
+        returns.observe(std::slice::from_ref(&resting), at(9));
+        assert!(returns.at.is_empty());
+        returns.observe(&[asking.clone(), resting.clone()], at(10));
+        assert!(returns.at.is_empty());
+
+        // The sidebar looks at every thread, listed or not, and forgets what it saw while the
+        // shelf is off, so turning it on again starts from a fresh first look.
+        let hidden = busy(
+            "sub",
+            json!({"lineage": {"relationshipToParent": "subagent"}}),
+        );
+        let mut sidebar = Sidebar::with_working(true, false);
+        sidebar.rebuild(std::slice::from_ref(&hidden), ALL, None, at(11));
+        let hidden_asks = with(
+            hidden,
+            json!({"pendingRuntimeRequest": {"kind": "user_input"}}),
+        );
+        sidebar.rebuild(std::slice::from_ref(&hidden_asks), ALL, None, at(12));
+        assert_eq!(sidebar.returns.returned_at(&hidden_asks), Some(at(12)));
+        sidebar.working_enabled = false;
+        sidebar.rebuild(std::slice::from_ref(&hidden_asks), ALL, None, at(13));
+        assert!(sidebar.returns.working.is_none() && sidebar.returns.at.is_empty());
+        sidebar.working_enabled = true;
+        sidebar.rebuild(std::slice::from_ref(&asking), ALL, None, at(14));
+        assert!(sidebar.returns.at.is_empty());
+    }
+
+    #[test]
+    fn a_thread_that_leaves_working_lands_on_top_of_active() {
+        let at = |time: &str| ms(&format!("2026-10-08T{time}.000Z"));
+        let new = with(
+            thread("new"),
+            json!({"createdAt": "2026-10-08T11:00:00.000Z"}),
+        );
+        let done = with(
+            thread("done"),
+            json!({
+                "createdAt": "2026-10-03T00:00:00.000Z",
+                "latestRunId": "r",
+                "status": "completed",
+                "latestRunRequestedAt": "2026-10-08T11:50:00.000Z",
+                "latestRunCompletedAt": "2026-10-08T11:58:00.000Z",
+            }),
+        );
+        // Its run was asked for at 11:56:50, before `done` finished.
+        let working = busy("busy", json!({"createdAt": "2026-10-02T00:00:00.000Z"}));
+        let mut sidebar = Sidebar::with_working(true, true);
+        let mut step = |third: &Value, time: &str| {
+            sidebar.rebuild(
+                &[new.clone(), done.clone(), third.clone()],
+                ALL,
+                None,
+                at(time),
+            );
+            sidebar.rows.clone()
+        };
+        let busy_in_working = [
+            heading_row(Shelf::Active, false),
+            card("done"),
+            card("new"),
+            heading_row(Shelf::Working, true),
+            card("busy"),
+        ];
+        let busy_on_top = [
+            heading_row(Shelf::Active, false),
+            card("busy"),
+            card("done"),
+            card("new"),
+        ];
+        assert_eq!(step(&working, "11:58:30"), busy_in_working);
+
+        // It asks for approval at 11:59. By its run times alone it would sit under `done`.
+        let asking = with(
+            working.clone(),
+            json!({"pendingRuntimeRequest": {"kind": "command"}}),
+        );
+        assert!(
+            returned_ms(&asking, &Returns::default()) < returned_ms(&done, &Returns::default())
+        );
+        assert_eq!(step(&asking, "11:59:00"), busy_on_top);
+
+        // Approved, it goes back to Working, and when the run finishes it comes back on top.
+        assert_eq!(step(&working, "11:59:30"), busy_in_working);
+        let finished = with(
+            working,
+            json!({
+                "status": "completed",
+                "activeRunId": null,
+                "activityRunStatus": null,
+                "latestRunCompletedAt": "2026-10-08T12:00:00.000Z",
+            }),
+        );
+        assert_eq!(step(&finished, "12:00:00"), busy_on_top);
+    }
+
+    #[test]
+    fn a_closed_working_shelf_counts_its_cards_and_keeps_the_open_one() {
+        let threads = vec![
+            thread("a"),
+            busy(
+                "w1",
+                json!({"latestUserAuthoredMessageAt": "2026-10-08T11:00:00.000Z"}),
+            ),
+            busy(
+                "w2",
+                json!({"latestUserAuthoredMessageAt": "2026-10-08T10:00:00.000Z"}),
+            ),
+            snoozed("z"),
+        ];
+        let mut sidebar = Sidebar::with_working(true, false);
+        sidebar.rebuild(&threads, ALL, None, now());
+        assert_eq!(
+            sidebar.rows,
+            [
+                heading_row(Shelf::Active, false),
+                card("a"),
+                heading_row(Shelf::Working, true),
+                heading_row(Shelf::Snoozed, true),
+                card("z"),
+            ]
+        );
+        assert!(sidebar.has_working());
+        assert_eq!(sidebar.working_count, 2);
+
+        // Sending a message from the open thread folds it into the shelf, and its card stays.
+        sidebar.rebuild(&threads, ALL, Some("w2"), now());
+        assert_eq!(
+            sidebar.rows[2..],
+            [
+                heading_row(Shelf::Working, true),
+                card("w2"),
+                heading_row(Shelf::Snoozed, true),
+                card("z"),
+            ]
+        );
+        // Open, the shelf lists every card, newest send first.
+        sidebar.working_expanded = true;
+        sidebar.rebuild(&threads, ALL, Some("w2"), now());
+        assert_eq!(
+            sidebar.rows[2..5],
+            [heading_row(Shelf::Working, true), card("w1"), card("w2")]
+        );
+        // With nothing working, the heading goes, open or closed.
+        for expanded in [true, false] {
+            sidebar.working_expanded = expanded;
+            sidebar.rebuild(&[thread("a")], ALL, None, now());
+            assert_eq!(sidebar.rows, [heading_row(Shelf::Active, false), card("a")]);
+            assert!(!sidebar.has_working());
+        }
+        // A closed shelf with nothing above it leads the list.
+        sidebar.working_expanded = false;
+        sidebar.rebuild(&threads[1..3], ALL, None, now());
+        assert_eq!(sidebar.rows, [heading_row(Shelf::Working, false)]);
+        assert_eq!(sidebar.selected_thread_id(), None);
+    }
+
+    #[test]
+    fn the_working_heading_opens_and_closes_the_shelf() {
+        let listed = shell(vec![
+            thread("a"),
+            busy(
+                "w1",
+                json!({"latestUserAuthoredMessageAt": "2026-10-08T11:00:00.000Z"}),
+            ),
+            busy(
+                "w2",
+                json!({"latestUserAuthoredMessageAt": "2026-10-08T10:00:00.000Z"}),
+            ),
+        ]);
+        let theme = Theme::new(Depth::TrueColor);
+        let mut sidebar = Sidebar::with_working(true, false);
+        sidebar.rebuild(&listed.threads, ALL, None, now());
+        let buffer = render(&mut sidebar, Some(&listed), None, (30, 24));
+        let lines = text(&buffer);
+        // Closed, it counts its cards, and its chevron points the way the Settled footer's does.
+        let y = row_of(&lines, "Working (2) ─");
+        assert!(lines[y as usize].trim_end().ends_with("─ ›"), "{lines:#?}");
+        assert_eq!(buffer[(1, y)].fg, theme.sidebar_muted);
+        assert!(!lines.iter().any(|line| line.contains("Thread w")));
+        // Only the heading's own row takes the click, not the gap above it or a card.
+        assert!(sidebar.working_heading_at(y));
+        assert!(!sidebar.working_heading_at(y - 1));
+        assert!(!sidebar.working_heading_at(row_of(&lines, "Thread a")));
+        assert_eq!(sidebar.thread_at(y), None);
+
+        // The app opens the shelf, then lays the list out again.
+        assert_eq!(sidebar.toggle_working(), Some(true));
+        sidebar.rebuild(&listed.threads, ALL, None, now());
+        let lines = text(&render(&mut sidebar, Some(&listed), None, (30, 24)));
+        let y = row_of(&lines, "Working ─");
+        assert!(lines[y as usize].trim_end().ends_with("─ ⌄"), "{lines:#?}");
+        assert!(!lines.iter().any(|line| line.contains("Working (")));
+        assert!(y < row_of(&lines, "Thread w1"));
+        assert!(row_of(&lines, "Thread w1") < row_of(&lines, "Thread w2"));
+        assert!(sidebar.working_heading_at(y));
+        assert_eq!(sidebar.thread_at(row_of(&lines, "Thread w2")), Some("w2"));
+
+        // Closed again, the cards go.
+        assert_eq!(sidebar.toggle_working(), Some(false));
+        sidebar.rebuild(&listed.threads, ALL, None, now());
+        let lines = text(&render(&mut sidebar, Some(&listed), None, (30, 24)));
+        assert!(lines.iter().any(|line| line.contains("Working (2)")));
+        assert!(!lines.iter().any(|line| line.contains("Thread w")));
+    }
+
+    #[test]
+    fn a_working_heading_out_of_view_takes_no_click() {
+        let mut threads: Vec<Value> = (1..=6)
+            .map(|n| {
+                with(
+                    thread(&format!("a{n}")),
+                    json!({"createdAt": format!("2026-10-0{}T00:00:00.000Z", 8 - n)}),
+                )
+            })
+            .collect();
+        threads.push(busy("w", json!({})));
+        let listed = shell(threads);
+        let mut sidebar = Sidebar::with_working(true, false);
+        sidebar.rebuild(&listed.threads, ALL, None, now());
+        // Fourteen rows leave eleven for the list, which ends partway through a3.
+        let size = (30, 14);
+        let lines = text(&render(&mut sidebar, Some(&listed), None, size));
+        assert!(!lines.iter().any(|line| line.contains("Working")));
+        assert!((0..14).all(|y| !sidebar.working_heading_at(y)));
+
+        // At the bottom of Active the heading comes into view under a6, and takes the click.
+        for _ in 0..5 {
+            sidebar.move_selection(1);
+        }
+        assert_eq!(sidebar.selected_thread_id(), Some("a6"));
+        let lines = text(&render(&mut sidebar, Some(&listed), None, size));
+        let y = row_of(&lines, "Working (1)");
+        assert!(row_of(&lines, "Thread a6") < y);
+        assert!(sidebar.working_heading_at(y));
+        // Too small to draw, nothing takes the click.
+        render(&mut sidebar, Some(&listed), None, (5, 14));
+        assert!((0..14).all(|y| !sidebar.working_heading_at(y)));
+    }
+
+    #[test]
+    fn closing_the_shelf_moves_the_highlight_off_the_cards_it_hides() {
+        let sent =
+            |at: &str| json!({"latestUserAuthoredMessageAt": format!("2026-10-08T{at}:00.000Z")});
+        let threads = vec![
+            thread("a"),
+            busy("w1", sent("11:00")),
+            busy("w2", sent("10:00")),
+            busy("w3", sent("09:00")),
+            snoozed("z"),
+        ];
+        let closed_on = |highlight: &str, open: Option<&str>| {
+            let mut sidebar = Sidebar::with_working(true, true);
+            sidebar.rebuild(&threads, ALL, open, now());
+            assert!(sidebar.select(highlight));
+            assert_eq!(sidebar.toggle_working(), Some(false));
+            sidebar.rebuild(&threads, ALL, open, now());
+            sidebar.selected_thread_id().map(str::to_string)
+        };
+        // A hidden card gives the highlight to the first card under the heading: the open
+        // thread's, else the next shelf's.
+        assert_eq!(closed_on("w3", Some("w2")).as_deref(), Some("w2"));
+        assert_eq!(closed_on("w1", None).as_deref(), Some("z"));
+        // The open thread's card stays, and so does a highlight outside the shelf.
+        assert_eq!(closed_on("w2", Some("w2")).as_deref(), Some("w2"));
+        assert_eq!(closed_on("a", None).as_deref(), Some("a"));
+        assert_eq!(closed_on("z", Some("w2")).as_deref(), Some("z"));
+        // With nothing below the shelf, the last card above it.
+        let mut sidebar = Sidebar::with_working(true, true);
+        sidebar.rebuild(&threads[..4], ALL, None, now());
+        assert!(sidebar.select("w2"));
+        sidebar.toggle_working();
+        sidebar.rebuild(&threads[..4], ALL, None, now());
+        assert_eq!(sidebar.selected_thread_id(), Some("a"));
+
+        // A list scrolled to a card the shelf hides keeps the heading on top instead.
+        let mut sidebar = Sidebar::with_working(true, true);
+        sidebar.rebuild(&threads, ALL, None, now());
+        assert!(sidebar.select("w3"));
+        sidebar.offset = sidebar
+            .rows
+            .iter()
+            .position(|row| *row == card("w2"))
+            .unwrap();
+        sidebar.toggle_working();
+        sidebar.rebuild(&threads, ALL, None, now());
+        assert_eq!(
+            sidebar.rows[sidebar.offset],
+            heading_row(Shelf::Working, true)
+        );
+        assert_eq!(sidebar.selected_thread_id(), Some("z"));
+
+        // A highlighted thread that starts working while the shelf is closed hands the
+        // highlight to the next card down in Active, as when a thread goes.
+        let resting = vec![
+            with(
+                thread("b1"),
+                json!({"createdAt": "2026-10-03T00:00:00.000Z"}),
+            ),
+            with(
+                thread("b2"),
+                json!({"createdAt": "2026-10-02T00:00:00.000Z"}),
+            ),
+            with(
+                thread("b3"),
+                json!({"createdAt": "2026-10-01T00:00:00.000Z"}),
+            ),
+        ];
+        let mut sidebar = Sidebar::with_working(true, false);
+        sidebar.rebuild(&resting, ALL, None, now());
+        assert!(sidebar.select("b2"));
+        let mut started = resting;
+        started[1] = with(started[1].clone(), running());
+        sidebar.rebuild(&started, ALL, None, now());
+        assert_eq!(sidebar.selected_thread_id(), Some("b3"));
+    }
+
+    #[test]
+    fn a_closed_working_shelf_needs_no_tick() {
+        let listed = shell(vec![
+            thread("a"),
+            busy("w1", json!({})),
+            busy("w2", json!({})),
+        ]);
+        let draw = |sidebar: &mut Sidebar, open: Option<&str>| {
+            sidebar.rebuild(&listed.threads, ALL, open, now());
+            text(&render(sidebar, Some(&listed), open, (30, 24)))
+        };
+        // Both busy cards hide behind the heading, so nothing on screen moves.
+        let mut sidebar = Sidebar::with_working(true, false);
+        let lines = draw(&mut sidebar, None);
+        assert!(lines.iter().any(|line| line.contains("Working (2)")));
+        assert!(!lines.iter().any(|line| line.contains("Thread w")));
+        assert!(!sidebar.drew_working());
+        // The open thread's card shows, spinner and all, and needs the tick.
+        let lines = draw(&mut sidebar, Some("w1"));
+        assert!(lines[row_of(&lines, "Thread w1") as usize - 1].contains("Working"));
+        assert!(sidebar.drew_working());
+        // Open, every card shows.
+        sidebar.toggle_working();
+        draw(&mut sidebar, None);
+        assert!(sidebar.drew_working());
+        // Off, the same threads are Active cards and tick as before.
+        let mut sidebar = Sidebar::default();
+        let lines = draw(&mut sidebar, None);
+        assert!(row_of(&lines, "Active ─") < row_of(&lines, "Thread w1"));
+        assert!(sidebar.drew_working());
+    }
+
     // ---- synthetic capture for review ----
 
     /// Writes the real renderer's styled output for a few invented sidebars, as ANSI text, to
@@ -3014,6 +3732,17 @@ mod tests {
         capture("statuses", &mut sidebar, Some(&statuses), None);
         size.set((26, 46));
         capture("statuses-narrow", &mut sidebar, Some(&statuses), None);
+
+        // The same threads with the Working shelf on: open, then closed with the open thread's
+        // card.
+        let mut sidebar = Sidebar::with_working(true, true);
+        sidebar.rebuild(&statuses.threads, ALL, None, now());
+        size.set((34, 46));
+        capture("working-open", &mut sidebar, Some(&statuses), None);
+        sidebar.toggle_working();
+        sidebar.rebuild(&statuses.threads, ALL, Some("t-c"), now());
+        assert!(sidebar.select("t-c"));
+        capture("working-closed", &mut sidebar, Some(&statuses), Some("t-c"));
     }
 
     /// Invented threads, one for each status word and one seen thread with none, in that order

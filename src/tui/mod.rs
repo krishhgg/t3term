@@ -3135,15 +3135,14 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let theme = Theme::new(Depth::TrueColor);
-        // The sidebar as the event loop holds it after drawing a frame of `threads`.
-        let drawn = |threads: Vec<Value>| {
+        // `sidebar` as the event loop holds it after drawing a frame of `threads`.
+        let drawn_by = |mut sidebar: Sidebar, threads: Vec<Value>| {
             let shell = ShellState {
                 sequence: 1,
                 projects: Vec::new(),
                 threads,
                 synchronized: true,
             };
-            let mut sidebar = Sidebar::default();
             sidebar.rebuild(&shell.threads, Capabilities::default(), None, now_ms());
             let view = View {
                 theme: &theme,
@@ -3162,6 +3161,7 @@ mod tests {
                 .unwrap();
             sidebar
         };
+        let drawn = |threads: Vec<Value>| drawn_by(Sidebar::default(), threads);
         let thread = |id: &str, lineage: Value| {
             json!({
                 "id": id,
@@ -3211,5 +3211,19 @@ mod tests {
         // finished run has no clock to move.
         assert!(!needs_tick(Some(&open("closed", "running")), &hidden));
         assert!(!needs_tick(Some(&open("live", "completed")), &hidden));
+
+        // A closed Working shelf hides the busy card behind its heading, so it needs no tick.
+        // Open, the card shows and ticks.
+        let closed = drawn_by(
+            Sidebar::with_working(true, false),
+            vec![thread("busy", json!({}))],
+        );
+        assert!(!closed.drew_working());
+        assert!(!needs_tick(None, &closed));
+        let open_shelf = drawn_by(
+            Sidebar::with_working(true, true),
+            vec![thread("busy", json!({}))],
+        );
+        assert!(open_shelf.drew_working());
     }
 }
