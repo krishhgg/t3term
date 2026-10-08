@@ -1,10 +1,12 @@
 //! The interactive client. It draws only after input or a server event, at most 30 times a second.
-//! The only timer is a one-second tick, armed while a run is active, so the elapsed-time labels
-//! and spinner advance. An idle TUI uses no CPU.
+//! Two timers can wake it besides: a one-second tick, armed while a run is active, so the
+//! elapsed-time labels and spinner advance, and a one-shot timer for the moment the soonest
+//! snooze ends, which no server event marks. An idle TUI uses no CPU.
 
 mod composer;
 mod markdown;
 mod picker;
+mod sidebar;
 mod theme;
 mod unsent;
 
@@ -35,9 +37,9 @@ use crate::transcript::{self, BlockKind};
 use composer::Composer;
 use markdown::Styles;
 use picker::{Item, Kind, Pick};
+use sidebar::{Capabilities, Sidebar, View};
 use theme::{
-    Theme, duration_label, model_display_name, monogram, now_ms, parse_iso_ms, relative_time,
-    runtime_mode_label,
+    Theme, duration_label, model_display_name, monogram, now_ms, parse_iso_ms, runtime_mode_label,
 };
 use unsent::{Failed, Unsent};
 
@@ -53,22 +55,6 @@ enum Focus {
     Sidebar,
     Transcript,
     Composer,
-}
-
-enum Row {
-    /// A shelf divider such as `Settled (3)`.
-    Section(String),
-    Thread(String),
-}
-
-impl Row {
-    /// Rows on screen: a card is three lines and a gap, a divider a gap and a line.
-    fn height(&self) -> usize {
-        match self {
-            Row::Section(_) => 2,
-            Row::Thread(_) => 4,
-        }
-    }
 }
 
 /// Wrapped lines for one transcript block, valid for one width and content version.
@@ -219,9 +205,7 @@ struct App {
     picker: Option<Picker>,
     shell: Option<ShellState>,
     shell_connection: String,
-    rows: Vec<Row>,
-    selected: usize,
-    sidebar_offset: usize,
+    sidebar: Sidebar,
     open: Option<OpenThread>,
     focus: Focus,
     composer: Composer,
@@ -240,17 +224,12 @@ struct App {
     verbose: bool,
     /// What each tool printed, for the rows verbose mode is showing.
     outputs: Outputs,
-    /// Settled threads stay behind the `Settled (N)` shelf until it is opened.
-    show_settled: bool,
-    settled_count: usize,
     cache: HashMap<String, Cached>,
     message: Option<(String, bool)>,
     actions: mpsc::UnboundedSender<ActionResult>,
     /// Wall-clock time of the frame being drawn, in milliseconds.
     now: i64,
     // Last drawn geometry, for mouse hit-testing and page sizes.
-    sidebar_list: Rect,
-    sidebar_footer: Rect,
     transcript_area: Rect,
     panel_area: Rect,
     /// Rows the request panel's text is scrolled down, and the request that applies to.
@@ -310,9 +289,7 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
         picker: None,
         shell: None,
         shell_connection: "connecting".into(),
-        rows: Vec::new(),
-        selected: 0,
-        sidebar_offset: 0,
+        sidebar: Sidebar::default(),
         open: None,
         focus: Focus::Sidebar,
         composer: Composer::default(),
@@ -323,14 +300,10 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
         drawn_scroll: 0,
         verbose: settings.verbose,
         outputs: Outputs::default(),
-        show_settled: false,
-        settled_count: 0,
         cache: HashMap::new(),
         message: None,
         actions,
         now: now_ms(),
-        sidebar_list: Rect::default(),
-        sidebar_footer: Rect::default(),
         transcript_area: Rect::default(),
         panel_area: Rect::default(),
         panel_scroll: 0,
@@ -359,6 +332,13 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
             tick_at = Instant::now() + TICK;
         }
         let tick_deadline = tokio::time::Instant::from_std(tick_at);
+        // Measured from the wall clock on every pass, 50ms late like the GUI's timer, and
+        // capped like its `setTimeout` delay.
+        let wake = app.sidebar.next_wake;
+        let wake_deadline = tokio::time::Instant::now()
+            + Duration::from_millis(wake.map_or(0, |at| {
+                ((at - now_ms()).max(0) + 50).min(i32::MAX as i64) as u64
+            }));
         let thread_event = async {
             match app.open.as_mut() {
                 Some(open) => open.events.recv().await,
@@ -390,9 +370,19 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
                 tick_at = Instant::now() + TICK;
                 dirty = true;
             }
+            // Only armed while a thread is snoozed, to move it back when the snooze ends.
+            _ = tokio::time::sleep_until(wake_deadline), if wake.is_some() => {
+                app.rebuild_rows();
+                dirty = true;
+            }
         }
     }
     Ok(())
+}
+
+/// The spinner frame for a wall-clock time, so every spinner on screen turns together.
+fn spinner_frame(now: i64) -> &'static str {
+    SPINNER[(now / 1000).rem_euclid(SPINNER.len() as i64) as usize]
 }
 
 fn str_of<'a>(value: &'a Value, key: &str) -> &'a str {
@@ -481,89 +471,42 @@ impl App {
             .is_some_and(|s| s.threads.iter().any(|t| is_active_status(status(t))))
     }
 
-    /// A flat list of cards newest first, like the GUI's default sidebar, with settled threads
-    /// under their own divider. Delegated child threads are hidden.
+    /// Lays the sidebar's shelves out again from the shell, as of now.
     fn rebuild_rows(&mut self) {
         let Some(shell) = self.shell.as_ref() else {
             return;
         };
-        let selected_id = self.selected_thread_id().map(str::to_string);
-        let mut threads: Vec<&Value> = shell
-            .threads
-            .iter()
-            .filter(|t| t["lineage"]["parentThreadId"].is_null())
-            .collect();
-        threads.sort_by(|a, b| str_of(b, "updatedAt").cmp(str_of(a, "updatedAt")));
-        let (settled, active): (Vec<&Value>, Vec<&Value>) =
-            threads.into_iter().partition(|t| !t["settledAt"].is_null());
-        self.rows.clear();
-        for thread in &active {
-            self.rows
-                .push(Row::Thread(str_of(thread, "id").to_string()));
-        }
-        self.settled_count = settled.len();
-        if self.show_settled && !settled.is_empty() {
-            self.rows
-                .push(Row::Section(format!("Settled ({})", settled.len())));
-            for thread in &settled {
-                self.rows
-                    .push(Row::Thread(str_of(thread, "id").to_string()));
-            }
-        }
-        self.selected = selected_id
-            .and_then(|id| {
-                self.rows
-                    .iter()
-                    .position(|r| matches!(r, Row::Thread(t) if *t == id))
-            })
-            .or_else(|| self.rows.iter().position(|r| matches!(r, Row::Thread(_))))
-            .unwrap_or(0);
+        let capabilities = self.capabilities();
+        let open_id = self.open.as_ref().map(|o| o.id.as_str());
+        self.sidebar
+            .rebuild(&shell.threads, capabilities, open_id, now_ms());
+    }
+
+    /// Whether the server supports snooze and settlement, which decides whether those shelves
+    /// apply. Discovery read the same environment descriptor that `server.getConfig` carries,
+    /// so the shelves are right before the config arrives.
+    fn capabilities(&self) -> Capabilities {
+        Capabilities::of(match self.config.as_ref() {
+            Some(config) => &config["environment"]["capabilities"],
+            None => &self.client.runtime.capabilities,
+        })
     }
 
     fn toggle_settled(&mut self) {
-        self.show_settled = !self.show_settled;
+        self.sidebar.show_settled = !self.sidebar.show_settled;
         self.rebuild_rows();
     }
 
-    fn selected_thread_id(&self) -> Option<&str> {
-        match self.rows.get(self.selected) {
-            Some(Row::Thread(id)) => Some(id),
-            _ => None,
-        }
-    }
-
     fn shell_thread(&self, id: &str) -> Option<&Value> {
-        self.shell
-            .as_ref()?
-            .threads
-            .iter()
-            .find(|t| str_of(t, "id") == id)
+        sidebar::find_thread(self.shell.as_ref()?, id)
     }
 
     fn project_title(&self, project_id: &str) -> String {
-        self.shell
-            .as_ref()
-            .and_then(|s| s.projects.iter().find(|p| str_of(p, "id") == project_id))
-            .map(|p| str_of(p, "title").to_string())
-            .unwrap_or_else(|| "Project".into())
-    }
-
-    fn move_selection(&mut self, delta: isize) {
-        let mut index = self.selected as isize;
-        loop {
-            index += delta;
-            if index < 0 || index >= self.rows.len() as isize {
-                return;
-            }
-            if matches!(self.rows[index as usize], Row::Thread(_)) {
-                self.selected = index as usize;
-                return;
-            }
-        }
+        sidebar::project_title(self.shell.as_ref(), project_id)
     }
 
     fn open_selected(&mut self) {
-        let Some(id) = self.selected_thread_id().map(str::to_string) else {
+        let Some(id) = self.sidebar.selected_thread_id().map(str::to_string) else {
             return;
         };
         if self.open.as_ref().is_some_and(|o| o.id == id) {
@@ -589,6 +532,9 @@ impl App {
         if let Some(open) = self.open.as_ref() {
             self.unsent.restore_saved(&mut self.composer, &open.id);
         }
+        // The thread that was open may have been listed on a closed Settled shelf only
+        // because it was open.
+        self.rebuild_rows();
     }
 
     // ---- input ----
@@ -667,11 +613,11 @@ impl App {
                     MouseEventKind::ScrollDown if inside(self.transcript_area) => {
                         self.scroll = self.scroll.saturating_sub(3)
                     }
-                    MouseEventKind::ScrollUp if inside(self.sidebar_list) => {
-                        self.move_selection(-1)
+                    MouseEventKind::ScrollUp if inside(self.sidebar.list) => {
+                        self.sidebar.move_selection(-1)
                     }
-                    MouseEventKind::ScrollDown if inside(self.sidebar_list) => {
-                        self.move_selection(1)
+                    MouseEventKind::ScrollDown if inside(self.sidebar.list) => {
+                        self.sidebar.move_selection(1)
                     }
                     MouseEventKind::Down(MouseButton::Left) if inside(self.transcript_area) => {
                         let bundle = self
@@ -685,15 +631,13 @@ impl App {
                             None => self.focus = Focus::Transcript,
                         }
                     }
-                    MouseEventKind::Down(MouseButton::Left) if inside(self.sidebar_footer) => {
+                    MouseEventKind::Down(MouseButton::Left) if inside(self.sidebar.footer) => {
                         self.toggle_settled()
                     }
-                    MouseEventKind::Down(MouseButton::Left) if inside(self.sidebar_list) => {
-                        let y = (mouse.row - self.sidebar_list.y) as usize;
-                        if let Some(row) = self.sidebar_row_at(y)
-                            && matches!(self.rows.get(row), Some(Row::Thread(_)))
+                    MouseEventKind::Down(MouseButton::Left) if inside(self.sidebar.list) => {
+                        if let Some(id) = self.sidebar.thread_at(mouse.row).map(str::to_string)
+                            && self.sidebar.select(&id)
                         {
-                            self.selected = row;
                             self.open_selected();
                         }
                     }
@@ -711,18 +655,6 @@ impl App {
             }
             _ => false,
         }
-    }
-
-    /// The sidebar entry drawn at `y` rows below the top of the list.
-    fn sidebar_row_at(&self, y: usize) -> Option<usize> {
-        let mut top = 0;
-        for (index, row) in self.rows.iter().enumerate().skip(self.sidebar_offset) {
-            if y < top + row.height() {
-                return Some(index);
-            }
-            top += row.height();
-        }
-        None
     }
 
     fn on_key(&mut self, key: KeyEvent) {
@@ -839,8 +771,8 @@ impl App {
             },
             Focus::Sidebar => match key.code {
                 KeyCode::Char('q') => self.quit = true,
-                KeyCode::Up | KeyCode::Char('k') => self.move_selection(-1),
-                KeyCode::Down | KeyCode::Char('j') => self.move_selection(1),
+                KeyCode::Up | KeyCode::Char('k') => self.sidebar.move_selection(-1),
+                KeyCode::Down | KeyCode::Char('j') => self.sidebar.move_selection(1),
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.open_selected(),
                 KeyCode::Char('e') => self.toggle_settled(),
                 _ => {}
@@ -948,6 +880,8 @@ impl App {
                 if self.picker.is_some() {
                     self.select_pick(previous);
                 }
+                // Its capabilities decide whether the Snoozed and Settled shelves apply.
+                self.rebuild_rows();
             }
             ActionResult::Output {
                 item_id,
@@ -1410,7 +1344,7 @@ impl App {
     // ---- drawing ----
 
     fn spinner(&self) -> &'static str {
-        SPINNER[(self.now / 1000).rem_euclid(SPINNER.len() as i64) as usize]
+        spinner_frame(self.now)
     }
 
     /// The thread record for the open thread: the shell's copy, else the projection's.
@@ -1442,7 +1376,21 @@ impl App {
         let [sidebar, main] =
             Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(20)])
                 .areas(area);
-        self.draw_sidebar(frame, sidebar);
+        // The wake timer usually moves a woken thread first, but it runs on a clock that
+        // stops while the machine sleeps.
+        if self.sidebar.next_wake.is_some_and(|wake| wake <= self.now) {
+            self.rebuild_rows();
+        }
+        let (_, dot) = self.connection_state();
+        let view = View {
+            theme: &self.theme,
+            shell: self.shell.as_ref(),
+            open_id: self.open.as_ref().map(|o| o.id.as_str()),
+            focused: self.focus == Focus::Sidebar,
+            now: self.now,
+            dot,
+        };
+        self.sidebar.draw(frame, sidebar, &view);
 
         // The main column keeps one blank column on each side, like the GUI's padding.
         let main = Rect {
@@ -1500,236 +1448,6 @@ impl App {
             Paragraph::new(self.status_line(status_area.width as usize)),
             status_area,
         );
-    }
-
-    fn draw_sidebar(&mut self, frame: &mut Frame, area: Rect) {
-        let t = self.theme.clone();
-        frame.render_widget(Block::new().style(Style::new().bg(t.sidebar_bg)), area);
-        if area.width < 6 || area.height < 4 {
-            // Nothing is drawn, so nothing there should take clicks.
-            self.sidebar_list = Rect::default();
-            self.sidebar_footer = Rect::default();
-            return;
-        }
-        // A one-column strip stands in for the GUI's 1px border.
-        frame.render_widget(
-            Block::new().style(Style::new().bg(t.sidebar_border)),
-            Rect::new(area.right() - 1, area.y, 1, area.height),
-        );
-        let inner = Rect::new(area.x + 1, area.y, area.width - 3, area.height);
-        let width = inner.width as usize;
-
-        let (_, dot) = self.connection_state();
-        let wordmark = row(
-            vec![
-                Span::styled(
-                    "T3",
-                    Style::new().fg(t.sidebar_fg).add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(" Code", Style::new().fg(t.sidebar_muted)),
-            ],
-            vec![Span::styled("●", Style::new().fg(dot))],
-            width,
-        );
-        frame.render_widget(
-            Paragraph::new(wordmark),
-            Rect::new(inner.x, inner.y, inner.width, 1),
-        );
-
-        // The shelf footer sits on the last row, as in the GUI.
-        let footer = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
-        self.sidebar_footer = footer;
-        let chevron = if self.show_settled { "⌄" } else { "›" };
-        let label = format!("Settled ({})", self.settled_count);
-        let shelf = Line::from(vec![
-            Span::styled(format!("{label} "), Style::new().fg(t.sidebar_muted)),
-            Span::styled(
-                "─".repeat(width.saturating_sub(label.width() + 3)),
-                Style::new().fg(t.sidebar_border),
-            ),
-            Span::styled(format!(" {chevron}"), Style::new().fg(t.sidebar_muted)),
-        ]);
-        frame.render_widget(Paragraph::new(shelf), footer);
-
-        let list = Rect::new(inner.x, inner.y + 2, inner.width, inner.height - 3);
-        self.sidebar_list = list;
-        let height = list.height as usize;
-        // Keep the selected card in view.
-        if self.selected < self.sidebar_offset {
-            self.sidebar_offset = self.selected;
-        }
-        while self.sidebar_offset < self.selected {
-            let used: usize = self.rows[self.sidebar_offset..=self.selected]
-                .iter()
-                .map(Row::height)
-                .sum();
-            if used <= height {
-                break;
-            }
-            self.sidebar_offset += 1;
-        }
-        let open_id = self.open.as_ref().map(|o| o.id.clone());
-        let mut lines: Vec<Line> = Vec::with_capacity(height);
-        for (index, row) in self.rows.iter().enumerate().skip(self.sidebar_offset) {
-            if lines.len() >= height {
-                break;
-            }
-            match row {
-                Row::Section(title) => {
-                    lines.push(Line::default());
-                    let rule = "─".repeat(width.saturating_sub(title.width() + 3));
-                    lines.push(Line::from(vec![
-                        Span::styled(format!("{title} "), Style::new().fg(t.sidebar_muted)),
-                        Span::styled(rule, Style::new().fg(t.sidebar_border)),
-                        Span::styled(" ⌄", Style::new().fg(t.sidebar_muted)),
-                    ]));
-                }
-                Row::Thread(id) => {
-                    let is_open = open_id.as_deref() == Some(id.as_str());
-                    let cursor = index == self.selected;
-                    let bg = if is_open {
-                        Some(t.row_active)
-                    } else if cursor {
-                        Some(t.row_selected)
-                    } else {
-                        None
-                    };
-                    lines.extend(self.thread_card(id, width, bg, cursor, &t));
-                    lines.push(Line::default());
-                }
-            }
-        }
-        lines.truncate(height);
-        if lines.is_empty() {
-            let hint = if self.shell.is_none() {
-                "Loading threads…"
-            } else {
-                "No threads yet"
-            };
-            lines.push(Line::styled(hint, Style::new().fg(t.sidebar_muted)));
-        }
-        frame.render_widget(Paragraph::new(lines), list);
-    }
-
-    /// Three lines like the GUI's thread card: project and status, title, branch and provider.
-    fn thread_card(
-        &self,
-        id: &str,
-        width: usize,
-        bg: Option<Color>,
-        cursor: bool,
-        t: &Theme,
-    ) -> Vec<Line<'static>> {
-        let thread = self.shell_thread(id);
-        let title = thread
-            .map(|t| str_of(t, "title"))
-            .filter(|s| !s.is_empty())
-            .unwrap_or("Untitled")
-            .to_string();
-        let project = thread
-            .map(|t| self.project_title(str_of(t, "projectId")))
-            .unwrap_or_default();
-        let badge = monogram(&project);
-        let (status_label, status_color) = self.thread_status(thread, t);
-        let branch = thread
-            .map(|t| str_of(t, "branch"))
-            .unwrap_or("")
-            .to_string();
-        let (glyph, glyph_color) = t.provider_glyph(
-            thread
-                .map(|t| str_of(&t["modelSelection"], "instanceId"))
-                .unwrap_or(""),
-        );
-        let bar = if cursor {
-            let color = if self.focus == Focus::Sidebar {
-                t.primary
-            } else {
-                t.sidebar_muted
-            };
-            Span::styled("▎", Style::new().fg(color))
-        } else {
-            Span::raw(" ")
-        };
-        let inner = width.saturating_sub(2);
-        let muted = Style::new().fg(t.sidebar_muted);
-        let project_room = inner.saturating_sub(badge.width() + status_label.width() + 2);
-        let line1 = row(
-            vec![
-                Span::styled(
-                    badge.clone(),
-                    Style::new()
-                        .fg(t.project_color(&project))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!(" {}", fit(&project, project_room)), muted),
-            ],
-            vec![Span::styled(status_label, Style::new().fg(status_color))],
-            inner,
-        );
-        let line2 = row(
-            vec![Span::styled(
-                fit(&title, inner),
-                Style::new().fg(t.sidebar_fg),
-            )],
-            Vec::new(),
-            inner,
-        );
-        let line3 = row(
-            vec![Span::styled(fit(&branch, inner.saturating_sub(2)), muted)],
-            vec![Span::styled(glyph, Style::new().fg(glyph_color))],
-            inner,
-        );
-        [line1, line2, line3]
-            .into_iter()
-            .map(|line| {
-                let mut spans = vec![bar.clone()];
-                spans.extend(line.spans);
-                spans.push(Span::raw(" "));
-                match bg {
-                    Some(bg) => Line::from(with_bg(spans, bg)),
-                    None => Line::from(spans),
-                }
-            })
-            .collect()
-    }
-
-    /// The card's right-hand label: a pending request, the working clock, a failure, or the
-    /// time of the latest activity.
-    fn thread_status(&self, thread: Option<&Value>, t: &Theme) -> (String, Color) {
-        let Some(thread) = thread else {
-            return (String::new(), t.sidebar_muted);
-        };
-        let request = &thread["pendingRuntimeRequest"];
-        if !request.is_null() {
-            return if str_of(request, "kind") == "user_input" {
-                ("Input".into(), t.indigo)
-            } else {
-                ("Approval".into(), t.warning_fg)
-            };
-        }
-        let state = status(thread);
-        if is_active_status(state) {
-            let since = parse_iso_ms(str_of(thread, "latestRunStartedAt"))
-                .map(|started| self.now - started)
-                .unwrap_or(0);
-            return (
-                format!("{} {}", self.spinner(), theme::working_label(since)),
-                t.info,
-            );
-        }
-        match state {
-            "failed" => return ("Failed".into(), t.error_fg),
-            "queued" => return ("Queued".into(), t.sidebar_muted),
-            _ => {}
-        }
-        let stamp = [
-            str_of(thread, "latestUserMessageAt"),
-            str_of(thread, "updatedAt"),
-        ]
-        .into_iter()
-        .find(|s| !s.is_empty())
-        .unwrap_or_default();
-        (relative_time(stamp, self.now), t.sidebar_muted)
     }
 
     /// The GUI's breadcrumb: project, a slash, the thread title.
