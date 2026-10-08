@@ -91,6 +91,11 @@ pub struct Theme {
     pub info: Color,
     pub info_fg: Color,
     pub success: Color,
+    /// `--success` itself, emerald-500, which the sidebar's Done takes. `success` above is the
+    /// lighter shade the dark theme gives `--success-foreground`.
+    pub emerald: Color,
+    /// `--warning`, amber-500, for the sidebar's Limited and Woke.
+    pub warning: Color,
     pub warning_fg: Color,
     pub warning_border: Color,
     pub warning_surface: Color,
@@ -133,6 +138,8 @@ impl Theme {
             info: c(0x2b7fff),
             info_fg: c(0x51a2ff),
             success: c(0x00d492),
+            emerald: c(0x00bc7d),
+            warning: c(0xfe9a00),
             warning_fg: c(0xffb900),
             warning_border: c(0x4e3207),
             warning_surface: c(0x1d150a),

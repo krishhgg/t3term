@@ -454,7 +454,8 @@ impl App {
         }
     }
 
-    /// Whether any thread is working, which is when the clocks need a tick.
+    /// Whether the open thread has a run going or any thread reads Working by the sidebar's
+    /// rules, which is when the clocks and spinners need a tick.
     fn running(&self) -> bool {
         // A closed watch never hears that its run finished, so its last state can't count.
         if self
@@ -468,7 +469,7 @@ impl App {
         }
         self.shell
             .as_ref()
-            .is_some_and(|s| s.threads.iter().any(|t| is_active_status(status(t))))
+            .is_some_and(|s| s.threads.iter().any(sidebar::working))
     }
 
     /// Lays the sidebar's shelves out again from the shell, as of now.

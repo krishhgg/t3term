@@ -8,6 +8,9 @@
 //!   `apps/web/src/components/Sidebar.tsx`.
 //! - The order inside each shelf comes from `packages/client-runtime/src/state/threadSort.ts`.
 //! - Snooze is `effectiveSnoozed` in `packages/client-runtime/src/state/threadSettled.ts`.
+//! - A card's status word is `resolveSidebarThreadStatus` and `resolveSidebarV2TopStatus` in
+//!   `Sidebar.logic.ts`, with the labels, colors and Woke test of `SidebarThreadRow` in
+//!   `Sidebar.tsx` and the wake time from `threadWokeAt` in `threadSettled.ts`.
 //!
 //! Field names are the shell's (`OrchestrationV2ThreadShell` in
 //! `packages/contracts/src/orchestrationV2.ts`), read the way `presentThreadShell` in
@@ -15,6 +18,12 @@
 //!
 //! A snooze ends at a wall-clock time and no server event marks it, so the sidebar reports its
 //! next wake and the event loop sets one timer for it.
+//!
+//! Done and Woke compare against the shell's `lastVisitedAt`, which the server keeps for every
+//! client. t3term reads it but doesn't send `thread.visit` yet, so opening a thread here doesn't
+//! clear either word. The GUI keeps a visit time of its own for a server that leaves the field
+//! out. t3term has none, so on such a server a thread is never Done, and a woken thread stays
+//! Woke until it is settled or the server clears its snooze, as a new message does.
 
 use std::cmp::Reverse;
 
@@ -28,7 +37,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::theme::{self, Theme, monogram, parse_iso_ms, relative_time};
 use super::{fit, row, spinner_frame, str_of, with_bg};
-use crate::projection::{ShellState, is_active_status, is_terminal_status, status};
+use crate::projection::{ShellState, is_terminal_status, status};
 
 /// The lifecycle features a server supports, from its environment descriptor.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -194,12 +203,25 @@ fn runtime_status(thread: &Value) -> Option<&str> {
     })
 }
 
+/// What a pending request asks of the user, as `presentThreadShell` sorts it into
+/// `hasPendingUserInput` and `hasPendingApprovals`: a question is input, an auth refresh is
+/// neither, and every other kind, known or not, is an approval.
+fn pending(thread: &Value) -> Option<Word> {
+    let request = &thread["pendingRuntimeRequest"];
+    if request.is_null() {
+        return None;
+    }
+    match request["kind"].as_str() {
+        Some("user_input") => Some(Word::Input),
+        Some("auth_refresh") => None,
+        _ => Some(Word::Approval),
+    }
+}
+
 /// `threadRaisedHandWhileSnoozed`: the agent is waiting on the user, it failed after the
 /// snooze began, or a run completed after the snooze began.
 fn raised_hand(thread: &Value) -> bool {
-    // `hasPendingApprovals` or `hasPendingUserInput`: any request but an auth refresh.
-    let request = &thread["pendingRuntimeRequest"];
-    if !request.is_null() && request["kind"] != "auth_refresh" {
+    if pending(thread).is_some() {
         return true;
     }
     // A thread snoozed while already failed stays snoozed. The runtime's `updatedAt` is the
@@ -219,6 +241,166 @@ fn raised_hand(thread: &Value) -> bool {
 /// hand first. A wake time that has passed or doesn't parse leaves the thread where it was.
 fn effective_snoozed(thread: &Value, now: i64) -> bool {
     instant(&thread["snoozedUntil"]).is_some_and(|wake| wake > now) && !raised_hand(thread)
+}
+
+// ---- status ----
+
+/// The word on a card's first line.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum Word {
+    Approval,
+    Input,
+    Working,
+    /// Working toward a native `/goal`, which keeps the agent going across turns until it is
+    /// met.
+    Goal,
+    /// Stopped, with background work pending that will wake the agent, so not the user's
+    /// turn yet.
+    Waiting,
+    /// Failed on a usage limit.
+    Limited,
+    Failed,
+    Woke,
+    /// A run finished that nobody has looked at since.
+    Done,
+}
+
+impl Word {
+    fn label(self) -> &'static str {
+        match self {
+            Word::Approval => "Approval",
+            Word::Input => "Input",
+            Word::Working => "Working",
+            Word::Goal => "Goal",
+            Word::Waiting => "Waiting",
+            Word::Limited => "Limited",
+            Word::Failed => "Failed",
+            Word::Woke => "Woke",
+            Word::Done => "Done",
+        }
+    }
+
+    /// The text color each word has in the GUI.
+    fn color(self, t: &Theme) -> Color {
+        match self {
+            Word::Approval => t.warning_fg,
+            Word::Input => t.indigo,
+            Word::Working | Word::Goal => t.info,
+            Word::Waiting => t.sidebar_muted,
+            Word::Limited | Word::Woke => t.warning,
+            Word::Failed => t.error,
+            Word::Done => t.emerald,
+        }
+    }
+
+    /// Whether the word comes with a spinner and the working clock.
+    fn working(self) -> bool {
+        matches!(self, Word::Working | Word::Goal)
+    }
+}
+
+/// `resolveSidebarThreadStatus`: what the thread is doing, or None when it is at rest. A
+/// request for the user comes before anything the runtime is doing.
+fn activity(thread: &Value) -> Option<Word> {
+    if let Some(word) = pending(thread) {
+        return Some(word);
+    }
+    match runtime_status(thread)? {
+        "preparing" | "queued" | "starting" | "running" | "waiting" => {
+            Some(if thread["goal"]["status"] == "active" {
+                Word::Goal
+            } else {
+                Word::Working
+            })
+        }
+        "idle" => Some(Word::Waiting),
+        "failed" if thread["lastErrorClass"] == "usage_limit" => Some(Word::Limited),
+        "failed" => Some(Word::Failed),
+        _ => None,
+    }
+}
+
+/// The word a card shows at `now`, after `resolveSidebarV2TopStatus`: what the thread is
+/// doing, else a wake, else a finish nobody has seen. None leaves the card showing its age.
+fn status_word(thread: &Value, now: i64) -> Option<Word> {
+    activity(thread).or_else(|| {
+        if woke(thread, now) {
+            Some(Word::Woke)
+        } else if unseen_completion(thread) {
+            Some(Word::Done)
+        } else {
+            None
+        }
+    })
+}
+
+/// Whether the thread's card shows Working or Goal, whose spinner and clock move with the
+/// event loop's tick.
+pub fn working(thread: &Value) -> bool {
+    activity(thread).is_some_and(Word::working)
+}
+
+/// `resolveThreadWorkingStartedAt`: when the work on show began, which a wake that continues
+/// it doesn't reset. A server that sends `activityRunStartedAt` decides alone. On an older
+/// one the clock counts from the latest run while that run is the active one. None leaves the
+/// clock off.
+fn working_since(thread: &Value) -> Option<i64> {
+    if let Some(started) = thread.get("activityRunStartedAt") {
+        return instant(started);
+    }
+    let run = latest_run(thread)?;
+    if run.completed_at.is_null() && thread["activeRunId"] == thread["latestRunId"] {
+        instant(run.started_at).or_else(|| instant(run.requested_at))
+    } else {
+        None
+    }
+}
+
+/// `threadWokeAt`: when a snoozed thread came back, or None while it sleeps or if it never
+/// slept. A thread that raised its hand woke at that moment, and keeps that time after the
+/// wake time passes, so a visit between the two still clears the word.
+fn woke_at(thread: &Value, now: i64) -> Option<&Value> {
+    let wake = instant(&thread["snoozedUntil"])?;
+    if !raised_hand(thread) {
+        return (wake <= now).then_some(&thread["snoozedUntil"]);
+    }
+    let snoozed_at = &thread["snoozedAt"];
+    let finished =
+        latest_run(thread).filter(|run| run.completed && later(run.completed_at, snoozed_at));
+    if let Some(run) = finished {
+        return Some(run.completed_at);
+    }
+    // The runtime's `updatedAt` is the thread's. Without a runtime, the snooze's start.
+    let runtime_at = runtime_status(thread).map(|_| &thread["updatedAt"]);
+    runtime_at
+        .into_iter()
+        .chain([snoozed_at])
+        .find(|at| !at.is_null())
+}
+
+/// `isWoke` in `SidebarThreadRow`: the thread woke after the last visit, and it isn't
+/// settled. A visit time that is missing or doesn't parse counts as no visit.
+fn woke(thread: &Value, now: i64) -> bool {
+    let Some(at) = woke_at(thread, now).and_then(instant) else {
+        return false;
+    };
+    thread["settledOverride"] != "settled"
+        && instant(&thread["lastVisitedAt"]).is_none_or(|visited| visited < at)
+}
+
+/// `hasUnseenCompletion`: the latest run finished after the last visit. A thread nobody has
+/// visited counts as seen, so a new server doesn't mark its whole history unread, and so
+/// does every thread on a server that doesn't send `lastVisitedAt`. A visit time that doesn't
+/// parse counts as before the finish.
+fn unseen_completion(thread: &Value) -> bool {
+    let Some(completed) = latest_run(thread).and_then(|run| instant(run.completed_at)) else {
+        return false;
+    };
+    let visited = &thread["lastVisitedAt"];
+    if visited.as_str().is_none_or(str::is_empty) {
+        return false;
+    }
+    instant(visited).is_none_or(|visited| completed > visited)
 }
 
 // ---- order ----
@@ -693,7 +875,11 @@ impl View<'_> {
             .map(|t| project_title(self.shell, str_of(t, "projectId")))
             .unwrap_or_default();
         let badge = monogram(&project);
-        let (status_label, status_color) = self.thread_status(thread);
+        let inner = width.saturating_sub(2);
+        // The status keeps its width and the project name gives way, down to a one-column
+        // ellipsis and one column of gap.
+        let (status_label, status_color) =
+            self.thread_status(thread, inner.saturating_sub(badge.width() + 3));
         let branch = thread
             .map(|t| str_of(t, "branch"))
             .unwrap_or("")
@@ -713,7 +899,6 @@ impl View<'_> {
         } else {
             Span::raw(" ")
         };
-        let inner = width.saturating_sub(2);
         let muted = Style::new().fg(t.sidebar_muted);
         let project_room = inner.saturating_sub(badge.width() + status_label.width() + 2);
         let line1 = row(
@@ -756,48 +941,40 @@ impl View<'_> {
             .collect()
     }
 
-    /// The card's right-hand label: a pending request, the working clock, a failure, or the
-    /// time of the latest activity.
-    fn thread_status(&self, thread: Option<&Value>) -> (String, Color) {
+    /// The card's right-hand status in at most `room` columns: its word, with a spinner and
+    /// the working clock while the agent works, or else the time of the latest activity. When
+    /// the whole doesn't fit, the clock goes first, then the spinner, then the word is cut.
+    fn thread_status(&self, thread: Option<&Value>, room: usize) -> (String, Color) {
         let t = self.theme;
-        let Some(thread) = thread else {
+        let Some(thread) = thread.filter(|_| room > 0) else {
             return (String::new(), t.sidebar_muted);
         };
-        let request = &thread["pendingRuntimeRequest"];
-        if !request.is_null() {
-            return if str_of(request, "kind") == "user_input" {
-                ("Input".into(), t.indigo)
-            } else {
-                ("Approval".into(), t.warning_fg)
-            };
+        let Some(word) = status_word(thread, self.now) else {
+            let stamp = [
+                str_of(thread, "latestUserMessageAt"),
+                str_of(thread, "updatedAt"),
+            ]
+            .into_iter()
+            .find(|s| !s.is_empty())
+            .unwrap_or_default();
+            return (fit(&relative_time(stamp, self.now), room), t.sidebar_muted);
+        };
+        let label = word.label();
+        let mut choices = Vec::with_capacity(3);
+        if word.working() {
+            let spinner = spinner_frame(self.now);
+            if let Some(since) = working_since(thread) {
+                let clock = theme::working_label(self.now - since);
+                choices.push(format!("{spinner} {label} {clock}"));
+            }
+            choices.push(format!("{spinner} {label}"));
         }
-        let state = status(thread);
-        if is_active_status(state) {
-            let since = parse_iso_ms(str_of(thread, "latestRunStartedAt"))
-                .map(|started| self.now - started)
-                .unwrap_or(0);
-            return (
-                format!(
-                    "{} {}",
-                    spinner_frame(self.now),
-                    theme::working_label(since)
-                ),
-                t.info,
-            );
-        }
-        match state {
-            "failed" => return ("Failed".into(), t.error_fg),
-            "queued" => return ("Queued".into(), t.sidebar_muted),
-            _ => {}
-        }
-        let stamp = [
-            str_of(thread, "latestUserMessageAt"),
-            str_of(thread, "updatedAt"),
-        ]
-        .into_iter()
-        .find(|s| !s.is_empty())
-        .unwrap_or_default();
-        (relative_time(stamp, self.now), t.sidebar_muted)
+        choices.push(label.to_string());
+        let text = choices
+            .into_iter()
+            .find(|choice| choice.width() <= room)
+            .unwrap_or_else(|| fit(label, room));
+        (text, word.color(t))
     }
 }
 
@@ -1345,6 +1522,564 @@ mod tests {
         assert_eq!(sidebar.selected_thread_id(), Some("p"));
     }
 
+    // ---- status words ----
+
+    /// The word a thread made of `fields` shows at noon.
+    fn word_of(fields: Value) -> Option<Word> {
+        status_word(&with(thread("t"), fields), now())
+    }
+
+    /// The fields of a thread whose run started at 11:57 and is still going, as a nightly
+    /// server sends them.
+    fn running() -> Value {
+        json!({
+            "latestRunId": "r",
+            "activeRunId": "r",
+            "status": "running",
+            "latestRunRequestedAt": "2026-10-08T11:56:50.000Z",
+            "latestRunStartedAt": "2026-10-08T11:57:00.000Z",
+            "latestRunCompletedAt": null,
+            "activityRunStatus": "running",
+            "activityRunStartedAt": "2026-10-08T11:57:00.000Z",
+        })
+    }
+
+    /// The fields of a thread whose run finished at 11:00 and was last visited at `visited`.
+    fn finished(visited: Value) -> Value {
+        json!({
+            "latestRunId": "r",
+            "status": "completed",
+            "latestRunCompletedAt": "2026-10-08T11:00:00.000Z",
+            "lastVisitedAt": visited,
+        })
+    }
+
+    fn without(mut thread: Value, key: &str) -> Value {
+        thread.as_object_mut().unwrap().remove(key);
+        thread
+    }
+
+    #[test]
+    fn a_request_for_the_user_outranks_what_the_agent_is_doing() {
+        let asking =
+            |kind: Value| with(running(), json!({"pendingRuntimeRequest": {"kind": kind}}));
+        // The shell carries one request, so Approval and Input are never pending together.
+        // Every kind but a question is an approval, including kinds this build doesn't know.
+        for kind in [
+            "command",
+            "file-read",
+            "file-change",
+            "mcp-elicitation",
+            "permission",
+            "dynamic_tool_call",
+            "something_new",
+        ] {
+            assert_eq!(word_of(asking(json!(kind))), Some(Word::Approval), "{kind}");
+        }
+        assert_eq!(word_of(asking(json!("user_input"))), Some(Word::Input));
+        assert_eq!(
+            word_of(json!({"pendingRuntimeRequest": {"id": "q"}})),
+            Some(Word::Approval),
+            "a request without a kind still waits on the user"
+        );
+
+        // An auth refresh isn't the user's to answer, so the runtime's word shows instead.
+        assert_eq!(word_of(asking(json!("auth_refresh"))), Some(Word::Working));
+        assert_eq!(
+            word_of(json!({"pendingRuntimeRequest": {"kind": "auth_refresh"}})),
+            None
+        );
+
+        // A request outranks a failure, a goal and a wake.
+        let failed = json!({"latestRunId": "r", "status": "failed", "pendingRuntimeRequest": {"kind": "permission"}});
+        assert_eq!(word_of(failed), Some(Word::Approval));
+        let goal = with(
+            asking(json!("user_input")),
+            json!({"goal": {"objective": "Ship it", "status": "active"}}),
+        );
+        assert_eq!(word_of(goal), Some(Word::Input));
+        let woken = json!({
+            "snoozedAt": "2026-10-08T10:00:00.000Z",
+            "snoozedUntil": "2026-10-08T11:30:00.000Z",
+            "pendingRuntimeRequest": {"kind": "user_input"},
+        });
+        assert_eq!(word_of(woken), Some(Word::Input));
+    }
+
+    #[test]
+    fn the_runtime_decides_working_waiting_limited_and_failed() {
+        for state in ["preparing", "queued", "starting", "running", "waiting"] {
+            assert_eq!(
+                word_of(json!({"latestRunId": "r", "status": state})),
+                Some(Word::Working),
+                "{state}"
+            );
+        }
+        // The activity run outranks the thread's status, as when a wake continues the work.
+        assert_eq!(
+            word_of(
+                json!({"latestRunId": "r", "status": "completed", "activityRunStatus": "starting"})
+            ),
+            Some(Word::Working)
+        );
+
+        // Background work that will wake the agent parks it at Waiting. A command it left
+        // running, such as a dev server, doesn't.
+        let background = |kinds: &[&str]| {
+            let tasks: Vec<Value> = kinds
+                .iter()
+                .map(|kind| json!({"taskId": format!("task-{kind}"), "kind": kind}))
+                .collect();
+            json!({"latestRunId": "r", "status": "completed", "pendingBackgroundTasks": tasks})
+        };
+        for kinds in [
+            &["subagent"][..],
+            &["monitor"],
+            &["background_task"],
+            &["kind_from_the_future"],
+            &["command", "subagent"],
+        ] {
+            assert_eq!(word_of(background(kinds)), Some(Word::Waiting), "{kinds:?}");
+        }
+        assert_eq!(word_of(background(&["command"])), None);
+        assert_eq!(word_of(background(&[])), None);
+        // Work that holds a thread can hold one that never ran.
+        let unrun = json!({"pendingBackgroundTasks": [{"taskId": "w", "kind": "monitor"}]});
+        assert_eq!(word_of(unrun), Some(Word::Waiting));
+
+        // A usage limit is Limited. Every other failure, or one with no class, is Failed.
+        let failed =
+            |class: Value| json!({"latestRunId": "r", "status": "failed", "lastErrorClass": class});
+        assert_eq!(word_of(failed(json!("usage_limit"))), Some(Word::Limited));
+        for class in [
+            json!("provider_error"),
+            json!("transport_error"),
+            json!("permission_error"),
+            json!("validation_error"),
+            json!("unknown"),
+            Value::Null,
+        ] {
+            assert_eq!(
+                word_of(failed(class.clone())),
+                Some(Word::Failed),
+                "{class}"
+            );
+        }
+        assert_eq!(
+            word_of(without(failed(Value::Null), "lastErrorClass")),
+            Some(Word::Failed)
+        );
+        // A failure outranks the background roster, so it stays visible.
+        let held = with(
+            failed(json!("usage_limit")),
+            json!({"pendingBackgroundTasks": [{"taskId": "s", "kind": "subagent"}]}),
+        );
+        assert_eq!(word_of(held), Some(Word::Limited));
+        // A live activity run outranks the thread's failed status.
+        assert_eq!(
+            word_of(with(
+                failed(json!("usage_limit")),
+                json!({"activityRunStatus": "running"})
+            )),
+            Some(Word::Working)
+        );
+        // Without a run or a provider thread there is no runtime, so nothing failed.
+        assert_eq!(
+            word_of(json!({"status": "failed", "lastErrorClass": "usage_limit"})),
+            None
+        );
+
+        // A run that ended for any other reason leaves the thread at rest.
+        for state in [
+            "completed",
+            "interrupted",
+            "cancelled",
+            "rolled_back",
+            "nonsense",
+        ] {
+            assert_eq!(
+                word_of(json!({"latestRunId": "r", "status": state})),
+                None,
+                "{state}"
+            );
+        }
+        assert_eq!(word_of(json!({"latestRunId": "r", "status": 7})), None);
+        assert_eq!(word_of(json!({})), None, "a thread that never ran");
+        // The server sends `idle` only before the first run. The GUI reads it as Waiting
+        // whenever a runtime exists, as it does for a provider thread with no run yet.
+        assert_eq!(
+            word_of(json!({"activeProviderThreadId": "pt"})),
+            Some(Word::Waiting)
+        );
+        assert_eq!(
+            word_of(json!({"latestRunId": "r", "status": "idle"})),
+            Some(Word::Waiting)
+        );
+    }
+
+    #[test]
+    fn working_reads_goal_only_while_the_goal_is_active() {
+        let goal = |status: &str| json!({"goal": {"objective": "Ship it", "status": status}});
+        assert_eq!(word_of(with(running(), goal("active"))), Some(Word::Goal));
+        for status in [
+            "paused",
+            "blocked",
+            "usage_limited",
+            "budget_limited",
+            "complete",
+        ] {
+            assert_eq!(
+                word_of(with(running(), goal(status))),
+                Some(Word::Working),
+                "{status}"
+            );
+        }
+        // A server without goals leaves the field out, and a malformed one is no goal.
+        assert_eq!(word_of(running()), Some(Word::Working));
+        assert_eq!(
+            word_of(with(running(), json!({"goal": null}))),
+            Some(Word::Working)
+        );
+        assert_eq!(
+            word_of(with(running(), json!({"goal": "active"}))),
+            Some(Word::Working)
+        );
+        // An active goal on a thread at rest adds no word.
+        assert_eq!(
+            word_of(with(
+                json!({"latestRunId": "r", "status": "completed"}),
+                goal("active")
+            )),
+            None
+        );
+    }
+
+    #[test]
+    fn done_is_a_finish_nobody_has_seen() {
+        assert_eq!(
+            word_of(finished(json!("2026-10-08T10:00:00.000Z"))),
+            Some(Word::Done)
+        );
+        assert_eq!(
+            word_of(finished(json!("2026-10-08T11:00:00.000Z"))),
+            None,
+            "seen as it finished"
+        );
+        assert_eq!(word_of(finished(json!("2026-10-08T11:30:00.000Z"))), None);
+
+        // A thread nobody has visited counts as seen, so a server doesn't mark its whole
+        // history unread. A server without visit tracking leaves the field out, and then
+        // nothing is Done.
+        assert_eq!(word_of(finished(Value::Null)), None);
+        assert_eq!(word_of(finished(json!(""))), None);
+        assert_eq!(
+            word_of(without(finished(Value::Null), "lastVisitedAt")),
+            None
+        );
+        // A visit time that doesn't parse can't show the finish was seen.
+        assert_eq!(word_of(finished(json!("yesterday"))), Some(Word::Done));
+
+        // No finish time that parses, or no run, means nothing finished.
+        let visited = json!("2026-10-08T10:00:00.000Z");
+        assert_eq!(
+            word_of(with(
+                finished(visited.clone()),
+                json!({"latestRunCompletedAt": "soon"})
+            )),
+            None
+        );
+        assert_eq!(
+            word_of(with(
+                finished(visited.clone()),
+                json!({"latestRunCompletedAt": null})
+            )),
+            None
+        );
+        assert_eq!(
+            word_of(json!({"lastVisitedAt": "2026-10-08T10:00:00.000Z"})),
+            None
+        );
+        // A server that leaves out the finish time has it read from `updatedAt`.
+        let implied = with(
+            without(finished(visited.clone()), "latestRunCompletedAt"),
+            json!({"updatedAt": "2026-10-08T11:00:00.000Z"}),
+        );
+        assert_eq!(word_of(implied), Some(Word::Done));
+        // An interrupted or cancelled run finished too.
+        for state in ["interrupted", "cancelled"] {
+            assert_eq!(
+                word_of(with(finished(visited.clone()), json!({"status": state}))),
+                Some(Word::Done),
+                "{state}"
+            );
+        }
+        // What the thread is doing outranks an unseen finish.
+        assert_eq!(
+            word_of(with(finished(visited.clone()), json!({"status": "failed"}))),
+            Some(Word::Failed)
+        );
+        assert_eq!(
+            word_of(with(
+                finished(visited),
+                json!({"activityRunStatus": "running"})
+            )),
+            Some(Word::Working)
+        );
+    }
+
+    #[test]
+    fn a_thread_moves_through_its_words_as_the_shell_changes() {
+        let mut t = with(
+            thread("t"),
+            json!({"lastVisitedAt": "2026-10-08T09:00:00.000Z"}),
+        );
+        let mut step = |fields: Value| {
+            t = with(t.clone(), fields);
+            status_word(&t, now())
+        };
+        assert_eq!(step(json!({})), None, "never ran");
+        let queued = json!({
+            "latestRunId": "r",
+            "activeRunId": "r",
+            "status": "queued",
+            "latestRunRequestedAt": "2026-10-08T11:58:00.000Z",
+            "latestRunCompletedAt": null,
+        });
+        assert_eq!(step(queued), Some(Word::Working));
+        assert_eq!(
+            step(json!({"status": "running", "pendingRuntimeRequest": {"kind": "command"}})),
+            Some(Word::Approval)
+        );
+        assert_eq!(
+            step(json!({"pendingRuntimeRequest": null})),
+            Some(Word::Working)
+        );
+        // The run ends while a subagent it started is still out.
+        let ended = json!({
+            "status": "completed",
+            "activeRunId": null,
+            "latestRunCompletedAt": "2026-10-08T11:59:00.000Z",
+            "pendingBackgroundTasks": [{"taskId": "s", "kind": "subagent"}],
+        });
+        assert_eq!(step(ended), Some(Word::Waiting));
+        assert_eq!(
+            step(json!({"pendingBackgroundTasks": []})),
+            Some(Word::Done)
+        );
+        // Another client opens the thread.
+        assert_eq!(
+            step(json!({"lastVisitedAt": "2026-10-08T11:59:30.000Z"})),
+            None
+        );
+    }
+
+    #[test]
+    fn woke_shows_until_a_visit_after_the_wake() {
+        // Snoozed at 10:00 until 11:30, so its timer woke it half an hour before noon.
+        let slept = |fields: Value| {
+            with(
+                json!({
+                    "snoozedAt": "2026-10-08T10:00:00.000Z",
+                    "snoozedUntil": "2026-10-08T11:30:00.000Z",
+                }),
+                fields,
+            )
+        };
+        let visited = |at: Value| slept(json!({"lastVisitedAt": at}));
+        assert_eq!(word_of(slept(json!({}))), Some(Word::Woke), "never visited");
+        assert_eq!(word_of(visited(Value::Null)), Some(Word::Woke));
+        assert_eq!(
+            word_of(visited(json!("2026-10-08T11:00:00.000Z"))),
+            Some(Word::Woke),
+            "visited before the wake"
+        );
+        assert_eq!(word_of(visited(json!("2026-10-08T11:30:00.000Z"))), None);
+        assert_eq!(word_of(visited(json!("2026-10-08T11:45:00.000Z"))), None);
+        assert_eq!(
+            word_of(visited(json!("not a time"))),
+            Some(Word::Woke),
+            "a visit time that doesn't parse is no visit"
+        );
+
+        // A settled thread isn't Woke. Any other override is.
+        assert_eq!(word_of(slept(json!({"settledOverride": "settled"}))), None);
+        assert_eq!(
+            word_of(slept(json!({"settledOverride": "active"}))),
+            Some(Word::Woke)
+        );
+        // A wake time that is missing or doesn't parse never woke anything.
+        assert_eq!(word_of(slept(json!({"snoozedUntil": "soon"}))), None);
+        assert_eq!(word_of(slept(json!({"snoozedUntil": null}))), None);
+        assert_eq!(word_of(without(slept(json!({})), "snoozedUntil")), None);
+
+        // Woke outranks an unseen finish, and what the thread is doing outranks Woke.
+        let unseen = finished(json!("2026-10-08T08:00:00.000Z"));
+        assert_eq!(
+            word_of(with(
+                unseen.clone(),
+                json!({"latestRunCompletedAt": "2026-10-08T09:00:00.000Z"})
+            )),
+            Some(Word::Done)
+        );
+        assert_eq!(
+            word_of(slept(with(
+                unseen,
+                json!({"latestRunCompletedAt": "2026-10-08T09:00:00.000Z"})
+            ))),
+            Some(Word::Woke)
+        );
+        assert_eq!(word_of(slept(running())), Some(Word::Working));
+    }
+
+    #[test]
+    fn a_timer_wake_shows_woke_from_the_wake_time() {
+        let t = with(
+            snoozed("t"),
+            json!({"snoozedUntil": "2026-10-08T12:00:30.000Z"}),
+        );
+        let wake = ms("2026-10-08T12:00:30.000Z");
+        assert_eq!(status_word(&t, wake - 1), None, "still asleep");
+        assert_eq!(status_word(&t, wake), Some(Word::Woke));
+        assert_eq!(woke_at(&t, wake), Some(&t["snoozedUntil"]));
+    }
+
+    #[test]
+    fn an_early_wake_dates_from_when_the_hand_went_up() {
+        // Snoozed at 11:00 until 13:00. A run finished at 11:30 and woke it early.
+        let early = with(
+            snoozed("t"),
+            json!({"latestRunId": "r", "status": "completed", "latestRunCompletedAt": "2026-10-08T11:30:00.000Z"}),
+        );
+        let after_wake = ms("2026-10-08T14:00:00.000Z");
+        assert_eq!(status_word(&early, now()), Some(Word::Woke));
+        assert_eq!(
+            woke_at(&early, now()),
+            Some(&json!("2026-10-08T11:30:00.000Z"))
+        );
+        let visited = |at: &str| with(early.clone(), json!({"lastVisitedAt": at}));
+        assert_eq!(
+            status_word(&visited("2026-10-08T11:15:00.000Z"), now()),
+            Some(Word::Woke),
+            "a visit before the early wake doesn't count"
+        );
+        let seen = visited("2026-10-08T11:45:00.000Z");
+        assert_eq!(status_word(&seen, now()), None);
+        // The wake still dates from 11:30 once 13:00 passes, so the 11:45 visit still counts.
+        assert_eq!(status_word(&seen, after_wake), None);
+        assert_eq!(
+            woke_at(&seen, after_wake),
+            Some(&json!("2026-10-08T11:30:00.000Z"))
+        );
+
+        // A fresh failure woke it at the runtime's last update. The card says Failed.
+        let failed = with(
+            snoozed("t"),
+            json!({"latestRunId": "r", "status": "failed", "updatedAt": "2026-10-08T11:40:00.000Z"}),
+        );
+        assert_eq!(
+            woke_at(&failed, now()),
+            Some(&json!("2026-10-08T11:40:00.000Z"))
+        );
+        assert_eq!(status_word(&failed, now()), Some(Word::Failed));
+        // A request woke a thread with no runtime at the snooze's start.
+        let asked = with(
+            snoozed("t"),
+            json!({"pendingRuntimeRequest": {"kind": "user_input"}}),
+        );
+        assert_eq!(
+            woke_at(&asked, now()),
+            Some(&json!("2026-10-08T11:00:00.000Z"))
+        );
+        // Once answered, the hand is down and the thread sleeps until 13:00 again.
+        let answered = with(asked, json!({"pendingRuntimeRequest": null}));
+        assert_eq!(woke_at(&answered, now()), None);
+        assert_eq!(status_word(&answered, now()), None);
+        // An auth refresh never raised a hand.
+        let refreshing = with(
+            snoozed("t"),
+            json!({"pendingRuntimeRequest": {"kind": "auth_refresh"}}),
+        );
+        assert_eq!(woke_at(&refreshing, now()), None);
+        assert!(effective_snoozed(&refreshing, now()));
+    }
+
+    #[test]
+    fn only_a_working_card_needs_the_tick() {
+        let ticks = |fields: Value| working(&with(thread("t"), fields));
+        assert!(ticks(running()));
+        assert!(ticks(json!({"latestRunId": "r", "status": "queued"})));
+        assert!(ticks(
+            json!({"latestRunId": "r", "status": "completed", "activityRunStatus": "waiting"})
+        ));
+        assert!(ticks(with(
+            running(),
+            json!({"goal": {"objective": "Ship it", "status": "active"}})
+        )));
+        assert!(ticks(with(
+            running(),
+            json!({"pendingRuntimeRequest": {"kind": "auth_refresh"}})
+        )));
+        // A card that shows a request, Waiting or a failure has no clock to move.
+        assert!(!ticks(with(
+            running(),
+            json!({"pendingRuntimeRequest": {"kind": "command"}})
+        )));
+        assert!(!ticks(
+            json!({"latestRunId": "r", "status": "completed", "pendingBackgroundTasks": [{"taskId": "s", "kind": "subagent"}]})
+        ));
+        assert!(!ticks(json!({"latestRunId": "r", "status": "failed"})));
+        assert!(!ticks(finished(json!("2026-10-08T10:00:00.000Z"))));
+        assert!(!ticks(json!({})));
+    }
+
+    #[test]
+    fn the_clock_counts_from_when_the_work_began() {
+        let since = |fields: Value| working_since(&with(thread("t"), fields));
+        let at = |iso: &str| Some(ms(iso));
+        // A server that sends `activityRunStartedAt` decides alone, even when it is null. A
+        // wake keeps the start of the work it continues.
+        assert_eq!(since(running()), at("2026-10-08T11:57:00.000Z"));
+        assert_eq!(
+            since(with(
+                running(),
+                json!({"activityRunStartedAt": "2026-10-08T11:00:00.000Z"})
+            )),
+            at("2026-10-08T11:00:00.000Z")
+        );
+        assert_eq!(
+            since(with(running(), json!({"activityRunStartedAt": null}))),
+            None
+        );
+        assert_eq!(
+            since(with(running(), json!({"activityRunStartedAt": "later"}))),
+            None
+        );
+
+        // An older server: the latest run's start, while it is unfinished and the active run.
+        let older = without(running(), "activityRunStartedAt");
+        assert_eq!(since(older.clone()), at("2026-10-08T11:57:00.000Z"));
+        assert_eq!(
+            since(with(older.clone(), json!({"latestRunStartedAt": null}))),
+            at("2026-10-08T11:56:50.000Z"),
+            "the request time until the run starts"
+        );
+        assert_eq!(
+            since(with(older.clone(), json!({"activeRunId": "another"}))),
+            None
+        );
+        assert_eq!(
+            since(with(older.clone(), json!({"activeRunId": null}))),
+            None
+        );
+        assert_eq!(
+            since(with(
+                older,
+                json!({"latestRunCompletedAt": "2026-10-08T11:59:00.000Z"})
+            )),
+            None
+        );
+    }
+
     // ---- drawing ----
 
     fn render(
@@ -1601,6 +2336,168 @@ mod tests {
         );
     }
 
+    #[test]
+    fn each_word_draws_in_its_color_at_the_cards_right_edge() {
+        let theme = Theme::new(Depth::TrueColor);
+        let spinner = spinner_frame(now());
+        let background = json!({"latestRunId": "r", "status": "completed", "pendingBackgroundTasks": [{"taskId": "s", "kind": "subagent"}]});
+        let cases = [
+            (
+                with(
+                    running(),
+                    json!({"pendingRuntimeRequest": {"kind": "command"}}),
+                ),
+                "Approval".to_string(),
+                theme.warning_fg,
+            ),
+            (
+                with(
+                    running(),
+                    json!({"pendingRuntimeRequest": {"kind": "user_input"}}),
+                ),
+                "Input".to_string(),
+                theme.indigo,
+            ),
+            (running(), format!("{spinner} Working 3m"), theme.info),
+            (
+                with(
+                    running(),
+                    json!({"goal": {"objective": "Ship it", "status": "active"}}),
+                ),
+                format!("{spinner} Goal 3m"),
+                theme.info,
+            ),
+            (background, "Waiting".to_string(), theme.sidebar_muted),
+            (
+                json!({"latestRunId": "r", "status": "failed", "lastErrorClass": "usage_limit"}),
+                "Limited".to_string(),
+                theme.warning,
+            ),
+            (
+                json!({"latestRunId": "r", "status": "failed", "lastErrorClass": "provider_error"}),
+                "Failed".to_string(),
+                theme.error,
+            ),
+            (
+                json!({"snoozedAt": "2026-10-08T10:00:00.000Z", "snoozedUntil": "2026-10-08T11:30:00.000Z"}),
+                "Woke".to_string(),
+                theme.warning,
+            ),
+            (
+                finished(json!("2026-10-08T10:00:00.000Z")),
+                "Done".to_string(),
+                theme.emerald,
+            ),
+            // A seen finish has no word, so the card shows the time of the last message.
+            (
+                with(
+                    finished(json!("2026-10-08T11:30:00.000Z")),
+                    json!({"latestUserMessageAt": "2026-10-08T10:50:00.000Z"}),
+                ),
+                "1h".to_string(),
+                theme.sidebar_muted,
+            ),
+        ];
+        for (fields, want, color) in cases {
+            let shell = shell(vec![with(thread("t"), fields)]);
+            let mut sidebar = Sidebar::default();
+            sidebar.rebuild(&shell.threads, ALL, None, now());
+            let buffer = render(&mut sidebar, Some(&shell), None, (34, 10));
+            let lines = text(&buffer);
+            let y = row_of(&lines, "Thread t") - 1;
+            let line = &lines[y as usize];
+            assert!(line.trim_end().ends_with(&want), "{want}: {line:?}");
+            // The card's inside ends two columns before the border strip.
+            assert_eq!(buffer[(30, y)].fg, color, "{want}");
+            assert_eq!(buffer[(31, y)].symbol(), " ", "{want}");
+        }
+    }
+
+    #[test]
+    fn a_narrow_card_cuts_the_project_name_and_keeps_the_status() {
+        let mut shell = shell(vec![with(thread("t"), running())]);
+        shell.projects = vec![json!({"id": "p1", "title": "Interface experiments"})];
+        let mut sidebar = Sidebar::default();
+        sidebar.rebuild(&shell.threads, ALL, None, now());
+        // At the narrowest the app draws the sidebar, 26 columns, the card has 21 inside its
+        // bar: the badge, the project cut to one ellipsis, a gap and the whole status.
+        let lines = text(&render(&mut sidebar, Some(&shell), None, (26, 10)));
+        let y = row_of(&lines, "Thread t") as usize - 1;
+        let inside: String = lines[y].chars().skip(2).take(21).collect();
+        let spinner = spinner_frame(now());
+        assert_eq!(inside, format!("IE Inte… {spinner} Working 3m"));
+    }
+
+    #[test]
+    fn a_status_short_of_room_drops_the_clock_then_the_spinner_then_cuts_the_word() {
+        let theme = Theme::new(Depth::TrueColor);
+        let view = View {
+            theme: &theme,
+            shell: None,
+            open_id: None,
+            focused: true,
+            now: now(),
+            dot: theme.success,
+        };
+        let spinner = spinner_frame(now());
+        let busy = with(thread("t"), running());
+        let within = |room| view.thread_status(Some(&busy), room).0;
+        assert_eq!(within(40), format!("{spinner} Working 3m"));
+        assert_eq!(within(12), format!("{spinner} Working 3m"));
+        assert_eq!(within(11), format!("{spinner} Working"));
+        assert_eq!(within(9), format!("{spinner} Working"));
+        assert_eq!(within(8), "Working");
+        assert_eq!(within(7), "Working");
+        assert_eq!(within(6), "Worki…");
+        assert_eq!(within(1), "…");
+        assert_eq!(within(0), "");
+        assert_eq!(view.thread_status(Some(&busy), 0).1, theme.sidebar_muted);
+
+        // Without a start time that parses there is no clock, rather than one at 0s.
+        let unstarted = with(busy.clone(), json!({"activityRunStartedAt": null}));
+        assert_eq!(
+            view.thread_status(Some(&unstarted), 40).0,
+            format!("{spinner} Working")
+        );
+        // A clock past an hour takes more room.
+        let long = with(
+            busy.clone(),
+            json!({"activityRunStartedAt": "2026-10-08T10:58:00.000Z"}),
+        );
+        assert_eq!(
+            view.thread_status(Some(&long), 40).0,
+            format!("{spinner} Working 1h 2m")
+        );
+        assert_eq!(
+            view.thread_status(Some(&long), 14).0,
+            format!("{spinner} Working")
+        );
+
+        // A word without a spinner can only be cut.
+        let failed = with(thread("t"), json!({"latestRunId": "r", "status": "failed"}));
+        assert_eq!(
+            view.thread_status(Some(&failed), 6),
+            ("Failed".to_string(), theme.error)
+        );
+        assert_eq!(view.thread_status(Some(&failed), 5).0, "Fail…");
+
+        // With no word the card shows its age, from the last message or else the last update.
+        let resting = with(
+            thread("t"),
+            json!({"latestUserMessageAt": "2026-10-08T11:30:00.000Z"}),
+        );
+        assert_eq!(
+            view.thread_status(Some(&resting), 10),
+            ("30m".to_string(), theme.sidebar_muted)
+        );
+        assert_eq!(view.thread_status(Some(&thread("t")), 10).0, "7d");
+        assert_eq!(view.thread_status(Some(&resting), 2).0, "3…");
+        assert_eq!(
+            view.thread_status(None, 10),
+            (String::new(), theme.sidebar_muted)
+        );
+    }
+
     // ---- synthetic capture for review ----
 
     /// Writes the real renderer's styled output for a few invented sidebars, as ANSI text, to
@@ -1614,10 +2511,10 @@ mod tests {
         let dir = std::path::PathBuf::from(dir);
         std::fs::create_dir_all(&dir).unwrap();
         let demo = demo_shell();
-        let size = (34, 40);
+        let size = std::cell::Cell::new((34, 40));
         let capture =
             |name: &str, sidebar: &mut Sidebar, shell: Option<&ShellState>, open: Option<&str>| {
-                let buffer = render(sidebar, shell, open, size);
+                let buffer = render(sidebar, shell, open, size.get());
                 std::fs::write(dir.join(format!("sidebar-{name}.ans")), ansi(&buffer)).unwrap();
                 std::fs::write(
                     dir.join(format!("sidebar-{name}.txt")),
@@ -1653,6 +2550,113 @@ mod tests {
         let mut sidebar = Sidebar::default();
         sidebar.rebuild(&empty.threads, ALL, None, now());
         capture("empty", &mut sidebar, Some(&empty), None);
+
+        // Every status word, at the usual width and at the narrowest the app draws.
+        let statuses = status_shell();
+        let mut sidebar = Sidebar::default();
+        sidebar.rebuild(&statuses.threads, ALL, None, now());
+        size.set((34, 46));
+        capture("statuses", &mut sidebar, Some(&statuses), None);
+        size.set((26, 46));
+        capture("statuses-narrow", &mut sidebar, Some(&statuses), None);
+    }
+
+    /// Invented threads, one for each status word and one seen thread with none, in that order
+    /// on the Active shelf.
+    fn status_shell() -> ShellState {
+        let card = |key: &str, project: &str, title: &str, fields: Value| {
+            let id = format!("t-{key}");
+            with(
+                with(
+                    thread(&id),
+                    json!({
+                        "projectId": project,
+                        "title": title,
+                        "branch": format!("demo/{key}"),
+                        "activeOrderKey": key,
+                    }),
+                ),
+                fields,
+            )
+        };
+        let slept = json!({"snoozedAt": "2026-10-08T09:00:00.000Z", "snoozedUntil": "2026-10-08T11:00:00.000Z"});
+        ShellState {
+            sequence: 1,
+            projects: vec![
+                json!({"id": "atlas", "title": "atlas"}),
+                json!({"id": "lab", "title": "interface experiments"}),
+            ],
+            threads: vec![
+                card(
+                    "a",
+                    "atlas",
+                    "Run the database migration",
+                    with(
+                        running(),
+                        json!({"pendingRuntimeRequest": {"kind": "command"}}),
+                    ),
+                ),
+                card(
+                    "b",
+                    "lab",
+                    "Pick a chart palette",
+                    json!({"pendingRuntimeRequest": {"kind": "user_input"}}),
+                ),
+                card("c", "atlas", "Speed up the search index", running()),
+                card(
+                    "d",
+                    "lab",
+                    "Get the test suite green",
+                    with(
+                        running(),
+                        json!({
+                            "goal": {"objective": "All tests pass", "status": "active"},
+                            "activityRunStartedAt": "2026-10-08T10:48:00.000Z",
+                        }),
+                    ),
+                ),
+                card(
+                    "e",
+                    "atlas",
+                    "Audit the dependencies",
+                    json!({
+                        "latestRunId": "r",
+                        "status": "completed",
+                        "latestRunCompletedAt": "2026-10-08T11:58:00.000Z",
+                        "pendingBackgroundTasks": [{"taskId": "s", "kind": "subagent"}],
+                    }),
+                ),
+                card(
+                    "f",
+                    "lab",
+                    "Port the layout engine",
+                    json!({"latestRunId": "r", "status": "failed", "lastErrorClass": "usage_limit"}),
+                ),
+                card(
+                    "g",
+                    "atlas",
+                    "Rotate the signing keys",
+                    json!({"latestRunId": "r", "status": "failed", "lastErrorClass": "provider_error"}),
+                ),
+                card("h", "lab", "Revisit the color tokens", slept),
+                card(
+                    "i",
+                    "atlas",
+                    "Write the release notes",
+                    finished(json!("2026-10-08T10:00:00.000Z")),
+                ),
+                card(
+                    "j",
+                    "lab",
+                    "Sketch the settings page",
+                    with(
+                        finished(json!("2026-10-08T11:30:00.000Z")),
+                        json!({"latestUserMessageAt": "2026-10-08T10:50:00.000Z"}),
+                    ),
+                ),
+            ],
+            synchronized: true,
+        }
     }
 
     /// Invented projects and threads covering every shelf and card label.
@@ -1693,8 +2697,12 @@ mod tests {
                     json!({
                         "createdAt": "2026-10-08T08:00:00.000Z",
                         "latestRunId": "r1",
+                        "activeRunId": "r1",
                         "status": "running",
                         "latestRunStartedAt": "2026-10-08T11:57:00.000Z",
+                        "latestRunCompletedAt": null,
+                        "activityRunStatus": "running",
+                        "activityRunStartedAt": "2026-10-08T11:57:00.000Z",
                     }),
                 ),
                 card(
@@ -1704,7 +2712,7 @@ mod tests {
                     "fix/upload-test",
                     json!({
                         "createdAt": "2026-10-07T00:00:00.000Z",
-                        "pendingRuntimeRequest": {"kind": "approval"},
+                        "pendingRuntimeRequest": {"kind": "file-change"},
                         "modelSelection": {"instanceId": "claudeAgent"},
                     }),
                 ),
