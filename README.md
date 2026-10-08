@@ -50,21 +50,29 @@ Exit codes: 0 success, 1 failure or a turn that ended without completing, 2 usag
 | --- | --- |
 | Anywhere | Tab / Shift+Tab move focus, PgUp/PgDn scroll, Ctrl+X interrupt, Ctrl+C quit |
 | Anywhere, approval pending | Alt+A accept, Alt+S accept for session, Alt+D decline. Alt+↑/↓ or the mouse wheel scrolls a request too long for its panel |
+| Anywhere, thread open | Alt+M model, Alt+E reasoning effort and other model options, Alt+P access and plan mode |
+| Open menu | ↑/↓ choose, Enter select, Esc close. In the model menu, type to search |
 | Sidebar | ↑/↓ or j/k select, Enter open, e show or hide the Settled shelf, q quit |
 | Composer | Enter send (queues if the thread is busy), Alt+Enter or Ctrl+J newline, Esc to transcript |
 | Transcript | ↑/↓ scroll, g/G top/bottom, t show activity for finished turns and tool output, Enter compose, Esc sidebar |
 
-The mouse wheel scrolls the transcript and the sidebar, and clicking a thread opens it. When a question is pending, the composer becomes the answer box: type an option number or your own text.
+On macOS, the Alt keys need Option to send Meta: "Use Option as Meta key" in Terminal, "Esc+" for the Option key in iTerm2, or `macos-option-as-alt = true` in Ghostty.
+
+The mouse wheel scrolls the transcript and the sidebar, and clicking a thread opens it. Clicking a chip under the composer opens its menu. When a question is pending, the composer becomes the answer box: type an option number or your own text.
+
+A menu choice turns its chip blue and goes to T3 with the thread's next message, as in the desktop app. Ultrathink applies to that one message. T3 refuses a mode change while a run is active, so the TUI leaves that message in the composer to send once the run ends.
+
+![Choosing a model, effort and mode in the TUI, then sending](docs/screenshots/picker.gif)
 
 ## Look
 
-The TUI follows the T3 Code desktop app. The sidebar lists threads as cards with the project monogram, status or age, title, branch and provider glyph. Finished threads move to a Settled shelf at the bottom. The header shows the project and thread title. User prompts are right-aligned bubbles, and each turn folds its tool activity under a "Worked for" row that opens with `t`. Approvals and questions appear in a panel above the composer with their keys printed on the buttons. The composer shows the provider, model, runtime mode and a send hint.
+The TUI follows the T3 Code desktop app. The sidebar lists threads as cards with the project monogram, status or age, title, branch and provider glyph. Finished threads move to a Settled shelf at the bottom. The header shows the project and thread title. User prompts are right-aligned bubbles, and each turn folds its tool activity under a "Worked for" row that opens with `t`. Approvals and questions appear in a panel above the composer with their keys printed on the buttons. The composer has chips for the model, the reasoning effort and other model options, the runtime mode and plan mode, plus a send hint. Each chip opens a menu.
 
 Colors come from T3's dark theme tokens. When `COLORTERM` reports truecolor the TUI uses the exact hex values. Otherwise, or when `T3TERM_COLOR=256` is set, it maps each color to the nearest entry in the 256-color palette.
 
 ![The desktop app and t3term showing the same thread](docs/screenshots/gui-vs-tui.png)
 
-`docs/screenshots/` also has `before-tui.png`, `after-tui.png`, `approval.png` and `streaming.gif`.
+`docs/screenshots/` also has `before-tui.png`, `after-tui.png`, `approval.png`, `streaming.gif` and `picker-model.png`.
 
 ## How it works
 
@@ -80,14 +88,13 @@ Colors come from T3's dark theme tokens. When `COLORTERM` reports truecolor the 
 cargo test
 ```
 
-The unit tests cover the reducers, Markdown wrapping, the composer and auth command parsing. `tests/fake_server.rs` drives the real RPC client against a fake Effect RPC server. It drops the socket mid-stream and checks the resume cursor, chunk acks, batched frames, duplicate suppression and error decoding.
+The unit tests cover the reducers, Markdown wrapping, the composer, the model menus and auth command parsing. `tests/fake_server.rs` drives the real RPC client against a fake Effect RPC server. It drops the socket mid-stream and checks the resume cursor, chunk acks, batched frames, duplicate suppression and error decoding.
 
 ## Not done yet
 
-- Model, reasoning-effort and mode selection in the TUI. The CLI has them.
 - Loading older history for long threads. The TUI opens a bounded recent window.
 - New threads, diffs and checkpoints, worktrees, attachments, embedded terminals and queue management.
 - A check of the reducer's output against T3's TypeScript reducer on recorded event streams.
 - Linux and Windows. The code has Linux pid lookup, but only macOS has been tested. The saved login needs the macOS Keychain, so other systems issue a new session on every run.
 - Resource numbers beyond one 60-second idle check with a thread open: no measurable CPU time (under 10 ms over the minute) and 7.6 MB RSS, as reported by `ps`.
-- Syntax highlighting in code blocks, the thinking-level chip, the project and git panel, and the Pinned and Snoozed shelves from the desktop app.
+- Syntax highlighting in code blocks, the project and git panel, and the Pinned and Snoozed shelves from the desktop app.

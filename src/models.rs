@@ -23,7 +23,7 @@ pub const RUNTIME_MODES: &[(&str, &str)] = &[
 const EFFORT_IDS: &[&str] = &["effort", "reasoningEffort", "reasoning", "thinking"];
 
 /// The desktop app sends this effort as a prefix on the message instead of as an option.
-const ULTRATHINK: &str = "ultrathink";
+pub const ULTRATHINK: &str = "ultrathink";
 const ULTRATHINK_PREFIX: &str = "Ultrathink:";
 
 /// What the user asked to change. `None` keeps the thread's current value.

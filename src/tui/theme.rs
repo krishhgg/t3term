@@ -4,8 +4,6 @@
 //! True color is used when `COLORTERM` says the terminal supports it. Otherwise every value
 //! degrades to the nearest xterm-256 color at startup, so drawing never pays for the mapping.
 
-use std::collections::HashMap;
-
 use ratatui::style::{Color, Style};
 
 /// Whether colors go out as 24-bit values or as xterm-256 indexes.
@@ -112,6 +110,9 @@ pub struct Theme {
     pub sidebar_border: Color,
     pub row_active: Color,
     pub row_selected: Color,
+    /// Menus, and the highlighted row in one: the GUI's `popover` and `accent`.
+    pub popover: Color,
+    pub highlight: Color,
     pub indigo_border: Color,
     pub indigo_surface: Color,
     pub claude: Color,
@@ -150,6 +151,8 @@ impl Theme {
             sidebar_border: c(0x1f1f1f),
             row_active: c(0x1a1b1b),
             row_selected: c(0x111111),
+            popover: c(0x171717),
+            highlight: c(0x262626),
             indigo_border: c(0x2f3366),
             indigo_surface: c(0x14152a),
             claude: c(0xd97757),
@@ -238,26 +241,9 @@ pub fn runtime_mode_label(mode: &str) -> &str {
     }
 }
 
-/// Model display names by slug, from T3's `server.getConfig` reply.
-pub fn model_names(config: &serde_json::Value) -> HashMap<String, String> {
-    crate::models::providers(config)
-        .iter()
-        .flat_map(crate::models::models)
-        .filter_map(|model| {
-            Some((
-                model["slug"].as_str()?.to_string(),
-                model["name"].as_str()?.to_string(),
-            ))
-        })
-        .collect()
-}
-
-/// T3's name for the model when known, else a readable form of the slug (`claude-haiku-4-5` becomes
-/// `Claude Haiku 4.5`).
-pub fn model_display_name(slug: &str, names: &HashMap<String, String>) -> String {
-    if let Some(name) = names.get(slug) {
-        return name.clone();
-    }
+/// A readable form of a model slug (`claude-haiku-4-5` becomes `Claude Haiku 4.5`), for models
+/// missing from T3's provider list.
+pub fn model_display_name(slug: &str) -> String {
     let mut words: Vec<String> = Vec::new();
     for part in slug.split('-').filter(|p| !p.is_empty()) {
         let numeric = part.chars().all(|c| c.is_ascii_digit());
@@ -408,32 +394,9 @@ mod tests {
     }
 
     #[test]
-    fn reads_model_names_from_the_server_config() {
-        let config = serde_json::json!({"providers": [
-            {"instanceId": "codex", "models": [{"slug": "gpt-6-astra", "name": "GPT-6-Astra"}]},
-            {"instanceId": "claudeAgent", "models": [
-                {"slug": "claude-opus-5-5", "name": "Claude Opus 5.5"},
-                {"slug": "unnamed"}
-            ]}
-        ]});
-        let names = model_names(&config);
-        assert_eq!(names.len(), 2);
-        assert_eq!(
-            model_display_name("claude-opus-5-5", &names),
-            "Claude Opus 5.5"
-        );
-        assert_eq!(model_display_name("unnamed", &names), "Unnamed");
-    }
-
-    #[test]
     fn formats_model_names_modes_and_times() {
-        let names = HashMap::from([("gpt-6-astra".to_string(), "GPT-6-Astra".to_string())]);
-        assert_eq!(model_display_name("gpt-6-astra", &names), "GPT-6-Astra");
-        assert_eq!(
-            model_display_name("claude-haiku-4-5", &names),
-            "Claude Haiku 4.5"
-        );
-        assert_eq!(model_display_name("gpt-5.5", &names), "GPT 5.5");
+        assert_eq!(model_display_name("claude-haiku-4-5"), "Claude Haiku 4.5");
+        assert_eq!(model_display_name("gpt-5.5"), "GPT 5.5");
         assert_eq!(runtime_mode_label("approval-required"), "Supervised");
         assert_eq!(runtime_mode_label("full-access"), "Full access");
 
