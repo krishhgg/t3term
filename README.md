@@ -51,7 +51,7 @@ Tested against T3 Code `0.0.46-nightly.20261007.2787` on orchestration protocol 
 
 ## Why it exists
 
-**You already live in the terminal.** The agents T3 Code drives are terminal programs. Your editor is one window over. A whole desktop app to watch them is one window too many.
+**You prefer a TUI.** That is the main reason, and it does not need a better one. If you keep a terminal open all day, this puts the thread in it.
 
 **It costs less to leave open.** Both clients open on the same thread, on the same Mac, against one server holding 14 projects and 123 threads. Sampled every 5 seconds across a minute:
 
