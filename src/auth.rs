@@ -27,6 +27,9 @@ const SAVED_TTL_SECS: u64 = 30 * 24 * 60 * 60;
 /// A saved login this close to expiring is replaced rather than reused.
 const RENEW_WITHIN_SECS: u64 = 24 * 60 * 60;
 const SAVED_SCOPES: &[Scope] = &[Scope::Read, Scope::Operate];
+/// Longer than one login takes, which includes issuing a session (up to 90 seconds when T3 is
+/// slow). Past this, `login` falls back to a temporary session.
+const LOCK_WAIT: Duration = Duration::from_secs(30);
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
@@ -35,7 +38,7 @@ pub enum Scope {
 }
 
 impl Scope {
-    fn as_str(self) -> &'static str {
+    pub fn as_str(self) -> &'static str {
         match self {
             Scope::Read => "orchestration:read",
             Scope::Operate => "orchestration:operate",
@@ -179,6 +182,7 @@ pub struct Session {
     pub id: String,
     token: String,
     pub source: LoginSource,
+    pub scopes: Vec<Scope>,
 }
 
 impl fmt::Debug for Session {
@@ -187,6 +191,7 @@ impl fmt::Debug for Session {
             .field("id", &self.id)
             .field("token", &"<redacted>")
             .field("source", &self.source)
+            .field("scopes", &self.scopes)
             .finish()
     }
 }
@@ -216,18 +221,18 @@ impl Session {
         if !keychain::available() || std::env::var_os("T3TERM_NO_SAVED_LOGIN").is_some() {
             return Session::issue(runtime, scopes, ttl).await;
         }
-        let environment = runtime.environment_id.clone();
         // Concurrent first runs would each issue a login, and all but the last saved would leak.
-        let _lock = tokio::task::spawn_blocking(move || lock_logins(&environment))
-            .await
-            .ok()
-            .flatten();
-        let stale = match keychain::load(&runtime.environment_id) {
+        // Without the lock, a temporary session cannot collide with anything.
+        let Some(_lock) = lock_logins(&runtime.environment_id).await else {
+            return Session::issue(runtime, scopes, ttl).await;
+        };
+        let stale = match keychain::load(&runtime.environment_id).await {
             Some(saved) if fresh_enough(&saved, now_secs()) && accepted(runtime, &saved).await => {
                 return Ok(Session {
                     id: saved.session_id,
                     token: saved.token,
                     source: LoginSource::Saved,
+                    scopes: SAVED_SCOPES.to_vec(),
                 });
             }
             other => other,
@@ -238,12 +243,13 @@ impl Session {
             token: issued.token,
             expires_at: now_secs() + SAVED_TTL_SECS,
         };
-        if !keychain::save(&runtime.environment_id, &saved) {
+        if !keychain::save(&runtime.environment_id, &saved).await {
             track_live(&saved.session_id, &command, runtime);
             return Ok(Session {
                 id: saved.session_id,
                 token: saved.token,
                 source: LoginSource::Temporary,
+                scopes: SAVED_SCOPES.to_vec(),
             });
         }
         if let Some(old) = stale {
@@ -254,6 +260,7 @@ impl Session {
             id: saved.session_id,
             token: saved.token,
             source: LoginSource::NewlySaved,
+            scopes: SAVED_SCOPES.to_vec(),
         })
     }
 
@@ -265,6 +272,7 @@ impl Session {
             id: issued.session_id,
             token: issued.token,
             source: LoginSource::Temporary,
+            scopes: scopes.to_vec(),
         })
     }
 }
@@ -277,26 +285,48 @@ async fn accepted(runtime: &Runtime, saved: &SavedLogin) -> bool {
         .is_ok_and(|state| state.get("authenticated").and_then(Value::as_bool) == Some(true))
 }
 
-/// An exclusive lock shared by every t3term process logging in to this environment.
-fn lock_logins(environment_id: &str) -> Option<std::fs::File> {
+/// An exclusive lock shared by every t3term process that changes this environment's saved
+/// login. Polls without blocking so signals still get through, and gives up after `LOCK_WAIT`.
+async fn lock_logins(environment_id: &str) -> Option<std::fs::File> {
     let name: String = environment_id
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
         .collect();
-    let file = std::fs::OpenOptions::new()
-        .create(true)
-        .truncate(false)
-        .write(true)
-        .open(std::env::temp_dir().join(format!("t3term-login-{name}.lock")))
-        .ok()?;
-    file.lock().ok()?;
-    Some(file)
+    let path = std::env::temp_dir().join(format!("t3term-login-{name}.lock"));
+    let file = tokio::task::spawn_blocking(move || {
+        std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(false)
+            .write(true)
+            .open(path)
+    })
+    .await
+    .ok()?
+    .ok()?;
+    let deadline = tokio::time::Instant::now() + LOCK_WAIT;
+    loop {
+        match file.try_lock() {
+            Ok(()) => return Some(file),
+            Err(std::fs::TryLockError::WouldBlock) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(_) => return None,
+        }
+    }
 }
 
 /// Revokes this environment's saved login and removes it from the Keychain.
 /// Returns the revoked session id, or `None` when nothing was saved.
 pub async fn logout(runtime: &Runtime) -> Result<Option<String>> {
-    let Some(saved) = keychain::load(&runtime.environment_id) else {
+    // Holding the login lock means no other process can replace the saved login between the
+    // revoke and the delete below.
+    let _lock = lock_logins(&runtime.environment_id).await.ok_or_else(|| {
+        err(
+            "T3_AUTH_FAILED",
+            "Another t3term process is changing the saved login. Try again.",
+        )
+    })?;
+    let Some(saved) = keychain::load(&runtime.environment_id).await else {
         return Ok(None);
     };
     let command = resolve_t3_command(runtime)?;
@@ -321,7 +351,7 @@ pub async fn logout(runtime: &Runtime) -> Result<Option<String>> {
             "`t3 auth session revoke` failed, so the saved login was kept.",
         ));
     }
-    keychain::delete(Some(&runtime.environment_id));
+    keychain::delete(Some(&runtime.environment_id)).await?;
     Ok(Some(saved.session_id))
 }
 

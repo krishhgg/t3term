@@ -3,15 +3,26 @@
 //! Items are written and read through Apple's `/usr/bin/security`, so each item trusts that signed
 //! tool rather than this binary, and rebuilding t3term never triggers a Keychain prompt. The secret
 //! reaches `security` on stdin, never in argv where other processes could read it.
+//!
+//! Every call runs `security` as an async child with a timeout, so a stalled Keychain (for
+//! example one waiting on an unlock prompt) cannot block the runtime or the signal handlers.
 
 use std::fmt;
-use std::io::Write;
-use std::process::{Command, Stdio};
+use std::process::{Output, Stdio};
+use std::time::Duration;
 
+use anyhow::Result;
 use serde::{Deserialize, Serialize};
+use tokio::io::AsyncWriteExt;
+use tokio::process::Command;
+
+use crate::error::err;
 
 const SERVICE: &str = "t3term";
 const SECURITY: &str = "/usr/bin/security";
+const TIMEOUT: Duration = Duration::from_secs(15);
+/// `security` exits with this when no item matches (errSecItemNotFound).
+const NOT_FOUND: i32 = 44;
 
 #[derive(Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -36,23 +47,46 @@ pub fn available() -> bool {
     cfg!(target_os = "macos") && std::path::Path::new(SECURITY).exists()
 }
 
-pub fn load(environment_id: &str) -> Option<SavedLogin> {
+/// Runs `security` with optional stdin. `None` means it could not start or timed out, in which
+/// case dropping the child kills it.
+async fn security(args: &[&str], input: Option<&str>) -> Option<Output> {
+    let mut child = Command::new(SECURITY)
+        .args(args)
+        .stdin(if input.is_some() {
+            Stdio::piped()
+        } else {
+            Stdio::null()
+        })
+        .stdout(Stdio::piped())
+        .stderr(Stdio::null())
+        .kill_on_drop(true)
+        .spawn()
+        .ok()?;
+    let run = async {
+        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+            stdin.write_all(input.as_bytes()).await.ok()?;
+        }
+        child.wait_with_output().await.ok()
+    };
+    tokio::time::timeout(TIMEOUT, run).await.ok().flatten()
+}
+
+pub async fn load(environment_id: &str) -> Option<SavedLogin> {
     if !available() || !is_plain_word(environment_id) {
         return None;
     }
-    let output = Command::new(SECURITY)
-        .args([
+    let output = security(
+        &[
             "find-generic-password",
             "-s",
             SERVICE,
             "-a",
             environment_id,
             "-w",
-        ])
-        .stdin(Stdio::null())
-        .stderr(Stdio::null())
-        .output()
-        .ok()?;
+        ],
+        None,
+    )
+    .await?;
     if !output.status.success() {
         return None;
     }
@@ -60,57 +94,52 @@ pub fn load(environment_id: &str) -> Option<SavedLogin> {
 }
 
 /// Saves the login and reads it back, returning whether it is now stored.
-pub fn save(environment_id: &str, login: &SavedLogin) -> bool {
+pub async fn save(environment_id: &str, login: &SavedLogin) -> bool {
     if !available() || !is_plain_word(environment_id) {
         return false;
     }
-    let Ok(mut child) = Command::new(SECURITY)
-        .arg("-i")
-        .stdin(Stdio::piped())
-        .stdout(Stdio::null())
-        .stderr(Stdio::null())
-        .spawn()
-    else {
-        return false;
-    };
     let line = format!(
         "add-generic-password -U -s {SERVICE} -a {environment_id} -w {}\n",
         encode(login)
     );
-    let written = child
-        .stdin
-        .take()
-        .is_some_and(|mut stdin| stdin.write_all(line.as_bytes()).is_ok());
-    let exited = child.wait().is_ok_and(|status| status.success());
+    let exited = security(&["-i"], Some(&line))
+        .await
+        .is_some_and(|output| output.status.success());
     // `security -i` can exit 0 after a failed command, so confirm by reading the item back.
-    written && exited && load(environment_id).as_ref() == Some(login)
+    exited && load(environment_id).await.as_ref() == Some(login)
 }
 
-/// Deletes the saved login for one environment, or every t3term login. Returns how many it removed.
-pub fn delete(environment_id: Option<&str>) -> usize {
+/// Deletes the saved login for one environment, or every t3term login, and returns how many it
+/// removed. Fails if `security` reports anything other than success or "not found".
+pub async fn delete(environment_id: Option<&str>) -> Result<usize> {
     if !available() || environment_id.is_some_and(|id| !is_plain_word(id)) {
-        return 0;
+        return Ok(0);
+    }
+    let mut args = vec!["delete-generic-password", "-s", SERVICE];
+    if let Some(id) = environment_id {
+        args.extend(["-a", id]);
     }
     let mut removed = 0;
     // `delete-generic-password` removes one match per call.
     while removed < 1000 {
-        let mut command = Command::new(SECURITY);
-        command.args(["delete-generic-password", "-s", SERVICE]);
-        if let Some(id) = environment_id {
-            command.args(["-a", id]);
+        let status = security(&args, None).await.map(|output| output.status);
+        match status.and_then(|status| status.code()) {
+            Some(0) => removed += 1,
+            Some(NOT_FOUND) => break,
+            code => {
+                return Err(err(
+                    "KEYCHAIN_FAILED",
+                    match code {
+                        Some(code) => format!(
+                            "`security delete-generic-password` exited with {code}, so the saved login may still be in the Keychain."
+                        ),
+                        None => "`security delete-generic-password` did not finish, so the saved login may still be in the Keychain.".to_string(),
+                    },
+                ));
+            }
         }
-        let deleted = command
-            .stdin(Stdio::null())
-            .stdout(Stdio::null())
-            .stderr(Stdio::null())
-            .status()
-            .is_ok_and(|status| status.success());
-        if !deleted {
-            break;
-        }
-        removed += 1;
     }
-    removed
+    Ok(removed)
 }
 
 /// The value is hex-encoded JSON, so it is a single word on the `security -i` command line.

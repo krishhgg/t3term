@@ -60,6 +60,11 @@ impl Client {
         self.session.source
     }
 
+    /// The scopes the session carries.
+    pub fn scopes(&self) -> &[Scope] {
+        &self.session.scopes
+    }
+
     /// The shared RPC connection, reopened if it dropped.
     pub async fn rpc(&self) -> Result<RpcClient> {
         let mut slot = self.rpc.lock().await;

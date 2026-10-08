@@ -127,27 +127,22 @@ impl DecisionArg {
 fn main() {
     let cli = Cli::parse();
     let json_mode = cli.json;
-    let tui = matches!(cli.command, None | Some(Command::Tui));
     let runtime = tokio::runtime::Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("tokio runtime");
-    let (code, signalled) = runtime.block_on(async move {
+    let code = runtime.block_on(async move {
         // Racing signals lets destructors run, which revokes the session. A closed terminal
         // window sends SIGHUP.
         tokio::select! {
             result = run(cli) => match result {
-                Ok(code) => (code, false),
-                Err(error) => (report(&error, json_mode), false),
+                Ok(code) => code,
+                Err(error) => report(&error, json_mode),
             },
-            _ = tokio::signal::ctrl_c() => (130, true),
-            code = hangup_or_terminate() => (code, true),
+            _ = tokio::signal::ctrl_c() => 130,
+            code = hangup_or_terminate() => code,
         }
     });
-    if signalled && tui {
-        // The TUI was dropped mid-frame, so put the terminal back in normal mode.
-        ratatui::restore();
-    }
     runtime.shutdown_timeout(Duration::from_millis(200));
     // Watcher tasks may still hold the client, so revoke explicitly rather than rely on Drop.
     t3term::auth::revoke_all_sessions();
@@ -158,9 +153,10 @@ fn main() {
 #[cfg(unix)]
 async fn hangup_or_terminate() -> i32 {
     use tokio::signal::unix::{SignalKind, signal};
-    let (Ok(mut hangup), Ok(mut terminate)) =
-        (signal(SignalKind::hangup()), signal(SignalKind::terminate()))
-    else {
+    let (Ok(mut hangup), Ok(mut terminate)) = (
+        signal(SignalKind::hangup()),
+        signal(SignalKind::terminate()),
+    ) else {
         return std::future::pending().await;
     };
     tokio::select! {
@@ -179,13 +175,16 @@ fn report(error: &anyhow::Error, json_mode: bool) -> i32 {
         Some(t3) => (t3.code, t3.exit_code),
         None => ("ERROR", exit::FAILURE),
     };
+    // `println!` panics when the terminal is gone, and a panic here would skip the revoke in
+    // `main`, so write without panicking.
     if json_mode {
-        println!(
+        let _ = writeln!(
+            std::io::stdout(),
             "{}",
             json!({"ok": false, "error": {"code": code, "message": error.to_string()}})
         );
     } else {
-        eprintln!("t3term: {error} [{code}]");
+        let _ = writeln!(std::io::stderr(), "t3term: {error} [{code}]");
     }
     exit_code
 }
@@ -732,7 +731,7 @@ async fn doctor(json_mode: bool) -> Result<i32> {
             );
         }
         Ok(client) => {
-            checks.insert("auth".into(), json!({"ok": true, "login": client.login_source().as_str(), "ms": started.elapsed().as_millis()}));
+            checks.insert("auth".into(), json!({"ok": true, "scopes": client.scopes().iter().map(|s| s.as_str()).collect::<Vec<_>>(), "login": client.login_source().as_str(), "ms": started.elapsed().as_millis()}));
             match client.shell().await {
                 Ok(shell) => checks.insert("http".into(), json!({"ok": true, "projects": shell.projects.len(), "threads": shell.threads.len()})),
                 Err(error) => {
@@ -774,7 +773,7 @@ async fn logout(json_mode: bool) -> Result<i32> {
             None => format!("No saved login for {}.", runtime.origin),
         },
         // Without the server there is no environment id to pick one login, so remove them all.
-        Err(_) => match t3term::keychain::delete(None) {
+        Err(_) => match t3term::keychain::delete(None).await? {
             0 => "No saved logins.".to_string(),
             removed => format!(
                 "Removed {removed} saved login(s) from the Keychain. T3 is not running, so they could not be revoked; each expires within 30 days of being issued."

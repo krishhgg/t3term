@@ -86,16 +86,35 @@ struct App {
 }
 
 pub async fn run(client: Arc<Client>) -> Result<()> {
-    let mut terminal = ratatui::init();
+    let mut screen = Screen(Some(ratatui::init()));
     crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
-    let result = event_loop(&mut terminal, client).await;
-    let _ = crossterm::execute!(
-        std::io::stdout(),
-        DisableMouseCapture,
-        DisableBracketedPaste
-    );
-    ratatui::restore();
-    result
+    let Some(terminal) = screen.0.as_mut() else {
+        return Ok(());
+    };
+    event_loop(terminal, client).await
+}
+
+/// Owns the terminal while the TUI runs and puts it back when dropped, including when main
+/// drops the TUI after a signal.
+struct Screen(Option<ratatui::DefaultTerminal>);
+
+impl Drop for Screen {
+    fn drop(&mut self) {
+        let _ = crossterm::execute!(
+            std::io::stdout(),
+            DisableMouseCapture,
+            DisableBracketedPaste
+        );
+        // Once the terminal has closed, ratatui's own Drop for Terminal and `ratatui::restore`
+        // print their errors with `eprintln!`, which panics. A panic here aborts the process
+        // before main revokes the session, so skip both when the terminal is gone.
+        if let Some(mut terminal) = self.0.take()
+            && terminal.show_cursor().is_err()
+        {
+            std::mem::forget(terminal);
+        }
+        let _ = ratatui::try_restore();
+    }
 }
 
 async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>) -> Result<()> {
