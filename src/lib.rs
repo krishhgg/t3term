@@ -3,6 +3,7 @@ pub mod client;
 pub mod discovery;
 pub mod error;
 pub mod http;
+pub mod keychain;
 pub mod projection;
 pub mod rpc;
 pub mod transcript;

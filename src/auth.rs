@@ -1,19 +1,32 @@
-//! Issues short-lived, scoped bearer sessions through the running server's own `t3` command.
+//! Logs in to the T3 server with bearer sessions issued through the server's own `t3` command.
 //!
 //! The `t3` on PATH is often a different build than the server. Running the server's own entry
 //! point keeps the auth command and the server on the same version and database.
+//!
+//! Issuing a session starts T3's Node CLI, which costs about half a second of CPU. So on macOS one
+//! session per environment is saved in the Keychain and reused for 30 days. Elsewhere, or when
+//! `T3TERM_NO_SAVED_LOGIN` is set, each process issues a temporary session and revokes it on exit.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
-use std::process::Stdio;
+use std::process::{Child, Stdio};
 use std::sync::Mutex;
-use std::time::Duration;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result};
 use serde::Deserialize;
+use serde_json::Value;
 
 use crate::discovery::Runtime;
 use crate::error::{err, err_exit, exit};
+use crate::http::Api;
+use crate::keychain::{self, SavedLogin};
+
+const SAVED_TTL: &str = "30d";
+const SAVED_TTL_SECS: u64 = 30 * 24 * 60 * 60;
+/// A saved login this close to expiring is replaced rather than reused.
+const RENEW_WITHIN_SECS: u64 = 24 * 60 * 60;
+const SAVED_SCOPES: &[Scope] = &[Scope::Read, Scope::Operate];
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
@@ -140,10 +153,32 @@ struct Issued {
     token: String,
 }
 
-/// A bearer session. It revokes itself when dropped so no credential outlives the process.
+/// Where a session came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LoginSource {
+    /// The login saved in the Keychain, reused.
+    Saved,
+    /// A new login, now saved in the Keychain.
+    NewlySaved,
+    /// A login for this process only, revoked when it exits.
+    Temporary,
+}
+
+impl LoginSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            LoginSource::Saved => "saved",
+            LoginSource::NewlySaved => "newly saved",
+            LoginSource::Temporary => "temporary",
+        }
+    }
+}
+
+/// A bearer session. A temporary one revokes itself when dropped so it never outlives the process.
 pub struct Session {
     pub id: String,
     token: String,
+    pub source: LoginSource,
 }
 
 impl fmt::Debug for Session {
@@ -151,8 +186,21 @@ impl fmt::Debug for Session {
         f.debug_struct("Session")
             .field("id", &self.id)
             .field("token", &"<redacted>")
+            .field("source", &self.source)
             .finish()
     }
+}
+
+fn now_secs() -> u64 {
+    SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map(|d| d.as_secs())
+        .unwrap_or(0)
+}
+
+/// Whether a saved login has enough time left to reuse.
+fn fresh_enough(saved: &SavedLogin, now: u64) -> bool {
+    saved.expires_at > now.saturating_add(RENEW_WITHIN_SECS)
 }
 
 impl Session {
@@ -160,68 +208,191 @@ impl Session {
         &self.token
     }
 
-    pub async fn issue(runtime: &Runtime, scopes: &[Scope], ttl: &str) -> Result<Session> {
-        let command = resolve_t3_command(runtime)?;
-        let mut issue = tokio::process::Command::from(command.command());
-        issue.args([
-            "auth",
-            "session",
-            "issue",
-            "--json",
-            "--ttl",
-            ttl,
-            "--label",
-            "t3term",
-            "--subject",
-            "t3term",
-        ]);
-        for scope in scopes {
-            issue.args(["--scope", scope.as_str()]);
+    /// Reuses the saved login for this environment, or issues and saves a new one.
+    ///
+    /// `scopes` and `ttl` apply only to a temporary session. A saved login always carries
+    /// read and operate, because the TUI and the write commands share it.
+    pub async fn login(runtime: &Runtime, scopes: &[Scope], ttl: &str) -> Result<Session> {
+        if !keychain::available() || std::env::var_os("T3TERM_NO_SAVED_LOGIN").is_some() {
+            return Session::issue(runtime, scopes, ttl).await;
         }
-        issue.arg("--base-dir").arg(&runtime.t3_home);
-        issue.stdin(Stdio::null()).kill_on_drop(true);
-        let output = tokio::time::timeout(Duration::from_secs(90), issue.output())
+        let environment = runtime.environment_id.clone();
+        // Concurrent first runs would each issue a login, and all but the last saved would leak.
+        let _lock = tokio::task::spawn_blocking(move || lock_logins(&environment))
             .await
-            .map_err(|_| {
-                err(
-                    "T3_AUTH_FAILED",
-                    "`t3 auth session issue` did not finish within 90 seconds.",
-                )
-            })?
-            .with_context(|| format!("could not start {}", command.program.display()))?;
-        if !output.status.success() {
-            return Err(err(
-                "T3_AUTH_FAILED",
-                format!(
-                    "`t3 auth session issue` failed: {}",
-                    String::from_utf8_lossy(&output.stderr)
-                        .lines()
-                        .last()
-                        .unwrap_or("no output")
-                ),
-            ));
+            .ok()
+            .flatten();
+        let stale = match keychain::load(&runtime.environment_id) {
+            Some(saved) if fresh_enough(&saved, now_secs()) && accepted(runtime, &saved).await => {
+                return Ok(Session {
+                    id: saved.session_id,
+                    token: saved.token,
+                    source: LoginSource::Saved,
+                });
+            }
+            other => other,
+        };
+        let (issued, command) = issue_session(runtime, SAVED_SCOPES, SAVED_TTL).await?;
+        let saved = SavedLogin {
+            session_id: issued.session_id,
+            token: issued.token,
+            expires_at: now_secs() + SAVED_TTL_SECS,
+        };
+        if !keychain::save(&runtime.environment_id, &saved) {
+            track_live(&saved.session_id, &command, runtime);
+            return Ok(Session {
+                id: saved.session_id,
+                token: saved.token,
+                source: LoginSource::Temporary,
+            });
         }
-        let issued: Issued = serde_json::from_slice(&output.stdout).map_err(|_| {
-            err(
-                "T3_AUTH_FAILED",
-                "`t3 auth session issue` returned an unreadable credential.",
-            )
-        })?;
-        LIVE.lock().unwrap_or_else(|e| e.into_inner()).push((
-            issued.session_id.clone(),
-            command.clone(),
-            runtime.t3_home.clone(),
-        ));
+        if let Some(old) = stale {
+            // Revoked on exit; the server ignores a revoke for a session it already dropped.
+            track_live(&old.session_id, &command, runtime);
+        }
+        Ok(Session {
+            id: saved.session_id,
+            token: saved.token,
+            source: LoginSource::NewlySaved,
+        })
+    }
+
+    /// Issues a temporary session that is revoked when it drops or the process exits.
+    pub async fn issue(runtime: &Runtime, scopes: &[Scope], ttl: &str) -> Result<Session> {
+        let (issued, command) = issue_session(runtime, scopes, ttl).await?;
+        track_live(&issued.session_id, &command, runtime);
         Ok(Session {
             id: issued.session_id,
             token: issued.token,
+            source: LoginSource::Temporary,
         })
     }
+}
+
+/// Whether the server still accepts a saved login. One local request.
+async fn accepted(runtime: &Runtime, saved: &SavedLogin) -> bool {
+    Api::new(runtime, &saved.token)
+        .get("/api/auth/session")
+        .await
+        .is_ok_and(|state| state.get("authenticated").and_then(Value::as_bool) == Some(true))
+}
+
+/// An exclusive lock shared by every t3term process logging in to this environment.
+fn lock_logins(environment_id: &str) -> Option<std::fs::File> {
+    let name: String = environment_id
+        .chars()
+        .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
+        .collect();
+    let file = std::fs::OpenOptions::new()
+        .create(true)
+        .truncate(false)
+        .write(true)
+        .open(std::env::temp_dir().join(format!("t3term-login-{name}.lock")))
+        .ok()?;
+    file.lock().ok()?;
+    Some(file)
+}
+
+/// Revokes this environment's saved login and removes it from the Keychain.
+/// Returns the revoked session id, or `None` when nothing was saved.
+pub async fn logout(runtime: &Runtime) -> Result<Option<String>> {
+    let Some(saved) = keychain::load(&runtime.environment_id) else {
+        return Ok(None);
+    };
+    let command = resolve_t3_command(runtime)?;
+    let mut revoke = tokio::process::Command::from(revoke_command(
+        &saved.session_id,
+        &command,
+        &runtime.t3_home,
+    ));
+    revoke.kill_on_drop(true);
+    let status = tokio::time::timeout(Duration::from_secs(60), revoke.status())
+        .await
+        .map_err(|_| {
+            err(
+                "T3_AUTH_FAILED",
+                "`t3 auth session revoke` did not finish within 60 seconds.",
+            )
+        })?
+        .with_context(|| format!("could not start {}", command.program.display()))?;
+    if !status.success() {
+        return Err(err(
+            "T3_AUTH_FAILED",
+            "`t3 auth session revoke` failed, so the saved login was kept.",
+        ));
+    }
+    keychain::delete(Some(&runtime.environment_id));
+    Ok(Some(saved.session_id))
+}
+
+async fn issue_session(
+    runtime: &Runtime,
+    scopes: &[Scope],
+    ttl: &str,
+) -> Result<(Issued, T3Command)> {
+    let command = resolve_t3_command(runtime)?;
+    let mut issue = tokio::process::Command::from(command.command());
+    issue.args([
+        "auth",
+        "session",
+        "issue",
+        "--json",
+        "--ttl",
+        ttl,
+        "--label",
+        "t3term",
+        "--subject",
+        "t3term",
+    ]);
+    for scope in scopes {
+        issue.args(["--scope", scope.as_str()]);
+    }
+    issue.arg("--base-dir").arg(&runtime.t3_home);
+    issue.stdin(Stdio::null()).kill_on_drop(true);
+    let output = tokio::time::timeout(Duration::from_secs(90), issue.output())
+        .await
+        .map_err(|_| {
+            err(
+                "T3_AUTH_FAILED",
+                "`t3 auth session issue` did not finish within 90 seconds.",
+            )
+        })?
+        .with_context(|| format!("could not start {}", command.program.display()))?;
+    if !output.status.success() {
+        return Err(err(
+            "T3_AUTH_FAILED",
+            format!(
+                "`t3 auth session issue` failed: {}",
+                String::from_utf8_lossy(&output.stderr)
+                    .lines()
+                    .last()
+                    .unwrap_or("no output")
+            ),
+        ));
+    }
+    let issued: Issued = serde_json::from_slice(&output.stdout).map_err(|_| {
+        err(
+            "T3_AUTH_FAILED",
+            "`t3 auth session issue` returned an unreadable credential.",
+        )
+    })?;
+    Ok((issued, command))
 }
 
 /// Sessions this process issued and has not revoked. Background tasks can keep a `Session` alive
 /// past the end of `main`, so the binary revokes whatever is left here before it exits.
 static LIVE: Mutex<Vec<(String, T3Command, PathBuf)>> = Mutex::new(Vec::new());
+
+/// Revocations already started, which `revoke_all_sessions` still waits for.
+static PENDING: Mutex<Vec<Child>> = Mutex::new(Vec::new());
+
+fn track_live(id: &str, command: &T3Command, runtime: &Runtime) {
+    LIVE.lock().unwrap_or_else(|e| e.into_inner()).push((
+        id.to_string(),
+        command.clone(),
+        runtime.t3_home.clone(),
+    ));
+}
 
 fn revoke_command(id: &str, command: &T3Command, t3_home: &Path) -> std::process::Command {
     let mut revoke = command.command();
@@ -231,6 +402,9 @@ fn revoke_command(id: &str, command: &T3Command, t3_home: &Path) -> std::process
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::null());
+    // Its own process group, so a terminal closing as t3term exits cannot hang it up mid-revoke.
+    #[cfg(unix)]
+    std::os::unix::process::CommandExt::process_group(&mut revoke, 0);
     revoke
 }
 
@@ -246,12 +420,14 @@ fn take_live(id: Option<&str>) -> Vec<(String, T3Command, PathBuf)> {
     }
 }
 
-/// Revokes every session still open and waits up to three seconds for the revocations.
+/// Revokes every temporary session still open and waits up to three seconds for all revocations,
+/// including ones a dropped `Session` already started.
 pub fn revoke_all_sessions() {
-    let mut children: Vec<_> = take_live(None)
+    let mut children: Vec<Child> = take_live(None)
         .iter()
         .filter_map(|(id, command, home)| revoke_command(id, command, home).spawn().ok())
         .collect();
+    children.append(&mut PENDING.lock().unwrap_or_else(|e| e.into_inner()));
     let deadline = std::time::Instant::now() + Duration::from_secs(3);
     while !children.is_empty() && std::time::Instant::now() < deadline {
         children.retain_mut(|child| matches!(child.try_wait(), Ok(None)));
@@ -262,8 +438,12 @@ pub fn revoke_all_sessions() {
 impl Drop for Session {
     fn drop(&mut self) {
         for (id, command, home) in take_live(Some(&self.id)) {
-            // Not awaited: a spawned revoke finishes even if this process exits first.
-            let _ = revoke_command(&id, &command, &home).spawn();
+            if let Ok(child) = revoke_command(&id, &command, &home).spawn() {
+                PENDING
+                    .lock()
+                    .unwrap_or_else(|e| e.into_inner())
+                    .push(child);
+            }
         }
     }
 }
@@ -287,6 +467,19 @@ mod tests {
             ]
         );
         assert!(command.electron_as_node);
+    }
+
+    #[test]
+    fn renews_a_saved_login_within_a_day_of_expiry() {
+        let saved = |expires_at| SavedLogin {
+            session_id: "s".into(),
+            token: "t".into(),
+            expires_at,
+        };
+        let now = 1_000_000;
+        assert!(fresh_enough(&saved(now + RENEW_WITHIN_SECS + 1), now));
+        assert!(!fresh_enough(&saved(now + RENEW_WITHIN_SECS), now));
+        assert!(!fresh_enough(&saved(now - 1), now));
     }
 
     #[test]

@@ -26,6 +26,7 @@ t3term wait <thread>                stream the current turn until it ends
 t3term requests <thread>            pending approvals and questions
 t3term approve <thread> [--request ID] [--decision accept|accept-for-session|decline|cancel]
 t3term interrupt <thread>
+t3term logout                       revoke the saved login and remove it from the Keychain
 ```
 
 `<thread>` takes a full id, the 8-character prefix `threads` prints, or an exact title. `send` reads stdin when you omit the prompt. Add `--json` to any command for machine-readable output.
@@ -47,7 +48,7 @@ The mouse wheel scrolls the transcript and the sidebar, and clicking a thread op
 ## How it works
 
 - **Discovery.** The client reads `~/.t3/userdata/server-runtime.json` (or `$T3CODE_HOME`, or `T3TERM_ORIGIN`). It checks `/.well-known/t3/environment` and refuses any server that is not on protocol 2.
-- **Auth.** It runs `t3 auth session issue` through the running server's own binary, which it finds from the server pid. The `t3` on PATH can be a different version. Each session gets only `orchestration:read`, plus `orchestration:operate` for commands that write. The session is revoked on exit, including after Ctrl+C. Override the binary with `T3TERM_T3_COMMAND`.
+- **Auth.** On macOS, t3term saves one login per T3 server in the login Keychain under the service `t3term`. The login lasts 30 days, the same as T3's default session length, and has only `orchestration:read` and `orchestration:operate`. Each run checks it against `/api/auth/session`. If it expires within a day or the server rejects it, t3term issues a new one and revokes the old one, so you never log in by hand. `t3term logout` revokes it and deletes it. With the saved login, a CLI command uses about 15 ms of CPU. Issuing a session costs about 0.8 s, because it runs `t3 auth session issue` through the running server's own binary. t3term finds that binary from the server pid, since the `t3` on PATH can be a different version. Override it with `T3TERM_T3_COMMAND`. Set `T3TERM_NO_SAVED_LOGIN=1` to use a session that lasts one run instead. t3term revokes it on exit, including after Ctrl+C, `kill` or a closed terminal window.
 - **RPC.** Effect RPC runs over one `/ws` connection. The client acks every stream chunk and pings every 10 seconds. If no frame arrives for 30 seconds, it treats the socket as dead.
 - **State.** Each V2 event carries the whole updated entity, so the reducer upserts it by id. After a dropped connection, the client resubscribes with `afterSequence` and skips any replayed event it already applied.
 - **Rendering.** The TUI draws only after input or a server event, at most 30 times a second. Each transcript block keeps its wrapped lines until its content or the width changes. Only the visible rows are copied into each frame.
@@ -66,5 +67,5 @@ The unit tests cover the reducers, Markdown wrapping, the composer and auth comm
 - Loading older history for long threads. The TUI opens a bounded recent window.
 - New threads, diffs and checkpoints, worktrees, attachments, embedded terminals and queue management.
 - A check of the reducer's output against T3's TypeScript reducer on recorded event streams.
-- Linux and Windows. The code has Linux pid lookup, but only macOS has been tested.
+- Linux and Windows. The code has Linux pid lookup, but only macOS has been tested. The saved login needs the macOS Keychain, so other systems issue a new session on every run.
 - Resource numbers beyond one 60-second idle check: 0.03% of one core, 13.5 MB RSS.

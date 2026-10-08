@@ -9,7 +9,7 @@ use anyhow::Result;
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
 
-use crate::auth::{Scope, Session};
+use crate::auth::{LoginSource, Scope, Session};
 use crate::discovery::{self, Runtime};
 use crate::error::{err, err_exit, exit};
 use crate::http::Api;
@@ -22,8 +22,8 @@ const MAX_BACKOFF: Duration = Duration::from_secs(10);
 pub struct Client {
     pub runtime: Runtime,
     pub api: Api,
-    // Held for its Drop, which revokes the credential.
-    _session: Session,
+    // Held for its Drop, which revokes a temporary credential.
+    session: Session,
     rpc: Mutex<Option<RpcClient>>,
 }
 
@@ -46,14 +46,18 @@ impl Client {
     pub async fn connect(scopes: &[Scope], ttl: &str) -> Result<Client> {
         let runtime = discovery::discover().await?;
         runtime.require_supported_protocol()?;
-        let session = Session::issue(&runtime, scopes, ttl).await?;
+        let session = Session::login(&runtime, scopes, ttl).await?;
         let api = Api::new(&runtime, session.token());
         Ok(Client {
             runtime,
             api,
-            _session: session,
+            session,
             rpc: Mutex::new(None),
         })
+    }
+
+    pub fn login_source(&self) -> LoginSource {
+        self.session.source
     }
 
     /// The shared RPC connection, reopened if it dropped.
