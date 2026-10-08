@@ -20,13 +20,14 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 
 | # | Pull request | What it does | Merge commit |
 |---|---|---|---|
-| 1 | https://github.com/krishhgg/t3term/pull/8 | CI, CLI exit-code tests, this record, nightly sync deferred | |
-| 2 | https://github.com/krishhgg/t3term/pull/9 | Pinned, Active, Snoozed and Settled shelves in the sidebar | |
-| 3 | https://github.com/krishhgg/t3term/pull/10 | The desktop's status words on sidebar cards | |
-| 4 | https://github.com/krishhgg/t3term/pull/11 | Build and Plan hidden unless the legacy plan setting turns them on | |
-| 5 | https://github.com/krishhgg/t3term/pull/12 | The Plan agent hidden in model options unless the same setting turns it on | |
-| 6 | https://github.com/krishhgg/t3term/pull/13 | An opt-in Working shelf for threads busy without the user | |
-| 7 | https://github.com/krishhgg/t3term/pull/14 | Proposed plans as cards that collapse when long | |
+| 1 | https://github.com/krishhgg/t3term/pull/8 | CI, CLI exit-code tests, this record, nightly sync deferred | `1a7a5ae5d140c4e880fcaf19f5a646b13fcc7f92` |
+| 2 | https://github.com/krishhgg/t3term/pull/9 | Pinned, Active, Snoozed and Settled shelves in the sidebar | `01b64a9e0f7a161c7275786e30da44c9608bb9c9` |
+| 3 | https://github.com/krishhgg/t3term/pull/10 | The desktop's status words on sidebar cards | `cf1ff1ff1fe3b7efa622abce8aa699feb86619b8` |
+| 4 | https://github.com/krishhgg/t3term/pull/11 | Build and Plan hidden unless the legacy plan setting turns them on | `ce171674f38ad416165a0b1b32f32c0b56923d0e` |
+| 5 | https://github.com/krishhgg/t3term/pull/12 | The Plan agent hidden in model options unless the same setting turns it on | `3fde25a954e3581ec031ab7470a5ffd777b69f7c` |
+| 6 | https://github.com/krishhgg/t3term/pull/13 | An opt-in Working shelf for threads busy without the user | `25477c1d01ca5e49fdba4568c80f7790c6be7a4c` |
+| 7 | https://github.com/krishhgg/t3term/pull/14 | Proposed plans as cards that collapse when long | `65e3d4351a0f70826c943cc160b7da6d898cd511` |
+| 8 | https://github.com/krishhgg/t3term/pull/15 | The running turn's tasks in a drawer above the composer, and checklist steps read in the nightly's shape | |
 
 ## Maintenance review PRs
 

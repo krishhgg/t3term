@@ -91,12 +91,13 @@ The TUI follows the desktop app closely, because muscle memory is worth more tha
 | Anywhere | Tab / Shift+Tab move focus, PgUp/PgDn scroll, Ctrl+X interrupt, Ctrl+C quit |
 | Anywhere, approval pending | Alt+A accept, Alt+S accept for session, Alt+D decline. Alt+↑/↓ or the wheel scrolls a long request |
 | Anywhere, thread open | Alt+M model, Alt+E reasoning effort and other model options, Alt+P access, and plan mode once it's turned on |
+| Anywhere, tasks drawer showing | Alt+T open or close the task list. Alt+↑/↓ or the wheel scrolls a long list |
 | Open menu | ↑/↓ choose, Enter select, Esc close. In the model menu, type to search |
 | Sidebar | ↑/↓ or j/k select, Enter open, w open or close the Working shelf once it's turned on, e show or hide the Settled shelf, q quit |
 | Composer | Enter send (queues if the thread is busy), Alt+Enter or Ctrl+J newline, Ctrl+R swap in an unsent message, Esc to transcript |
 | Transcript | ↑/↓ scroll, g/G top/bottom, t open or close every row of tool calls, p expand or collapse the first long plan in view, Enter compose, Esc sidebar |
 
-The wheel scrolls the transcript and the sidebar. Clicking a thread opens it, clicking the Working heading or the Settled footer opens or closes that shelf, clicking a chip under the composer opens its menu, and clicking a row of tool calls opens that row. Clicking the top edge of a long plan, or its Expand plan or Collapse plan button, expands or collapses that plan.
+The wheel scrolls the transcript and the sidebar. Clicking a thread opens it, clicking the Working heading or the Settled footer opens or closes that shelf, clicking a chip under the composer opens its menu, clicking the top row of the tasks drawer opens or closes its list, and clicking a row of tool calls opens that row. Clicking the top edge of a long plan, or its Expand plan or Collapse plan button, expands or collapses that plan.
 
 On macOS the Alt keys need Option to send Meta: "Use Option as Meta key" in Terminal, "Esc+" for the Option key in iTerm2, or `macos-option-as-alt = true` in Ghostty.
 
@@ -116,13 +117,23 @@ While Plan is hidden, the TUI sends every message in Build. A thread that the CL
 
 ### Proposed plans
 
-A plan an agent proposes appears in the transcript as a card, like the nightly desktop's plan card. Its top edge has a Plan chip and the plan's title, which is the first Markdown heading in it, or "Proposed plan" when it has none. Inside is the plan as Markdown, without its title line or a Summary heading right under it. Cards show whether or not `planModeEnabled` is on. The checklist an agent keeps while it works is a different item, and it keeps its plain Plan rows.
+A plan an agent proposes appears in the transcript as a card, like the nightly desktop's plan card. Its top edge has a Plan chip and the plan's title, which is the first Markdown heading in it, or "Proposed plan" when it has none. Inside is the plan as Markdown, without its title line or a Summary heading right under it. Cards show whether or not `planModeEnabled` is on. The checklist an agent keeps while it works is a different item. It stays a plain Plan row in the transcript, and the running turn's checklist also shows in the tasks drawer below.
 
 A plan longer than 900 characters or 20 lines starts collapsed, as on the desktop. Characters here are UTF-16 code units, the desktop's measure, so an emoji counts as two. A collapsed plan shows its first ten lines with text, then `...`, and has an Expand plan button in its bottom edge. A click on the button or on the card's top edge expands it, and Collapse plan folds it again. With the transcript focused, `p` does the same for the first long plan in view, reading down from the top of the screen. A plan counts as in view while any of it shows, even after its top edge has scrolled off. With no long plan in view `p` does nothing, and the status line offers `p` only when it would act. A shorter plan shows in full and has no button.
 
 Expanding or collapsing a plan keeps its top edge on the same screen row, so the text above it stays where it was. A collapse whose top edge had scrolled above the screen brings that edge back into view instead, as near the top row as the thread allows, so the shorter card doesn't end up out of view. Either way the view never scrolls past the end of the thread. When the card and what follows it are too short to reach the bottom of the screen from that row, the view stops at the end of the thread and the top edge sits lower. Expanding a plan near the bottom of the thread scrolls the view off the bottom, so new output stops pulling it down until you press G. A scroll that arrives before the screen redraws, such as G pressed right after p, wins, and the top edge moves with it. Each plan expands on its own. t3term remembers which are expanded only until you open another thread, and sends nothing to T3 or the settings file. The CLI prints plans as it did before.
 
 The frame needs 17 columns, the width of the Collapse plan button and its two corners. A narrower card drops it. The Plan chip and as much of the title as fits take the top row, the plan follows at the full width, and a long plan ends with its button, cut short when the label doesn't fit. A click on either of those rows works as it does on the edges. Text too long for a row breaks onto the next one, mid-word if it has to, so none of the plan is cut off.
+
+### Tasks
+
+While a turn runs, the checklist its agent keeps shows in a drawer on the composer's top edge, as in the nightly desktop. Its top row names the step in progress, or the next one to do, or the last step once all are done. The row ends with the number of steps done, such as 2/5, which turns green when every step is done. In a drawer 60 columns or wider, a list of 2 to 10 steps adds a bar with a segment per step, colored by its state. Alt+T or a click on the top row opens the list under it. Each step has a mark, ✓ done, ◉ running or ○ to do, then its text and, on the right, a time. A finished step shows how long it took as T3 recorded it, and the running step shows `now`.
+
+The drawer shows the newest list written by the run that owns the thread's work, while that run hasn't ended. A new turn that hasn't written a list yet shows nothing, rather than the last turn's list. A queued message doesn't take the drawer from the run still working, and a list with no steps shows nothing. The drawer goes away when the run ends, while a request waits for an answer, and while the thread's watch connects or reconnects. When it comes back, its list starts closed, as it does when you open another thread. Whether the list is open stays in this window, and t3term sends nothing to T3 or the settings file.
+
+The open list takes at most 15 rows, the desktop's height, and at most 40% of the terminal. A longer list ends with a row such as `Lines 1-14 of 30 · Alt+↑/↓ scroll`, and Alt+↑/↓ or the wheel scroll it. With less room the list shrinks, and with none the drawer isn't drawn. The Alt+T label leaves a drawer under 40 columns, and a very narrow one shows only the count and the arrow. A long step breaks onto more rows, mid-word if it has to.
+
+In the transcript and in `t3term read`, a checklist shows as Plan rows marked `[x]` done, `[>]` running and `[ ]` to do.
 
 ### The Working shelf
 
@@ -207,7 +218,7 @@ Set `T3TERM_NO_SAVED_LOGIN=1` to use a session that lasts one run instead. t3ter
 cargo test
 ```
 
-The unit tests cover the reducers, Markdown wrapping, the composer, the model menus, the transcript and auth command parsing. `tests/fake_server.rs` drives the real RPC client against a fake Effect RPC server, dropping the socket mid-stream to check the resume cursor, chunk acks, batched frames, duplicate suppression and error decoding. `tests/cli.rs` runs the built binary with a temporary home and checks the `--json` error and exit code when the server is gone, when it isn't on protocol 2 and when the TUI has no terminal. None of them reach a real T3 server or the Keychain, and CI runs them on macOS for every pull request.
+The unit tests cover the reducers, Markdown wrapping, the composer, the model menus, the transcript, the tasks drawer and auth command parsing. `tests/fake_server.rs` drives the real RPC client against a fake Effect RPC server, dropping the socket mid-stream to check the resume cursor, chunk acks, batched frames, duplicate suppression and error decoding. `tests/cli.rs` runs the built binary with a temporary home and checks the `--json` error and exit code when the server is gone, when it isn't on protocol 2 and when the TUI has no terminal. None of them reach a real T3 server or the Keychain, and CI runs them on macOS for every pull request.
 
 `docs/screenshots/` also holds `before-tui.png`, `after-tui.png`, `approval.png`, `streaming.gif`, `picker-model.png` and `tool-calls-failed.png`.
 

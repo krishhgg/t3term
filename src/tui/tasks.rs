@@ -6,7 +6,7 @@
 
 use crossterm::event::{KeyCode, KeyEvent, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 use ratatui::layout::Rect;
-use ratatui::style::{Color, Modifier, Style};
+use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
 use textwrap::{Options, WordSeparator, WrapAlgorithm};
@@ -279,7 +279,7 @@ impl Drawer {
 
 fn status_color(status: StepStatus, theme: &Theme) -> Color {
     match status {
-        StepStatus::Completed => theme.success,
+        StepStatus::Completed => theme.emerald,
         StepStatus::Running => theme.primary,
         StepStatus::Pending => theme.border_strong,
     }
@@ -287,17 +287,17 @@ fn status_color(status: StepStatus, theme: &Theme) -> Color {
 
 /// The summary row: the icon, `Tasks`, the current step, the count, the step bar when there is
 /// room for it, Alt+T and the chevron, which points up while the list is closed. The count
-/// turns green once every step is done.
+/// turns green once every step is done. Green is the GUI's `--success`, emerald-500.
 fn summary(tasks: &Tasks, open: bool, width: usize, theme: &Theme) -> Line<'static> {
     let muted = Style::new().fg(theme.muted);
     let count_color = if tasks.completed >= tasks.total() {
-        theme.success
+        theme.emerald
     } else {
         theme.muted
     };
     let count = Span::styled(
         format!("{}/{}", tasks.completed, tasks.total()),
-        Style::new().fg(count_color).add_modifier(Modifier::BOLD),
+        Style::new().fg(count_color),
     );
     let chevron = if open { " ▾" } else { " ▴" };
     let mut right = vec![count.clone()];
@@ -843,6 +843,6 @@ mod tests {
         let done = summary_of(3, 70);
         assert_eq!(done.width(), 70);
         let count = done.spans.iter().find(|span| span.content == "3/3");
-        assert_eq!(count.expect("the count").style.fg, Some(theme.success));
+        assert_eq!(count.expect("the count").style.fg, Some(theme.emerald));
     }
 }
