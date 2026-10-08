@@ -25,6 +25,16 @@ pub struct Block {
     pub body: String,
     pub streaming: bool,
     pub status: String,
+    /// The projection item type, such as `command_execution`, for picking an icon.
+    pub item_type: String,
+    /// The header without decoration: the command, file name, pattern or prompt.
+    pub detail: String,
+    pub exit_code: Option<i64>,
+    pub run_id: String,
+    /// For `dynamic_tool` items: the provider's tool name, such as `Read`.
+    pub tool_name: String,
+    /// For request items: the runtime request they show.
+    pub request_id: String,
 }
 
 fn str_of<'a>(item: &'a Value, key: &str) -> &'a str {
@@ -49,6 +59,7 @@ pub fn describe(item: &Value) -> Option<Block> {
     let block = |kind, header: String, body: String| Block {
         item_id: str_of(item, "id").to_string(),
         kind,
+        detail: header.clone(),
         header,
         body,
         streaming: item
@@ -56,6 +67,11 @@ pub fn describe(item: &Value) -> Option<Block> {
             .and_then(Value::as_bool)
             .unwrap_or(false),
         status: str_of(item, "status").to_string(),
+        item_type: item_type.to_string(),
+        exit_code: item.get("exitCode").and_then(Value::as_i64),
+        run_id: str_of(item, "runId").to_string(),
+        tool_name: str_of(item, "toolName").to_string(),
+        request_id: str_of(item, "requestId").to_string(),
     };
     Some(match item_type {
         "user_message" => block(
@@ -101,21 +117,27 @@ pub fn describe(item: &Value) -> Option<Block> {
             block(BlockKind::Plan, "Plan".into(), body)
         }
         "command_execution" => {
-            let mut header = format!(
-                "$ {}",
-                str_of(item, "input").lines().next().unwrap_or_default()
-            );
+            let command = str_of(item, "input")
+                .lines()
+                .next()
+                .unwrap_or_default()
+                .to_string();
+            let mut header = format!("$ {command}");
             if let Some(code) = item.get("exitCode").and_then(Value::as_i64) {
                 header.push_str(&format!("  (exit {code})"));
             }
-            block(
-                BlockKind::Tool,
-                header,
-                truncate_lines(str_of(item, "output"), 12),
-            )
+            Block {
+                detail: command,
+                ..block(
+                    BlockKind::Tool,
+                    header,
+                    truncate_lines(str_of(item, "output"), 12),
+                )
+            }
         }
         "file_change" => {
-            let mut header = format!("edit {}", str_of(item, "fileName"));
+            let name = str_of(item, "fileName").to_string();
+            let mut header = format!("edit {name}");
             let additions = item.get("additions").and_then(Value::as_u64);
             let deletions = item.get("deletions").and_then(Value::as_u64);
             if additions.is_some() || deletions.is_some() {
@@ -125,13 +147,19 @@ pub fn describe(item: &Value) -> Option<Block> {
                     deletions.unwrap_or(0)
                 ));
             }
-            block(BlockKind::Tool, header, String::new())
+            Block {
+                detail: name,
+                ..block(BlockKind::Tool, header, String::new())
+            }
         }
-        "file_search" => block(
-            BlockKind::Tool,
-            format!("search {}", str_of(item, "pattern")),
-            String::new(),
-        ),
+        "file_search" => Block {
+            detail: str_of(item, "pattern").to_string(),
+            ..block(
+                BlockKind::Tool,
+                format!("search {}", str_of(item, "pattern")),
+                String::new(),
+            )
+        },
         "web_search" => {
             let patterns = item
                 .get("patterns")
@@ -143,11 +171,14 @@ pub fn describe(item: &Value) -> Option<Block> {
                 .filter_map(Value::as_str)
                 .collect::<Vec<_>>()
                 .join(", ");
-            block(
-                BlockKind::Tool,
-                format!("web search {joined}"),
-                String::new(),
-            )
+            Block {
+                detail: joined.clone(),
+                ..block(
+                    BlockKind::Tool,
+                    format!("web search {joined}"),
+                    String::new(),
+                )
+            }
         }
         "dynamic_tool" | "subagent" => {
             let label = if title.is_empty() { item_type } else { title };
@@ -156,11 +187,14 @@ pub fn describe(item: &Value) -> Option<Block> {
         "approval_request" => {
             let kind = str_of(item, "requestKind");
             let prompt = str_of(item, "prompt");
-            block(
-                BlockKind::Request,
-                format!("Approval requested: {kind}"),
-                prompt.to_string(),
-            )
+            Block {
+                detail: prompt.to_string(),
+                ..block(
+                    BlockKind::Request,
+                    format!("Approval requested: {kind}"),
+                    prompt.to_string(),
+                )
+            }
         }
         "user_input_request" => {
             let questions = item
