@@ -54,7 +54,7 @@ Exit codes: 0 success, 1 failure or a turn that ended without completing, 2 usag
 | Open menu | ↑/↓ choose, Enter select, Esc close. In the model menu, type to search |
 | Sidebar | ↑/↓ or j/k select, Enter open, e show or hide the Settled shelf, q quit |
 | Composer | Enter send (queues if the thread is busy), Alt+Enter or Ctrl+J newline, Ctrl+R swap in an unsent message, Esc to transcript |
-| Transcript | ↑/↓ scroll, g/G top/bottom, t show activity for finished turns and tool output, Enter compose, Esc sidebar |
+| Transcript | ↑/↓ scroll, g/G top/bottom, t verbose mode on or off, Enter compose, Esc sidebar |
 
 On macOS, the Alt keys need Option to send Meta: "Use Option as Meta key" in Terminal, "Esc+" for the Option key in iTerm2, or `macos-option-as-alt = true` in Ghostty.
 
@@ -66,13 +66,23 @@ A menu choice turns its chip blue and goes to T3 with the thread's next message,
 
 ## Look
 
-The TUI follows the T3 Code desktop app. The sidebar lists threads as cards with the project monogram, status or age, title, branch and provider glyph. Finished threads move to a Settled shelf at the bottom. The header shows the project and thread title. User prompts are right-aligned bubbles, and each turn folds its tool activity under a "Worked for" row that opens with `t`. Approvals and questions appear in a panel above the composer with their keys printed on the buttons. The composer has chips for the model, the reasoning effort and other model options, the runtime mode and plan mode, plus a send hint. Each chip opens a menu.
+The TUI follows the T3 Code desktop app. The sidebar lists threads as cards with the project monogram, status or age, title, branch and provider glyph. Finished threads move to a Settled shelf at the bottom. The header shows the project and thread title. User prompts are right-aligned bubbles, and each turn folds its tool activity under a "Worked for" row that opens with `t`, which turns on verbose mode. Approvals and questions appear in a panel above the composer with their keys printed on the buttons. The composer has chips for the model, the reasoning effort and other model options, the runtime mode and plan mode, plus a send hint. Each chip opens a menu.
 
 Colors come from T3's dark theme tokens. When `COLORTERM` reports truecolor the TUI uses the exact hex values. Otherwise, or when `T3TERM_COLOR=256` is set, it maps each color to the nearest entry in the 256-color palette.
 
 ![The desktop app and t3term showing the same thread](docs/screenshots/gui-vs-tui.png)
 
 `docs/screenshots/` also has `before-tui.png`, `after-tui.png`, `approval.png`, `streaming.gif` and `picker-model.png`.
+
+## Verbose mode
+
+`t` turns on verbose mode, t3term's version of Conductor's Gary's Mode: every turn stays open, finished ones included. Each tool call is one row with its icon, what it did and a chip holding the file, command or query it did it to, with the output quoted under it and a red `exit N` after a failure. Reasoning is laid out as prose in grey, so the model's own answers stay the brightest text on screen.
+
+![A turn in verbose mode: two tool rows with their output, the reasoning in grey, then the answer](docs/screenshots/verbose.png)
+
+The same turn with verbose mode off is one "Worked for" row. The setting is saved in `~/.config/t3term/settings.json`, so it survives a restart. That file is t3term's own, not T3's.
+
+T3 leaves tool output out of a thread's projection so a large result can't stall the socket, and marks the item instead. Verbose mode asks for it with `orchestration.getTurnItem`, only for the rows on screen, and keeps the answer until the item changes. Each row shows twelve lines of it: the first twelve of a file or a search, the last twelve of a command, where its result is.
 
 ## How it works
 

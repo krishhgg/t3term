@@ -8,7 +8,7 @@ mod picker;
 mod theme;
 mod unsent;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,6 +30,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::client::{Client, IfBusy, WatchEvent};
 use crate::models::{self, Choice, Plan};
 use crate::projection::{Applied, ShellState, ThreadState, is_active_status, status};
+use crate::settings::Settings;
 use crate::transcript::{self, BlockKind};
 use composer::Composer;
 use markdown::Styles;
@@ -81,6 +82,12 @@ enum ActionResult {
     Error(String),
     /// T3's provider and model list, from `server.getConfig`.
     Config(Value),
+    /// What one tool printed, for the row that asked.
+    Output {
+        item_id: String,
+        revision: String,
+        text: String,
+    },
     Sent {
         note: String,
     },
@@ -136,8 +143,13 @@ struct App {
     composer: Composer,
     /// Rows scrolled up from the bottom. Zero follows new output.
     scroll: usize,
-    /// Show tool rows for finished runs and their output.
-    expand_tools: bool,
+    /// Shows every reasoning block and tool call in full. Saved between runs.
+    verbose: bool,
+    /// What each tool printed: the item id, the version it came from and the text. T3 leaves
+    /// tool output out of the projection, so verbose mode asks for the rows it is showing.
+    outputs: HashMap<String, (String, String)>,
+    /// Items whose output is on its way, so one row asks only once.
+    fetching: HashSet<String>,
     /// Settled threads stay behind the `Settled (N)` shelf until it is opened.
     show_settled: bool,
     settled_count: usize,
@@ -198,6 +210,7 @@ impl Drop for Screen {
 async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>) -> Result<()> {
     let (actions, mut action_results) = mpsc::unbounded_channel();
     let mut shell_events = client.watch_shell(None);
+    let settings = Settings::load();
     let mut app = App {
         client,
         theme: Theme::detect(),
@@ -214,7 +227,9 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
         focus: Focus::Sidebar,
         composer: Composer::default(),
         scroll: 0,
-        expand_tools: false,
+        verbose: settings.verbose,
+        outputs: HashMap::new(),
+        fetching: HashSet::new(),
         show_settled: false,
         settled_count: 0,
         cache: HashMap::new(),
@@ -467,6 +482,8 @@ impl App {
             run_changes: HashMap::new(),
         });
         self.cache.clear();
+        self.outputs.clear();
+        self.fetching.clear();
         self.scroll = 0;
         self.picker = None;
         self.focus = Focus::Composer;
@@ -723,10 +740,7 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => self.scroll = self.scroll.saturating_sub(1),
                 KeyCode::Char('g') | KeyCode::Home => self.scroll = usize::MAX / 2,
                 KeyCode::Char('G') | KeyCode::End => self.scroll = 0,
-                KeyCode::Char('t') => {
-                    self.expand_tools = !self.expand_tools;
-                    self.cache.clear();
-                }
+                KeyCode::Char('t') => self.toggle_verbose(),
                 KeyCode::Char('a') => self.respond("accept"),
                 KeyCode::Char('s') => self.respond("acceptForSession"),
                 KeyCode::Char('d') => self.respond("decline"),
@@ -735,6 +749,46 @@ impl App {
                 _ => {}
             },
         }
+    }
+
+    /// Turns verbose mode on or off and remembers it, the way the GUI keeps a view setting.
+    fn toggle_verbose(&mut self) {
+        self.verbose = !self.verbose;
+        self.cache.clear();
+        Settings {
+            verbose: self.verbose,
+        }
+        .save();
+        self.message = Some((
+            if self.verbose {
+                "Verbose mode on: every reasoning block and tool call stays open.".into()
+            } else {
+                "Verbose mode off: finished turns fold their activity away.".into()
+            },
+            false,
+        ));
+    }
+
+    /// Asks T3 what one tool printed. The answer arrives as an action, and a row that can't
+    /// be read keeps its empty body rather than interrupting with an error.
+    fn fetch_output(&mut self, item_id: String, revision: String) {
+        let Some(thread_id) = self.open.as_ref().map(|open| open.id.clone()) else {
+            return;
+        };
+        if !self.fetching.insert(item_id.clone()) {
+            return;
+        }
+        let (client, results) = (self.client.clone(), self.actions.clone());
+        tokio::spawn(async move {
+            let item = client.turn_item(&thread_id, &item_id, &revision).await;
+            let _ = results.send(ActionResult::Output {
+                item_id,
+                revision,
+                text: item
+                    .map(|item| transcript::tool_output(&item))
+                    .unwrap_or_default(),
+            });
+        });
     }
 
     fn page(&self) -> usize {
@@ -775,6 +829,14 @@ impl App {
                 if self.picker.is_some() {
                     self.select_pick(previous);
                 }
+            }
+            ActionResult::Output {
+                item_id,
+                revision,
+                text,
+            } => {
+                self.fetching.remove(&item_id);
+                self.outputs.insert(item_id, (revision, text));
             }
             ActionResult::Sent { note } => {
                 self.settle_draft();
@@ -1609,13 +1671,22 @@ impl App {
             return;
         };
         let width = area.width.saturating_sub(1).max(10);
-        let blocks = transcript::blocks(state);
+        let mut blocks = transcript::blocks(state);
+        // Tool output T3 withheld, for the rows that have already been given it.
+        for block in &mut blocks {
+            if let Some((revision, text)) = self.outputs.get(&block.item_id)
+                && *revision == block.updated_at
+            {
+                block.body = text.clone();
+            }
+        }
         let active_run = state.active_run().map(|r| str_of(r, "id").to_string());
-        let expand = self.expand_tools;
+        let expand = self.verbose;
         let context = RenderContext {
             theme: &t,
             text: Styles::new(&t, t.text()),
             bubble: Styles::new(&t, Style::new().fg(t.fg).bg(t.bubble)),
+            reasoning: Styles::new(&t, Style::new().fg(t.muted)),
             expand,
         };
         // Each block keeps its wrapped lines until its content or the width changes. Only a
@@ -1626,7 +1697,7 @@ impl App {
                 block.kind,
                 BlockKind::Tool | BlockKind::Reasoning | BlockKind::Request
             );
-            // Finished runs fold their activity away, as the GUI does, until `t` expands it.
+            // Finished runs fold their activity away, as the GUI does, unless verbose mode is on.
             if activity && !expand && active_run.as_deref() != Some(block.run_id.as_str()) {
                 heights.push(0);
                 continue;
@@ -1682,12 +1753,22 @@ impl App {
         // Copy only the rows in view.
         let mut lines = Vec::with_capacity(height);
         let mut offset = 0;
+        // Verbose mode shows what a tool printed, which T3 hands over one item at a time. Only
+        // the rows on screen ask for it, so opening a long thread doesn't fetch all of it.
+        let mut wanted = Vec::new();
         for (block, block_height) in blocks.iter().zip(&heights) {
             if *block_height > 0 && offset + block_height > start && offset < end {
                 let cached = &self.cache[&block.item_id].lines;
                 let from = start.saturating_sub(offset);
                 let to = (end - offset).min(*block_height);
                 lines.extend(cached[from..to].iter().cloned());
+                let missing = self
+                    .outputs
+                    .get(&block.item_id)
+                    .is_none_or(|(revision, _)| *revision != block.updated_at);
+                if expand && block.output_omitted && missing {
+                    wanted.push((block.item_id.clone(), block.updated_at.clone()));
+                }
             }
             offset += block_height;
             if offset >= end {
@@ -1705,6 +1786,9 @@ impl App {
                 )),
                 Rect::new(x, area.y + area.height - 1, label.width() as u16, 1),
             );
+        }
+        for (item_id, revision) in wanted {
+            self.fetch_output(item_id, revision);
         }
     }
 
@@ -1736,7 +1820,7 @@ impl App {
         Some(Fold {
             label,
             tone,
-            expanded: active || self.expand_tools,
+            expanded: active || self.verbose,
         })
     }
 
@@ -2228,8 +2312,11 @@ impl App {
             (Focus::Composer, None) => {
                 "Enter send · Alt+Enter newline · Alt+M model · Alt+E effort · Alt+P mode · Ctrl+X interrupt"
             }
+            (Focus::Transcript, None) if self.verbose => {
+                "↑↓/PgUp scroll · G bottom · t verbose off · Enter compose · Esc sidebar"
+            }
             (Focus::Transcript, None) => {
-                "↑↓/PgUp scroll · G bottom · t activity · Enter compose · Esc sidebar"
+                "↑↓/PgUp scroll · G bottom · t verbose · Enter compose · Esc sidebar"
             }
         };
         let head = fit(&format!("{connection}  ·  "), width.saturating_sub(2));
@@ -2256,6 +2343,8 @@ struct RenderContext<'a> {
     theme: &'a Theme,
     text: Styles,
     bubble: Styles,
+    /// Reasoning prose, dimmer than the model's answers.
+    reasoning: Styles,
     expand: bool,
 }
 
@@ -2423,17 +2512,29 @@ fn fit(text: &str, width: usize) -> String {
     out
 }
 
-/// The icon and label for a tool row, after the GUI's Eye/SquarePen/Terminal/Globe/Search set.
-fn tool_row(block: &transcript::Block) -> (&'static str, String) {
+/// The icon, action and argument for a tool row, after the GUI's
+/// Eye/SquarePen/Terminal/Globe/Search icon set. The argument is drawn as a chip after the
+/// action, so a long command or path can be cut without hiding what the tool did.
+fn tool_row(block: &transcript::Block) -> (&'static str, String, String) {
+    // T3 describes some items itself, as the GUI shows them. Its description beats a label
+    // built from the item type.
+    let described = |fallback: &str| {
+        if block.title.is_empty() || block.title == block.detail {
+            fallback.to_string()
+        } else {
+            block.title.clone()
+        }
+    };
     match block.item_type.as_str() {
-        "command_execution" => ("❯", block.detail.clone()),
+        "command_execution" => ("❯", described("Run"), block.detail.clone()),
         "file_change" => (
             "✎",
-            format!("Edit {}", block.header.trim_start_matches("edit ")),
+            described("Edit"),
+            block.header.trim_start_matches("edit ").to_string(),
         ),
-        "file_search" => ("⌕", format!("Search {}", block.detail)),
-        "web_search" => ("◎", format!("Searched {}", block.detail)),
-        "subagent" => ("⧉", block.header.clone()),
+        "file_search" => ("⌕", described("Search"), block.detail.clone()),
+        "web_search" => ("◎", described("Web search"), block.detail.clone()),
+        "subagent" => ("⧉", block.header.clone(), block.detail.clone()),
         "dynamic_tool" => {
             let name = block.tool_name.to_ascii_lowercase();
             let icon = if ["read", "view", "cat", "open"]
@@ -2469,9 +2570,16 @@ fn tool_row(block: &transcript::Block) -> (&'static str, String) {
             } else {
                 "⚙"
             };
-            (icon, block.header.clone())
+            // The tool's own name is the action; its input is the argument. T3's title
+            // repeats both, so it is only the fallback.
+            let action = if block.tool_name.is_empty() {
+                block.header.clone()
+            } else {
+                block.tool_name.clone()
+            };
+            (icon, action, block.detail.clone())
         }
-        _ => ("⚙", block.header.clone()),
+        _ => ("⚙", block.header.clone(), block.detail.clone()),
     }
 }
 
@@ -2541,43 +2649,65 @@ fn render_block(
             lines.push(Line::default());
         }
         BlockKind::Reasoning => {
-            // One line, like the GUI's collapsed reasoning row. `threads read --reasoning`
-            // prints the whole text.
             let label = if block.streaming {
                 "Thinking"
             } else {
                 "Thought"
             };
-            let first = block
-                .body
-                .lines()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or_default()
-                .trim_matches(|c: char| c == '*' || c == '#' || c.is_whitespace());
-            lines.push(Line::from(vec![
-                Span::styled(format!("✦ {label}"), muted),
-                Span::styled(
-                    fit(
-                        &format!(" · {first}"),
-                        width.saturating_sub(label.width() + 2),
+            if context.expand {
+                // Verbose mode reads the reasoning as prose, muted so the model's own answers
+                // stay the brightest text on screen. Tool rows stay packed together; a block of
+                // prose gets air around it.
+                lines.push(Line::default());
+                lines.push(Line::styled(format!("✦ {label}"), muted));
+                lines.extend(markdown::render(&block.body, width, &context.reasoning, 0));
+                lines.push(Line::default());
+            } else {
+                // One line, like the GUI's collapsed reasoning row.
+                let first = block
+                    .body
+                    .lines()
+                    .find(|l| !l.trim().is_empty())
+                    .unwrap_or_default()
+                    .trim_matches(|c: char| c == '*' || c == '#' || c.is_whitespace());
+                lines.push(Line::from(vec![
+                    Span::styled(format!("✦ {label}"), muted),
+                    Span::styled(
+                        fit(
+                            &format!(" · {first}"),
+                            width.saturating_sub(label.width() + 2),
+                        ),
+                        muted.add_modifier(Modifier::ITALIC),
                     ),
-                    muted.add_modifier(Modifier::ITALIC),
-                ),
-            ]));
+                ]));
+            }
         }
         BlockKind::Tool => {
-            let (icon, label) = tool_row(block);
+            let (icon, label, argument) = tool_row(block);
             let color = match block.status.as_str() {
                 "running" | "pending" | "inProgress" | "in_progress" => t.info,
                 "failed" | "error" => t.error_fg,
                 _ => t.muted,
             };
             let exit = block.exit_code.filter(|code| *code != 0);
-            let room = width.saturating_sub(2 + exit.map_or(0, |_| 10));
+            let mut room = width.saturating_sub(2 + exit.map_or(0, |_| 10));
+            // The action keeps at most half the row, so the argument always has space.
+            let label = fit(&label, room.min((width / 2).max(12)));
+            room = room.saturating_sub(label.width());
             let mut spans = vec![Span::styled(
-                format!("{icon} {}", fit(&label, room)),
+                format!("{icon} {label}"),
                 Style::new().fg(color),
             )];
+            // The argument rides in a chip, as in the GUI, where a path or command is set off
+            // from the words around it.
+            let argument = argument.trim();
+            if !argument.is_empty() && room > 6 {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    format!(" {} ", fit(argument, room - 4)),
+                    Style::new().fg(t.fg).bg(t.chip_bg),
+                ));
+            }
             if let Some(code) = exit {
                 spans.push(Span::styled(
                     format!("  exit {code}"),
@@ -2692,6 +2822,9 @@ mod tests {
             status: "completed".into(),
             item_type: item_type.into(),
             detail: header.into(),
+            title: header.into(),
+            output_omitted: false,
+            updated_at: "2026-10-07T00:00:00.000Z".into(),
             exit_code: None,
             run_id: "run".into(),
             tool_name: String::new(),
@@ -2713,6 +2846,7 @@ mod tests {
             theme: &theme,
             text: Styles::new(&theme, theme.text()),
             bubble: Styles::new(&theme, Style::new().fg(theme.fg).bg(theme.bubble)),
+            reasoning: Styles::new(&theme, Style::new().fg(theme.muted)),
             expand: false,
         };
         let fold = Extra::Fold(Fold {
@@ -2762,25 +2896,75 @@ mod tests {
     }
 
     #[test]
+    fn verbose_mode_reads_out_reasoning_that_is_otherwise_one_line() {
+        let theme = Theme::new(Depth::TrueColor);
+        let styles = |expand| RenderContext {
+            theme: &theme,
+            text: Styles::new(&theme, theme.text()),
+            bubble: Styles::new(&theme, theme.text()),
+            reasoning: Styles::new(&theme, Style::new().fg(theme.muted)),
+            expand,
+        };
+        let body = "First I check the tests.\n\nThen I run them.";
+        let thought = block(BlockKind::Reasoning, "reasoning", "Thinking", body);
+
+        // Folded, it is a single summary row.
+        let folded = render_block(&thought, 40, &styles(false), &Extra::None);
+        assert_eq!(folded.len(), 1);
+        assert!(text(&folded)[0].starts_with("✦ Thought · First I check"));
+
+        // Verbose, every sentence is there, dimmer than an answer would be.
+        let full = render_block(&thought, 40, &styles(true), &Extra::None);
+        let rows = text(&full).join("\n");
+        assert!(rows.contains("First I check the tests."), "{rows}");
+        assert!(rows.contains("Then I run them."), "{rows}");
+        let prose = full
+            .iter()
+            .flat_map(|line| &line.spans)
+            .find(|span| span.content.contains("Then"))
+            .expect("the reasoning text");
+        assert_eq!(prose.style.fg, Some(theme.muted));
+        assert_ne!(theme.muted, theme.fg, "reasoning must not match answers");
+    }
+
+    #[test]
     fn tool_rows_pick_icons_and_show_failures() {
         let theme = Theme::new(Depth::TrueColor);
         let context = RenderContext {
             theme: &theme,
             text: Styles::new(&theme, theme.text()),
             bubble: Styles::new(&theme, theme.text()),
+            reasoning: Styles::new(&theme, Style::new().fg(theme.muted)),
             expand: false,
         };
+        // The tool's name is the action and its input the argument, so a long path can be
+        // cut without hiding which tool ran.
         let mut read = block(BlockKind::Tool, "dynamic_tool", "Read notes.py", "");
         read.tool_name = "Read".into();
-        assert_eq!(tool_row(&read), ("◉", "Read notes.py".into()));
+        read.detail = "/tmp/demo/notes.py".into();
+        assert_eq!(
+            tool_row(&read),
+            ("◉", "Read".into(), "/tmp/demo/notes.py".into())
+        );
+        let lines = render_block(&read, 40, &context, &Extra::None);
+        assert_eq!(text(&lines), vec!["◉ Read   /tmp/demo/notes.py "]);
+        // The argument sits in a chip, which the action beside it does not.
+        assert_eq!(lines[0].spans[2].style.bg, Some(theme.chip_bg));
+        assert_eq!(lines[0].spans[0].style.bg, None);
 
+        // T3's own description of a command becomes the action, with the command as argument.
         let mut command = block(BlockKind::Tool, "command_execution", "$ make  (exit 2)", "");
         command.detail = "make".into();
+        command.title = "Build the project".into();
         command.exit_code = Some(2);
         command.status = "failed".into();
         let lines = render_block(&command, 40, &context, &Extra::None);
-        assert_eq!(text(&lines), vec!["❯ make  exit 2"]);
+        assert_eq!(text(&lines), vec!["❯ Build the project   make   exit 2"]);
         assert_eq!(lines[0].spans[0].style.fg, Some(theme.error_fg));
+
+        // Without a description the item type names the action.
+        command.title = String::new();
+        assert_eq!(tool_row(&command).1, "Run");
 
         let mut approval = block(
             BlockKind::Request,
