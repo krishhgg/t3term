@@ -183,7 +183,20 @@ impl Settings {
 
 #[cfg(test)]
 mod tests {
+    use std::io::Read;
+    use std::sync::mpsc;
+    use std::thread;
+    use std::time::Duration;
+
     use super::*;
+
+    /// Which file `path` names, or `None` when nothing is there.
+    #[cfg(unix)]
+    fn identity(path: &Path) -> Option<(u64, u64)> {
+        use std::os::unix::fs::MetadataExt;
+        let metadata = std::fs::metadata(path).ok()?;
+        Some((metadata.dev(), metadata.ino()))
+    }
 
     #[test]
     fn unknown_and_missing_fields_fall_back_to_the_defaults() {
@@ -236,6 +249,163 @@ mod tests {
                 plan_mode_enabled: true
             }
         );
+    }
+
+    #[test]
+    fn an_update_waits_for_one_under_way() {
+        // Two saves that overlap, from two t3term processes or two blocking threads in one.
+        // The first has read the file and is about to turn Plan mode on when the second starts.
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("t3term").join("settings.json");
+        let (has_read, wait_for_read) = mpsc::channel();
+        let (go, wait_for_go) = mpsc::channel();
+        let first = thread::spawn({
+            let path = path.clone();
+            move || {
+                update_at(&path, |settings| {
+                    has_read.send(()).unwrap();
+                    wait_for_go.recv().unwrap();
+                    settings.plan_mode_enabled = true;
+                })
+            }
+        });
+        wait_for_read.recv().unwrap();
+        let (finished, wait_for_second) = mpsc::channel();
+        let second = thread::spawn({
+            let path = path.clone();
+            move || {
+                let saved = update_at(&path, |settings| settings.verbose = true);
+                finished.send(()).unwrap();
+                saved
+            }
+        });
+        // Without the lock, the second reads, changes and saves inside this wait, and the first
+        // then saves over it. With the lock, the second can't read until the first has saved,
+        // so the wait runs out, and the result doesn't depend on how long the wait is.
+        let _ = wait_for_second.recv_timeout(Duration::from_millis(300));
+        go.send(()).unwrap();
+        first.join().unwrap().unwrap();
+        second.join().unwrap().unwrap();
+        assert_eq!(
+            read(&path),
+            Settings {
+                verbose: true,
+                plan_mode_enabled: true
+            },
+            "one save was lost to the other"
+        );
+    }
+
+    #[test]
+    fn an_update_leaves_a_file_it_cannot_parse_alone() {
+        // What a save that writes in place, as t3term's did before, leaves while it runs: the
+        // file emptied, then cut short. The whole file would have Plan mode on.
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("settings.json");
+        for unfinished in ["", r#"{"verbose": true, "planModeEna"#] {
+            std::fs::write(&path, unfinished).unwrap();
+            let saved = update_at(&path, |settings| settings.verbose = false);
+            assert_eq!(
+                std::fs::read_to_string(&path).unwrap(),
+                unfinished,
+                "an update saved the defaults over a file it couldn't parse"
+            );
+            assert!(saved.is_err());
+        }
+    }
+
+    #[test]
+    fn a_save_replaces_the_file_in_one_step() {
+        let home = tempfile::tempdir().unwrap();
+        let dir = home.path().join("t3term");
+        let path = dir.join("settings.json");
+        update_at(&path, |settings| settings.plan_mode_enabled = true).unwrap();
+        let before = std::fs::read_to_string(&path).unwrap();
+        // A reader that opened the file just before the save, such as another t3term starting,
+        // and a temporary file from a save that died partway.
+        let mut reader = std::fs::File::open(&path).unwrap();
+        std::fs::write(dir.join("settings.json.tmp"), r#"{"verb"#).unwrap();
+        #[cfg(unix)]
+        let lock_file = identity(&dir.join("settings.json.lock"));
+
+        update_at(&path, |settings| settings.verbose = true).unwrap();
+
+        let mut seen = String::new();
+        reader.read_to_string(&mut seen).unwrap();
+        assert_eq!(seen, before, "the reader saw the file change under it");
+        assert_eq!(
+            read(&path),
+            Settings {
+                verbose: true,
+                plan_mode_enabled: true
+            }
+        );
+        let mut left: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["settings.json", "settings.json.lock"]);
+        // Every process has to lock the same file, so saves leave the lock file where it is.
+        #[cfg(unix)]
+        assert_eq!(identity(&dir.join("settings.json.lock")), lock_file);
+    }
+
+    #[test]
+    fn changes_save_in_the_order_they_were_made() {
+        // `t` pressed twice, turning verbose on and then off, and the runtime starts the second
+        // press's thread before the first's.
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("settings.json");
+        let queue = Queue::new();
+        queue.push(Box::new(|settings: &mut Settings| settings.verbose = true));
+        queue.push(Box::new(|settings: &mut Settings| settings.verbose = false));
+        queue.save(&path);
+        queue.save(&path);
+        assert!(!read(&path).verbose, "the first press was saved last");
+    }
+
+    #[test]
+    fn a_save_that_fails_keeps_the_saved_settings() {
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("settings.json");
+        let saved = r#"{"verbose": true, "planModeEnabled": true}"#;
+        std::fs::write(&path, saved).unwrap();
+        // A directory where the lock file goes, so the save can't lock, then one where the
+        // temporary file goes, so it can't write.
+        for blocked in ["settings.json.lock", "settings.json.tmp"] {
+            let in_the_way = home.path().join(blocked);
+            std::fs::create_dir(&in_the_way).unwrap();
+            let result = update_at(&path, |settings| settings.plan_mode_enabled = false);
+            assert_eq!(std::fs::read_to_string(&path).unwrap(), saved, "{blocked}");
+            assert!(result.is_err(), "{blocked}");
+            std::fs::remove_dir(&in_the_way).unwrap();
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn a_linked_settings_file_stays_a_link() {
+        // settings.json linked into a dotfiles repository.
+        let home = tempfile::tempdir().unwrap();
+        let dotfiles = home.path().join("dotfiles");
+        let config = home.path().join("t3term");
+        std::fs::create_dir(&dotfiles).unwrap();
+        std::fs::create_dir(&config).unwrap();
+        let target = dotfiles.join("settings.json");
+        let path = config.join("settings.json");
+        std::fs::write(&target, r#"{"planModeEnabled": true}"#).unwrap();
+        std::os::unix::fs::symlink(&target, &path).unwrap();
+        update_at(&path, |settings| settings.verbose = true).unwrap();
+        assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
+        assert_eq!(
+            read(&target),
+            Settings {
+                verbose: true,
+                plan_mode_enabled: true
+            }
+        );
+        assert!(!dotfiles.join("settings.json.tmp").exists());
     }
 
     #[test]
