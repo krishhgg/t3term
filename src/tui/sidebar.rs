@@ -319,9 +319,17 @@ enum Row {
     Thread(String),
 }
 
+#[cfg(test)]
+thread_local! {
+    /// How many rows this thread has measured, so a test can see how far a scroll looks.
+    static MEASURED: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 impl Row {
     /// Rows on screen: a card is three lines and a gap, a heading one line and its gap.
     fn height(&self) -> usize {
+        #[cfg(test)]
+        MEASURED.set(MEASURED.get() + 1);
         match self {
             Row::Heading { gap, .. } => 1 + usize::from(*gap),
             Row::Thread(_) => 4,
@@ -336,6 +344,16 @@ impl Row {
             _ => false,
         }
     }
+}
+
+/// Whether `rows` fit in `height` lines. It stops at the first row past the bottom, so the
+/// rows below the screen cost nothing to check.
+fn fits(rows: &[Row], height: usize) -> bool {
+    let mut lines = 0;
+    rows.iter().all(|row| {
+        lines += row.height();
+        lines <= height
+    })
 }
 
 /// What the sidebar lists and where the reader is in it.
@@ -489,19 +507,18 @@ impl Sidebar {
             self.offset = 0;
             return;
         };
-        let span = |rows: &[Row]| rows.iter().map(Row::height).sum::<usize>();
         let selected = self.selected.min(last);
         self.offset = self.offset.min(selected);
-        while self.offset < selected && span(&self.rows[self.offset..=selected]) > height {
+        while self.offset < selected && !fits(&self.rows[self.offset..=selected], height) {
             self.offset += 1;
         }
         if self.offset > 0
             && matches!(self.rows[self.offset - 1], Row::Heading { .. })
-            && span(&self.rows[self.offset - 1..=selected]) <= height
+            && fits(&self.rows[self.offset - 1..=selected], height)
         {
             self.offset -= 1;
         }
-        while self.offset > 0 && span(&self.rows[self.offset - 1..]) <= height {
+        while self.offset > 0 && fits(&self.rows[self.offset - 1..], height) {
             self.offset -= 1;
         }
     }
@@ -1500,6 +1517,55 @@ mod tests {
         let lines = text(&render(&mut sidebar, Some(&shell(more)), None, size));
         assert!(row_of(&lines, "Active ─") < row_of(&lines, "Thread a1"));
         assert!(!lines.iter().any(|line| line.contains("Thread p2")));
+    }
+
+    /// The Active shelf with `cards` cards, `c0` first, so card `cN` is row `N + 1`.
+    fn long_list(cards: usize) -> Vec<Row> {
+        let mut rows = vec![heading_row(Shelf::Active, false)];
+        rows.extend((0..cards).map(|n| card(&format!("c{n}"))));
+        rows
+    }
+
+    /// Scrolls `rows` for a list `height` lines tall, with the highlight on row `selected` and
+    /// row `offset` on top. Returns the new top row and how many rows the scroll measured.
+    fn scroll(rows: Vec<Row>, selected: usize, offset: usize, height: usize) -> (usize, usize) {
+        let mut sidebar = Sidebar {
+            rows,
+            selected,
+            offset,
+            ..Sidebar::default()
+        };
+        MEASURED.set(0);
+        sidebar.scroll_into_view(height);
+        (sidebar.offset, MEASURED.get())
+    }
+
+    #[test]
+    fn a_redraw_measures_the_screen_not_the_rows_below_it() {
+        // Near the top of the list, as an idle redraw finds it: c2 to c7 fill 24 lines
+        // exactly, and the highlight is on c7.
+        let (top, few) = scroll(long_list(100), 8, 3, 24);
+        let (same_top, many) = scroll(long_list(10_000), 8, 3, 24);
+        assert_eq!((top, same_top), (3, 3));
+        assert_eq!(few, many, "the rows below the screen cost nothing");
+        assert!(many < 30, "measured {many} rows for a 24-line list");
+    }
+
+    #[test]
+    fn scrolling_fills_the_list_to_its_last_line_and_no_further() {
+        let rows = long_list(20);
+        // Row 20 is the last card. Six cards fill 24 lines exactly, whether the top starts
+        // above the highlight or on it.
+        assert_eq!(scroll(rows.clone(), 20, 0, 24).0, 15);
+        assert_eq!(scroll(rows.clone(), 20, 20, 24).0, 15);
+        // A line short, five fit.
+        assert_eq!(scroll(rows.clone(), 20, 0, 23).0, 16);
+        assert_eq!(scroll(rows.clone(), 20, 20, 23).0, 16);
+        // A heading comes back over its first card only when both fit, one line and four.
+        assert_eq!(scroll(rows.clone(), 1, 1, 5).0, 0);
+        assert_eq!(scroll(rows.clone(), 1, 1, 4).0, 1);
+        // A card taller than the list stays on top, cut off at the bottom.
+        assert_eq!(scroll(rows, 20, 0, 3).0, 20);
     }
 
     #[test]
