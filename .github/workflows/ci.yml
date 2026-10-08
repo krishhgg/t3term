@@ -79,9 +79,9 @@ jobs:
         run: |
           cargo build --locked --release
           ./target/release/t3term --version
-          home="$(mktemp -d)"
+          smoke_home_dir="$(mktemp -d)"
           status=0
-          env -i PATH="$PATH" HOME="$home" T3CODE_HOME="$home/.t3" \
+          env -i PATH="$PATH" HOME="$smoke_home_dir" T3CODE_HOME="$smoke_home_dir/.t3" \
             ./target/release/t3term --json doctor > doctor.json || status=$?
           cat doctor.json
           test "$status" -eq 5
