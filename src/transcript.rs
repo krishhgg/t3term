@@ -53,6 +53,45 @@ fn str_of<'a>(item: &'a Value, key: &str) -> &'a str {
     item.get(key).and_then(Value::as_str).unwrap_or_default()
 }
 
+/// Where one step of an agent's checklist stands.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StepStatus {
+    Pending,
+    Running,
+    Completed,
+}
+
+/// One step of a `todo_list`, the checklist an agent keeps while it works.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TaskStep {
+    pub text: String,
+    pub status: StepStatus,
+    /// How long the step took. T3 records it when a step completes, and only when it is more
+    /// than zero.
+    pub duration_ms: Option<f64>,
+}
+
+/// The steps of a `todo_list` plan or the turn item that shows it. Both carry V2 plan steps,
+/// `{id, text, status: "pending" | "running" | "completed", durationMs?}`
+/// (`OrchestrationV2PlanStep` in the nightly's `packages/contracts/src/orchestrationV2.ts`).
+/// A status this build doesn't know reads as pending.
+pub fn task_steps(list: &Value) -> Vec<TaskStep> {
+    list.get("steps")
+        .and_then(Value::as_array)
+        .into_iter()
+        .flatten()
+        .map(|step| TaskStep {
+            text: str_of(step, "text").to_string(),
+            status: match str_of(step, "status") {
+                "completed" => StepStatus::Completed,
+                "running" => StepStatus::Running,
+                _ => StepStatus::Pending,
+            },
+            duration_ms: step.get("durationMs").and_then(Value::as_f64),
+        })
+        .collect()
+}
+
 /// The one value a tool call is about, for a transcript row: the file, pattern or query it
 /// names. Tools differ, so this tries the keys they agree on before falling back to the whole
 /// input.
@@ -216,20 +255,15 @@ pub fn describe(item: &Value) -> Option<Block> {
             str_of(item, "markdown").to_string(),
         ),
         "todo_list" => {
-            let steps = item
-                .get("steps")
-                .and_then(Value::as_array)
-                .cloned()
-                .unwrap_or_default();
-            let body = steps
+            let body = task_steps(item)
                 .iter()
                 .map(|step| {
-                    let mark = match str_of(step, "status") {
-                        "completed" => "[x]",
-                        "inProgress" | "in_progress" => "[>]",
-                        _ => "[ ]",
+                    let mark = match step.status {
+                        StepStatus::Completed => "[x]",
+                        StepStatus::Running => "[>]",
+                        StepStatus::Pending => "[ ]",
                     };
-                    format!("{mark} {}", str_of(step, "step"))
+                    format!("{mark} {}", step.text)
                 })
                 .collect::<Vec<_>>()
                 .join("\n");
@@ -417,6 +451,66 @@ mod tests {
         );
         // An item whose output T3 has not handed over yet.
         assert_eq!(tool_output(&json!({"status": "completed"})), "");
+    }
+
+    #[test]
+    fn a_checklist_shows_each_steps_text_and_marks_the_running_one() {
+        // A nightly checklist, as T3 sends it in a `todo_list` item and its plan artifact.
+        let item = json!({
+            "id": "todo-1",
+            "type": "todo_list",
+            "planId": "plan-1",
+            "steps": [
+                {"id": "s1", "text": "Read the log", "status": "completed", "durationMs": 1200},
+                {
+                    "id": "s2",
+                    "text": "Patch the parser",
+                    "status": "running",
+                    "durationAnchorAt": "2026-10-08T10:00:00.000Z",
+                },
+                {"id": "s3", "text": "Run the tests", "status": "pending"},
+            ],
+        });
+        let steps = task_steps(&item);
+        let statuses: Vec<StepStatus> = steps.iter().map(|step| step.status).collect();
+        assert_eq!(
+            statuses,
+            [
+                StepStatus::Completed,
+                StepStatus::Running,
+                StepStatus::Pending
+            ]
+        );
+        assert_eq!(steps[0].duration_ms, Some(1200.0));
+        // A running step has only the anchor its clock started from.
+        assert_eq!(steps[1].duration_ms, None);
+
+        let block = describe(&item).expect("a checklist has a row");
+        assert_eq!(block.kind, BlockKind::Plan);
+        assert_eq!(
+            block.body,
+            "[x] Read the log\n[>] Patch the parser\n[ ] Run the tests"
+        );
+
+        // `threads read` prints the same rows.
+        let state = ThreadState::from_snapshot(&json!({
+            "snapshotSequence": 1,
+            "projection": {"thread": {"id": "t"}, "turnItems": [item.clone()]},
+        }))
+        .expect("a snapshot");
+        assert_eq!(
+            plain_text(&state, None, false),
+            "  · Plan\n    [x] Read the log\n    [>] Patch the parser\n    [ ] Run the tests\n"
+        );
+    }
+
+    #[test]
+    fn a_step_in_a_state_this_build_doesnt_know_reads_as_pending() {
+        let item = json!({"steps": [{"id": "s1", "text": "Wait", "status": "blocked"}]});
+        assert_eq!(task_steps(&item)[0].status, StepStatus::Pending);
+        // A list with no steps has no rows.
+        assert!(task_steps(&json!({"type": "todo_list"})).is_empty());
+        assert!(task_steps(&json!({"steps": null})).is_empty());
     }
 
     #[test]
