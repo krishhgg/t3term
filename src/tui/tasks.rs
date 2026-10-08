@@ -67,6 +67,13 @@ impl Tasks {
 }
 
 /// Run statuses that leave a run unsettled (`isLatestRunSettled`, `session-logic.ts:220`).
+/// The GUI also keeps a settled run unsettled while the thread's runtime names it the active
+/// run (`:233`). For a thread T3 projects, ChatView takes the run and the runtime from the same
+/// projection (`ChatView.tsx:2113-2137`). There `deriveThreadRuntime` names as active only the
+/// newest run preparing, starting or running (`threadExecution.ts:257`), and the activity run
+/// is settled only when no run is preparing, starting, running or waiting
+/// (`threadExecution.ts:101`). So the runtime never names a settled activity run, and the
+/// status alone decides.
 fn unsettled(status: &str) -> bool {
     matches!(
         status,
