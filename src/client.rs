@@ -146,6 +146,23 @@ impl Client {
             .await?)
     }
 
+    /// One turn item with the output the projection leaves out. T3 strips a tool's output
+    /// from the timeline so a large result can't stall the socket, marking the item
+    /// `outputOmitted`, and hands it over one item at a time here. `revision` is the item's
+    /// `updatedAt`, which keys T3's own cache.
+    pub async fn turn_item(&self, thread_id: &str, item_id: &str, revision: &str) -> Result<Value> {
+        let mut input = json!({ "threadId": thread_id, "itemId": item_id });
+        if !revision.is_empty() {
+            input["revision"] = json!(revision);
+        }
+        let result = self
+            .rpc()
+            .await?
+            .call("orchestration.getTurnItem", input, DISPATCH_TIMEOUT)
+            .await?;
+        Ok(result.get("item").cloned().unwrap_or(Value::Null))
+    }
+
     pub async fn send_message(
         &self,
         state: &ThreadState,

@@ -8,7 +8,7 @@ mod picker;
 mod theme;
 mod unsent;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -30,6 +30,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::client::{Client, IfBusy, WatchEvent};
 use crate::models::{self, Choice, Plan};
 use crate::projection::{Applied, ShellState, ThreadState, is_active_status, status};
+use crate::settings::Settings;
 use crate::transcript::{self, BlockKind};
 use composer::Composer;
 use markdown::Styles;
@@ -76,11 +77,101 @@ struct Cached {
     lines: Vec<Line<'static>>,
 }
 
+/// What tools printed, for the rows verbose mode is showing. T3 leaves tool output out of a
+/// thread's projection, so it is fetched one item at a time and held here, oldest evicted
+/// first. Each entry is small by construction, and there are at most `MAX_ENTRIES` of them,
+/// so a long thread in verbose mode cannot grow this without end.
+#[derive(Default)]
+struct Outputs {
+    /// Item id to the version it came from and the text, which may be a note about a read
+    /// that failed.
+    text: HashMap<String, (String, String)>,
+    /// Item ids in the order they were stored, for eviction.
+    order: VecDeque<String>,
+    /// Items whose output is on its way, so one row asks only once.
+    fetching: HashSet<String>,
+    /// Items whose read failed. They are asked for again when the thread reconnects.
+    failed: HashSet<String>,
+}
+
+impl Outputs {
+    /// Rows a screen can hold several times over, which is what scrolling back needs.
+    const MAX_ENTRIES: usize = 64;
+
+    /// What this version of the item printed, when it has already been fetched.
+    fn get(&self, item_id: &str, revision: &str) -> Option<&str> {
+        self.text
+            .get(item_id)
+            .filter(|(stored, _)| stored == revision)
+            .map(|(_, text)| text.as_str())
+    }
+
+    /// Whether this row still has to ask. A failed read waits for a reconnect instead.
+    fn wanted(&self, item_id: &str, revision: &str) -> bool {
+        self.get(item_id, revision).is_none() && !self.fetching.contains(item_id)
+    }
+
+    /// Marks an item as asked for. False when a request is already out for it.
+    fn start(&mut self, item_id: &str) -> bool {
+        self.fetching.insert(item_id.to_string())
+    }
+
+    /// Keeps what T3 sent, or a note when it couldn't be read.
+    fn store(&mut self, item_id: String, revision: String, text: Option<String>) {
+        self.fetching.remove(&item_id);
+        let text = match text {
+            Some(text) => {
+                self.failed.remove(&item_id);
+                text
+            }
+            None => {
+                self.failed.insert(item_id.clone());
+                "… this output couldn't be read".into()
+            }
+        };
+        if self
+            .text
+            .insert(item_id.clone(), (revision, text))
+            .is_some()
+        {
+            self.order.retain(|stored| *stored != item_id);
+        }
+        self.order.push_back(item_id);
+        while self.order.len() > Self::MAX_ENTRIES {
+            if let Some(oldest) = self.order.pop_front() {
+                self.text.remove(&oldest);
+                self.failed.remove(&oldest);
+            }
+        }
+    }
+
+    /// Drops the reads that failed, so the rows showing them ask again.
+    fn retry_failed(&mut self) {
+        for item_id in self.failed.drain() {
+            self.text.remove(&item_id);
+            self.order.retain(|stored| *stored != item_id);
+        }
+    }
+
+    fn clear(&mut self) {
+        self.text.clear();
+        self.order.clear();
+        self.fetching.clear();
+        self.failed.clear();
+    }
+}
+
 enum ActionResult {
     Info(String),
     Error(String),
     /// T3's provider and model list, from `server.getConfig`.
     Config(Value),
+    /// What one tool printed, for the row that asked. `None` when T3 couldn't be reached.
+    Output {
+        item_id: String,
+        revision: String,
+        text: Option<String>,
+    },
     Sent {
         note: String,
     },
@@ -136,8 +227,19 @@ struct App {
     composer: Composer,
     /// Rows scrolled up from the bottom. Zero follows new output.
     scroll: usize,
-    /// Show tool rows for finished runs and their output.
-    expand_tools: bool,
+    /// Runs of tool calls the reader has opened, by the item id of the first call.
+    open_bundles: HashSet<String>,
+    /// The screen row of each run-of-calls row drawn, with the run it opens.
+    bundle_rows: Vec<(u16, String)>,
+    /// The item at the top of the last frame and the row of it that was showing, so a block
+    /// that grows under the reader doesn't move the text.
+    anchor: Option<(String, usize)>,
+    /// The scroll the last frame drew, which says whether anything has moved it since.
+    drawn_scroll: usize,
+    /// Shows every reasoning block and tool call in full. Saved between runs.
+    verbose: bool,
+    /// What each tool printed, for the rows verbose mode is showing.
+    outputs: Outputs,
     /// Settled threads stay behind the `Settled (N)` shelf until it is opened.
     show_settled: bool,
     settled_count: usize,
@@ -198,6 +300,7 @@ impl Drop for Screen {
 async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>) -> Result<()> {
     let (actions, mut action_results) = mpsc::unbounded_channel();
     let mut shell_events = client.watch_shell(None);
+    let settings = Settings::load().await;
     let mut app = App {
         client,
         theme: Theme::detect(),
@@ -214,7 +317,12 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
         focus: Focus::Sidebar,
         composer: Composer::default(),
         scroll: 0,
-        expand_tools: false,
+        open_bundles: HashSet::new(),
+        bundle_rows: Vec::new(),
+        anchor: None,
+        drawn_scroll: 0,
+        verbose: settings.verbose,
+        outputs: Outputs::default(),
         show_settled: false,
         settled_count: 0,
         cache: HashMap::new(),
@@ -328,7 +436,12 @@ impl App {
                 let state = open.state.get_or_insert_with(ThreadState::default);
                 match state.apply(&item) {
                     Applied::Synchronized => open.connection = "live".into(),
-                    Applied::Snapshot => self.cache.clear(),
+                    Applied::Snapshot => {
+                        // A fresh snapshot means the watch reconnected, so output T3 couldn't
+                        // send before is worth asking for again.
+                        self.cache.clear();
+                        self.outputs.retry_failed();
+                    }
                     Applied::Event(kind) if kind.starts_with("run.") => {
                         if let Some(run_id) =
                             item.pointer("/event/payload/id").and_then(Value::as_str)
@@ -467,6 +580,9 @@ impl App {
             run_changes: HashMap::new(),
         });
         self.cache.clear();
+        self.outputs.clear();
+        self.open_bundles.clear();
+        self.bundle_rows.clear();
         self.scroll = 0;
         self.picker = None;
         self.focus = Focus::Composer;
@@ -556,6 +672,18 @@ impl App {
                     }
                     MouseEventKind::ScrollDown if inside(self.sidebar_list) => {
                         self.move_selection(1)
+                    }
+                    MouseEventKind::Down(MouseButton::Left) if inside(self.transcript_area) => {
+                        let bundle = self
+                            .bundle_rows
+                            .iter()
+                            .find(|(y, _)| *y == mouse.row)
+                            .map(|(_, id)| id.clone());
+                        match bundle {
+                            Some(id) => self.toggle_bundle(id),
+                            // A click in the transcript is also a way to read it.
+                            None => self.focus = Focus::Transcript,
+                        }
                     }
                     MouseEventKind::Down(MouseButton::Left) if inside(self.sidebar_footer) => {
                         self.toggle_settled()
@@ -723,10 +851,7 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => self.scroll = self.scroll.saturating_sub(1),
                 KeyCode::Char('g') | KeyCode::Home => self.scroll = usize::MAX / 2,
                 KeyCode::Char('G') | KeyCode::End => self.scroll = 0,
-                KeyCode::Char('t') => {
-                    self.expand_tools = !self.expand_tools;
-                    self.cache.clear();
-                }
+                KeyCode::Char('t') => self.toggle_verbose(),
                 KeyCode::Char('a') => self.respond("accept"),
                 KeyCode::Char('s') => self.respond("acceptForSession"),
                 KeyCode::Char('d') => self.respond("decline"),
@@ -735,6 +860,54 @@ impl App {
                 _ => {}
             },
         }
+    }
+
+    /// Opens or closes one run of tool calls, the way clicking it in the GUI would.
+    fn toggle_bundle(&mut self, id: String) {
+        self.focus = Focus::Transcript;
+        if !self.open_bundles.remove(&id) {
+            self.open_bundles.insert(id);
+        }
+    }
+
+    /// Turns verbose mode on or off and remembers it, the way the GUI keeps a view setting.
+    /// It opens every run of calls at once, instead of one click at a time.
+    fn toggle_verbose(&mut self) {
+        self.verbose = !self.verbose;
+        self.cache.clear();
+        self.open_bundles.clear();
+        Settings {
+            verbose: self.verbose,
+        }
+        .save();
+        self.message = Some((
+            if self.verbose {
+                "Verbose mode on: every tool call stays open, with its output.".into()
+            } else {
+                "Verbose mode off: tool calls fold into one row you can click.".into()
+            },
+            false,
+        ));
+    }
+
+    /// Asks T3 what one tool printed. The answer arrives as an action. A read that fails says
+    /// so in the row rather than interrupting, and is tried again when the thread reconnects.
+    fn fetch_output(&mut self, item_id: String, revision: String) {
+        let Some(thread_id) = self.open.as_ref().map(|open| open.id.clone()) else {
+            return;
+        };
+        if !self.outputs.start(&item_id) {
+            return;
+        }
+        let (client, results) = (self.client.clone(), self.actions.clone());
+        tokio::spawn(async move {
+            let item = client.turn_item(&thread_id, &item_id, &revision).await;
+            let _ = results.send(ActionResult::Output {
+                item_id,
+                revision,
+                text: item.ok().map(|item| transcript::tool_output(&item)),
+            });
+        });
     }
 
     fn page(&self) -> usize {
@@ -775,6 +948,13 @@ impl App {
                 if self.picker.is_some() {
                     self.select_pick(previous);
                 }
+            }
+            ActionResult::Output {
+                item_id,
+                revision,
+                text,
+            } => {
+                self.outputs.store(item_id, revision, text);
             }
             ActionResult::Sent { note } => {
                 self.settle_draft();
@@ -1609,25 +1789,36 @@ impl App {
             return;
         };
         let width = area.width.saturating_sub(1).max(10);
-        let blocks = transcript::blocks(state);
+        let mut blocks = transcript::blocks(state);
+        // Tool output T3 withheld, for the rows that have already been given it.
+        for block in &mut blocks {
+            if let Some(text) = self.outputs.get(&block.item_id, &block.updated_at) {
+                block.body = text.to_string();
+            }
+        }
         let active_run = state.active_run().map(|r| str_of(r, "id").to_string());
-        let expand = self.expand_tools;
         let context = RenderContext {
             theme: &t,
             text: Styles::new(&t, t.text()),
             bubble: Styles::new(&t, Style::new().fg(t.fg).bg(t.bubble)),
-            expand,
+            reasoning: Styles::new(&t, Style::new().fg(t.muted)).dimmed(),
         };
+        // Tool calls are shown in runs: one row for the lot, opened by clicking it or by
+        // verbose mode. Everything else, reasoning included, is always there.
+        let bundles = bundle_tools(&blocks);
         // Each block keeps its wrapped lines until its content or the width changes. Only a
         // streaming block, or the clock row under a running prompt, is rewrapped per frame.
         let mut heights = Vec::with_capacity(blocks.len());
-        for block in &blocks {
-            let activity = matches!(
-                block.kind,
-                BlockKind::Tool | BlockKind::Reasoning | BlockKind::Request
-            );
-            // Finished runs fold their activity away, as the GUI does, until `t` expands it.
-            if activity && !expand && active_run.as_deref() != Some(block.run_id.as_str()) {
+        for (index, block) in blocks.iter().enumerate() {
+            let bundle = bundles[index].as_ref().map(|head| {
+                let open = self.verbose || self.open_bundles.contains(&head.id);
+                (head, open)
+            });
+            // A closed run of calls is drawn by its first block alone.
+            if let Some((head, open)) = &bundle
+                && !open
+                && head.id != block.item_id
+            {
                 heights.push(0);
                 continue;
             }
@@ -1644,13 +1835,31 @@ impl App {
                 BlockKind::Request => decision_for(state, &block.request_id),
                 _ => String::new(),
             };
+            // Everything a row is drawn from, so a tool that keeps its header but changes its
+            // description, its argument or how it ended still redraws.
+            let exit = block
+                .exit_code
+                .map(|code| code.to_string())
+                .unwrap_or_default();
+            // The row this block stands for when it heads a run of calls, which changes as
+            // calls are added to it and when it is opened.
+            let head = match &bundle {
+                Some((head, open)) if head.id == block.item_id => {
+                    format!("{}{}{}", open, head.count, head.names)
+                }
+                _ => String::new(),
+            };
             let key = (
                 hash(
                     &[
                         &block.header,
                         &block.body,
                         &block.status,
-                        if expand { "1" } else { "0" },
+                        &block.title,
+                        &block.detail,
+                        &block.tool_name,
+                        &exit,
+                        &head,
                         clock,
                         &decision,
                     ],
@@ -1660,11 +1869,18 @@ impl App {
             );
             let fresh = self.cache.get(&block.item_id).is_none_or(|c| c.key != key);
             if fresh {
-                let extra = match block.kind {
-                    BlockKind::User => self
+                let extra = match (block.kind, &bundle) {
+                    (BlockKind::User, _) => self
                         .fold_for(state, &block.run_id)
                         .map_or(Extra::None, Extra::Fold),
-                    BlockKind::Request => Extra::Decision(decision),
+                    (BlockKind::Request, _) => Extra::Decision(decision),
+                    (BlockKind::Tool, Some((head, open))) if head.id == block.item_id => {
+                        Extra::Bundle(Bundle {
+                            count: head.count,
+                            names: head.names.clone(),
+                            open: *open,
+                        })
+                    }
                     _ => Extra::None,
                 };
                 let lines = render_block(block, width as usize, &context, &extra);
@@ -1675,6 +1891,24 @@ impl App {
         }
         let total: usize = heights.iter().sum();
         let height = area.height as usize;
+        // Scrolled up, the view stays on the row it was reading: output that arrives for a
+        // block on screen makes it taller, and without this the text would slide away. The
+        // anchor is dropped as soon as anything else moves the scroll, so keys and the wheel
+        // still win, and following the bottom is untouched.
+        if self.scroll > 0
+            && self.scroll == self.drawn_scroll
+            && let Some((item_id, within)) = self.anchor.clone()
+        {
+            let mut above = 0;
+            for (block, block_height) in blocks.iter().zip(&heights) {
+                if block.item_id == item_id {
+                    let top = above + within.min(block_height.saturating_sub(1));
+                    self.scroll = total.saturating_sub(top + height);
+                    break;
+                }
+                above += block_height;
+            }
+        }
         self.scroll = self.scroll.min(total.saturating_sub(height));
         let end = total - self.scroll;
         let start = end.saturating_sub(height);
@@ -1682,18 +1916,35 @@ impl App {
         // Copy only the rows in view.
         let mut lines = Vec::with_capacity(height);
         let mut offset = 0;
-        for (block, block_height) in blocks.iter().zip(&heights) {
+        // Verbose mode shows what a tool printed, which T3 hands over one item at a time. Only
+        // the rows on screen ask for it, so opening a long thread doesn't fetch all of it.
+        let mut wanted = Vec::new();
+        let mut anchor = None;
+        let mut rows = Vec::new();
+        for ((block, block_height), bundle) in blocks.iter().zip(&heights).zip(&bundles) {
             if *block_height > 0 && offset + block_height > start && offset < end {
                 let cached = &self.cache[&block.item_id].lines;
                 let from = start.saturating_sub(offset);
                 let to = (end - offset).min(*block_height);
+                // The row a run of calls is drawn as, so a click on it can open the run.
+                if let Some(head) = bundle
+                    && head.id == block.item_id
+                    && from == 0
+                {
+                    rows.push((area.y + lines.len() as u16, head.id.clone()));
+                }
                 lines.extend(cached[from..to].iter().cloned());
+                anchor.get_or_insert_with(|| (block.item_id.clone(), from));
+                if block.output_omitted && self.outputs.wanted(&block.item_id, &block.updated_at) {
+                    wanted.push((block.item_id.clone(), block.updated_at.clone()));
+                }
             }
             offset += block_height;
             if offset >= end {
                 break;
             }
         }
+        self.bundle_rows = rows;
         frame.render_widget(Paragraph::new(lines), area);
         if self.scroll > 0 {
             let label = format!(" ↓ {} more ", self.scroll);
@@ -1705,6 +1956,11 @@ impl App {
                 )),
                 Rect::new(x, area.y + area.height - 1, label.width() as u16, 1),
             );
+        }
+        self.anchor = anchor.filter(|_| self.scroll > 0);
+        self.drawn_scroll = self.scroll;
+        for (item_id, revision) in wanted {
+            self.fetch_output(item_id, revision);
         }
     }
 
@@ -1733,11 +1989,7 @@ impl App {
                 _ => (format!("Worked for {elapsed}"), Tone::Muted),
             }
         };
-        Some(Fold {
-            label,
-            tone,
-            expanded: active || self.expand_tools,
-        })
+        Some(Fold { label, tone })
     }
 
     /// The command an approval request gates. It must be the same request that Alt+A answers,
@@ -2228,8 +2480,11 @@ impl App {
             (Focus::Composer, None) => {
                 "Enter send · Alt+Enter newline · Alt+M model · Alt+E effort · Alt+P mode · Ctrl+X interrupt"
             }
+            (Focus::Transcript, None) if self.verbose => {
+                "↑↓/PgUp scroll · G bottom · click a row of calls · t close them · Esc sidebar"
+            }
             (Focus::Transcript, None) => {
-                "↑↓/PgUp scroll · G bottom · t activity · Enter compose · Esc sidebar"
+                "↑↓/PgUp scroll · G bottom · click a row of calls · t open all · Esc sidebar"
             }
         };
         let head = fit(&format!("{connection}  ·  "), width.saturating_sub(2));
@@ -2256,7 +2511,8 @@ struct RenderContext<'a> {
     theme: &'a Theme,
     text: Styles,
     bubble: Styles,
-    expand: bool,
+    /// Reasoning prose, dimmer than the model's answers.
+    reasoning: Styles,
 }
 
 #[derive(Clone, Copy, PartialEq, Eq)]
@@ -2269,7 +2525,6 @@ enum Tone {
 struct Fold {
     label: String,
     tone: Tone,
-    expanded: bool,
 }
 
 /// A pending request's panel, in the parts that lay out differently when space is short.
@@ -2286,6 +2541,65 @@ enum Extra {
     None,
     Fold(Fold),
     Decision(String),
+    /// The head of a run of tool calls, which is one row until it is opened.
+    Bundle(Bundle),
+}
+
+/// A run of tool calls shown as one row. Clicking it opens the calls and their output.
+struct Bundle {
+    /// How many calls the row stands for.
+    count: usize,
+    /// What they were, such as `Read, Run`, so a closed row still says what happened.
+    names: String,
+    open: bool,
+}
+
+/// The head of a run of tool calls: the block that draws the row, and what it stands for.
+#[derive(Clone)]
+struct BundleHead {
+    /// The item id of the first call, which names the run.
+    id: String,
+    count: usize,
+    names: String,
+}
+
+/// Groups neighbouring tool calls from one run, so each group is one row in the transcript.
+/// The result lines up with `blocks`: every call in a group points at the same head.
+fn bundle_tools(blocks: &[transcript::Block]) -> Vec<Option<BundleHead>> {
+    let mut heads: Vec<Option<BundleHead>> = vec![None; blocks.len()];
+    let mut start = 0;
+    while start < blocks.len() {
+        if blocks[start].kind != BlockKind::Tool {
+            start += 1;
+            continue;
+        }
+        let mut end = start;
+        while end < blocks.len()
+            && blocks[end].kind == BlockKind::Tool
+            && blocks[end].run_id == blocks[start].run_id
+        {
+            end += 1;
+        }
+        // Each tool named once, in the order they ran: `Read, Run` reads better than
+        // `Read, Read, Run, Read`.
+        let mut names: Vec<String> = Vec::new();
+        for block in &blocks[start..end] {
+            let name = tool_row(block).1;
+            if !names.contains(&name) {
+                names.push(name);
+            }
+        }
+        let head = BundleHead {
+            id: blocks[start].item_id.clone(),
+            count: end - start,
+            names: names.join(", "),
+        };
+        for slot in &mut heads[start..end] {
+            *slot = Some(head.clone());
+        }
+        start = end;
+    }
+    heads
 }
 
 /// What became of a runtime request, for the row that shows it in the transcript.
@@ -2423,17 +2737,29 @@ fn fit(text: &str, width: usize) -> String {
     out
 }
 
-/// The icon and label for a tool row, after the GUI's Eye/SquarePen/Terminal/Globe/Search set.
-fn tool_row(block: &transcript::Block) -> (&'static str, String) {
+/// The icon, action and argument for a tool row, after the GUI's
+/// Eye/SquarePen/Terminal/Globe/Search icon set. The argument is drawn as a chip after the
+/// action, so a long command or path can be cut without hiding what the tool did.
+fn tool_row(block: &transcript::Block) -> (&'static str, String, String) {
+    // T3 describes some items itself, as the GUI shows them. Its description beats a label
+    // built from the item type.
+    let described = |fallback: &str| {
+        if block.title.is_empty() || block.title == block.detail {
+            fallback.to_string()
+        } else {
+            block.title.clone()
+        }
+    };
     match block.item_type.as_str() {
-        "command_execution" => ("❯", block.detail.clone()),
+        "command_execution" => ("❯", described("Run"), block.detail.clone()),
         "file_change" => (
             "✎",
-            format!("Edit {}", block.header.trim_start_matches("edit ")),
+            described("Edit"),
+            block.header.trim_start_matches("edit ").to_string(),
         ),
-        "file_search" => ("⌕", format!("Search {}", block.detail)),
-        "web_search" => ("◎", format!("Searched {}", block.detail)),
-        "subagent" => ("⧉", block.header.clone()),
+        "file_search" => ("⌕", described("Search"), block.detail.clone()),
+        "web_search" => ("◎", described("Web search"), block.detail.clone()),
+        "subagent" => ("⧉", block.header.clone(), block.detail.clone()),
         "dynamic_tool" => {
             let name = block.tool_name.to_ascii_lowercase();
             let icon = if ["read", "view", "cat", "open"]
@@ -2469,9 +2795,16 @@ fn tool_row(block: &transcript::Block) -> (&'static str, String) {
             } else {
                 "⚙"
             };
-            (icon, block.header.clone())
+            // The tool's own name is the action; its input is the argument. T3's title
+            // repeats both, so it is only the fallback.
+            let action = if block.tool_name.is_empty() {
+                block.header.clone()
+            } else {
+                block.tool_name.clone()
+            };
+            (icon, action, block.detail.clone())
         }
-        _ => ("⚙", block.header.clone()),
+        _ => ("⚙", block.header.clone(), block.detail.clone()),
     }
 }
 
@@ -2527,57 +2860,85 @@ fn render_block(
                     Tone::Error => t.error_fg,
                     Tone::Muted => t.muted,
                 };
-                let chevron = if fold.expanded { "⌄" } else { "›" };
-                lines.push(Line::styled(
-                    format!("{} {chevron}", fold.label),
-                    Style::new().fg(color),
-                ));
+                lines.push(Line::styled(fold.label.clone(), Style::new().fg(color)));
                 lines.push(Line::styled("─".repeat(width), hairline));
             }
         }
         BlockKind::Assistant => {
             lines.push(Line::default());
-            lines.extend(markdown::render(&block.body, width, &context.text, 0));
+            lines.extend(markdown::render(block.body.trim(), width, &context.text, 0));
             lines.push(Line::default());
         }
         BlockKind::Reasoning => {
-            // One line, like the GUI's collapsed reasoning row. `threads read --reasoning`
-            // prints the whole text.
             let label = if block.streaming {
                 "Thinking"
             } else {
                 "Thought"
             };
-            let first = block
-                .body
-                .lines()
-                .find(|l| !l.trim().is_empty())
-                .unwrap_or_default()
-                .trim_matches(|c: char| c == '*' || c == '#' || c.is_whitespace());
-            lines.push(Line::from(vec![
-                Span::styled(format!("✦ {label}"), muted),
-                Span::styled(
-                    fit(
-                        &format!(" · {first}"),
-                        width.saturating_sub(label.width() + 2),
-                    ),
-                    muted.add_modifier(Modifier::ITALIC),
-                ),
-            ]));
+            // Reasoning always reads out in full, muted so the model's own answers stay the
+            // brightest text on screen. Tool rows pack together; a block of prose gets air.
+            lines.push(Line::default());
+            lines.push(Line::styled(format!("✦ {label}"), muted));
+            lines.extend(markdown::render(
+                block.body.trim(),
+                width,
+                &context.reasoning,
+                0,
+            ));
+            lines.push(Line::default());
         }
         BlockKind::Tool => {
-            let (icon, label) = tool_row(block);
+            // A run of tool calls is one row until the reader asks for it. The row says how
+            // many there were and which tools ran, so a closed turn still reads.
+            if let Extra::Bundle(bundle) = extra {
+                let calls = match bundle.count {
+                    1 => "1 tool call".to_string(),
+                    count => format!("{count} tool calls"),
+                };
+                let mut spans = vec![
+                    Span::styled(
+                        format!("{} ", if bundle.open { "⌄" } else { "›" }),
+                        Style::new().fg(t.border_strong),
+                    ),
+                    Span::styled(calls.clone(), Style::new().fg(t.muted)),
+                ];
+                let room = width.saturating_sub(calls.width() + 5);
+                if !bundle.names.is_empty() && room > 4 {
+                    spans.push(Span::styled(
+                        format!(" · {}", fit(&bundle.names, room)),
+                        Style::new().fg(t.border_strong),
+                    ));
+                }
+                lines.push(Line::from(spans));
+                if !bundle.open {
+                    return lines;
+                }
+            }
+            let (icon, label, argument) = tool_row(block);
             let color = match block.status.as_str() {
                 "running" | "pending" | "inProgress" | "in_progress" => t.info,
                 "failed" | "error" => t.error_fg,
                 _ => t.muted,
             };
             let exit = block.exit_code.filter(|code| *code != 0);
-            let room = width.saturating_sub(2 + exit.map_or(0, |_| 10));
+            let mut room = width.saturating_sub(2 + exit.map_or(0, |_| 10));
+            // The action keeps at most half the row, so the argument always has space.
+            let label = fit(&label, room.min((width / 2).max(12)));
+            room = room.saturating_sub(label.width());
             let mut spans = vec![Span::styled(
-                format!("{icon} {}", fit(&label, room)),
+                format!("{icon} {label}"),
                 Style::new().fg(color),
             )];
+            // The argument rides in a chip, as in the GUI, where a path or command is set off
+            // from the words around it.
+            let argument = argument.trim();
+            if !argument.is_empty() && room > 6 {
+                spans.push(Span::raw("  "));
+                spans.push(Span::styled(
+                    format!(" {} ", fit(argument, room - 4)),
+                    Style::new().fg(t.fg).bg(t.chip_bg),
+                ));
+            }
             if let Some(code) = exit {
                 spans.push(Span::styled(
                     format!("  exit {code}"),
@@ -2585,7 +2946,7 @@ fn render_block(
                 ));
             }
             lines.push(Line::from(spans));
-            if context.expand && !block.body.is_empty() {
+            if !block.body.is_empty() {
                 for line in block.body.lines() {
                     lines.push(Line::from(vec![
                         Span::styled("  │ ", Style::new().fg(t.border_strong)),
@@ -2692,6 +3053,9 @@ mod tests {
             status: "completed".into(),
             item_type: item_type.into(),
             detail: header.into(),
+            title: header.into(),
+            output_omitted: false,
+            updated_at: "2026-10-07T00:00:00.000Z".into(),
             exit_code: None,
             run_id: "run".into(),
             tool_name: String::new(),
@@ -2713,12 +3077,11 @@ mod tests {
             theme: &theme,
             text: Styles::new(&theme, theme.text()),
             bubble: Styles::new(&theme, Style::new().fg(theme.fg).bg(theme.bubble)),
-            expand: false,
+            reasoning: Styles::new(&theme, Style::new().fg(theme.muted)).dimmed(),
         };
         let fold = Extra::Fold(Fold {
             label: "Worked for 2m 32s".into(),
             tone: Tone::Muted,
-            expanded: false,
         });
         let lines = render_block(
             &block(BlockKind::User, "user_message", "You", "List the functions"),
@@ -2733,7 +3096,7 @@ mod tests {
         assert_eq!(rows[0], rows[2], "padding rows above and below");
         assert!(lines[1].spans[1].style.bg == Some(theme.bubble));
         assert!(lines[1].spans[0].style.bg.is_none());
-        assert_eq!(rows[4], "Worked for 2m 32s ›");
+        assert_eq!(rows[4], "Worked for 2m 32s");
         assert_eq!(rows[5], "─".repeat(40));
 
         // Long prompts wrap inside 80% of the width.
@@ -2762,25 +3125,182 @@ mod tests {
     }
 
     #[test]
+    fn fetched_output_is_bounded_and_a_failed_read_waits_for_the_reconnect() {
+        let mut outputs = Outputs::default();
+        // A row asks once, and what comes back belongs to that version of the item.
+        assert!(outputs.wanted("a", "v1"));
+        assert!(outputs.start("a"));
+        assert!(!outputs.start("a"), "a request is already out");
+        assert!(!outputs.wanted("a", "v1"));
+        outputs.store("a".into(), "v1".into(), Some("done".into()));
+        assert_eq!(outputs.get("a", "v1"), Some("done"));
+        // The tool ran again, so its output is a new question.
+        assert_eq!(outputs.get("a", "v2"), None);
+        assert!(outputs.wanted("a", "v2"));
+
+        // A read that failed says so in the row and is not asked again until the thread
+        // reconnects, so a dropped socket can't leave a row empty for good.
+        outputs.store("b".into(), "v1".into(), None);
+        assert!(
+            outputs
+                .get("b", "v1")
+                .is_some_and(|t| t.contains("couldn't"))
+        );
+        assert!(!outputs.wanted("b", "v1"));
+        outputs.retry_failed();
+        assert!(outputs.wanted("b", "v1"));
+        assert_eq!(outputs.get("a", "v1"), Some("done"), "a good read is kept");
+
+        // Only so many are held, the oldest dropped first.
+        for n in 0..Outputs::MAX_ENTRIES {
+            outputs.store(format!("item{n}"), "v1".into(), Some("x".into()));
+        }
+        assert_eq!(outputs.text.len(), Outputs::MAX_ENTRIES);
+        assert_eq!(outputs.order.len(), Outputs::MAX_ENTRIES);
+        assert_eq!(outputs.get("a", "v1"), None, "the oldest went first");
+    }
+
+    #[test]
+    fn reasoning_reads_out_in_full_and_stays_dimmer_than_an_answer() {
+        let theme = Theme::new(Depth::TrueColor);
+        let context = RenderContext {
+            theme: &theme,
+            text: Styles::new(&theme, theme.text()),
+            bubble: Styles::new(&theme, theme.text()),
+            reasoning: Styles::new(&theme, Style::new().fg(theme.muted)).dimmed(),
+        };
+        // Code and links carry colors of their own, which must not make reasoning bright.
+        let body =
+            "First I check the tests.\n\n```sh\ncargo test\n```\n\nThen [they](http://x) run.";
+        let thought = block(BlockKind::Reasoning, "reasoning", "Thinking", body);
+
+        let full = render_block(&thought, 40, &context, &Extra::None);
+        let rows = text(&full).join("\n");
+        assert!(rows.contains("First I check the tests."), "{rows}");
+        assert!(rows.contains("cargo test"), "{rows}");
+        assert!(rows.contains("Then they (http://x) run."), "{rows}");
+        assert_ne!(theme.muted, theme.fg, "reasoning must not match answers");
+        for span in full.iter().flat_map(|line| &line.spans) {
+            assert_ne!(
+                span.style.fg,
+                Some(theme.fg),
+                "{:?} is as bright as an answer",
+                span.content
+            );
+        }
+        for word in ["cargo test", "they"] {
+            let span = full
+                .iter()
+                .flat_map(|line| &line.spans)
+                .find(|span| span.content.contains(word))
+                .expect("the reasoning text");
+            assert_eq!(span.style.fg, Some(theme.muted), "{word}");
+        }
+    }
+
+    #[test]
+    fn neighbouring_tool_calls_become_one_row_until_it_is_opened() {
+        let theme = Theme::new(Depth::TrueColor);
+        let context = RenderContext {
+            theme: &theme,
+            text: Styles::new(&theme, theme.text()),
+            bubble: Styles::new(&theme, theme.text()),
+            reasoning: Styles::new(&theme, Style::new().fg(theme.muted)).dimmed(),
+        };
+        let tool = |id: &str, name: &str, run: &str| {
+            let mut call = block(BlockKind::Tool, "dynamic_tool", name, "the output");
+            call.item_id = id.into();
+            call.tool_name = name.into();
+            call.detail = "notes.py".into();
+            call.run_id = run.into();
+            call
+        };
+        let blocks = vec![
+            tool("a", "Read", "run1"),
+            tool("b", "Read", "run1"),
+            tool("c", "Grep", "run1"),
+            block(BlockKind::Assistant, "assistant_message", "T3", "Done."),
+            tool("d", "Read", "run2"),
+        ];
+        let heads = bundle_tools(&blocks);
+
+        // The three calls of the first run share a head; the one after the answer is its own.
+        let ids: Vec<Option<&str>> = heads
+            .iter()
+            .map(|head| head.as_ref().map(|h| h.id.as_str()))
+            .collect();
+        assert_eq!(ids, vec![Some("a"), Some("a"), Some("a"), None, Some("d")]);
+        let head = heads[0].clone().expect("the first run of calls");
+        assert_eq!(head.count, 3);
+        assert_eq!(head.names, "Read, Grep", "each tool named once, in order");
+
+        // Closed, the head draws one row for the run and the calls themselves draw nothing.
+        let closed = render_block(
+            &blocks[0],
+            60,
+            &context,
+            &Extra::Bundle(Bundle {
+                count: head.count,
+                names: head.names.clone(),
+                open: false,
+            }),
+        );
+        assert_eq!(text(&closed), vec!["› 3 tool calls · Read, Grep"]);
+
+        // Opened, the same row is followed by the call and what it printed.
+        let open = render_block(
+            &blocks[0],
+            60,
+            &context,
+            &Extra::Bundle(Bundle {
+                count: head.count,
+                names: head.names,
+                open: true,
+            }),
+        );
+        let rows = text(&open);
+        assert_eq!(rows[0], "⌄ 3 tool calls · Read, Grep");
+        assert!(rows[1].starts_with("◉ Read"), "{rows:?}");
+        assert!(rows[2].contains("│ the output"), "{rows:?}");
+    }
+
+    #[test]
     fn tool_rows_pick_icons_and_show_failures() {
         let theme = Theme::new(Depth::TrueColor);
         let context = RenderContext {
             theme: &theme,
             text: Styles::new(&theme, theme.text()),
             bubble: Styles::new(&theme, theme.text()),
-            expand: false,
+            reasoning: Styles::new(&theme, Style::new().fg(theme.muted)).dimmed(),
         };
+        // The tool's name is the action and its input the argument, so a long path can be
+        // cut without hiding which tool ran.
         let mut read = block(BlockKind::Tool, "dynamic_tool", "Read notes.py", "");
         read.tool_name = "Read".into();
-        assert_eq!(tool_row(&read), ("◉", "Read notes.py".into()));
+        read.detail = "/tmp/demo/notes.py".into();
+        assert_eq!(
+            tool_row(&read),
+            ("◉", "Read".into(), "/tmp/demo/notes.py".into())
+        );
+        let lines = render_block(&read, 40, &context, &Extra::None);
+        assert_eq!(text(&lines), vec!["◉ Read   /tmp/demo/notes.py "]);
+        // The argument sits in a chip, which the action beside it does not.
+        assert_eq!(lines[0].spans[2].style.bg, Some(theme.chip_bg));
+        assert_eq!(lines[0].spans[0].style.bg, None);
 
+        // T3's own description of a command becomes the action, with the command as argument.
         let mut command = block(BlockKind::Tool, "command_execution", "$ make  (exit 2)", "");
         command.detail = "make".into();
+        command.title = "Build the project".into();
         command.exit_code = Some(2);
         command.status = "failed".into();
         let lines = render_block(&command, 40, &context, &Extra::None);
-        assert_eq!(text(&lines), vec!["❯ make  exit 2"]);
+        assert_eq!(text(&lines), vec!["❯ Build the project   make   exit 2"]);
         assert_eq!(lines[0].spans[0].style.fg, Some(theme.error_fg));
+
+        // Without a description the item type names the action.
+        command.title = String::new();
+        assert_eq!(tool_row(&command).1, "Run");
 
         let mut approval = block(
             BlockKind::Request,

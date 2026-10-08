@@ -4,6 +4,12 @@ use serde_json::Value;
 
 use crate::projection::ThreadState;
 
+/// Lines of a tool's output one row shows. Enough to see what happened, little enough that a
+/// long one doesn't bury the turn around it.
+const MAX_OUTPUT_LINES: usize = 12;
+/// What one row's output can weigh, since a single line has no length of its own to bound.
+const MAX_OUTPUT_BYTES: usize = 4096;
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockKind {
     User,
@@ -29,6 +35,12 @@ pub struct Block {
     pub item_type: String,
     /// The header without decoration: the command, file name, pattern or prompt.
     pub detail: String,
+    /// T3's own one-line description of the item, when it has one.
+    pub title: String,
+    /// When T3 kept the tool's output out of the projection. It is fetched on demand.
+    pub output_omitted: bool,
+    /// The item's `updatedAt`, which identifies this version of it.
+    pub updated_at: String,
     pub exit_code: Option<i64>,
     pub run_id: String,
     /// For `dynamic_tool` items: the provider's tool name, such as `Read`.
@@ -41,14 +53,115 @@ fn str_of<'a>(item: &'a Value, key: &str) -> &'a str {
     item.get(key).and_then(Value::as_str).unwrap_or_default()
 }
 
+/// The one value a tool call is about, for a transcript row: the file, pattern or query it
+/// names. Tools differ, so this tries the keys they agree on before falling back to the whole
+/// input.
+fn tool_argument(item: &Value) -> String {
+    const KEYS: [&str; 10] = [
+        "file_path",
+        "filePath",
+        "path",
+        "command",
+        "pattern",
+        "query",
+        "url",
+        "skill",
+        "name",
+        "prompt",
+    ];
+    match item.get("input") {
+        Some(Value::String(text)) => text.lines().next().unwrap_or_default().to_string(),
+        Some(Value::Object(input)) => {
+            if let Some(text) = KEYS
+                .iter()
+                .find_map(|key| input.get(*key).and_then(Value::as_str))
+            {
+                return text.lines().next().unwrap_or_default().to_string();
+            }
+            // An unfamiliar tool: show its arguments as they came, on one line.
+            match input.len() {
+                0 => String::new(),
+                _ => serde_json::to_string(input).unwrap_or_default(),
+            }
+        }
+        _ => String::new(),
+    }
+}
+
+/// What a tool printed, as text for the transcript. T3 keeps a tool's output out of the
+/// projection so a large result can't stall the socket, and hands it over one item at a time,
+/// in whatever shape the tool returned it.
+pub fn tool_output(item: &Value) -> String {
+    let lines = match item.get("output") {
+        None | Some(Value::Null) => return String::new(),
+        // A command prints its result at the end, so a long one keeps its tail. Anything
+        // else, such as a file a reader returned, starts at the top.
+        Some(value @ Value::String(_)) => {
+            truncate_lines(output_text(value).trim_end(), MAX_OUTPUT_LINES)
+        }
+        Some(value) => head_lines(output_text(value).trim_end(), MAX_OUTPUT_LINES),
+    };
+    // A line has no length limit of its own: one long enough to matter is a record printed
+    // as a single line. The row can only show a screen's worth of it anyway.
+    truncate_bytes(lines, MAX_OUTPUT_BYTES)
+}
+
+/// The text cut to a byte budget, on a character boundary.
+fn truncate_bytes(text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text;
+    }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
+}
+
+/// The text inside a tool's result. Tools answer with a string, with the content blocks an
+/// MCP tool returns, or with a record such as a reader's `{"file": {"content": …}}`, so this
+/// follows the keys that hold text and prints anything else as it came.
+fn output_text(value: &Value) -> String {
+    const KEYS: [&str; 6] = ["text", "content", "stdout", "output", "result", "file"];
+    match value {
+        Value::String(text) => text.clone(),
+        Value::Array(items) => items.iter().map(output_text).collect::<Vec<_>>().join("\n"),
+        Value::Object(fields) => {
+            for key in KEYS {
+                match fields.get(key) {
+                    Some(Value::String(text)) => return text.clone(),
+                    Some(nested @ (Value::Array(_) | Value::Object(_))) => {
+                        return output_text(nested);
+                    }
+                    _ => {}
+                }
+            }
+            serde_json::to_string(value).unwrap_or_default()
+        }
+        other => other.to_string(),
+    }
+}
+
+/// The first lines of a long text, with a note where the rest was.
+fn head_lines(text: &str, max_lines: usize) -> String {
+    let lines: Vec<&str> = text.lines().collect();
+    if lines.len() <= max_lines {
+        return text.trim_end().to_string();
+    }
+    let hidden = lines.len() - max_lines;
+    format!("{}\n… {hidden} more lines", lines[..max_lines].join("\n"))
+}
+
 fn truncate_lines(text: &str, max_lines: usize) -> String {
     let lines: Vec<&str> = text.lines().collect();
     if lines.len() <= max_lines {
         return text.trim_end().to_string();
     }
     let hidden = lines.len() - max_lines;
+    // The tail is what a command's reader wants, so the note goes above the kept lines,
+    // where the dropped ones were.
     format!(
-        "{}\n… {hidden} more lines",
+        "… {hidden} earlier lines\n{}",
         lines[lines.len() - max_lines..].join("\n")
     )
 }
@@ -60,6 +173,12 @@ pub fn describe(item: &Value) -> Option<Block> {
         item_id: str_of(item, "id").to_string(),
         kind,
         detail: header.clone(),
+        title: title.to_string(),
+        output_omitted: item
+            .get("outputOmitted")
+            .and_then(Value::as_bool)
+            .unwrap_or(false),
+        updated_at: str_of(item, "updatedAt").to_string(),
         header,
         body,
         streaming: item
@@ -131,7 +250,7 @@ pub fn describe(item: &Value) -> Option<Block> {
                 ..block(
                     BlockKind::Tool,
                     header,
-                    truncate_lines(str_of(item, "output"), 12),
+                    truncate_lines(str_of(item, "output"), MAX_OUTPUT_LINES),
                 )
             }
         }
@@ -182,7 +301,10 @@ pub fn describe(item: &Value) -> Option<Block> {
         }
         "dynamic_tool" | "subagent" => {
             let label = if title.is_empty() { item_type } else { title };
-            block(BlockKind::Tool, label.to_string(), String::new())
+            Block {
+                detail: tool_argument(item),
+                ..block(BlockKind::Tool, label.to_string(), String::new())
+            }
         }
         "approval_request" => {
             let kind = str_of(item, "requestKind");
@@ -265,4 +387,54 @@ pub fn plain_text(state: &ThreadState, last: Option<usize>, include_reasoning: b
         }
     }
     out
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn a_tools_output_reads_as_text_whatever_shape_it_arrives_in() {
+        // A command's output is a string.
+        assert_eq!(tool_output(&json!({"output": "one\ntwo"})), "one\ntwo");
+        // A reader answers with the file it read.
+        let read = json!({"output": {
+            "type": "text",
+            "file": { "filePath": "/tmp/a.py", "content": "import sys\n" },
+        }});
+        assert_eq!(tool_output(&read), "import sys");
+        // An MCP tool answers with content blocks.
+        let blocks = json!({"output": [
+            { "type": "text", "text": "first" },
+            { "type": "text", "text": "second" },
+        ]});
+        assert_eq!(tool_output(&blocks), "first\nsecond");
+        // A record holding no text is shown as it came.
+        assert_eq!(
+            tool_output(&json!({"output": {"success": true}})),
+            r#"{"success":true}"#
+        );
+        // An item whose output T3 has not handed over yet.
+        assert_eq!(tool_output(&json!({"status": "completed"})), "");
+    }
+
+    #[test]
+    fn a_long_output_says_what_it_dropped_and_keeps_the_end_that_matters() {
+        let lines = (1..=30)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join("\n");
+        // A command's last lines are its result, so those are the ones kept.
+        let command = tool_output(&json!({ "output": lines.clone() }));
+        assert!(
+            command.starts_with("… 18 earlier lines\n19\n20\n"),
+            "{command}"
+        );
+        assert!(command.ends_with("\n30"), "{command}");
+        // A file a reader returned is read from the top.
+        let file = tool_output(&json!({"output": {"file": {"content": lines}}}));
+        assert!(file.starts_with("1\n2\n"), "{file}");
+        assert!(file.ends_with("\n12\n… 18 more lines"), "{file}");
+    }
 }

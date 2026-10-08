@@ -38,6 +38,17 @@ impl Styles {
             bullet: Style::new().fg(theme.muted),
         }
     }
+
+    /// The same styles in one color, for text that has to stay quieter than the model's
+    /// answers. Code blocks and links carry colors of their own, which would make a reasoning
+    /// block bright again.
+    pub fn dimmed(mut self) -> Styles {
+        if let Some(color) = self.text.fg {
+            self.code_block = self.code_block.fg(color);
+            self.link = self.text.add_modifier(Modifier::UNDERLINED);
+        }
+        self
+    }
 }
 
 /// Splits a line into styled segments for `code`, **bold**, *italic* and [text](url) markers.
