@@ -1,7 +1,8 @@
 //! The interactive client. It draws only after input or a server event, at most 30 times a second.
-//! Two timers can wake it besides: a one-second tick, armed while a run is active, so the
-//! elapsed-time labels and spinner advance, and a one-shot timer for the moment the soonest
-//! snooze ends, which no server event marks. An idle TUI uses no CPU.
+//! Two timers can wake it besides: a one-second tick, armed while the open thread has a run
+//! going or a sidebar card on screen reads Working or Goal, so the elapsed-time labels and
+//! spinners advance, and a one-shot timer for the moment the soonest snooze ends, which no
+//! server event marks. An idle TUI uses no CPU.
 
 mod composer;
 mod markdown;
@@ -327,7 +328,9 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
             dirty = false;
         }
         let redraw_at = tokio::time::Instant::from_std(last_draw + FRAME);
-        let running = app.running();
+        // The sidebar's half reads the last frame drawn. A frame still waiting out the budget
+        // puts it at most one frame behind.
+        let running = needs_tick(app.open.as_ref(), &app.sidebar);
         if !running {
             tick_at = Instant::now() + TICK;
         }
@@ -365,7 +368,7 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
             }
             // Only armed while a draw is waiting out the frame budget.
             _ = tokio::time::sleep_until(redraw_at), if dirty => {}
-            // Only armed while a run is active, to advance the clocks and spinner.
+            // Only armed while a clock or spinner moves, to advance it.
             _ = tokio::time::sleep_until(tick_deadline), if running => {
                 tick_at = Instant::now() + TICK;
                 dirty = true;
@@ -378,6 +381,18 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
         }
     }
     Ok(())
+}
+
+/// Whether a clock or spinner needs the once-a-second tick: the open thread has a run going,
+/// or the last frame drew a sidebar card that reads Working or Goal. Work the sidebar doesn't
+/// show, because it is hidden, settled or scrolled away, doesn't wake the TUI.
+fn needs_tick(open: Option<&OpenThread>, sidebar: &Sidebar) -> bool {
+    // A closed watch never hears that its run finished, so its last state can't count.
+    let open_run = open
+        .filter(|o| o.connection != "closed")
+        .and_then(|o| o.state.as_ref())
+        .is_some_and(|s| s.active_run().is_some());
+    open_run || sidebar.drew_working()
 }
 
 /// The spinner frame for a wall-clock time, so every spinner on screen turns together.
@@ -452,23 +467,6 @@ impl App {
                 self.message = Some((message, true));
             }
         }
-    }
-
-    /// Whether any thread is working, which is when the clocks need a tick.
-    fn running(&self) -> bool {
-        // A closed watch never hears that its run finished, so its last state can't count.
-        if self
-            .open
-            .as_ref()
-            .filter(|o| o.connection != "closed")
-            .and_then(|o| o.state.as_ref())
-            .is_some_and(|s| s.active_run().is_some())
-        {
-            return true;
-        }
-        self.shell
-            .as_ref()
-            .is_some_and(|s| s.threads.iter().any(|t| is_active_status(status(t))))
     }
 
     /// Lays the sidebar's shelves out again from the shell, as of now.
@@ -3082,5 +3080,89 @@ mod tests {
         let line = row(vec![Span::raw("left")], vec![Span::raw("right")], 9);
         assert_eq!(text(&[line])[0], "leftright");
         assert_eq!(fit("abcdef", 4), "abc…");
+    }
+
+    #[test]
+    fn the_tick_follows_the_open_run_and_the_working_cards_drawn() {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::new(Depth::TrueColor);
+        // The sidebar as the event loop holds it after drawing a frame of `threads`.
+        let drawn = |threads: Vec<Value>| {
+            let shell = ShellState {
+                sequence: 1,
+                projects: Vec::new(),
+                threads,
+                synchronized: true,
+            };
+            let mut sidebar = Sidebar::default();
+            sidebar.rebuild(&shell.threads, Capabilities::default(), None, now_ms());
+            let view = View {
+                theme: &theme,
+                shell: Some(&shell),
+                open_id: None,
+                focused: false,
+                now: now_ms(),
+                dot: theme.success,
+            };
+            let mut terminal = Terminal::new(TestBackend::new(30, 12)).unwrap();
+            terminal
+                .draw(|frame| {
+                    let area = frame.area();
+                    sidebar.draw(frame, area, &view);
+                })
+                .unwrap();
+            sidebar
+        };
+        let thread = |id: &str, lineage: Value| {
+            json!({
+                "id": id,
+                "projectId": "p",
+                "title": id,
+                "latestRunId": "r",
+                "status": "running",
+                "lineage": lineage,
+            })
+        };
+        // The open thread `o`, with one run in `status`. It has no card in these sidebars.
+        let open = |connection: &str, status: &str| OpenThread {
+            id: "o".into(),
+            state: ThreadState::from_snapshot(&json!({
+                "snapshotSequence": 1,
+                "projection": {
+                    "thread": {"id": "o"},
+                    "runs": [{"id": "r", "status": status, "ordinal": 1}],
+                },
+            })),
+            events: mpsc::unbounded_channel().1,
+            connection: connection.into(),
+            answers: serde_json::Map::new(),
+            run_changes: HashMap::new(),
+        };
+
+        // A working card on screen ticks by itself, even past a closed watch.
+        let busy = drawn(vec![thread("busy", json!({}))]);
+        assert!(busy.drew_working());
+        assert!(needs_tick(None, &busy));
+        assert!(needs_tick(Some(&open("closed", "running")), &busy));
+
+        // A subagent works with no card, so it needs no tick. The open thread's run still
+        // ticks the transcript's clock while its watch is open.
+        let hidden = drawn(vec![thread(
+            "sub",
+            json!({"relationshipToParent": "subagent"}),
+        )]);
+        assert!(!hidden.drew_working());
+        assert!(!needs_tick(None, &hidden));
+        assert!(needs_tick(Some(&open("live", "running")), &hidden));
+        assert!(needs_tick(
+            Some(&open("reconnecting: timeout", "waiting")),
+            &hidden
+        ));
+        // A closed watch never hears the run finish, so its last state doesn't count. A
+        // finished run has no clock to move.
+        assert!(!needs_tick(Some(&open("closed", "running")), &hidden));
+        assert!(!needs_tick(Some(&open("live", "completed")), &hidden));
     }
 }
