@@ -243,8 +243,19 @@ impl Session {
             token: issued.token,
             expires_at: now_secs() + SAVED_TTL_SECS,
         };
+        // Track both logins before the Keychain write. A signal during the write drops this
+        // future, and exit cleanup then revokes them, so neither stays active unsaved. The next
+        // run finds the saved login rejected and issues a new one.
+        track_live(&saved.session_id, &command, runtime);
+        if let Some(old) = &stale {
+            // The server ignores a revoke for a session it already dropped.
+            track_live(&old.session_id, &command, runtime);
+        }
         if !keychain::save(&runtime.environment_id, &saved).await {
-            track_live(&saved.session_id, &command, runtime);
+            // The old login may still be the saved one, so keep it.
+            if let Some(old) = &stale {
+                take_live(Some(&old.session_id));
+            }
             return Ok(Session {
                 id: saved.session_id,
                 token: saved.token,
@@ -252,10 +263,7 @@ impl Session {
                 scopes: SAVED_SCOPES.to_vec(),
             });
         }
-        if let Some(old) = stale {
-            // Revoked on exit; the server ignores a revoke for a session it already dropped.
-            track_live(&old.session_id, &command, runtime);
-        }
+        take_live(Some(&saved.session_id));
         Ok(Session {
             id: saved.session_id,
             token: saved.token,
