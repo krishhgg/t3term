@@ -79,13 +79,31 @@ fn lock(path: &Path) -> io::Result<File> {
     Ok(file)
 }
 
+/// The file a save replaces: `path`, or the file a symlink there names. Links are followed one
+/// at a time, so a link to a file that doesn't exist yet still names it. Replacing that file
+/// keeps the link, such as one into a dotfiles repository, as writing in place did. A loop of
+/// links is an error, so a save can't replace one of them with a plain file.
+fn follow_links(path: &Path) -> io::Result<PathBuf> {
+    let mut target = path.to_path_buf();
+    // macOS follows at most 32 links in a path, MAXSYMLINKS in <sys/param.h>.
+    for _ in 0..32 {
+        let Ok(link) = std::fs::read_link(&target) else {
+            return Ok(target);
+        };
+        // A relative link is relative to the directory that holds it.
+        target = match target.parent() {
+            Some(dir) => dir.join(link),
+            None => link,
+        };
+    }
+    Err(io::Error::other("too many levels of symbolic links"))
+}
+
 /// Replaces the file at `path` with `settings` in one step: the text goes to a temporary file
 /// in the same directory, then a rename moves it over the old one. A temporary file left by a
-/// save that died partway is removed first, and so is this save's own if it fails. When `path`
-/// is a symlink, such as one into a dotfiles repository, the file it points to is replaced and
-/// the link stays, as it did when the file was written in place.
+/// save that died partway is removed first, and so is this save's own if it fails.
 fn write(path: &Path, settings: &Settings) -> io::Result<()> {
-    let target = std::fs::canonicalize(path).unwrap_or_else(|_| path.to_path_buf());
+    let target = follow_links(path)?;
     let temp = beside(&target, ".tmp");
     let text = serde_json::to_string_pretty(settings)? + "\n";
     let _ = std::fs::remove_file(&temp);
@@ -392,20 +410,46 @@ mod tests {
         let config = home.path().join("t3term");
         std::fs::create_dir(&dotfiles).unwrap();
         std::fs::create_dir(&config).unwrap();
-        let target = dotfiles.join("settings.json");
         let path = config.join("settings.json");
-        std::fs::write(&target, r#"{"planModeEnabled": true}"#).unwrap();
-        std::os::unix::fs::symlink(&target, &path).unwrap();
+
+        // An absolute link to a file that exists.
+        let existing = dotfiles.join("settings.json");
+        std::fs::write(&existing, r#"{"planModeEnabled": true}"#).unwrap();
+        std::os::unix::fs::symlink(&existing, &path).unwrap();
         update_at(&path, |settings| settings.verbose = true).unwrap();
-        assert!(std::fs::symlink_metadata(&path).unwrap().is_symlink());
+        assert!(
+            std::fs::symlink_metadata(&path).unwrap().is_symlink(),
+            "the save replaced the link to an existing file"
+        );
         assert_eq!(
-            read(&target),
+            read(&existing),
             Settings {
                 verbose: true,
                 plan_mode_enabled: true
             }
         );
-        assert!(!dotfiles.join("settings.json.tmp").exists());
+
+        // A relative link to a file that doesn't exist yet, which the save creates.
+        std::fs::remove_file(&path).unwrap();
+        std::os::unix::fs::symlink("../dotfiles/new.json", &path).unwrap();
+        update_at(&path, |settings| settings.verbose = true).unwrap();
+        assert!(
+            std::fs::symlink_metadata(&path).unwrap().is_symlink(),
+            "the save replaced the link to a missing file"
+        );
+        assert_eq!(
+            read(&dotfiles.join("new.json")),
+            Settings {
+                verbose: true,
+                plan_mode_enabled: false
+            }
+        );
+        let mut left: Vec<String> = std::fs::read_dir(&dotfiles)
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name().into_string().unwrap())
+            .collect();
+        left.sort();
+        assert_eq!(left, ["new.json", "settings.json"]);
     }
 
     #[test]
