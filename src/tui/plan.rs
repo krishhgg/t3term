@@ -262,8 +262,8 @@ pub fn card(markdown: &str, width: usize, context: &RenderContext, expanded: boo
 /// A card long enough to collapse, as the last frame drew it.
 pub struct Drawn {
     pub id: String,
-    /// The header's row counted from the top of the transcript, negative once the reader has
-    /// scrolled past it.
+    /// The header's row counted from the first transcript row on screen, negative once the
+    /// reader has scrolled past it.
     pub header: isize,
     /// The screen rows of the header and the button, where each is in view.
     pub rows: [Option<u16>; 2],
