@@ -590,19 +590,6 @@ impl App {
                 self.quit = true;
                 return;
             }
-            _ if self.picker.is_some() => {
-                self.on_picker_key(key);
-                return;
-            }
-            // The desktop app's model, effort and mode menus. It uses Cmd+Shift+M, E and A.
-            KeyCode::Char(c @ ('m' | 'e' | 'p')) if alt => {
-                self.open_picker(match c {
-                    'm' => Kind::Model,
-                    'e' => Kind::Traits,
-                    _ => Kind::Mode,
-                });
-                return;
-            }
             KeyCode::Char('x') if ctrl => {
                 self.interrupt();
                 return;
@@ -623,6 +610,19 @@ impl App {
             }
             KeyCode::Down if alt && self.panel_area.height > 0 => {
                 self.panel_scroll += 1;
+                return;
+            }
+            _ if self.picker.is_some() => {
+                self.on_picker_key(key);
+                return;
+            }
+            // The desktop app's model, effort and mode menus. It uses Cmd+Shift+M, E and A.
+            KeyCode::Char(c @ ('m' | 'e' | 'p')) if alt => {
+                self.open_picker(match c {
+                    'm' => Kind::Model,
+                    'e' => Kind::Traits,
+                    _ => Kind::Mode,
+                });
                 return;
             }
             KeyCode::Tab => {
@@ -2033,6 +2033,8 @@ impl App {
         let Some(picker) = self.picker.as_mut() else {
             return;
         };
+        // A refreshed model list can be shorter than the one the highlight was on.
+        picker.selected = picker.selected.min(items.len() - 1);
         let selected = picker.selected;
         if selected < picker.offset {
             picker.offset = selected;
