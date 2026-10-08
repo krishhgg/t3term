@@ -54,6 +54,8 @@ pub struct View {
     pub interaction_mode: String,
     /// Whether the mode menu offers Build and Plan.
     pub offers_plan: bool,
+    /// The legacy plan setting, which also decides whether the options menu offers the Plan agent.
+    pub plan_mode_enabled: bool,
     pub prompt_effort: Option<String>,
     /// What sending now would change.
     pub plan: Plan,
@@ -75,11 +77,87 @@ pub fn offers_plan(config: Option<&Value>, selection: &Value, plan_mode_enabled:
             .is_none_or(|provider| provider["showInteractionModeToggle"] != false)
 }
 
+/// The Plan agent's id in an `agent` select, such as OpenCode's.
+const PLAN_AGENT: &str = "plan";
+
+fn is_agent_select(descriptor: &Value) -> bool {
+    descriptor["id"] == "agent" && descriptor["type"] == "select"
+}
+
+/// A model's options as the composer offers them. With the legacy plan setting off, the
+/// desktop's `getProviderModelCapabilities` in apps/web/src/providerModels.ts takes Plan out of
+/// every `agent` select, whatever the provider, and drops a select left with no choices. The
+/// select's current value stays if it is still offered, else it moves to the default, else to the
+/// first choice left.
+fn offered_descriptors(model: &Value, plan_mode_enabled: bool) -> Vec<Value> {
+    models::descriptors(model)
+        .iter()
+        .filter_map(|descriptor| {
+            if plan_mode_enabled || !is_agent_select(descriptor) {
+                return Some(descriptor.clone());
+            }
+            let choices: Vec<Value> = descriptor["options"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|choice| choice["id"] != PLAN_AGENT)
+                .cloned()
+                .collect();
+            let current = choices
+                .iter()
+                .find(|choice| choice["id"] == descriptor["currentValue"])
+                .or_else(|| choices.iter().find(|choice| choice["isDefault"] == true))
+                .or_else(|| choices.first())?["id"]
+                .clone();
+            let mut offered = descriptor.clone();
+            offered["options"] = Value::Array(choices);
+            offered["currentValue"] = current;
+            Some(offered)
+        })
+        .collect()
+}
+
+/// `selection` without the Plan agent, or `None` when it doesn't pick Plan. As in the desktop's
+/// `getComposerProviderState` in apps/web/src/components/chat/composerProviderState.tsx, a saved
+/// `agent: plan` takes the agent select's current value from `offered_descriptors`, or goes when
+/// the model has no agent left. For a model T3 doesn't list it goes too, and the other options
+/// stay, as the desktop keeps them for an OpenCode model missing from the list.
+fn without_plan_agent(config: Option<&Value>, selection: &Value) -> Option<Value> {
+    let picks_plan = |option: &Value| option["id"] == "agent" && option["value"] == PLAN_AGENT;
+    let options = selection["options"].as_array()?;
+    if !options.iter().any(picks_plan) {
+        return None;
+    }
+    let agent = config
+        .and_then(|config| selected_model(config, selection))
+        .and_then(|(_, model)| {
+            offered_descriptors(model, false)
+                .into_iter()
+                .find(is_agent_select)
+        })
+        .map(|descriptor| descriptor["currentValue"].clone());
+    let options = options
+        .iter()
+        .filter_map(|option| {
+            if !picks_plan(option) {
+                return Some(option.clone());
+            }
+            let mut kept = option.clone();
+            kept["value"] = agent.clone()?;
+            Some(kept)
+        })
+        .collect();
+    let mut selection = selection.clone();
+    selection["options"] = Value::Array(options);
+    Some(selection)
+}
+
 /// What sending a message now changes: the draft, checked against `config`, and the mode the
 /// desktop would send. Where Build and Plan aren't offered, that mode is Build, as in the
 /// desktop's `persistThreadSettingsForNextTurn` in ChatView.tsx. A Plan pick in the draft then
 /// waits unused, and a thread left in Plan goes back to Build with this message, so a hidden
-/// control never leaves a turn planning.
+/// control never leaves a turn planning. The Plan agent is hidden the same way: with the setting
+/// off, a thread saved on it, or a model switch that carries it over, sends another agent.
 pub fn send_plan(
     config: Option<&Value>,
     thread: &Value,
@@ -95,6 +173,17 @@ pub fn send_plan(
         Some(config) if !choice.is_empty() => models::plan(config, thread, &choice)?,
         _ => Plan::default(),
     };
+    // Every message sends the selection without the Plan agent, as every message switches a
+    // thread left in Plan to Build, so neither keeps a draft alive.
+    if !plan_mode_enabled {
+        let selection = plan
+            .model_selection
+            .as_ref()
+            .unwrap_or(&thread["modelSelection"]);
+        if let Some(selection) = without_plan_agent(config, selection) {
+            plan.model_selection = Some(selection);
+        }
+    }
     let selection = plan
         .model_selection
         .as_ref()
@@ -139,6 +228,7 @@ pub fn view(
         .unwrap_or_else(|| thread["modelSelection"].clone());
     View {
         offers_plan: offers_plan(config, &selection, plan_mode_enabled),
+        plan_mode_enabled,
         selection,
         runtime_mode: plan.runtime_mode.clone().unwrap_or_else(|| {
             thread["runtimeMode"]
@@ -231,7 +321,7 @@ fn trait_items(config: &Value, view: &View) -> Vec<Item> {
         return Vec::new();
     };
     let mut items = Vec::new();
-    for descriptor in models::descriptors(model) {
+    for descriptor in &offered_descriptors(model, view.plan_mode_enabled) {
         let id = str_of(descriptor, "id");
         let label = descriptor["label"].as_str().unwrap_or(id);
         let current = models::effective_value(descriptor, &view.selection);
@@ -347,7 +437,7 @@ pub fn traits_label(config: &Value, view: &View) -> Option<String> {
     let mut labels: Vec<String> = Vec::new();
     let mut effort_index = None;
     let mut fast = None;
-    for descriptor in models::descriptors(model) {
+    for descriptor in &offered_descriptors(model, view.plan_mode_enabled) {
         let id = str_of(descriptor, "id");
         let value = models::effective_value(descriptor, &view.selection);
         let label = match descriptor["type"].as_str() {
@@ -702,5 +792,276 @@ mod tests {
                 .as_deref(),
             Some("default")
         );
+    }
+
+    /// Models with agent selects, as OpenCode lists them before OpenCode 2. Acme stands for any
+    /// other provider with one, since the desktop takes Plan out whatever the provider.
+    fn agents() -> Value {
+        json!({"providers": [
+            {"instanceId": "opencode", "displayName": "OpenCode", "enabled": true, "status": "ready",
+             "showInteractionModeToggle": false,
+             "models": [
+                {"slug": "big-pickle", "name": "Big Pickle", "capabilities": {"optionDescriptors": [
+                    {"id": "variant", "label": "Reasoning", "type": "select",
+                     "options": [{"id": "low", "label": "Low"}, {"id": "high", "label": "High", "isDefault": true}],
+                     "currentValue": "high"},
+                    {"id": "agent", "label": "Agent", "type": "select",
+                     "options": [{"id": "build", "label": "Build", "isDefault": true}, {"id": "plan", "label": "Plan"}],
+                     "currentValue": "build"}
+                ]}},
+                {"slug": "planner", "name": "Planner", "capabilities": {"optionDescriptors": [
+                    {"id": "agent", "label": "Agent", "type": "select",
+                     "options": [{"id": "plan", "label": "Plan", "isDefault": true}, {"id": "research", "label": "Research"}],
+                     "currentValue": "plan"}
+                ]}},
+                {"slug": "plan-only", "name": "Plan Only", "capabilities": {"optionDescriptors": [
+                    {"id": "agent", "label": "Agent", "type": "select",
+                     "options": [{"id": "plan", "label": "Plan", "isDefault": true}], "currentValue": "plan"}
+                ]}}
+             ]},
+            {"instanceId": "acme", "displayName": "Acme", "enabled": true, "status": "ready",
+             "models": [{"slug": "acme-1", "name": "Acme One", "capabilities": {"optionDescriptors": [
+                {"id": "agent", "label": "Agent", "type": "select",
+                 "options": [{"id": "plan", "label": "Plan"}, {"id": "write", "label": "Write", "isDefault": true}]}
+             ]}}]}
+        ]})
+    }
+
+    fn on_opencode(model: &str, options: Value) -> Value {
+        json!({
+            "modelSelection": {"instanceId": "opencode", "model": model, "options": options},
+            "runtimeMode": "full-access",
+            "interactionMode": "default"
+        })
+    }
+
+    fn entry(label: &str, current: bool) -> (String, bool) {
+        (label.to_string(), current)
+    }
+
+    #[test]
+    fn the_plan_agent_is_offered_only_with_the_setting() {
+        let config = agents();
+        let none = Choice::default();
+        let thread = on_opencode("big-pickle", json!([]));
+        let off = view(Some(&config), &thread, &none, PLAN_OFF);
+        assert_eq!(
+            entries(&items(Kind::Traits, &config, &off, "")),
+            [
+                entry("Low", false),
+                entry("High", true),
+                entry("Build", true)
+            ]
+        );
+        assert_eq!(traits_label(&config, &off).as_deref(), Some("High · Build"));
+        assert_eq!(off.plan, Plan::default());
+        let on = view(Some(&config), &thread, &none, PLAN_ON);
+        assert_eq!(
+            entries(&items(Kind::Traits, &config, &on, "")),
+            [
+                entry("Low", false),
+                entry("High", true),
+                entry("Build", true),
+                entry("Plan", false)
+            ]
+        );
+
+        // The desktop filters by the option, not the provider.
+        let acme = json!({"modelSelection": {"instanceId": "acme", "model": "acme-1"}});
+        let acme_off = view(Some(&config), &acme, &none, PLAN_OFF);
+        assert_eq!(
+            entries(&items(Kind::Traits, &config, &acme_off, "")),
+            [entry("Write", true)]
+        );
+        let acme_on = view(Some(&config), &acme, &none, PLAN_ON);
+        assert_eq!(
+            entries(&items(Kind::Traits, &config, &acme_on, "")),
+            [entry("Plan", false), entry("Write", true)]
+        );
+    }
+
+    #[test]
+    fn a_thread_saved_on_the_plan_agent_sends_the_agent_left() {
+        let config = agents();
+        let none = Choice::default();
+        let thread = on_opencode(
+            "big-pickle",
+            json!([{"id": "agent", "value": "plan"}, {"id": "variant", "value": "low"}]),
+        );
+        // Off, the next message sends Build in Plan's place, and the menu and chip say so.
+        let off = view(Some(&config), &thread, &none, PLAN_OFF);
+        assert_eq!(
+            off.plan,
+            Plan {
+                model_selection: Some(json!({"instanceId": "opencode", "model": "big-pickle",
+                    "options": [{"id": "agent", "value": "build"}, {"id": "variant", "value": "low"}]})),
+                ..Plan::default()
+            }
+        );
+        assert_eq!(traits_label(&config, &off).as_deref(), Some("Low · Build"));
+        assert!(entries(&items(Kind::Traits, &config, &off, "")).contains(&entry("Build", true)));
+        // On, the thread keeps its agent and nothing more is sent.
+        let on = view(Some(&config), &thread, &none, PLAN_ON);
+        assert_eq!(on.plan, Plan::default());
+        assert_eq!(traits_label(&config, &on).as_deref(), Some("Low · Plan"));
+        assert!(entries(&items(Kind::Traits, &config, &on, "")).contains(&entry("Plan", true)));
+
+        // Every message swaps the agent, so a draft is spent once the thread has the rest of it.
+        let mut draft = Choice::default();
+        apply(&mut draft, &thread, &Pick::Mode("approval-required".into()));
+        assert!(!spent(&config, &thread, &draft, PLAN_OFF).unwrap());
+        let mut applied = thread.clone();
+        applied["runtimeMode"] = json!("approval-required");
+        assert!(spent(&config, &applied, &draft, PLAN_OFF).unwrap());
+
+        // The CLI's `--option agent=plan` goes through `models::plan`, which has no setting.
+        let cli = models::plan(
+            &config,
+            &on_opencode("big-pickle", json!([])),
+            &Choice {
+                options: vec![("agent".into(), "plan".into())],
+                ..Choice::default()
+            },
+        )
+        .unwrap();
+        assert_eq!(
+            cli.model_selection.unwrap()["options"],
+            json!([{"id": "agent", "value": "plan"}])
+        );
+    }
+
+    #[test]
+    fn plan_as_the_default_or_the_only_agent() {
+        let config = agents();
+        let none = Choice::default();
+        // Off, the menu and chip show Research in place of Plan, the default. A message sends
+        // no agent, as the desktop sends none for a value nobody picked.
+        let planner = view(
+            Some(&config),
+            &on_opencode("planner", json!([])),
+            &none,
+            PLAN_OFF,
+        );
+        assert_eq!(
+            entries(&items(Kind::Traits, &config, &planner, "")),
+            [entry("Research", true)]
+        );
+        assert_eq!(traits_label(&config, &planner).as_deref(), Some("Research"));
+        assert_eq!(planner.plan, Plan::default());
+        let saved = on_opencode("planner", json!([{"id": "agent", "value": "plan"}]));
+        assert_eq!(
+            send_plan(Some(&config), &saved, &none, PLAN_OFF)
+                .unwrap()
+                .model_selection
+                .unwrap()["options"],
+            json!([{"id": "agent", "value": "research"}])
+        );
+
+        // With Plan the only agent, the select goes, and a saved Plan is sent as no agent.
+        let only = on_opencode("plan-only", json!([{"id": "agent", "value": "plan"}]));
+        let off = view(Some(&config), &only, &none, PLAN_OFF);
+        assert!(items(Kind::Traits, &config, &off, "").is_empty());
+        assert_eq!(traits_label(&config, &off), None);
+        assert_eq!(off.selection["options"], json!([]));
+        let unpicked = on_opencode("plan-only", json!([]));
+        assert_eq!(
+            send_plan(Some(&config), &unpicked, &none, PLAN_OFF).unwrap(),
+            Plan::default()
+        );
+        let on = view(Some(&config), &only, &none, PLAN_ON);
+        assert_eq!(
+            entries(&items(Kind::Traits, &config, &on, "")),
+            [entry("Plan", true)]
+        );
+        assert_eq!(on.plan, Plan::default());
+    }
+
+    #[test]
+    fn a_model_switch_does_not_carry_the_plan_agent_over() {
+        let config = agents();
+        let thread = on_opencode("big-pickle", json!([{"id": "agent", "value": "plan"}]));
+        let switch = |model: &str, setting: bool| {
+            let draft = Choice {
+                model: Some(model.into()),
+                ..Choice::default()
+            };
+            send_plan(Some(&config), &thread, &draft, setting)
+                .unwrap()
+                .model_selection
+                .unwrap()["options"]
+                .clone()
+        };
+        // Planner and Acme offer Plan too, so `models::plan` keeps it for them.
+        assert_eq!(
+            switch("opencode/planner", PLAN_OFF),
+            json!([{"id": "agent", "value": "research"}])
+        );
+        assert_eq!(
+            switch("opencode/planner", PLAN_ON),
+            json!([{"id": "agent", "value": "plan"}])
+        );
+        assert_eq!(switch("opencode/plan-only", PLAN_OFF), json!([]));
+        assert_eq!(
+            switch("acme/acme-1", PLAN_OFF),
+            json!([{"id": "agent", "value": "write"}])
+        );
+    }
+
+    #[test]
+    fn an_unlisted_model_loses_only_the_plan_agent_and_checks_still_refuse() {
+        let config = agents();
+        let none = Choice::default();
+        let gone = on_opencode(
+            "gone",
+            json!([{"id": "variant", "value": "max"}, {"id": "agent", "value": "plan"}]),
+        );
+        let kept = Some(json!({"instanceId": "opencode", "model": "gone",
+                               "options": [{"id": "variant", "value": "max"}]}));
+        // T3 doesn't list the model, and before T3's list arrives no model is known. The desktop
+        // keeps the other options for an OpenCode model it can't find, and so does t3term.
+        for list in [Some(&config), None] {
+            assert_eq!(
+                send_plan(list, &gone, &none, PLAN_OFF)
+                    .unwrap()
+                    .model_selection,
+                kept
+            );
+            assert_eq!(Some(view(list, &gone, &none, PLAN_OFF).selection), kept);
+        }
+        assert_eq!(
+            send_plan(Some(&config), &gone, &none, PLAN_ON).unwrap(),
+            Plan::default()
+        );
+
+        // Choices T3 would refuse still fail, and the view shows no draft, still without Plan.
+        let variant = Choice {
+            options: vec![("variant".into(), "max".into())],
+            ..Choice::default()
+        };
+        assert!(send_plan(Some(&config), &gone, &variant, PLAN_OFF).is_err());
+        let pickle = on_opencode("big-pickle", json!([{"id": "agent", "value": "plan"}]));
+        for draft in [
+            Choice {
+                options: vec![("agent".into(), "nope".into())],
+                ..Choice::default()
+            },
+            Choice {
+                model: Some("opencode/nope".into()),
+                ..Choice::default()
+            },
+        ] {
+            assert!(send_plan(Some(&config), &pickle, &draft, PLAN_OFF).is_err());
+            assert_eq!(
+                view(Some(&config), &pickle, &draft, PLAN_OFF).selection["options"],
+                json!([{"id": "agent", "value": "build"}])
+            );
+        }
+        let pi = json!({"modelSelection": {"instanceId": "pi", "model": "pi-1",
+                                           "options": [{"id": "agent", "value": "plan"}]}});
+        let access = Choice {
+            runtime_mode: Some("full-access".into()),
+            ..Choice::default()
+        };
+        assert!(send_plan(Some(&self::config()), &pi, &access, PLAN_OFF).is_err());
     }
 }
