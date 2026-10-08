@@ -45,7 +45,7 @@ cargo build --release
 
 `cargo install --path .` puts `t3term` on your PATH instead.
 
-You need T3 Code already running, either the desktop app or `t3` from [their installer](https://github.com/pingdotgg/t3code#installation), plus a Rust toolchain. t3term finds the server on its own and logs itself in, so there is nothing to configure. If `doctor` fails it names the step that failed.
+You need T3 Code already running, either the desktop app or `t3` from [their installer](https://github.com/pingdotgg/t3code#installation), plus a Rust toolchain. t3term finds the server on its own and logs itself in, so there is nothing to configure. If `doctor` fails it names the step that failed. It cannot create a thread yet, so start one in the app and open it here.
 
 Tested against T3 Code `0.0.46-nightly.20261007.2787` on orchestration protocol 2, on macOS. Linux and Windows have not been tried.
 
@@ -66,7 +66,7 @@ Neither row counts what runs whichever client you use: T3's server itself used 4
 
 **It is scriptable.** Every subcommand takes `--json`, and `t3term threads --limit 1` answers in 30 to 50 ms using the saved login. Send a prompt from a git hook, wait for the turn, approve what it asks, read the result. One gap: when the agent asks a question rather than for approval, `requests` lists it but only the TUI can answer it.
 
-**It is a client, not a fork.** t3term opens no database and starts no server. A thread you start here is the thread the desktop app and the phone app show.
+**It is a client, not a fork.** t3term opens no database and starts no server. A thread you open here is the thread the desktop app and the phone app show.
 
 <p align="center">
   <img src="docs/screenshots/gui-vs-tui.png" alt="The T3 Code desktop app on the left and t3term on the right, showing the same thread with the same answer and code block" width="940">
@@ -114,7 +114,7 @@ Click the row to open it. Each call is then one row with its icon, what it did a
 
 ![The same turn with the row open: a file read and a search, each with its output](docs/screenshots/tool-calls-open.png)
 
-`t` opens every row at once and keeps new turns open, which is t3term's version of Conductor's Gary's Mode. `t` again closes them all. The setting is saved in `~/.config/t3term/settings.json`, so it survives a restart. That file is t3term's own, not T3's.
+`t` opens every row at once and keeps new turns open, so a long run reads as it happens with no clicking. `t` again closes them all. The setting is saved in `~/.config/t3term/settings.json`, so it survives a restart. That file is t3term's own, not T3's.
 
 T3 leaves tool output out of a thread's projection so a large result can't stall the socket, and marks the item instead. t3term asks for it with `orchestration.getTurnItem`, only for the rows on screen, and keeps the answer until the item changes. Each row shows twelve lines: the first twelve of a file or a search, the last twelve of a command, where its result is.
 
