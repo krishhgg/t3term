@@ -124,7 +124,7 @@ Click the row to open it. Each call is then one row with its icon, what it did a
 
 ![The same turn with the row open: a file read and a search, each with its output](docs/screenshots/tool-calls-open.png)
 
-`t` opens every row at once and keeps new turns open, so a long run reads as it happens with no clicking. `t` again closes them all. The setting is saved in `~/.config/t3term/settings.json`, so it survives a restart. That file is t3term's own, not T3's.
+`t` opens every row at once and keeps new turns open, so a long run reads as it happens with no clicking. `t` again closes them all. The setting is saved in `~/.config/t3term/settings.json`, so it survives a restart. That file is t3term's own, not T3's. Each save reads the file again while it holds a lock on `settings.json.lock` beside it, then replaces the file whole, so a second t3term or a quick second `t` can't save over a change it hasn't read. If the file doesn't parse, t3term starts with the defaults and leaves the file as it is, so `t` saves nothing until you fix or delete it.
 
 T3 leaves tool output out of a thread's projection so a large result can't stall the socket, and marks the item instead. t3term asks for it with `orchestration.getTurnItem`, only for the rows on screen, and keeps the answer until the item changes. Each row shows twelve lines: the first twelve of a file or a search, the last twelve of a command, where its result is.
 
