@@ -80,7 +80,7 @@ Rust is a big part of why it stays that low, since there's no runtime or garbage
 
 ## What you get
 
-The TUI follows the desktop app closely, because muscle memory is worth more than a new idea here. The sidebar lists threads as cards with the project monogram, status or age, title, branch and provider glyph, and finished threads drop to a Settled shelf. Your prompts are right-aligned bubbles. Approvals and questions open a panel above the composer with their keys printed on the buttons.
+The TUI follows the desktop app closely, because muscle memory is worth more than a new idea here. The sidebar lists threads as cards with the project monogram, status or age, title, branch and provider glyph. The cards sit on the desktop's Pinned, Active, Snoozed and Settled shelves, in the desktop's order, each under its own heading. A snoozed thread comes back to its shelf when the snooze ends, and the Settled shelf stays closed until you open it. Forks are listed like any other thread. Archived threads and subagents are not. Your prompts are right-aligned bubbles. Approvals and questions open a panel above the composer with their keys printed on the buttons.
 
 <p align="center">
   <img src="docs/screenshots/tui.png" alt="t3term with a thread open: the sidebar on the left, a turn showing a command and its output, the answer, and the composer with model, effort and mode chips" width="940">
@@ -166,7 +166,7 @@ The choices on `send` and `settings` are `--model`, `--effort`, `--option ID=VAL
 - **Auth.** On macOS, t3term keeps one login per T3 server in the login Keychain under the service `t3term`. It lasts 30 days, the same as T3's own default, and holds only `orchestration:read` and `orchestration:operate`. Each run checks it against `/api/auth/session`, and if it expires within a day or the server rejects it, t3term issues a new one and revokes the old one, so you never log in by hand. `t3term logout` revokes and deletes it.
 - **RPC.** Effect RPC over one `/ws` connection. The client acks every stream chunk and pings every 10 seconds. If no frame arrives for 30 seconds it treats the socket as dead.
 - **State.** Each V2 event carries the whole updated entity, so the reducer upserts it by id. After a dropped connection the client resubscribes with `afterSequence` and skips any replayed event it already applied.
-- **Rendering.** The TUI draws only after input or a server event, at most 30 times a second. Each transcript block keeps its wrapped lines until its content or the width changes, and only the visible rows are copied into a frame. While a turn runs, a once-a-second tick advances the spinner and the clock, and that tick stops when the turn ends, so an idle TUI wakes only for input or server events.
+- **Rendering.** The TUI draws only after input or a server event, at most 30 times a second. Each transcript block keeps its wrapped lines until its content or the width changes, and only the visible rows are copied into a frame. While a turn runs, a once-a-second tick advances the spinner and the clock, and that tick stops when the turn ends. While a thread is snoozed, one timer waits for the soonest snooze to end, because no server event marks that moment. Otherwise an idle TUI wakes only for input or server events.
 
 <details>
 <summary><strong>More on the saved login</strong></summary>
@@ -194,7 +194,8 @@ The unit tests cover the reducers, Markdown wrapping, the composer, the model me
 - New threads, diffs and checkpoints, worktrees, attachments, embedded terminals and queue management.
 - A check of the reducer's output against T3's TypeScript reducer on recorded event streams.
 - Linux and Windows. The code has Linux pid lookup, but only macOS has been tested, and the saved login needs the macOS Keychain, so other systems would issue a new session every run.
-- Syntax highlighting in code blocks, the project and git panel, and the Pinned and Snoozed shelves from the desktop app.
+- Syntax highlighting in code blocks and the project and git panel.
+- Pinning, snoozing, settling and reordering threads. The sidebar shows the shelves, but moving a thread between them still takes the desktop app. The Snoozed shelf also stays open, where the desktop starts it closed, and there is no Working shelf.
 
 ## Credit
 
