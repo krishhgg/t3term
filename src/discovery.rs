@@ -25,11 +25,17 @@ pub struct Runtime {
     pub label: Option<String>,
     pub server_version: String,
     pub protocol_version: Option<u64>,
+    /// Feature flags from the environment descriptor, such as `serverResolvedCommandContext`.
+    pub capabilities: Value,
 }
 
 impl Runtime {
     pub fn protocol_supported(&self) -> bool {
         self.protocol_version == Some(PROTOCOL_VERSION)
+    }
+
+    pub fn has_capability(&self, name: &str) -> bool {
+        self.capabilities[name] == true
     }
 
     pub fn require_supported_protocol(&self) -> Result<()> {
@@ -64,6 +70,8 @@ struct Descriptor {
     server_version: String,
     label: Option<String>,
     orchestration_protocol_version: Option<Value>,
+    #[serde(default)]
+    capabilities: Value,
 }
 
 pub fn t3_home() -> PathBuf {
@@ -151,6 +159,7 @@ pub async fn discover() -> Result<Runtime> {
             protocol_version: descriptor
                 .orchestration_protocol_version
                 .and_then(|v| v.as_u64()),
+            capabilities: descriptor.capabilities,
         });
     }
     Err(err_exit(

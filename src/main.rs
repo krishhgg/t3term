@@ -4,13 +4,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use clap::{Parser, Subcommand, ValueEnum};
+use clap::{Args, Parser, Subcommand, ValueEnum};
 use serde_json::{Value, json};
 
 use t3term::auth::Scope;
 use t3term::client::{Client, IfBusy, WatchEvent};
 use t3term::discovery;
 use t3term::error::{T3Error, err, err_exit, exit};
+use t3term::models::{self, Choice, Plan};
 use t3term::projection::{Applied, ThreadState, is_active_status, is_terminal_status, status};
 use t3term::transcript;
 
@@ -74,6 +75,8 @@ enum Command {
         /// What to do if the thread is already working.
         #[arg(long, value_enum, default_value_t = BusyArg::Refuse)]
         if_busy: BusyArg,
+        #[command(flatten)]
+        choice: ChoiceArgs,
     },
     /// Wait for the thread's current turn to finish, streaming its reply.
     Wait {
@@ -94,8 +97,98 @@ enum Command {
     },
     /// Interrupt the thread's running turn.
     Interrupt { thread: String },
+    /// List the providers and models T3 offers, with each model's options.
+    Models {
+        /// Include providers that are turned off in T3's settings.
+        #[arg(long)]
+        all: bool,
+    },
+    /// Show a thread's model, effort and modes, or change them without sending a message.
+    Settings {
+        thread: String,
+        #[command(flatten)]
+        choice: ChoiceArgs,
+    },
     /// Revoke the saved login for this server and remove it from the Keychain.
     Logout,
+}
+
+/// Model and mode choices. Anything left out keeps the thread's current value.
+#[derive(Args)]
+struct ChoiceArgs {
+    /// Model as provider/model, a model id or its name. `t3term models` lists them.
+    #[arg(long)]
+    model: Option<String>,
+    /// Reasoning effort, such as low, medium or high. The values depend on the model.
+    #[arg(long)]
+    effort: Option<String>,
+    /// Another model option as ID=VALUE, such as fastMode=on. Repeat for more.
+    #[arg(long = "option", value_name = "ID=VALUE")]
+    options: Vec<String>,
+    /// What the agent may do without asking.
+    #[arg(long, value_enum)]
+    mode: Option<ModeArg>,
+    /// Turn plan mode on.
+    #[arg(long, conflicts_with = "no_plan")]
+    plan: bool,
+    /// Turn plan mode off.
+    #[arg(long)]
+    no_plan: bool,
+}
+
+impl ChoiceArgs {
+    fn choice(&self) -> Result<Choice> {
+        let options = self
+            .options
+            .iter()
+            .map(|pair| {
+                pair.split_once('=')
+                    .map(|(id, value)| (id.trim().to_string(), value.trim().to_string()))
+                    .ok_or_else(|| {
+                        err_exit(
+                            "INVALID_CHOICE",
+                            exit::USAGE,
+                            format!("--option takes ID=VALUE, not {pair}."),
+                        )
+                    })
+            })
+            .collect::<Result<_>>()?;
+        Ok(Choice {
+            model: self.model.clone(),
+            effort: self.effort.clone(),
+            options,
+            runtime_mode: self.mode.map(|mode| mode.wire().to_string()),
+            interaction_mode: match (self.plan, self.no_plan) {
+                (true, _) => Some("plan".into()),
+                (_, true) => Some("default".into()),
+                _ => None,
+            },
+        })
+    }
+}
+
+#[derive(Clone, Copy, ValueEnum)]
+enum ModeArg {
+    /// Supervised: ask before commands and file changes.
+    #[value(alias = "supervised")]
+    ApprovalRequired,
+    /// Approve edits, ask before other actions.
+    AutoAcceptEdits,
+    /// Providers that support it approve routine actions; others still ask.
+    Auto,
+    /// Allow commands and edits without asking.
+    FullAccess,
+}
+
+impl ModeArg {
+    fn wire(self) -> &'static str {
+        match self {
+            ModeArg::ApprovalRequired => "approval-required",
+            ModeArg::AutoAcceptEdits => "auto-accept-edits",
+            ModeArg::Auto => "auto",
+            ModeArg::FullAccess => "full-access",
+        }
+    }
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -147,6 +240,147 @@ fn main() {
     // Watcher tasks may still hold the client, so revoke explicitly rather than rely on Drop.
     t3term::auth::revoke_all_sessions();
     std::process::exit(code);
+}
+
+fn plan_json(plan: &Plan) -> Value {
+    json!({
+        "modelSelection": plan.model_selection,
+        "runtimeMode": plan.runtime_mode,
+        "interactionMode": plan.interaction_mode,
+        "promptEffort": plan.prompt_effort,
+    })
+}
+
+fn option_text(value: &Value) -> String {
+    match value {
+        Value::Bool(true) => "on".into(),
+        Value::Bool(false) => "off".into(),
+        Value::String(s) => s.clone(),
+        other => other.to_string(),
+    }
+}
+
+/// One line per model, with its options. `*` marks the default model and each option's default.
+fn models_text(providers: &[&Value]) -> String {
+    let mut out = String::new();
+    for provider in providers {
+        let state = match provider["status"].as_str() {
+            _ if !models::enabled(provider) => "  (off)".to_string(),
+            Some(status) if status != "ready" => format!("  ({status})"),
+            _ => String::new(),
+        };
+        out += &format!(
+            "{}  {}{state}\n",
+            text(&provider["instanceId"]),
+            text(&provider["displayName"])
+        );
+        let models = models::models(provider);
+        let width = models
+            .iter()
+            .map(|m| text(&m["slug"]).chars().count() + 1)
+            .max()
+            .unwrap_or(0);
+        for model in models {
+            let marker = if model["isDefault"] == true { "*" } else { "" };
+            let options: Vec<String> = models::descriptors(model)
+                .iter()
+                .map(|d| {
+                    let default = models::effective_value(d, &Value::Null);
+                    let values = match d["type"].as_str() {
+                        Some("select") => d["options"]
+                            .as_array()
+                            .map(|choices| {
+                                choices
+                                    .iter()
+                                    .map(|c| {
+                                        let star = if Some(&c["id"]) == default.as_ref() {
+                                            "*"
+                                        } else {
+                                            ""
+                                        };
+                                        format!("{}{star}", text(&c["id"]))
+                                    })
+                                    .collect::<Vec<_>>()
+                                    .join("|")
+                            })
+                            .unwrap_or_default(),
+                        _ => [("on", true), ("off", false)]
+                            .iter()
+                            .map(|(label, value)| {
+                                let star = if default == Some(json!(value)) {
+                                    "*"
+                                } else {
+                                    ""
+                                };
+                                format!("{label}{star}")
+                            })
+                            .collect::<Vec<_>>()
+                            .join("|"),
+                    };
+                    format!("{} {values}", text(&d["id"]))
+                })
+                .collect();
+            out += &format!(
+                "  {:<width$} {:<22} {}\n",
+                format!("{}{marker}", text(&model["slug"])),
+                text(&model["name"]),
+                options.join("  ")
+            );
+        }
+    }
+    out
+}
+
+fn settings_text(settings: &Value) -> String {
+    let mut out = format!(
+        "model     {}/{}",
+        text(&settings["instanceId"]),
+        text(&settings["model"])
+    );
+    if let Some(name) = settings["modelName"].as_str() {
+        out += &format!("  ({}, {name})", text(&settings["provider"]));
+    }
+    out += "\n";
+    if let Some(options) = settings["options"].as_object() {
+        for (id, value) in options {
+            out += &format!("{id:<9} {}\n", option_text(value));
+        }
+    }
+    out += &format!("mode      {}\n", text(&settings["runtimeModeLabel"]));
+    out += &format!(
+        "plan      {}\n",
+        if settings["interactionMode"] == "plan" {
+            "on"
+        } else {
+            "off"
+        }
+    );
+    out
+}
+
+fn changes_text(plan: &Plan) -> String {
+    let mut out = String::new();
+    if let Some(selection) = &plan.model_selection {
+        let options: Vec<String> = selection["options"]
+            .as_array()
+            .map_or(&[][..], Vec::as_slice)
+            .iter()
+            .map(|o| format!("{}={}", text(&o["id"]), option_text(&o["value"])))
+            .collect();
+        out += &format!(
+            "model set to {}/{} {}\n",
+            text(&selection["instanceId"]),
+            text(&selection["model"]),
+            options.join(" ")
+        );
+    }
+    if let Some(mode) = &plan.runtime_mode {
+        out += &format!("mode set to {}\n", models::runtime_mode_label(mode));
+    }
+    if let Some(mode) = &plan.interaction_mode {
+        out += &format!("plan mode {}\n", if mode == "plan" { "on" } else { "off" });
+    }
+    out
 }
 
 /// Resolves to the shell exit code for SIGHUP or SIGTERM, whichever arrives first.
@@ -219,6 +453,53 @@ async fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Command::Doctor => doctor(json_mode).await,
+        Command::Models { all } => {
+            let client = connect(READ, "10m").await?;
+            let config = client.server_config().await?;
+            let providers: Vec<&Value> = models::providers(&config)
+                .iter()
+                .filter(|p| all || models::enabled(p))
+                .collect();
+            if json_mode {
+                print_json(&json!({"ok": true, "providers": providers}));
+            } else {
+                print!("{}", models_text(&providers));
+            }
+            Ok(0)
+        }
+        Command::Settings { thread, choice } => {
+            let choice = choice.choice()?;
+            let scopes = if choice.is_empty() { READ } else { OPERATE };
+            let client = connect(scopes, "10m").await?;
+            let id = resolve_thread(&client, &thread).await?;
+            let state = client.thread(&id, true).await?;
+            let config = client.server_config().await?;
+            let plan = models::plan(&config, state.thread(), &choice)?;
+            let applied = client.apply_settings(&state, &plan).await?;
+            if json_mode {
+                // Report the settings as they are now, not as the snapshot read before the change.
+                let state = match applied {
+                    Some(sequence) => client.thread_after(&id, sequence).await?,
+                    None => state,
+                };
+                print_json(&json!({
+                    "ok": true,
+                    "threadId": id,
+                    "settings": models::thread_settings(&config, state.thread()),
+                    "changed": plan_json(&plan),
+                }));
+            } else if choice.is_empty() {
+                print!(
+                    "{}",
+                    settings_text(&models::thread_settings(&config, state.thread()))
+                );
+            } else if plan == Plan::default() {
+                println!("Nothing to change.");
+            } else {
+                print!("{}", changes_text(&plan));
+            }
+            Ok(0)
+        }
         Command::Logout => logout(json_mode).await,
         Command::Projects => {
             let client = connect(READ, "10m").await?;
@@ -356,7 +637,9 @@ async fn run(cli: Cli) -> Result<i32> {
             wait,
             timeout,
             if_busy,
+            choice,
         } => {
+            let choice = choice.choice()?;
             let prompt = match prompt {
                 Some(prompt) => prompt,
                 None => {
@@ -374,11 +657,18 @@ async fn run(cli: Cli) -> Result<i32> {
                 BusyArg::Queue => IfBusy::Queue,
                 BusyArg::Steer => IfBusy::Steer,
             };
-            let receipt = client.send_message(&state, &prompt, if_busy).await?;
+            let plan = if choice.is_empty() {
+                Plan::default()
+            } else {
+                models::plan(&client.server_config().await?, state.thread(), &choice)?
+            };
+            let receipt = client
+                .send_message_with(&state, &prompt, if_busy, &plan)
+                .await?;
             if !wait {
                 if json_mode {
                     print_json(
-                        &json!({"ok": true, "threadId": id, "messageId": receipt.message_id, "dispatchMode": receipt.dispatch_mode, "sequence": receipt.sequence}),
+                        &json!({"ok": true, "threadId": id, "messageId": receipt.message_id, "dispatchMode": receipt.dispatch_mode, "sequence": receipt.sequence, "changed": plan_json(&plan)}),
                     );
                 } else {
                     println!("sent {} ({})", receipt.message_id, receipt.dispatch_mode);
@@ -802,4 +1092,26 @@ fn finish_doctor(checks: serde_json::Map<String, Value>, ok: bool, json_mode: bo
         }
     }
     Ok(if ok { 0 } else { exit::UNAVAILABLE })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn models_text_marks_each_options_default() {
+        let provider = json!({"instanceId": "cursor", "displayName": "Cursor", "status": "ready",
+        "models": [{"slug": "grok-4.7", "name": "Grok 4.7", "isDefault": true,
+            "capabilities": {"optionDescriptors": [
+                {"id": "reasoning", "type": "select",
+                 "options": [{"id": "low"}, {"id": "high", "isDefault": true}]},
+                {"id": "fastMode", "type": "boolean", "currentValue": true},
+                {"id": "thinking", "type": "boolean"}
+            ]}}]});
+        let text = models_text(&[&provider]);
+        assert!(text.contains("grok-4.7*"), "{text}");
+        assert!(text.contains("reasoning low|high*"), "{text}");
+        assert!(text.contains("fastMode on*|off"), "{text}");
+        assert!(text.contains("thinking on|off"), "{text}");
+    }
 }
