@@ -272,7 +272,8 @@ pub struct Drawn {
 /// The card `id` when a frame draws rows `from..to` of it, the first of them on transcript row
 /// `base` of a transcript that starts on screen row `y`. `toggle` holds the card's header and
 /// button rows. A card counts as in view while any row from its header to its button shows,
-/// even when that is only part of the body. The blank rows around it don't count.
+/// even when that is only part of the body. The blank rows around it don't count, and neither
+/// does a frame that draws no rows, as a transcript with no height does.
 pub fn drawn(
     id: &str,
     (header, button): (usize, usize),
@@ -281,7 +282,7 @@ pub fn drawn(
     base: usize,
     y: u16,
 ) -> Option<Drawn> {
-    if header >= to || button < from {
+    if from >= to || header >= to || button < from {
         return None;
     }
     let row = |index: usize| {
@@ -609,6 +610,20 @@ mod tests {
         // Only a blank row around it.
         assert!(drawn("p", toggle, 31, 32, 0, 5).is_none());
         assert!(drawn("p", toggle, 0, 1, 0, 5).is_none());
+    }
+
+    #[test]
+    fn a_frame_that_draws_no_rows_of_a_card_leaves_it_out_of_view() {
+        let toggle = (1, 30);
+        // A transcript with no height draws an empty range, which can fall inside the body.
+        assert!(drawn("p", toggle, 10, 10, 0, 5).is_none());
+        assert!(drawn("p", toggle, 30, 30, 0, 5).is_none());
+        // An inverted range draws nothing either.
+        assert!(drawn("p", toggle, 12, 10, 0, 5).is_none());
+        // One body row is still enough.
+        let card = drawn("p", toggle, 10, 11, 0, 5).expect("one body row in view");
+        assert_eq!(card.header, -9);
+        assert_eq!(card.rows, [None, None]);
     }
 
     #[test]
