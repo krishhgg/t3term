@@ -80,11 +80,11 @@ jobs:
           cargo build --locked --release
           ./target/release/t3term --version
           smoke_home_dir="$(mktemp -d)"
-          status=0
+          smoke_exit_code=0
           env -i PATH="$PATH" HOME="$smoke_home_dir" T3CODE_HOME="$smoke_home_dir/.t3" \
-            ./target/release/t3term --json doctor > doctor.json || status=$?
+            ./target/release/t3term --json doctor > doctor.json || smoke_exit_code=$?
           cat doctor.json
-          test "$status" -eq 5
+          test "$smoke_exit_code" -eq 5
           jq -e '.ok == false and .checks.server.ok == false' doctor.json > /dev/null
 
       - name: Save cache
