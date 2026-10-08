@@ -85,7 +85,8 @@ jobs:
             ./target/release/t3term --json doctor > doctor.json || smoke_exit_code=$?
           cat doctor.json
           test "$smoke_exit_code" -eq 5
-          jq -e '.ok == false and .checks.server.ok == false' doctor.json > /dev/null
+          # -s reads every value into one array, so a second JSON value fails the check.
+          jq -s -e 'length == 1 and (.[0] | .ok == false and .checks.server.ok == false)' doctor.json > /dev/null
 
       - name: Save cache
         if: github.event_name == 'push' && steps.cache.outputs.cache-hit != 'true'
