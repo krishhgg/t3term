@@ -206,6 +206,22 @@ impl ThreadState {
         self.list("runs").iter().max_by_key(|r| ordinal(r))
     }
 
+    /// The run that owns the thread's work: the newest one working, else the newest run not
+    /// held in a queue, as the nightly's `deriveThreadActivityRun` picks it
+    /// (`packages/client-runtime/src/state/threadExecution.ts:101`). A newer queued run doesn't
+    /// take over from one still working.
+    pub fn activity_run(&self) -> Option<&Value> {
+        self.active_run().or_else(|| {
+            self.list("runs")
+                .iter()
+                .filter(|r| {
+                    !(status(r) == "queued"
+                        && r.get("queueHeld").and_then(Value::as_bool) == Some(true))
+                })
+                .max_by_key(|r| ordinal(r))
+        })
+    }
+
     /// Whether the thread holds the user message with this id.
     pub fn has_message(&self, message_id: &str) -> bool {
         let id = Some(message_id);
@@ -515,6 +531,50 @@ mod tests {
         ));
         assert!(state.pending_requests().is_empty());
         assert!(state.active_run().is_none());
+    }
+
+    #[test]
+    fn the_activity_run_is_the_one_working_before_any_newer_queued_run() {
+        // r1 finished. With nothing working, the newest run stands for the thread.
+        let mut state = ThreadState::from_snapshot(&snapshot()).unwrap();
+        assert_eq!(state.activity_run().unwrap()["id"], "r1");
+
+        // A follow-up queued while r2 works doesn't take over from it.
+        state.apply(&event(
+            11,
+            "run.created",
+            json!({"id": "r2", "ordinal": 2, "status": "running"}),
+        ));
+        state.apply(&event(
+            12,
+            "run.created",
+            json!({"id": "r3", "ordinal": 3, "status": "queued"}),
+        ));
+        assert_eq!(state.activity_run().unwrap()["id"], "r2");
+
+        // Once r2 ends, the queued run is the newest, unless its queue waits on the user.
+        state.apply(&event(
+            13,
+            "run.updated",
+            json!({"id": "r2", "ordinal": 2, "status": "completed"}),
+        ));
+        assert_eq!(state.activity_run().unwrap()["id"], "r3");
+        state.apply(&event(
+            14,
+            "run.updated",
+            json!({"id": "r3", "ordinal": 3, "status": "queued", "queueHeld": true}),
+        ));
+        assert_eq!(state.activity_run().unwrap()["id"], "r2");
+
+        // A thread that never ran has none.
+        let mut empty = snapshot();
+        empty["projection"]["runs"] = json!([]);
+        assert!(
+            ThreadState::from_snapshot(&empty)
+                .unwrap()
+                .activity_run()
+                .is_none()
+        );
     }
 
     #[test]
