@@ -225,8 +225,9 @@ impl Client {
         })
     }
 
-    /// Changes the thread's model and modes now, without sending a message.
-    pub async fn apply_settings(&self, state: &ThreadState, plan: &Plan) -> Result<()> {
+    /// Changes the thread's model and modes now, without sending a message. Returns the sequence
+    /// of the last event it caused, or `None` when nothing changed.
+    pub async fn apply_settings(&self, state: &ThreadState, plan: &Plan) -> Result<Option<u64>> {
         if plan.prompt_effort.is_some() {
             return Err(err_exit(
                 "INVALID_CHOICE",
@@ -238,15 +239,39 @@ impl Client {
             return Err(busy_for_settings(run));
         }
         self.check_plan(state, plan)?;
+        let mut last = None;
         if let Some(selection) = &plan.model_selection {
-            self.dispatch(json!({
-                "type": "thread.model-selection.set",
-                "threadId": state.thread_id(),
-                "modelSelection": selection,
-            }))
-            .await?;
+            last = Some(
+                self.dispatch(json!({
+                    "type": "thread.model-selection.set",
+                    "threadId": state.thread_id(),
+                    "modelSelection": selection,
+                }))
+                .await?,
+            );
         }
-        self.dispatch_modes(state.thread_id(), plan).await
+        Ok(self.dispatch_modes(state.thread_id(), plan).await?.or(last))
+    }
+
+    /// Reads a thread once its snapshot includes event `sequence`, so it shows a change just made.
+    pub async fn thread_after(&self, thread_id: &str, sequence: u64) -> Result<ThreadState> {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let state = self.thread(thread_id, true).await?;
+            if state.sequence >= sequence {
+                return Ok(state);
+            }
+            if tokio::time::Instant::now() >= deadline {
+                return Err(err(
+                    "T3_STALE_SNAPSHOT",
+                    format!(
+                        "T3 accepted the change, but thread {thread_id} still showed event {} of {sequence} after 5 seconds.",
+                        state.sequence
+                    ),
+                ));
+            }
+            tokio::time::sleep(Duration::from_millis(50)).await;
+        }
     }
 
     fn check_plan(&self, state: &ThreadState, plan: &Plan) -> Result<()> {
@@ -269,24 +294,30 @@ impl Client {
         Ok(())
     }
 
-    async fn dispatch_modes(&self, thread_id: &str, plan: &Plan) -> Result<()> {
+    /// Returns the sequence of the last mode change, or `None` when the modes stay the same.
+    async fn dispatch_modes(&self, thread_id: &str, plan: &Plan) -> Result<Option<u64>> {
+        let mut last = None;
         if let Some(mode) = &plan.runtime_mode {
-            self.dispatch(json!({
-                "type": "thread.runtime-mode.set",
-                "threadId": thread_id,
-                "runtimeMode": mode,
-            }))
-            .await?;
+            last = Some(
+                self.dispatch(json!({
+                    "type": "thread.runtime-mode.set",
+                    "threadId": thread_id,
+                    "runtimeMode": mode,
+                }))
+                .await?,
+            );
         }
         if let Some(mode) = &plan.interaction_mode {
-            self.dispatch(json!({
-                "type": "thread.interaction-mode.set",
-                "threadId": thread_id,
-                "interactionMode": mode,
-            }))
-            .await?;
+            last = Some(
+                self.dispatch(json!({
+                    "type": "thread.interaction-mode.set",
+                    "threadId": thread_id,
+                    "interactionMode": mode,
+                }))
+                .await?,
+            );
         }
-        Ok(())
+        Ok(last)
     }
 
     pub async fn respond(&self, thread_id: &str, request_id: &str, decision: &str) -> Result<u64> {

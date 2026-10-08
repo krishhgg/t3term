@@ -237,8 +237,54 @@ fn set_option(options: &mut Vec<Value>, id: &str, value: Value) {
     options.push(json!({"id": id, "value": value}));
 }
 
+/// Whether T3 sends this select value through the message text instead of as an option.
+fn prompt_injected(descriptor: &Value, value: &str) -> bool {
+    descriptor["promptInjectedValues"]
+        .as_array()
+        .is_some_and(|values| values.iter().any(|v| v.as_str() == Some(value)))
+}
+
+/// Whether a saved value is already valid for a descriptor. T3 keeps a value across a model
+/// switch only in this case: a boolean for a boolean, an offered choice id for a select.
+fn fits(descriptor: &Value, value: &Value) -> bool {
+    match (descriptor["type"].as_str(), value) {
+        (Some("boolean"), Value::Bool(_)) => true,
+        (Some("select"), Value::String(value)) => {
+            !prompt_injected(descriptor, value)
+                && descriptor["options"]
+                    .as_array()
+                    .is_some_and(|choices| choices.iter().any(|c| c["id"] == *value))
+        }
+        _ => false,
+    }
+}
+
+/// Applies one `--effort` or `--option` value. A value T3 sends through the message text, such
+/// as ultrathink, becomes the plan's prompt effort instead of an option.
+fn choose(plan: &mut Plan, options: &mut Vec<Value>, descriptor: &Value, raw: &str) -> Result<()> {
+    let value = option_value(descriptor, raw)?;
+    match value.as_str().filter(|v| prompt_injected(descriptor, v)) {
+        Some(ULTRATHINK) => plan.prompt_effort = Some(ULTRATHINK.to_string()),
+        Some(other) => {
+            return Err(usage(format!(
+                "T3 applies {other} through the message text in a way t3term does not support yet."
+            )));
+        }
+        None => set_option(
+            options,
+            descriptor["id"].as_str().unwrap_or_default(),
+            value,
+        ),
+    }
+    Ok(())
+}
+
 /// Works out the commands that apply `choice` to `thread`, checking every value against `config`.
 pub fn plan(config: &Value, thread: &Value, choice: &Choice) -> Result<Plan> {
+    // Reading settings needs no provider, even one that is turned off.
+    if choice.is_empty() {
+        return Ok(Plan::default());
+    }
     let current = &thread["modelSelection"];
     let current_instance = current["instanceId"]
         .as_str()
@@ -290,12 +336,9 @@ pub fn plan(config: &Value, thread: &Value, choice: &Choice) -> Result<Plan> {
             .iter()
             .filter(|o| {
                 same_model
-                    || descriptors(model).iter().any(|d| {
-                        d["id"] == o["id"]
-                            && o["value"]
-                                .as_str()
-                                .map_or(d["type"] == "boolean", |v| option_value(d, v).is_ok())
-                    })
+                    || descriptors(model)
+                        .iter()
+                        .any(|d| d["id"] == o["id"] && fits(d, &o["value"]))
             })
             .cloned()
             .collect();
@@ -306,23 +349,7 @@ pub fn plan(config: &Value, thread: &Value, choice: &Choice) -> Result<Plan> {
                     qualified(provider, model)
                 ))
             })?;
-            let prompt_injected = descriptor["promptInjectedValues"]
-                .as_array()
-                .is_some_and(|values| values.iter().any(|v| v.as_str() == Some(effort.as_str())));
-            if prompt_injected && effort != ULTRATHINK {
-                return Err(usage(format!(
-                    "T3 applies {effort} through the message text in a way t3term does not support yet."
-                )));
-            } else if prompt_injected {
-                result.prompt_effort = Some(effort.clone());
-            } else {
-                let value = option_value(descriptor, effort)?;
-                set_option(
-                    &mut options,
-                    descriptor["id"].as_str().unwrap_or_default(),
-                    value,
-                );
-            }
+            choose(&mut result, &mut options, descriptor, effort)?;
         }
         for (id, value) in &choice.options {
             let descriptor = descriptors(model)
@@ -339,8 +366,7 @@ pub fn plan(config: &Value, thread: &Value, choice: &Choice) -> Result<Plan> {
                             .join(", ")
                     ))
                 })?;
-            let value = option_value(descriptor, value)?;
-            set_option(&mut options, id, value);
+            choose(&mut result, &mut options, descriptor, value)?;
         }
         let selection = json!({"instanceId": instance, "model": slug, "options": options});
         // An ultrathink-only choice changes the message, not the thread's model.
@@ -583,6 +609,90 @@ mod tests {
             "Ultrathink:\n/src/a.rs is wrong"
         );
         assert_eq!(plan.message_text("Ultrathink: again"), "Ultrathink: again");
+        // The label and `--option` reach the same prefix, never the thread's options.
+        for choice in [
+            Choice {
+                effort: Some("Ultrathink".into()),
+                ..choice()
+            },
+            Choice {
+                options: vec![("effort".into(), "ultrathink".into())],
+                ..choice()
+            },
+        ] {
+            let plan = super::plan(&config(), &thread(), &choice).unwrap();
+            assert_eq!(plan.model_selection, None);
+            assert_eq!(plan.prompt_effort.as_deref(), Some(ULTRATHINK));
+        }
+    }
+
+    #[test]
+    fn model_switch_keeps_only_values_valid_for_the_new_model() {
+        let pi_thread = json!({
+            "modelSelection": {"instanceId": "pi", "model": "pi-1",
+                               "options": [{"id": "thinking", "value": "on"}]},
+        });
+        let switched = plan(
+            &config(),
+            &pi_thread,
+            &Choice {
+                model: Some("claude-opus-5-5".into()),
+                ..choice()
+            },
+        )
+        .unwrap();
+        // Claude's thinking is a boolean, so Pi's "on" string is dropped, not carried over.
+        assert_eq!(switched.model_selection.unwrap()["options"], json!([]));
+        let codex_thread = json!({
+            "modelSelection": {"instanceId": "codex", "model": "gpt-6",
+                               "options": [{"id": "effort", "value": "ultrathink"}, {"id": "fastMode", "value": true},
+                                           {"id": "thinking", "value": "on"}]},
+        });
+        let to_claude = |effort: &str| {
+            let mut thread = codex_thread.clone();
+            thread["modelSelection"]["options"][0]["value"] = json!(effort);
+            plan(
+                &config(),
+                &thread,
+                &Choice {
+                    model: Some("claude-opus-5-5".into()),
+                    ..choice()
+                },
+            )
+            .unwrap()
+            .model_selection
+            .unwrap()["options"]
+                .clone()
+        };
+        // A message-only effort is never carried into the options; an offered one is.
+        assert_eq!(
+            to_claude("ultrathink"),
+            json!([{"id": "fastMode", "value": true}])
+        );
+        assert_eq!(
+            to_claude("high"),
+            json!([{"id": "effort", "value": "high"}, {"id": "fastMode", "value": true}])
+        );
+    }
+
+    #[test]
+    fn settings_read_on_a_disabled_provider() {
+        let pi_thread = json!({"modelSelection": {"instanceId": "pi", "model": "pi-1"}});
+        assert_eq!(
+            plan(&config(), &pi_thread, &choice()).unwrap(),
+            Plan::default()
+        );
+        assert!(
+            plan(
+                &config(),
+                &pi_thread,
+                &Choice {
+                    runtime_mode: Some("full-access".into()),
+                    ..choice()
+                }
+            )
+            .is_err()
+        );
     }
 
     #[test]

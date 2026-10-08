@@ -304,7 +304,18 @@ fn models_text(providers: &[&Value]) -> String {
                                     .join("|")
                             })
                             .unwrap_or_default(),
-                        _ => "on|off".into(),
+                        _ => [("on", true), ("off", false)]
+                            .iter()
+                            .map(|(label, value)| {
+                                let star = if default == Some(json!(value)) {
+                                    "*"
+                                } else {
+                                    ""
+                                };
+                                format!("{label}{star}")
+                            })
+                            .collect::<Vec<_>>()
+                            .join("|"),
                     };
                     format!("{} {values}", text(&d["id"]))
                 })
@@ -464,8 +475,13 @@ async fn run(cli: Cli) -> Result<i32> {
             let state = client.thread(&id, true).await?;
             let config = client.server_config().await?;
             let plan = models::plan(&config, state.thread(), &choice)?;
-            client.apply_settings(&state, &plan).await?;
+            let applied = client.apply_settings(&state, &plan).await?;
             if json_mode {
+                // Report the settings as they are now, not as the snapshot read before the change.
+                let state = match applied {
+                    Some(sequence) => client.thread_after(&id, sequence).await?,
+                    None => state,
+                };
                 print_json(&json!({
                     "ok": true,
                     "threadId": id,
@@ -1076,4 +1092,26 @@ fn finish_doctor(checks: serde_json::Map<String, Value>, ok: bool, json_mode: bo
         }
     }
     Ok(if ok { 0 } else { exit::UNAVAILABLE })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn models_text_marks_each_options_default() {
+        let provider = json!({"instanceId": "cursor", "displayName": "Cursor", "status": "ready",
+        "models": [{"slug": "grok-4.7", "name": "Grok 4.7", "isDefault": true,
+            "capabilities": {"optionDescriptors": [
+                {"id": "reasoning", "type": "select",
+                 "options": [{"id": "low"}, {"id": "high", "isDefault": true}]},
+                {"id": "fastMode", "type": "boolean", "currentValue": true},
+                {"id": "thinking", "type": "boolean"}
+            ]}}]});
+        let text = models_text(&[&provider]);
+        assert!(text.contains("grok-4.7*"), "{text}");
+        assert!(text.contains("reasoning low|high*"), "{text}");
+        assert!(text.contains("fastMode on*|off"), "{text}");
+        assert!(text.contains("thinking on|off"), "{text}");
+    }
 }
