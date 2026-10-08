@@ -237,6 +237,30 @@ impl ThreadState {
             .rev()
             .find(|i| i.get("requestId").and_then(Value::as_str) == Some(request_id))
     }
+
+    /// The turn item a runtime request is about, such as the command an approval gates. Providers
+    /// put the request's node under the node of that item.
+    pub fn request_subject(&self, request_id: &str) -> Option<&Value> {
+        let id_of = |v: &Value, key: &str| v.get(key).and_then(Value::as_str).map(str::to_string);
+        let request = self
+            .list("runtimeRequests")
+            .iter()
+            .find(|r| r.get("id").and_then(Value::as_str) == Some(request_id))?;
+        let node_id = id_of(request, "nodeId")?;
+        let parent = self
+            .list("nodes")
+            .iter()
+            .find(|n| n.get("id").and_then(Value::as_str) == Some(node_id.as_str()))
+            .and_then(|n| id_of(n, "parentNodeId"))?;
+        self.list("turnItems")
+            .iter()
+            .chain(
+                self.list("visibleTurnItems")
+                    .iter()
+                    .filter_map(|e| e.get("item")),
+            )
+            .find(|i| i.get("nodeId").and_then(Value::as_str) == Some(parent.as_str()))
+    }
 }
 
 pub fn status(entity: &Value) -> &str {
@@ -464,6 +488,41 @@ mod tests {
         ));
         assert!(state.pending_requests().is_empty());
         assert!(state.active_run().is_none());
+    }
+
+    #[test]
+    fn finds_the_command_each_request_gates() {
+        let mut state = ThreadState::from_snapshot(&snapshot()).unwrap();
+        let mut sequence = 10;
+        let mut apply = |event_type: &str, payload: Value| {
+            sequence += 1;
+            state.apply(&event(sequence, event_type, payload));
+        };
+        // Two commands wait at once. The newer one's request is listed first.
+        for (n, command) in [(1, "rm -rf build"), (2, "ls")] {
+            apply(
+                "turn-item.updated",
+                json!({"id": format!("c{n}"), "type": "command_execution", "ordinal": n,
+                       "status": "running", "nodeId": format!("tool{n}"), "input": command}),
+            );
+            apply(
+                "node.updated",
+                json!({"id": format!("ask{n}"), "parentNodeId": format!("tool{n}")}),
+            );
+        }
+        for n in [2, 1] {
+            apply(
+                "runtime-request.updated",
+                json!({"id": format!("q{n}"), "nodeId": format!("ask{n}"),
+                       "status": "pending", "kind": "command"}),
+            );
+        }
+        assert_eq!(
+            state.request_subject("q1").unwrap()["input"],
+            "rm -rf build"
+        );
+        assert_eq!(state.request_subject("q2").unwrap()["input"], "ls");
+        assert!(state.request_subject("missing").is_none());
     }
 
     #[test]
