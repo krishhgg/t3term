@@ -6,9 +6,9 @@ It comes from reading the source, not from clicking around the app. Codex, runni
 
 ## Where t3term is
 
-The desktop app has 303 features. t3term does 11 of them fully and 30 partly, and is missing the other 262.
+The desktop app has 302 features. t3term does 11 of them fully and 30 partly, and is missing the other 261.
 
-Most of that can be built. 245 features port to a terminal as they are. 42 can be done with something lost, like a background blur or a second font, which a terminal can't do. 16 can't be done in a terminal at all, and those are mostly the embedded browser, the device simulator and rendered HTML. That count assumes a plain terminal, though. Ghostty, kitty and iTerm2 can draw images, so image previews could move from "can't" to "approximate" in those.
+Most of that can be built. 244 features port to a terminal as they are. 42 can be done with something lost, like a background blur or a second font, which a terminal can't do. 16 can't be done in a terminal at all, and those are mostly the embedded browser, the device simulator and rendered HTML. That count assumes a plain terminal, though. Ghostty, kitty and iTerm2 can draw images, so image previews could move from "can't" to "approximate" in those.
 
 The commands tell the same story. A client can send T3's server 50 kinds of command, and t3term sends 6: send a message, interrupt, answer an approval or a question, and set the model, the permission mode and Build or Plan. The desktop app sends 30 of the other 44. The last 14 come from the server, from agents through MCP, or from older clients, so they aren't something t3term is missing. Subagents are one of those. An agent starts them through MCP, and the desktop shows them in the Lineage panel as threads you can open, which is in the plan below. Past commands, the desktop also calls whole groups of API that t3term never touches: projects, git, diffs, terminals, the browser preview, PRs, scheduled tasks, providers and settings.
 
@@ -40,7 +40,7 @@ Each group is one PR, or a short series if it's big. Sizes are rough estimates f
 | 6 | [Notifications](#6-notifications) | 4 | 0 | 0 | 4 | 0 | 2 / 2 / 0 |
 | 7 | [History, diffs and rewind](#7-history-diffs-and-rewind) | 20 | 0 | 2 | 18 | 0 | 5 / 14 / 1 |
 | 8 | [Machines](#8-machines) | 7 | 0 | 1 | 6 | 0 | 0 / 1 / 6 |
-| 9 | [Composer](#9-composer) | 25 | 3 | 2 | 20 | 1 | 8 / 15 / 2 |
+| 9 | [Composer](#9-composer) | 24 | 3 | 2 | 19 | 1 | 7 / 15 / 2 |
 | 10 | [Search, palette and navigation](#10-search-palette-and-navigation) | 4 | 0 | 1 | 3 | 0 | 1 / 3 / 0 |
 | 11 | [Git and workspaces](#11-git-and-workspaces) | 20 | 0 | 0 | 20 | 0 | 5 / 12 / 3 |
 | 12 | [Pull requests](#12-pull-requests) | 21 | 0 | 0 | 21 | 0 | 8 / 9 / 4 |
@@ -277,7 +277,6 @@ Prompt history, stash, attaching files and images by path, folding a big paste i
 | Show skills in slash menu | General | no | port | S |
 | Rich text opt-out | General | no; only plain text is implemented | approximate; plain/rich textual editor modes | M |
 | Composer collapse-on-scroll preference | General | no | port | S |
-| Send key preference | General | no | port | S |
 
 ### 10. Search, palette and navigation
 
