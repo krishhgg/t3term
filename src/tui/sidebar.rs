@@ -338,7 +338,7 @@ fn status_word(thread: &Value, now: i64) -> Option<Word> {
 
 /// Whether the thread's card shows Working or Goal, whose spinner and clock move with the
 /// event loop's tick.
-pub fn working(thread: &Value) -> bool {
+fn working(thread: &Value) -> bool {
     activity(thread).is_some_and(Word::working)
 }
 
@@ -559,6 +559,8 @@ pub struct Sidebar {
     /// The screen rows each drawn card covers, top inclusive and bottom exclusive, with its
     /// thread.
     cards: Vec<(u16, u16, String)>,
+    /// Whether the last frame drew a card that reads Working or Goal.
+    drew_working: bool,
 }
 
 impl Sidebar {
@@ -684,6 +686,13 @@ impl Sidebar {
             .map(|(_, _, id)| id.as_str())
     }
 
+    /// Whether the last frame drew a card that reads Working or Goal, whose spinner and clock
+    /// need the event loop's tick. A card scrolled out of view, behind the closed Settled
+    /// shelf or left out of the sidebar has nothing on screen to move, so it doesn't count.
+    pub fn drew_working(&self) -> bool {
+        self.drew_working
+    }
+
     /// Scrolls so the highlighted card fits in `height` rows, with its shelf's heading when
     /// that fits too, and so rows above fill any room left below the last card.
     fn scroll_into_view(&mut self, height: usize) {
@@ -724,6 +733,7 @@ impl Sidebar {
         let t = view.theme;
         frame.render_widget(Block::new().style(Style::new().bg(t.sidebar_bg)), area);
         self.cards.clear();
+        self.drew_working = false;
         if area.width < 6 || area.height < 4 {
             // Nothing is drawn, so nothing there should take clicks.
             self.list = Rect::default();
@@ -789,6 +799,10 @@ impl Sidebar {
                     let top = list.y + lines.len() as u16;
                     self.cards
                         .push((top, (top + 3).min(list.bottom()), id.clone()));
+                    // A card starts no lower than the list's last line, so its first line,
+                    // which has the word, is on screen even when the rest is cut off.
+                    let thread = view.shell.and_then(|shell| find_thread(shell, id));
+                    self.drew_working |= thread.is_some_and(working);
                     let is_open = view.open_id == Some(id.as_str());
                     let cursor = index == self.selected;
                     let bg = if is_open {
@@ -798,7 +812,7 @@ impl Sidebar {
                     } else {
                         None
                     };
-                    lines.extend(view.thread_card(id, width, bg, cursor));
+                    lines.extend(view.thread_card(thread, width, bg, cursor));
                     lines.push(Line::default());
                 }
             }
@@ -861,13 +875,12 @@ impl View<'_> {
     /// Three lines like the GUI's thread card: project and status, title, branch and provider.
     fn thread_card(
         &self,
-        id: &str,
+        thread: Option<&Value>,
         width: usize,
         bg: Option<Color>,
         cursor: bool,
     ) -> Vec<Line<'static>> {
         let t = self.theme;
-        let thread = self.shell.and_then(|shell| find_thread(shell, id));
         let title = thread
             .map(|t| str_of(t, "title"))
             .filter(|s| !s.is_empty())
@@ -2501,6 +2514,189 @@ mod tests {
             view.thread_status(None, 10),
             (String::new(), theme.sidebar_muted)
         );
+    }
+
+    #[test]
+    fn a_drawn_card_needs_the_tick_only_while_it_reads_working_or_goal() {
+        // Draws one card and checks its word, then says whether the frame needs the tick.
+        let ticks = |fields: Value, word: &str| {
+            let listed = shell(vec![with(thread("t"), fields)]);
+            let mut sidebar = Sidebar::default();
+            sidebar.rebuild(&listed.threads, ALL, None, now());
+            let lines = text(&render(&mut sidebar, Some(&listed), None, (30, 12)));
+            let line = &lines[row_of(&lines, "Thread t") as usize - 1];
+            assert!(line.contains(word), "{line:?} should show {word}");
+            sidebar.drew_working()
+        };
+        // Queued and continuing work read Working, and a goal reads Goal. Their spinners turn.
+        assert!(ticks(
+            json!({"latestRunId": "r", "status": "queued"}),
+            "Working"
+        ));
+        assert!(ticks(
+            json!({"latestRunId": "r", "status": "completed", "activityRunStatus": "waiting"}),
+            "Working"
+        ));
+        assert!(ticks(
+            with(
+                running(),
+                json!({"goal": {"objective": "Ship it", "status": "active"}})
+            ),
+            "Goal"
+        ));
+        // A request, Waiting, a failure or a finish shows a word with nothing to move.
+        assert!(!ticks(
+            with(
+                running(),
+                json!({"pendingRuntimeRequest": {"kind": "command"}})
+            ),
+            "Approval"
+        ));
+        assert!(!ticks(
+            with(
+                running(),
+                json!({"pendingRuntimeRequest": {"kind": "user_input"}})
+            ),
+            "Input"
+        ));
+        assert!(!ticks(
+            json!({"latestRunId": "r", "status": "completed", "pendingBackgroundTasks": [{"taskId": "s", "kind": "subagent"}]}),
+            "Waiting"
+        ));
+        assert!(!ticks(
+            json!({"latestRunId": "r", "status": "failed"}),
+            "Failed"
+        ));
+        assert!(!ticks(finished(json!("2026-10-08T10:00:00.000Z")), "Done"));
+    }
+
+    #[test]
+    fn work_the_sidebar_leaves_out_needs_no_tick() {
+        // Each of these reads Working by the card rules, but none has a card in the list.
+        let archived = with(
+            thread("archived"),
+            with(running(), json!({"archivedAt": "2026-10-05T00:00:00.000Z"})),
+        );
+        let subagent = with(
+            thread("subagent"),
+            json!({
+                "latestRunId": "r",
+                "status": "queued",
+                "lineage": {"parentThreadId": "a", "relationshipToParent": "subagent", "rootThreadId": "a"},
+            }),
+        );
+        let settled = with(
+            thread("s"),
+            json!({
+                "latestRunId": "r",
+                "status": "completed",
+                "activityRunStatus": "waiting",
+                "settledOverride": "settled",
+            }),
+        );
+        assert!([&archived, &subagent, &settled].into_iter().all(working));
+        let listed = shell(vec![thread("a"), archived, subagent, settled]);
+        let draw = |sidebar: &mut Sidebar, open: Option<&str>| {
+            sidebar.rebuild(&listed.threads, ALL, open, now());
+            text(&render(sidebar, Some(&listed), open, (30, 24)))
+        };
+        let mut sidebar = Sidebar::default();
+        let lines = draw(&mut sidebar, None);
+        assert!(lines.iter().any(|line| line.contains("Thread a")));
+        assert!(!lines.iter().any(|line| line.contains("Working")));
+        assert!(!sidebar.drew_working());
+
+        // Opening the Settled shelf draws the settled card, and its spinner needs the tick.
+        sidebar.show_settled = true;
+        let lines = draw(&mut sidebar, None);
+        assert!(lines[row_of(&lines, "Thread s") as usize - 1].contains("Working"));
+        assert!(sidebar.drew_working());
+
+        // Closed again, the shelf keeps the open thread's card, and the tick with it.
+        sidebar.show_settled = false;
+        let lines = draw(&mut sidebar, Some("s"));
+        assert!(lines[row_of(&lines, "Thread s") as usize - 1].contains("Working"));
+        assert!(sidebar.drew_working());
+
+        // Once another thread is open, the card goes back behind the footer.
+        let lines = draw(&mut sidebar, Some("a"));
+        assert!(!lines.iter().any(|line| line.contains("Thread s")));
+        assert!(!sidebar.drew_working());
+    }
+
+    #[test]
+    fn a_working_card_needs_the_tick_only_while_it_is_in_view() {
+        // a1 is the newest, so it heads the list. It works toward a goal, and a8 at the bottom
+        // works too.
+        let threads = (1..=8)
+            .map(|n| {
+                let card = with(
+                    thread(&format!("a{n}")),
+                    json!({"createdAt": format!("2026-10-0{}T00:00:00.000Z", 9 - n)}),
+                );
+                match n {
+                    1 => with(
+                        card,
+                        with(
+                            running(),
+                            json!({"goal": {"objective": "Ship it", "status": "active"}}),
+                        ),
+                    ),
+                    8 => with(card, running()),
+                    _ => card,
+                }
+            })
+            .collect();
+        let listed = shell(threads);
+        let mut sidebar = Sidebar::default();
+        sidebar.rebuild(&listed.threads, ALL, None, now());
+        // Fourteen rows leave eleven for the list: the heading, a1, a2 and the top of a3.
+        let size = (30, 14);
+        let lines = text(&render(&mut sidebar, Some(&listed), None, size));
+        assert!(lines[row_of(&lines, "Thread a1") as usize - 1].contains("Goal"));
+        assert!(sidebar.drew_working());
+
+        // Down at a5 the view holds a4 to a6, which rest, though a1 and a8 still work.
+        for _ in 0..4 {
+            sidebar.move_selection(1);
+        }
+        assert_eq!(sidebar.selected_thread_id(), Some("a5"));
+        let lines = text(&render(&mut sidebar, Some(&listed), None, size));
+        assert!(lines.iter().any(|line| line.contains("Thread a6")));
+        assert!(
+            !lines
+                .iter()
+                .any(|line| line.contains("Goal") || line.contains("Working")),
+            "{lines:#?}"
+        );
+        assert!(!sidebar.drew_working());
+
+        // At the bottom of the list, a8 comes into view and the tick with it.
+        for _ in 0..3 {
+            sidebar.move_selection(1);
+        }
+        assert_eq!(sidebar.selected_thread_id(), Some("a8"));
+        let lines = text(&render(&mut sidebar, Some(&listed), None, size));
+        assert!(lines[row_of(&lines, "Thread a8") as usize - 1].contains("Working"));
+        assert!(sidebar.drew_working());
+    }
+
+    #[test]
+    fn a_sidebar_too_small_for_cards_needs_no_tick() {
+        let listed = shell(vec![with(thread("t"), running())]);
+        let mut sidebar = Sidebar::default();
+        sidebar.rebuild(&listed.threads, ALL, None, now());
+        render(&mut sidebar, Some(&listed), None, (30, 12));
+        assert!(sidebar.drew_working());
+        // Too narrow or too short to draw a card, so nothing on screen moves.
+        render(&mut sidebar, Some(&listed), None, (5, 12));
+        assert!(!sidebar.drew_working());
+        render(&mut sidebar, Some(&listed), None, (30, 3));
+        assert!(!sidebar.drew_working());
+        // Four rows leave the list one line, which is the card's first line, word and all.
+        let lines = text(&render(&mut sidebar, Some(&listed), None, (30, 4)));
+        assert!(lines[2].contains("Working"), "{lines:#?}");
+        assert!(sidebar.drew_working());
     }
 
     // ---- synthetic capture for review ----
