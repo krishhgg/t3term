@@ -23,7 +23,7 @@ pub const RUNTIME_MODES: &[(&str, &str)] = &[
 const EFFORT_IDS: &[&str] = &["effort", "reasoningEffort", "reasoning", "thinking"];
 
 /// The desktop app sends this effort as a prefix on the message instead of as an option.
-const ULTRATHINK: &str = "ultrathink";
+pub const ULTRATHINK: &str = "ultrathink";
 const ULTRATHINK_PREFIX: &str = "Ultrathink:";
 
 /// What the user asked to change. `None` keeps the thread's current value.
@@ -379,11 +379,14 @@ pub fn plan(config: &Value, thread: &Value, choice: &Choice) -> Result<Plan> {
             choose(&mut result, &mut options, descriptor, value)?;
         }
         let selection = json!({"instanceId": instance, "model": slug, "options": options});
-        // An ultrathink-only choice changes the message, not the thread's model.
-        if !(same_model
-            && options.as_slice() == current["options"].as_array().map_or(&[][..], Vec::as_slice)
-            && choice.model.is_none())
-        {
+        // Send a selection only when it differs from the thread's, in any option's value
+        // rather than in list order. A choice the thread already has, or an ultrathink-only
+        // one, changes nothing here.
+        let unchanged = same_model
+            && descriptors(model)
+                .iter()
+                .all(|d| effective_value(d, &selection) == effective_value(d, current));
+        if !unchanged {
             result.model_selection = Some(selection);
         }
     }
@@ -664,6 +667,53 @@ mod tests {
         assert_eq!(
             ultrathink_last.model_selection.unwrap()["options"],
             json!([{"id": "fastMode", "value": true}, {"id": "effort", "value": "low"}])
+        );
+    }
+
+    #[test]
+    fn choices_the_thread_already_has_change_nothing() {
+        let (config, thread) = (config(), thread());
+        let same = |choice: Choice| plan(&config, &thread, &choice).unwrap();
+        // The TUI keeps a draft until this holds, so it must hold once the thread catches up.
+        assert_eq!(
+            same(Choice {
+                model: Some("claude-opus-5-5".into()),
+                ..choice()
+            }),
+            Plan::default()
+        );
+        // Setting a value moves it to the end of the list. Order alone is no change.
+        assert_eq!(
+            same(Choice {
+                effort: Some("high".into()),
+                options: vec![("fastMode".into(), "true".into())],
+                ..choice()
+            }),
+            Plan::default()
+        );
+        // A value the thread gets by default is no change either.
+        let mut bare = thread.clone();
+        bare["modelSelection"]["options"] = json!([]);
+        assert_eq!(
+            plan(
+                &config,
+                &bare,
+                &Choice {
+                    effort: Some("medium".into()),
+                    ..choice()
+                }
+            )
+            .unwrap(),
+            Plan::default()
+        );
+        assert!(
+            same(Choice {
+                model: Some("claude-opus-5-5".into()),
+                effort: Some("low".into()),
+                ..choice()
+            })
+            .model_selection
+            .is_some()
         );
     }
 

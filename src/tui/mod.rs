@@ -4,7 +4,9 @@
 
 mod composer;
 mod markdown;
+mod picker;
 mod theme;
+mod unsent;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -20,20 +22,23 @@ use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, BorderType, Borders, Paragraph};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
 
 use crate::client::{Client, IfBusy, WatchEvent};
+use crate::models::{self, Choice, Plan};
 use crate::projection::{Applied, ShellState, ThreadState, is_active_status, status};
 use crate::transcript::{self, BlockKind};
 use composer::Composer;
 use markdown::Styles;
+use picker::{Item, Kind, Pick};
 use theme::{
     Theme, duration_label, model_display_name, monogram, now_ms, parse_iso_ms, relative_time,
     runtime_mode_label,
 };
+use unsent::{Failed, Unsent};
 
 const FRAME: Duration = Duration::from_millis(33);
 /// While a run is active, elapsed-time labels advance once a second.
@@ -74,8 +79,31 @@ struct Cached {
 enum ActionResult {
     Info(String),
     Error(String),
-    /// Model display names by slug, from T3's `server.getConfig`.
-    ModelNames(HashMap<String, String>),
+    /// T3's provider and model list, from `server.getConfig`.
+    Config(Value),
+    Sent {
+        note: String,
+    },
+    /// A send that failed. The composer gets its text back.
+    SendFailed {
+        thread_id: String,
+        message_id: String,
+        text: String,
+        error: String,
+        /// One-message draft options this send took, such as ultrathink, to put back.
+        reserved: Vec<(String, String)>,
+    },
+}
+
+/// An open model, effort or mode menu.
+struct Picker {
+    kind: Kind,
+    /// Search text. Only the model menu takes it.
+    filter: String,
+    /// Index into the menu's items, always an entry.
+    selected: usize,
+    /// First item shown.
+    offset: usize,
 }
 
 struct OpenThread {
@@ -92,7 +120,12 @@ struct OpenThread {
 struct App {
     client: Arc<Client>,
     theme: Theme,
-    model_names: HashMap<String, String>,
+    config: Option<Value>,
+    /// Model, effort and mode choices per thread, sent with the thread's next message.
+    drafts: HashMap<String, Choice>,
+    /// Messages that failed to send, until they go out or reach T3 late.
+    unsent: Unsent,
+    picker: Option<Picker>,
     shell: Option<ShellState>,
     shell_connection: String,
     rows: Vec<Row>,
@@ -121,6 +154,12 @@ struct App {
     /// Rows the request panel's text is scrolled down, and the request that applies to.
     panel_scroll: usize,
     panel_key: String,
+    composer_area: Rect,
+    /// Each composer chip and the menu it opens.
+    chips: Vec<(Rect, Kind)>,
+    picker_area: Rect,
+    /// The screen row of each menu item drawn, with its index.
+    picker_rows: Vec<(u16, usize)>,
     quit: bool,
 }
 
@@ -159,18 +198,13 @@ impl Drop for Screen {
 async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>) -> Result<()> {
     let (actions, mut action_results) = mpsc::unbounded_channel();
     let mut shell_events = client.watch_shell(None);
-    // Model names come from T3. Until they arrive, or if T3 can't send them, the composer shows
-    // a readable form of the slug.
-    let (config_client, results) = (client.clone(), actions.clone());
-    tokio::spawn(async move {
-        if let Ok(config) = config_client.server_config().await {
-            let _ = results.send(ActionResult::ModelNames(theme::model_names(&config)));
-        }
-    });
     let mut app = App {
         client,
         theme: Theme::detect(),
-        model_names: HashMap::new(),
+        config: None,
+        drafts: HashMap::new(),
+        unsent: Unsent::default(),
+        picker: None,
         shell: None,
         shell_connection: "connecting".into(),
         rows: Vec::new(),
@@ -193,8 +227,13 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
         panel_area: Rect::default(),
         panel_scroll: 0,
         panel_key: String::new(),
+        composer_area: Rect::default(),
+        chips: Vec::new(),
+        picker_area: Rect::default(),
+        picker_rows: Vec::new(),
         quit: false,
     };
+    app.load_config();
     let mut input = EventStream::new();
     let mut dirty = true;
     let mut last_draw = Instant::now() - FRAME;
@@ -233,11 +272,7 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
                 dirty = true;
             }
             Some(result) = action_results.recv() => {
-                match result {
-                    ActionResult::Info(text) => app.message = Some((text, false)),
-                    ActionResult::Error(text) => app.message = Some((text, true)),
-                    ActionResult::ModelNames(names) => app.model_names = names,
-                }
+                app.on_action_result(result);
                 dirty = true;
             }
             // Only armed while a draw is waiting out the frame budget.
@@ -277,6 +312,7 @@ impl App {
                     self.shell_connection = "live".into();
                 }
                 self.rebuild_rows();
+                self.settle_draft();
             }
             WatchEvent::Reconnecting { .. } => self.shell_connection = "reconnecting".into(),
             WatchEvent::Failed(message) => self.message = Some((message, true)),
@@ -302,6 +338,8 @@ impl App {
                     }
                     _ => {}
                 }
+                self.settle_draft();
+                self.drop_landed();
             }
             WatchEvent::Reconnecting { reason, .. } => {
                 open.connection = format!("reconnecting: {reason}")
@@ -430,7 +468,11 @@ impl App {
         });
         self.cache.clear();
         self.scroll = 0;
+        self.picker = None;
         self.focus = Focus::Composer;
+        if let Some(open) = self.open.as_ref() {
+            self.unsent.restore_saved(&mut self.composer, &open.id);
+        }
     }
 
     // ---- input ----
@@ -442,8 +484,16 @@ impl App {
                 true
             }
             Event::Paste(text) => {
-                if self.focus == Focus::Composer {
-                    self.composer.insert_str(&text);
+                // An open menu covers the composer, so a paste goes to the model search or
+                // nowhere.
+                match self.picker.as_ref().map(|p| p.kind) {
+                    Some(Kind::Model) => {
+                        let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                        self.set_filter(|filter| filter.push_str(&line));
+                    }
+                    Some(_) => {}
+                    None if self.focus == Focus::Composer => self.composer.insert_str(&text),
+                    None => {}
                 }
                 true
             }
@@ -454,6 +504,44 @@ impl App {
                         && mouse.row >= area.y
                         && mouse.row < area.y + area.height
                 };
+                let click = mouse.kind == MouseEventKind::Down(MouseButton::Left);
+                let chip = self
+                    .chips
+                    .iter()
+                    .find(|(area, _)| inside(*area))
+                    .map(|(_, kind)| *kind);
+                if let Some(open) = self.picker.as_ref() {
+                    let open_kind = open.kind;
+                    match mouse.kind {
+                        _ if click && inside(self.picker_area) => {
+                            if let Some(&(_, index)) =
+                                self.picker_rows.iter().find(|(y, _)| *y == mouse.row)
+                            {
+                                self.choose(index);
+                            }
+                        }
+                        // A click elsewhere closes the menu. On another chip it opens that one.
+                        _ if click => {
+                            self.picker = None;
+                            if let Some(kind) = chip.filter(|kind| *kind != open_kind) {
+                                self.open_picker(kind);
+                            }
+                        }
+                        MouseEventKind::ScrollUp if inside(self.picker_area) => {
+                            self.move_picker(-1)
+                        }
+                        MouseEventKind::ScrollDown if inside(self.picker_area) => {
+                            self.move_picker(1)
+                        }
+                        _ => return false,
+                    }
+                    return true;
+                }
+                if let Some(kind) = chip.filter(|_| click) {
+                    self.focus = Focus::Composer;
+                    self.open_picker(kind);
+                    return true;
+                }
                 match mouse.kind {
                     MouseEventKind::ScrollUp if inside(self.panel_area) => {
                         self.panel_scroll = self.panel_scroll.saturating_sub(1)
@@ -541,6 +629,23 @@ impl App {
                 self.panel_scroll += 1;
                 return;
             }
+            _ if self.picker.is_some() => {
+                self.on_picker_key(key);
+                return;
+            }
+            // The desktop app's model, effort and mode menus. It uses Cmd+Shift+M, E and A.
+            KeyCode::Char(c @ ('m' | 'e' | 'p')) if alt => {
+                self.open_picker(match c {
+                    'm' => Kind::Model,
+                    'e' => Kind::Traits,
+                    _ => Kind::Mode,
+                });
+                return;
+            }
+            KeyCode::Char('r') if ctrl => {
+                self.swap_unsent();
+                return;
+            }
             KeyCode::Tab => {
                 self.focus = match self.focus {
                     Focus::Sidebar => Focus::Composer,
@@ -576,7 +681,10 @@ impl App {
                 KeyCode::Char('j') if ctrl => self.composer.insert('\n'),
                 KeyCode::Enter => self.submit(),
                 KeyCode::Char('w') if ctrl => self.composer.delete_word(),
-                KeyCode::Char('u') if ctrl => self.composer.clear(),
+                KeyCode::Char('u') if ctrl => {
+                    self.composer.clear();
+                    self.unsent.forget_composer();
+                }
                 KeyCode::Char('a') if ctrl => self.composer.home(),
                 KeyCode::Char('e') if ctrl => self.composer.end(),
                 KeyCode::Char(c) if !ctrl && !alt => self.composer.insert(c),
@@ -655,6 +763,302 @@ impl App {
         });
     }
 
+    fn on_action_result(&mut self, result: ActionResult) {
+        match result {
+            ActionResult::Info(text) => self.message = Some((text, false)),
+            ActionResult::Error(text) => self.message = Some((text, true)),
+            ActionResult::Config(config) => {
+                // A refresh can add or drop rows, so the highlight follows its entry, not
+                // its row number.
+                let previous = self.selected_pick();
+                self.config = Some(config);
+                if self.picker.is_some() {
+                    self.select_pick(previous);
+                }
+            }
+            ActionResult::Sent { note } => {
+                self.settle_draft();
+                self.message = Some((note, false));
+            }
+            ActionResult::SendFailed {
+                thread_id,
+                message_id,
+                text,
+                error,
+                reserved,
+            } => {
+                // The one-message choice didn't go out, so it waits for the next try, unless
+                // the user has picked another value for it since.
+                if !reserved.is_empty() {
+                    let draft = self.drafts.entry(thread_id.clone()).or_default();
+                    for (id, value) in reserved {
+                        if !draft.options.iter().any(|(other, _)| *other == id) {
+                            draft.options.push((id, value));
+                        }
+                    }
+                }
+                let message = Failed {
+                    thread_id: thread_id.clone(),
+                    message_id: Some(message_id),
+                    text,
+                };
+                self.give_back(&thread_id, message, error);
+                // The thread may have shown the message before this result arrived.
+                self.drop_landed();
+            }
+        }
+    }
+
+    /// A send that timed out can still reach T3. Once the open thread shows one, the copy kept
+    /// for a retry comes out, so it isn't sent twice.
+    fn drop_landed(&mut self) {
+        let Some(open) = self.open.as_ref() else {
+            return;
+        };
+        let Some(state) = open.state.as_ref() else {
+            return;
+        };
+        if let Some(note) = self
+            .unsent
+            .drop_landed(&mut self.composer, &open.id, |id| state.has_message(id))
+        {
+            self.message = Some(note);
+        }
+    }
+
+    /// Puts a failed message back in the composer. If the composer holds other text, or the
+    /// message was for another thread, it waits for Ctrl+R or for that thread.
+    fn give_back(&mut self, thread_id: &str, message: Failed, error: String) {
+        if self.open.as_ref().is_some_and(|o| o.id == thread_id) && self.composer.is_empty() {
+            self.unsent.restore(&mut self.composer, vec![message]);
+            self.message = Some((error, true));
+            return;
+        }
+        self.unsent.save(thread_id, message);
+        self.message = Some((
+            format!(
+                "{}. The message is saved. Ctrl+R in its thread brings it back.",
+                error.trim_end().trim_end_matches('.')
+            ),
+            true,
+        ));
+    }
+
+    /// Swaps the composer's text with the open thread's unsent message, so neither is lost.
+    fn swap_unsent(&mut self) {
+        let Some(id) = self.open.as_ref().map(|o| o.id.clone()) else {
+            return;
+        };
+        if self.unsent.swap(&mut self.composer, &id) {
+            self.focus = Focus::Composer;
+        } else {
+            self.message = Some(("This thread has no unsent message.".into(), false));
+        }
+    }
+
+    /// Drops the open thread's draft once the thread has every choice in it, so the next
+    /// message doesn't undo a change made in another client.
+    fn settle_draft(&mut self) {
+        let (Some(open), Some(config)) = (self.open.as_ref(), self.config.as_ref()) else {
+            return;
+        };
+        let (Some(draft), Some(thread)) = (self.drafts.get(&open.id), self.open_thread_json())
+        else {
+            return;
+        };
+        if models::plan(config, thread, draft).is_ok_and(|plan| plan == Plan::default()) {
+            let id = open.id.clone();
+            self.drafts.remove(&id);
+        }
+    }
+
+    // ---- model, effort and mode menus ----
+
+    /// Fetches T3's provider list in the background. Menus use the last copy until it arrives.
+    fn load_config(&self) {
+        let (client, results) = (self.client.clone(), self.actions.clone());
+        tokio::spawn(async move {
+            let _ = results.send(match client.server_config().await {
+                Ok(config) => ActionResult::Config(config),
+                Err(e) => ActionResult::Error(format!("Couldn't read T3's model list: {e}")),
+            });
+        });
+    }
+
+    /// The open thread's settings with its draft applied.
+    fn settings_view(&self) -> Option<picker::View> {
+        let open = self.open.as_ref()?;
+        let thread = self.open_thread_json()?;
+        let empty = Choice::default();
+        let draft = self.drafts.get(&open.id).unwrap_or(&empty);
+        Some(picker::view(self.config.as_ref(), thread, draft))
+    }
+
+    fn picker_items(&self) -> Vec<Item> {
+        let (Some(picker), Some(config), Some(view)) = (
+            self.picker.as_ref(),
+            self.config.as_ref(),
+            self.settings_view(),
+        ) else {
+            return Vec::new();
+        };
+        picker::items(picker.kind, config, &view, &picker.filter)
+    }
+
+    fn open_picker(&mut self, kind: Kind) {
+        if self.open_thread_json().is_none() {
+            self.message = Some((
+                "Open a thread first: pick one in the sidebar and press Enter.".into(),
+                true,
+            ));
+            return;
+        }
+        // Provider status changes while T3 runs, so each menu refreshes the list.
+        if self.picker.is_none() {
+            self.load_config();
+        }
+        self.focus = Focus::Composer;
+        self.picker = Some(Picker {
+            kind,
+            filter: String::new(),
+            selected: 0,
+            offset: 0,
+        });
+        self.select_pick(None);
+    }
+
+    /// The pick under the menu's highlight.
+    fn selected_pick(&self) -> Option<Pick> {
+        let selected = self.picker.as_ref()?.selected;
+        match self.picker_items().get(selected)? {
+            Item::Entry { pick, .. } => Some(pick.clone()),
+            Item::Heading { .. } => None,
+        }
+    }
+
+    /// Highlights `pick` if the menu still has it, else the current choice, else the first
+    /// entry.
+    fn select_pick(&mut self, pick: Option<Pick>) {
+        let items = self.picker_items();
+        let index = pick
+            .and_then(|pick| {
+                items
+                    .iter()
+                    .position(|i| matches!(i, Item::Entry { pick: p, .. } if *p == pick))
+            })
+            .or_else(|| {
+                items
+                    .iter()
+                    .position(|i| matches!(i, Item::Entry { current: true, .. }))
+            })
+            .or_else(|| items.iter().position(Item::is_entry));
+        if let Some(picker) = self.picker.as_mut() {
+            picker.selected = index.unwrap_or(0);
+        }
+    }
+
+    fn on_picker_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let alt = key.modifiers.contains(KeyModifiers::ALT);
+        let Some((kind, selected)) = self.picker.as_ref().map(|p| (p.kind, p.selected)) else {
+            return;
+        };
+        let searching = kind == Kind::Model;
+        match key.code {
+            KeyCode::Esc => self.picker = None,
+            KeyCode::Enter => self.choose(selected),
+            KeyCode::Up => self.move_picker(-1),
+            KeyCode::Down => self.move_picker(1),
+            KeyCode::Char('p') if ctrl => self.move_picker(-1),
+            KeyCode::Char('n') if ctrl => self.move_picker(1),
+            KeyCode::PageUp => self.move_picker(-8),
+            KeyCode::PageDown => self.move_picker(8),
+            KeyCode::Home => self.move_picker(-isize::MAX),
+            KeyCode::End => self.move_picker(isize::MAX),
+            // The same shortcut closes the menu. Another one switches to its menu.
+            KeyCode::Char(c @ ('m' | 'e' | 'p')) if alt => {
+                let next = match c {
+                    'm' => Kind::Model,
+                    'e' => Kind::Traits,
+                    _ => Kind::Mode,
+                };
+                if next == kind {
+                    self.picker = None;
+                } else {
+                    self.open_picker(next);
+                }
+            }
+            KeyCode::Char('k') if !searching => self.move_picker(-1),
+            KeyCode::Char('j') if !searching => self.move_picker(1),
+            KeyCode::Char(c) if searching && !ctrl && !alt => self.set_filter(|f| f.push(c)),
+            KeyCode::Backspace if searching => self.set_filter(|f| {
+                f.pop();
+            }),
+            _ => {}
+        }
+    }
+
+    fn set_filter(&mut self, edit: impl FnOnce(&mut String)) {
+        if let Some(picker) = self.picker.as_mut() {
+            edit(&mut picker.filter);
+            picker.offset = 0;
+        }
+        let first = self.picker_items().iter().position(Item::is_entry);
+        if let Some(picker) = self.picker.as_mut() {
+            picker.selected = first.unwrap_or(0);
+        }
+    }
+
+    /// Moves the highlight by `delta` entries, skipping section labels.
+    fn move_picker(&mut self, delta: isize) {
+        let items = self.picker_items();
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        let step = delta.signum();
+        let mut index = picker.selected as isize;
+        for _ in 0..delta.unsigned_abs() {
+            let mut next = index + step;
+            while items.get(next as usize).is_some_and(|i| !i.is_entry()) {
+                next += step;
+            }
+            if next < 0 || next as usize >= items.len() {
+                break;
+            }
+            index = next;
+        }
+        picker.selected = index as usize;
+    }
+
+    /// Records the entry at `index` in the open thread's draft and closes the menu.
+    fn choose(&mut self, index: usize) {
+        let items = self.picker_items();
+        let Some(Item::Entry { pick, .. }) = items.get(index) else {
+            return;
+        };
+        self.picker = None;
+        let (Some(open), Some(config), Some(thread)) = (
+            self.open.as_ref(),
+            self.config.as_ref(),
+            self.open_thread_json(),
+        ) else {
+            return;
+        };
+        let id = open.id.clone();
+        let mut draft = self.drafts.get(&id).cloned().unwrap_or_default();
+        picker::apply(&mut draft, thread, pick);
+        // Check the draft now, so a choice T3 would refuse fails here rather than at send.
+        match models::plan(config, thread, &draft) {
+            Err(e) => self.message = Some((e.to_string(), true)),
+            Ok(plan) if plan == Plan::default() => {
+                self.drafts.remove(&id);
+            }
+            Ok(_) => {
+                self.drafts.insert(id, draft);
+            }
+        }
+    }
+
     fn submit(&mut self) {
         if self.composer.is_empty() {
             return;
@@ -706,6 +1110,7 @@ impl App {
                 open.answers
                     .insert(str_of(question, "id").to_string(), answer);
                 self.composer.clear();
+                self.unsent.forget_composer();
                 if open.answers.len() < questions.len() {
                     return;
                 }
@@ -719,15 +1124,64 @@ impl App {
             }
         }
 
+        // The draft goes out with this message and stays until the thread shows it. A check
+        // that fails here leaves the text in the composer.
+        let thread_id = open.id.clone();
+        let plan = match (self.config.as_ref(), self.drafts.get(&thread_id)) {
+            (Some(config), Some(draft)) => match models::plan(config, state.thread(), draft) {
+                Ok(plan) => plan,
+                Err(e) => {
+                    self.message = Some((e.to_string(), true));
+                    return;
+                }
+            },
+            _ => Plan::default(),
+        };
+        // The client refuses this too, but its message names the run id.
+        if plan.changes_modes() && state.active_run().is_some() {
+            let error = "T3 can't change the mode during a run. Send again when it finishes, or set the mode back with Alt+P.";
+            self.message = Some((error.into(), true));
+            return;
+        }
         self.composer.clear();
+        self.unsent.forget_composer();
         self.scroll = 0;
-        let client = self.client.clone();
-        self.spawn_action(async move {
-            let receipt = client.send_message(&state, &text, IfBusy::Queue).await?;
-            Ok(match receipt.dispatch_mode {
-                "queue_after_active" => "Queued after the running turn.".into(),
-                _ => "Sent.".into(),
-            })
+        // As in the desktop app, ultrathink applies to one message. This send takes it out of
+        // the draft now, so a second message sent before this one lands doesn't reuse it.
+        let mut reserved = Vec::new();
+        if let Some(effort) = &plan.prompt_effort
+            && let Some(draft) = self.drafts.get_mut(&thread_id)
+        {
+            let (taken, kept) = std::mem::take(&mut draft.options)
+                .into_iter()
+                .partition(|(_, value)| value == effort);
+            draft.options = kept;
+            reserved = taken;
+            if draft.is_empty() {
+                self.drafts.remove(&thread_id);
+            }
+        }
+        let (client, results) = (self.client.clone(), self.actions.clone());
+        let message_id = uuid::Uuid::new_v4().to_string();
+        tokio::spawn(async move {
+            let sent = client
+                .send_message_as(&message_id, &state, &text, IfBusy::Queue, &plan)
+                .await;
+            let _ = results.send(match sent {
+                Ok(receipt) => ActionResult::Sent {
+                    note: match receipt.dispatch_mode {
+                        "queue_after_active" => "Queued after the running turn.".into(),
+                        _ => "Sent.".into(),
+                    },
+                },
+                Err(e) => ActionResult::SendFailed {
+                    thread_id,
+                    message_id,
+                    text,
+                    error: e.to_string(),
+                    reserved,
+                },
+            });
         });
     }
 
@@ -851,7 +1305,17 @@ impl App {
         if !panel.is_empty() {
             self.draw_request_panel(frame, panel_area, panel);
         }
+        self.composer_area = composer_area;
         self.draw_composer(frame, composer_area, &composer_rows, cursor);
+        self.picker_area = Rect::default();
+        self.picker_rows.clear();
+        if self.picker.is_some() {
+            let above = Rect {
+                height: composer_area.y.saturating_sub(main.y),
+                ..main
+            };
+            self.draw_picker(frame, above);
+        }
         frame.render_widget(
             Paragraph::new(self.status_line(status_area.width as usize)),
             status_area,
@@ -1437,12 +1901,13 @@ impl App {
     }
 
     fn draw_composer(
-        &self,
+        &mut self,
         frame: &mut Frame,
         area: Rect,
         rows: &[String],
         cursor: (usize, usize),
     ) {
+        self.chips.clear();
         let t = &self.theme;
         let focused = self.focus == Focus::Composer;
         let border = if focused { t.border_strong } else { t.border };
@@ -1484,30 +1949,88 @@ impl App {
                 text_area.y + (cursor.0 - first) as u16,
             ));
         }
-        frame.render_widget(
-            Paragraph::new(self.composer_chips(chips_area.width as usize)),
-            chips_area,
-        );
+        let (chips_line, chips) = self.composer_chips(chips_area.width as usize);
+        frame.render_widget(Paragraph::new(chips_line), chips_area);
+        self.chips = chips
+            .into_iter()
+            .filter(|(start, _, _)| *start < chips_area.width as usize)
+            .map(|(start, width, kind)| {
+                let x = chips_area.x + start as u16;
+                let width = (width as u16).min(chips_area.right() - x);
+                (Rect::new(x, chips_area.y, width, 1), kind)
+            })
+            .collect();
     }
 
-    /// The composer footer: provider and model, runtime mode, and the send button.
-    fn composer_chips(&self, width: usize) -> Line<'static> {
+    /// The composer footer: model, effort and other options, runtime mode, plan mode and the
+    /// send button. Returns each chip's column, width and menu. A choice waiting for the next
+    /// message shows in the info color.
+    fn composer_chips(&self, width: usize) -> (Line<'static>, Vec<(usize, usize, Kind)>) {
         let t = &self.theme;
         let muted = Style::new().fg(t.muted);
+        let pending = Style::new().fg(t.info_fg);
         let divider = Span::styled("  │  ", Style::new().fg(t.border_strong));
         let mut left: Vec<Span<'static>> = Vec::new();
-        if let Some(thread) = self.open_thread_json() {
-            let selection = &thread["modelSelection"];
+        let mut chips = Vec::new();
+        if let (Some(thread), Some(view)) = (self.open_thread_json(), self.settings_view()) {
+            let config = self.config.as_ref();
+            let (current, selection) = (&thread["modelSelection"], &view.selection);
             let (glyph, color) = t.provider_glyph(str_of(selection, "instanceId"));
-            let model = model_display_name(str_of(selection, "model"), &self.model_names);
-            left.push(Span::styled(format!("{glyph} "), Style::new().fg(color)));
-            left.push(Span::styled(model, muted));
+            let model = config
+                .and_then(|config| picker::selected_model(config, selection))
+                .and_then(|(_, model)| model["name"].as_str().map(str::to_string))
+                .unwrap_or_else(|| model_display_name(str_of(selection, "model")));
+            let new_model = selection["instanceId"] != current["instanceId"]
+                || selection["model"] != current["model"];
+            push_chip(
+                &mut left,
+                &mut chips,
+                Kind::Model,
+                vec![
+                    Span::styled(format!("{glyph} "), Style::new().fg(color)),
+                    Span::styled(model, if new_model { pending } else { muted }),
+                    Span::styled(" ▾", muted),
+                ],
+            );
+            if let Some(traits) = config.and_then(|config| picker::traits_label(config, &view)) {
+                let new_traits =
+                    view.prompt_effort.is_some() || selection["options"] != current["options"];
+                left.push(divider.clone());
+                push_chip(
+                    &mut left,
+                    &mut chips,
+                    Kind::Traits,
+                    vec![
+                        Span::styled(traits, if new_traits { pending } else { muted }),
+                        Span::styled(" ▾", muted),
+                    ],
+                );
+            }
             left.push(divider.clone());
-            let mode = runtime_mode_label(str_of(thread, "runtimeMode"));
-            left.push(Span::styled(format!("⊡ {mode}"), muted));
-            if str_of(thread, "interactionMode") == "plan" {
+            let mode = runtime_mode_label(&view.runtime_mode);
+            let new_mode = view.plan.runtime_mode.is_some();
+            push_chip(
+                &mut left,
+                &mut chips,
+                Kind::Mode,
+                vec![Span::styled(
+                    format!("⊡ {mode}"),
+                    if new_mode { pending } else { muted },
+                )],
+            );
+            if view.interaction_mode == "plan" {
+                let style = if view.plan.interaction_mode.is_some() {
+                    pending
+                } else {
+                    Style::new().fg(t.violet)
+                };
                 left.push(divider);
-                left.push(Span::styled("Plan", Style::new().fg(t.violet)));
+                push_chip(
+                    &mut left,
+                    &mut chips,
+                    Kind::Mode,
+                    vec![Span::styled("Plan", style)],
+                );
             }
         }
         let send = if self.composer.is_empty() {
@@ -1519,7 +2042,172 @@ impl App {
                 .add_modifier(Modifier::BOLD)
         };
         let right = vec![Span::styled("Enter ", muted), Span::styled(" ↑ ", send)];
-        row(left, right, width)
+        (row(left, right, width), chips)
+    }
+
+    /// The open menu, drawn in `above` just over the composer and lined up with its chip.
+    fn draw_picker(&mut self, frame: &mut Frame, above: Rect) {
+        let Some(kind) = self.picker.as_ref().map(|p| p.kind) else {
+            return;
+        };
+        let t = self.theme.clone();
+        let muted = Style::new().fg(t.muted);
+        let items = self.picker_items();
+        let empty = match (&self.config, kind) {
+            (None, _) => "Loading T3's model list…",
+            (_, Kind::Model) => "No model matches",
+            (_, Kind::Traits) => "This model has no options",
+            (_, Kind::Mode) => "",
+        };
+        let searching = kind == Kind::Model;
+        // Section labels, then entries as a check column and the label.
+        let content = items
+            .iter()
+            .map(|item| match item {
+                Item::Heading { text, provider } => text.width() + 2 * provider.is_some() as usize,
+                Item::Entry { label, .. } => 3 + label.width(),
+            })
+            .max()
+            .unwrap_or(0)
+            .max(empty.width())
+            .max(if searching { 30 } else { 16 });
+        let width = (content as u16 + 4).min(above.width);
+        let list_height = items.len().max(1) as u16;
+        let search_height = if searching { 2 } else { 0 };
+        let height = (list_height + search_height + 2).min(above.height);
+        if height < 3 + search_height || width < 8 {
+            return;
+        }
+        let chip_x = self
+            .chips
+            .iter()
+            .find(|(_, chip)| *chip == kind)
+            .map_or(above.x, |(area, _)| area.x);
+        let x = chip_x
+            .saturating_sub(2)
+            .clamp(above.x, above.right().saturating_sub(width));
+        let area = Rect::new(x, above.bottom() - height, width, height);
+        let block = Block::new()
+            .borders(Borders::ALL)
+            .border_type(BorderType::Rounded)
+            .border_style(Style::new().fg(t.border_strong))
+            .style(Style::new().bg(t.popover));
+        let inner = block.inner(area);
+        frame.render_widget(Clear, area);
+        frame.render_widget(block, area);
+        self.picker_area = area;
+
+        let mut list = inner;
+        if searching {
+            let filter = self
+                .picker
+                .as_ref()
+                .map(|p| p.filter.clone())
+                .unwrap_or_default();
+            let line = if filter.is_empty() {
+                Line::from(vec![
+                    Span::styled(" ⌕ ", muted),
+                    Span::styled("Search models", muted),
+                ])
+            } else {
+                Line::from(vec![
+                    Span::styled(" ⌕ ", muted),
+                    Span::styled(
+                        fit(&filter, inner.width as usize - 4),
+                        Style::new().fg(t.fg),
+                    ),
+                ])
+            };
+            frame.render_widget(Paragraph::new(line), Rect { height: 1, ..inner });
+            frame.render_widget(
+                Paragraph::new(Line::styled(
+                    "─".repeat(inner.width as usize),
+                    Style::new().fg(t.border),
+                )),
+                Rect {
+                    y: inner.y + 1,
+                    height: 1,
+                    ..inner
+                },
+            );
+            let cursor = 3 + filter.width().min(inner.width as usize - 4);
+            frame.set_cursor_position((inner.x + cursor as u16, inner.y));
+            list = Rect {
+                y: inner.y + 2,
+                height: inner.height - 2,
+                ..inner
+            };
+        }
+        if items.is_empty() {
+            frame.render_widget(
+                Paragraph::new(Line::styled(format!(" {empty}"), muted)),
+                list,
+            );
+            return;
+        }
+
+        // Keep the highlight in view, with its section label when it is the section's first.
+        let visible = list.height as usize;
+        let Some(picker) = self.picker.as_mut() else {
+            return;
+        };
+        // A refreshed model list can be shorter than the one the highlight was on.
+        picker.selected = picker.selected.min(items.len() - 1);
+        let selected = picker.selected;
+        if selected < picker.offset {
+            picker.offset = selected;
+        }
+        if selected >= picker.offset + visible {
+            picker.offset = selected + 1 - visible;
+        }
+        if picker.offset > 0
+            && picker.offset == selected
+            && !items[selected - 1].is_entry()
+            && visible > 1
+        {
+            picker.offset -= 1;
+        }
+        let offset = picker.offset;
+
+        let row_width = list.width as usize;
+        let lines: Vec<Line> = items
+            .iter()
+            .enumerate()
+            .skip(offset)
+            .take(visible)
+            .map(|(index, item)| {
+                self.picker_rows
+                    .push((list.y + (index - offset) as u16, index));
+                match item {
+                    Item::Heading { text, provider } => {
+                        let mut spans = vec![Span::raw(" ")];
+                        if let Some(provider) = provider {
+                            let (glyph, color) = t.provider_glyph(provider);
+                            spans.push(Span::styled(format!("{glyph} "), Style::new().fg(color)));
+                        }
+                        spans.push(Span::styled(text.clone(), muted));
+                        Line::from(spans)
+                    }
+                    Item::Entry { label, current, .. } => {
+                        let check = if *current { " ✓ " } else { "   " };
+                        let left = vec![
+                            Span::styled(check, Style::new().fg(t.primary)),
+                            Span::styled(
+                                fit(label, row_width.saturating_sub(4)),
+                                Style::new().fg(t.fg),
+                            ),
+                        ];
+                        let line = row(left, Vec::new(), row_width);
+                        if index == selected {
+                            Line::from(with_bg(line.spans, t.highlight))
+                        } else {
+                            line
+                        }
+                    }
+                }
+            })
+            .collect();
+        frame.render_widget(Paragraph::new(lines), list);
     }
 
     fn status_line(&self, width: usize) -> Line<'static> {
@@ -1529,22 +2217,36 @@ impl App {
             return Line::styled(fit(text, width), Style::new().fg(color));
         }
         let (connection, color) = self.connection_state();
-        let keys = match self.focus {
-            Focus::Sidebar => "↑↓ select · Enter open · e settled · Tab focus · q quit",
-            Focus::Composer => {
-                "Enter send · Alt+Enter newline · Esc transcript · Ctrl+X interrupt · Ctrl+C quit"
+        let unsent = self
+            .open
+            .as_ref()
+            .is_some_and(|o| self.unsent.has_saved(&o.id));
+        let keys = match (self.focus, self.picker.as_ref().map(|p| p.kind)) {
+            (_, Some(Kind::Model)) => "Type to search · ↑↓ choose · Enter select · Esc close",
+            (_, Some(_)) => "↑↓ choose · Enter select · Esc close",
+            (Focus::Sidebar, None) => "↑↓ select · Enter open · e settled · Tab focus · q quit",
+            (Focus::Composer, None) => {
+                "Enter send · Alt+Enter newline · Alt+M model · Alt+E effort · Alt+P mode · Ctrl+X interrupt"
             }
-            Focus::Transcript => {
+            (Focus::Transcript, None) => {
                 "↑↓/PgUp scroll · G bottom · t activity · Enter compose · Esc sidebar"
             }
         };
-        Line::from(vec![
+        let head = fit(&format!("{connection}  ·  "), width.saturating_sub(2));
+        let mut room = width.saturating_sub(2 + head.width());
+        let mut spans = vec![
             Span::styled("● ", Style::new().fg(color)),
-            Span::styled(
-                fit(&format!("{connection}  ·  {keys}"), width.saturating_sub(2)),
-                Style::new().fg(t.muted),
-            ),
-        ])
+            Span::styled(head, Style::new().fg(t.muted)),
+        ];
+        if unsent && self.picker.is_none() && room > 0 {
+            let note = fit("Unsent message: Ctrl+R  ·  ", room);
+            room -= note.width();
+            spans.push(Span::styled(note, Style::new().fg(t.warning_fg)));
+        }
+        if room > 0 {
+            spans.push(Span::styled(fit(keys, room), Style::new().fg(t.muted)));
+        }
+        Line::from(spans)
     }
 }
 
@@ -1624,6 +2326,19 @@ fn with_bg(spans: Vec<Span<'static>>, bg: Color) -> Vec<Span<'static>> {
             span
         })
         .collect()
+}
+
+/// Appends a chip's spans to `left` and records its column, width and menu.
+fn push_chip(
+    left: &mut Vec<Span<'static>>,
+    chips: &mut Vec<(usize, usize, Kind)>,
+    kind: Kind,
+    spans: Vec<Span<'static>>,
+) {
+    let start: usize = left.iter().map(|s| s.content.width()).sum();
+    let width: usize = spans.iter().map(|s| s.content.width()).sum();
+    left.extend(spans);
+    chips.push((start, width, kind));
 }
 
 /// `left` at the start, `right` at the end, padded to exactly `width` columns.
