@@ -33,6 +33,14 @@ pub struct Settings {
     /// shares the key. Off, the default, every message from the TUI runs in Build, and a thread
     /// left in Plan goes back to Build with its next message. The CLI's `--plan` ignores it.
     pub plan_mode_enabled: bool,
+    /// Move threads with a run under way out of Active into a Working shelf of their own, like
+    /// the desktop's "Working shelf" setting, which shares the key. Read at start, like
+    /// `plan_mode_enabled`, so a change takes effect when t3term starts again.
+    pub sidebar_working_shelf_enabled: bool,
+    /// Whether the Working shelf lists every thread in it or only its heading. `w` and a click
+    /// on the heading save it. The desktop keeps its own in the browser's storage, so this key
+    /// is t3term's.
+    pub sidebar_working_shelf_expanded: bool,
 }
 
 fn path() -> PathBuf {
@@ -239,8 +247,71 @@ mod tests {
         let saved = serde_json::to_value(&on).unwrap();
         assert_eq!(
             saved,
-            serde_json::json!({"verbose": false, "planModeEnabled": true})
+            serde_json::json!({
+                "verbose": false,
+                "planModeEnabled": true,
+                "sidebarWorkingShelfEnabled": false,
+                "sidebarWorkingShelfExpanded": false,
+            })
         );
+    }
+
+    #[test]
+    fn the_working_shelf_uses_the_desktops_key_and_starts_off() {
+        let before: Settings =
+            serde_json::from_str(r#"{"verbose": true, "planModeEnabled": true}"#).unwrap();
+        assert!(!before.sidebar_working_shelf_enabled);
+        assert!(
+            !before.sidebar_working_shelf_expanded,
+            "the shelf starts collapsed"
+        );
+
+        let on: Settings = serde_json::from_str(r#"{"sidebarWorkingShelfEnabled": true}"#).unwrap();
+        assert!(on.sidebar_working_shelf_enabled);
+        assert!(!on.sidebar_working_shelf_expanded);
+        assert!(!on.plan_mode_enabled && !on.verbose);
+
+        let open: Settings =
+            serde_json::from_str(r#"{"sidebarWorkingShelfExpanded": true}"#).unwrap();
+        assert!(open.sidebar_working_shelf_expanded);
+        assert!(!open.sidebar_working_shelf_enabled);
+    }
+
+    #[test]
+    fn opening_the_working_shelf_keeps_the_other_settings() {
+        // The shelf turned on by hand, then `w` pressed in the TUI and then `t`.
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("settings.json");
+        std::fs::write(
+            &path,
+            r#"{"planModeEnabled": true, "sidebarWorkingShelfEnabled": true}"#,
+        )
+        .unwrap();
+        update_at(&path, |settings| {
+            settings.sidebar_working_shelf_expanded = true;
+        })
+        .unwrap();
+        update_at(&path, |settings| settings.verbose = true).unwrap();
+        assert_eq!(
+            read(&path),
+            Settings {
+                verbose: true,
+                plan_mode_enabled: true,
+                sidebar_working_shelf_enabled: true,
+                sidebar_working_shelf_expanded: true,
+            }
+        );
+
+        // Closing it again leaves the switch alone.
+        update_at(&path, |settings| {
+            settings.sidebar_working_shelf_expanded = false;
+        })
+        .unwrap();
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert_eq!(saved["sidebarWorkingShelfEnabled"], true);
+        assert_eq!(saved["sidebarWorkingShelfExpanded"], false);
+        assert_eq!(saved["planModeEnabled"], true);
     }
 
     #[test]
@@ -252,7 +323,8 @@ mod tests {
             read(&path),
             Settings {
                 verbose: true,
-                plan_mode_enabled: false
+                plan_mode_enabled: false,
+                ..Settings::default()
             },
             "a missing file and its directory start from the defaults"
         );
@@ -264,7 +336,8 @@ mod tests {
             read(&path),
             Settings {
                 verbose: false,
-                plan_mode_enabled: true
+                plan_mode_enabled: true,
+                ..Settings::default()
             }
         );
     }
@@ -308,7 +381,8 @@ mod tests {
             read(&path),
             Settings {
                 verbose: true,
-                plan_mode_enabled: true
+                plan_mode_enabled: true,
+                ..Settings::default()
             },
             "one save was lost to the other"
         );
@@ -355,7 +429,8 @@ mod tests {
             read(&path),
             Settings {
                 verbose: true,
-                plan_mode_enabled: true
+                plan_mode_enabled: true,
+                ..Settings::default()
             }
         );
         let mut left: Vec<String> = std::fs::read_dir(&dir)
@@ -425,7 +500,8 @@ mod tests {
             read(&existing),
             Settings {
                 verbose: true,
-                plan_mode_enabled: true
+                plan_mode_enabled: true,
+                ..Settings::default()
             }
         );
 
@@ -441,7 +517,8 @@ mod tests {
             read(&dotfiles.join("new.json")),
             Settings {
                 verbose: true,
-                plan_mode_enabled: false
+                plan_mode_enabled: false,
+                ..Settings::default()
             }
         );
         let mut left: Vec<String> = std::fs::read_dir(&dotfiles)
