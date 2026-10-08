@@ -66,7 +66,7 @@ impl Tasks {
     }
 }
 
-/// Run statuses that leave a run unsettled (`isLatestRunSettled`, `session-logic.ts:219`).
+/// Run statuses that leave a run unsettled (`isLatestRunSettled`, `session-logic.ts:220`).
 fn unsettled(status: &str) -> bool {
     matches!(status, "preparing" | "queued" | "starting" | "running" | "waiting")
 }
