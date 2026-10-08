@@ -72,7 +72,7 @@ Colors come from T3's dark theme tokens. When `COLORTERM` reports truecolor the 
 
 ![The desktop app and t3term showing the same thread](docs/screenshots/gui-vs-tui.png)
 
-`docs/screenshots/` also has `before-tui.png`, `after-tui.png`, `approval.png`, `streaming.gif` and `picker-model.png`.
+`docs/screenshots/` also has `before-tui.png`, `after-tui.png`, `approval.png`, `streaming.gif`, `picker-model.png` and `tool-calls-failed.png`.
 
 ## Tool calls and reasoning
 
@@ -80,7 +80,7 @@ Reasoning is always there to read. It is laid out as prose in grey, so the model
 
 ![A turn with its tool calls folded into one row, the reasoning in grey, then the answer](docs/screenshots/tool-calls.png)
 
-Click the row to open it. Each call is then one row with its icon, what it did and a chip holding the file, command or query it did it to, with the output quoted under it and a red `exit N` after a failure. Clicking the row again closes it. What you are reading stays where it is on screen while the rows above it grow.
+Click the row to open it. Each call is then one row with its icon, what it did and a chip holding the file, command or query it did it to, with the output quoted under it. A call that failed is red, and carries `exit N` when T3 reports the code. Clicking the row again closes it. What you are reading stays where it is on screen while the rows above it grow.
 
 ![The same turn with the row open: a file read and a search, each with its output](docs/screenshots/tool-calls-open.png)
 
