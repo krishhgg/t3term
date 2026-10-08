@@ -21,6 +21,7 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 | # | Pull request | What it does | Merge commit |
 |---|---|---|---|
 | 1 | https://github.com/krishhgg/t3term/pull/8 | CI, CLI exit-code tests, this record, nightly sync deferred | |
+| 2 | https://github.com/krishhgg/t3term/pull/9 | Pinned, Active, Snoozed and Settled shelves in the sidebar | |
 
 ## Maintenance review PRs
 
