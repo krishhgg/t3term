@@ -739,7 +739,8 @@ impl App {
                 self.on_picker_key(key);
                 return;
             }
-            // Alt+T opens and closes the tasks drawer. Alt+↑/↓ scroll its list when it is too long.
+            // While the tasks drawer shows, Alt+T opens and closes its list, and Alt+↑/↓ scroll
+            // a list too long to show. With no drawer they go on, so Alt+T can reach `t` below.
             _ if self.tasks.on_key(&key) => return,
             // The desktop app's model, effort and mode menus. It uses Cmd+Shift+M, E and A.
             KeyCode::Char(c @ ('m' | 'e' | 'p')) if alt => {

@@ -188,20 +188,17 @@ impl Drawer {
         self.open = open;
     }
 
-    /// Alt+T opens or closes the list from any pane. It does nothing while no drawer shows,
-    /// and never types a letter or reaches the transcript's `t`. Alt+↑/↓ scroll a list too
-    /// long to show. Returns whether the key was the drawer's.
+    /// Alt+T opens or closes the list from any pane while the drawer shows. With no drawer on
+    /// screen the key isn't the drawer's and goes where it went before there was one, so Esc
+    /// then a quick `t`, which terminals send as Alt+T, still reaches the transcript's `t`.
+    /// Alt+↑/↓ scroll a list too long to show. Returns whether the key was the drawer's.
     pub fn on_key(&mut self, key: &KeyEvent) -> bool {
         let modifiers = key.modifiers;
         if !modifiers.contains(KeyModifiers::ALT) || modifiers.contains(KeyModifiers::CONTROL) {
             return false;
         }
         match key.code {
-            KeyCode::Char('t' | 'T') => {
-                if self.area.height > 0 {
-                    self.toggle();
-                }
-            }
+            KeyCode::Char('t' | 'T') if self.area.height > 0 => self.toggle(),
             KeyCode::Up if self.overflows => self.scroll = self.scroll.saturating_sub(1),
             KeyCode::Down if self.overflows => self.scroll += 1,
             _ => return false,
@@ -639,7 +636,7 @@ mod tests {
     }
 
     #[test]
-    fn alt_t_is_the_drawers_and_letters_stay_text() {
+    fn alt_t_is_the_drawers_only_while_it_shows_and_letters_stay_text() {
         let mut drawer = Drawer {
             area: Rect::new(2, 10, 40, 1),
             ..Drawer::default()
@@ -671,10 +668,16 @@ mod tests {
         assert!(!drawer.on_key(&key(KeyCode::Up, KeyModifiers::ALT)));
         assert!(!drawer.on_key(&key(KeyCode::Down, KeyModifiers::ALT)));
 
-        // With no drawer on screen, Alt+T still belongs to it and does nothing.
+        // With no drawer on screen, Alt+T isn't the drawer's. It goes on as it did before the
+        // drawer, so Esc then a quick `t` in the transcript still opens the tool-call rows.
         drawer.area = Rect::default();
-        assert!(drawer.on_key(&alt_t));
+        assert!(!drawer.on_key(&alt_t));
+        assert!(!drawer.on_key(&key(KeyCode::Char('T'), alt_shift)));
         assert!(!drawer.open);
+        // When the drawer comes back, Alt+T is its again.
+        drawer.area = Rect::new(2, 10, 40, 1);
+        assert!(drawer.on_key(&alt_t));
+        assert!(drawer.open);
     }
 
     #[test]
