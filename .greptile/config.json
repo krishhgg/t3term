@@ -1,0 +1,94 @@
+{
+  "strictness": 1,
+  "commentTypes": ["logic", "syntax", "style"],
+  "triggerOnUpdates": true,
+  "includeBranches": ["**"],
+  "statusCheck": true,
+  "ignorePatterns": "**/Cargo.lock\nresearch/*.json\nresearch/*.txt\nresearch/*.html\nbenchmarks/bin/**\ntarget/**\ndocs/screenshots/**",
+  "instructions": "t3term is a Rust terminal client for T3 Code's orchestrator V2 (protocol 2). It is one binary: with no arguments it opens a ratatui TUI, and its subcommands form a CLI. It connects to the T3 server already running on the machine. It never starts a server or opens T3's database. Its purpose is to replace the Electron desktop app with a client that uses far less CPU, memory and energy while still behaving like T3, so idle CPU and per-command cost are requirements, not polish. Layout: discovery.rs finds the server from ~/.t3/userdata/server-runtime.json and checks the protocol version. auth.rs issues and revokes bearer sessions through the server's own `t3 auth session` command and keeps one 30-day login per environment in the macOS Keychain through keychain.rs. http.rs and rpc.rs speak HTTP and Effect RPC over one /ws WebSocket, with chunk acks, pings and resume by afterSequence. client.rs joins them. projection.rs reduces V2 events into thread state. transcript.rs turns thread state into text. main.rs is the CLI, with documented exit codes and --json output. src/tui/ is the TUI. tests/fake_server.rs runs the real RPC client against a fake server. research/ and benchmarks/ hold measurements and the scripts that produced them. Wire formats and field names come from T3's TypeScript source (pingdotgg/t3code), so a change to them should say which T3 file or recorded event it matches. Review for correctness and credential safety first, then for CPU and memory cost, then for clarity. macOS is the only supported platform for now, and Linux or Windows code must not change the macOS build. Point out claims in README.md or research/ that the code or measurements in the PR do not support. PRs that change how the TUI looks include screenshots or recordings. Review those for behavior, not visual taste.",
+  "rules": [
+    {
+      "id": "credential-handling",
+      "rule": "Bearer tokens must never appear in argv, logs, error messages, panic messages, Debug output or --json output, and must never be written to disk outside the Keychain. Keychain writes pass the secret to /usr/bin/security on stdin. Flag any new path that formats, prints or stores a token, and any struct holding a token without a Debug impl that redacts it.",
+      "scope": ["src/**"],
+      "severity": "high"
+    },
+    {
+      "id": "session-lifecycle",
+      "rule": "Every session t3term issues must end up either saved in the Keychain or revoked before the process exits, on every exit path: normal return, error, Ctrl+C, SIGHUP from a closed terminal and SIGTERM. A spawned revoke must be waited for, or tracked so exit waits for it, and must not die with the terminal's process group. Concurrent t3term processes must not issue duplicate saved logins. Flag new exit paths (process::exit, panics, early returns from main) that skip revoke_all_sessions.",
+      "scope": ["src/auth.rs", "src/keychain.rs", "src/client.rs", "src/main.rs", "src/tui/**"],
+      "severity": "high"
+    },
+    {
+      "id": "least-privilege",
+      "rule": "Sessions carry only the orchestration:read and orchestration:operate scopes and last at most 30 days. Flag any new scope, any longer TTL, and any HTTP or RPC call that needs more access than these scopes grant.",
+      "scope": ["src/**"],
+      "severity": "high"
+    },
+    {
+      "id": "hands-off-t3",
+      "rule": "t3term must not open or write T3's SQLite databases or other files under ~/.t3, except reading server-runtime.json. It must not start, stop, restart or signal the T3 server or desktop app. It talks to T3 only through the server's HTTP and WebSocket API and the server's own `t3 auth session` commands.",
+      "scope": ["src/**", "benchmarks/**"],
+      "severity": "high"
+    },
+    {
+      "id": "protocol-fidelity",
+      "rule": "Method names, message shapes, field names and enum values must match T3 orchestrator V2 protocol 2 as defined in T3's TypeScript source. Flag field names that look guessed, fields T3 requires that are left out, and enum string literals that are neither cited nor tested. The client must keep acking stream chunks, keep the 10-second ping and the 30-second dead-socket timeout, and resume with afterSequence after a reconnect. It must refuse servers that do not report protocol 2.",
+      "scope": ["src/rpc.rs", "src/http.rs", "src/client.rs", "src/projection.rs", "src/discovery.rs", "tests/**"],
+      "severity": "high"
+    },
+    {
+      "id": "reducer-idempotence",
+      "rule": "V2 events carry the whole updated entity, so the reducer upserts it by id. Applying an event a second time, as happens after a reconnect, must leave state unchanged. Flag reducer changes that merge partial fields, depend on arrival order beyond sequence numbers, or can append a message or activity twice.",
+      "scope": ["src/projection.rs", "src/client.rs"],
+      "severity": "high"
+    },
+    {
+      "id": "terminal-safety",
+      "rule": "Thread titles, messages, tool output and file paths come from the server and from coding agents, so treat them as untrusted. Flag places where that text reaches the terminal, in CLI output or TUI cells, without removing escape and control characters that could move the cursor, redraw the screen or set the clipboard. The TUI must restore the terminal (raw mode, alternate screen, mouse capture) on every exit path, including panics and signals.",
+      "scope": ["src/tui/**", "src/main.rs", "src/transcript.rs"],
+      "severity": "high"
+    },
+    {
+      "id": "idle-cost",
+      "rule": "Low CPU and memory use is the reason t3term exists. The TUI draws only after input or a server event, at most 30 times a second, and copies only the visible rows into each frame. Flag timers or polling loops that wake while idle, redraws that no input or event caused, rewrapping or re-rendering the whole transcript on each frame, per-frame allocations that grow with transcript length, and caches without a bound.",
+      "scope": ["src/tui/**", "src/client.rs", "src/rpc.rs"],
+      "severity": "high"
+    },
+    {
+      "id": "async-blocking",
+      "rule": "Code on the tokio runtime must not block. Keychain calls, std::process, std::fs and file locks belong in spawn_blocking or a tokio equivalent. External commands and network calls need timeouts. Child processes need kill_on_drop or explicit tracking. Data from the server must not be unwrapped or indexed in ways that panic on unexpected input.",
+      "scope": ["src/**"],
+      "severity": "medium"
+    },
+    {
+      "id": "cli-contract",
+      "rule": "Scripts and agents depend on the CLI. Exit codes must stay as README.md documents them: 0 success, 1 failure, 2 usage, 3 not found, 4 rejected or unsupported protocol, 5 server unavailable, 6 timeout, 7 waiting for an approval or answer. With --json, stdout carries only JSON: one object per command, or one per line for watch, with errors as {\"ok\": false, \"error\": {\"code\", \"message\"}}. Flag changes to commands, flags, output fields or exit codes that README.md does not reflect.",
+      "scope": ["src/main.rs", "README.md"],
+      "severity": "medium"
+    },
+    {
+      "id": "tui-parity",
+      "rule": "The TUI should behave like the T3 desktop app: the same thread list, transcript order, approval and question flows, and the same names for providers, models, modes and statuses. Flag key bindings that clash with existing ones or are missing from README.md, and behavior that differs from the desktop app without a stated reason.",
+      "scope": ["src/tui/**"],
+      "severity": "medium"
+    },
+    {
+      "id": "platform-gating",
+      "rule": "macOS is the only tested platform. Linux or Windows code must sit behind cfg gates that leave the macOS build and behavior unchanged, and features that need the macOS Keychain must fall back to a temporary session elsewhere. Flag hard-coded home directories and other machine-specific paths.",
+      "scope": ["src/**"],
+      "severity": "medium"
+    },
+    {
+      "id": "measured-claims",
+      "rule": "CPU, memory, latency and energy numbers in docs must come from a measurement that benchmarks/ can reproduce or that the PR describes. Flag numbers a PR adds or changes without saying how they were measured, and scripts that hard-code a user's home directory.",
+      "scope": ["README.md", "research/**", "benchmarks/**"],
+      "severity": "medium"
+    }
+  ],
+  "summarySection": {
+    "included": true,
+    "collapsible": false,
+    "defaultOpen": true
+  }
+}

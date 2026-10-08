@@ -1,0 +1,27 @@
+{
+  "files": [
+    {
+      "path": "README.md",
+      "description": "What t3term does, the CLI commands and exit codes, TUI keys, how discovery, auth, RPC, state and rendering work, and what is not done yet"
+    },
+    {
+      "path": "research/next-steps.md",
+      "description": "The agreed plan: milestones from the shared V2 connection and read-only CLI to desktop-independent operation, T3 workflows and measured resource savings"
+    },
+    {
+      "path": "research/agent-opus.md",
+      "description": "Source review of T3's server and V2 wire protocol, with the protocol fixes every terminal client needs",
+      "scope": ["src/rpc.rs", "src/http.rs", "src/client.rs", "src/projection.rs", "src/discovery.rs", "src/auth.rs"]
+    },
+    {
+      "path": "research/report.md",
+      "description": "Measured cost of the Electron app against terminal renderers, the Rust and ratatui choice, and the energy acceptance targets",
+      "scope": ["src/tui/**", "benchmarks/**", "README.md"]
+    },
+    {
+      "path": "benchmarks/README.md",
+      "description": "How to reproduce the CPU, memory and energy measurements",
+      "scope": ["benchmarks/**", "research/**", "README.md"]
+    }
+  ]
+}
