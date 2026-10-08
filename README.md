@@ -57,12 +57,12 @@ Tested against T3 Code `0.0.46-nightly.20261007.2787` on orchestration protocol 
 
 | | Memory | CPU |
 | --- | --- | --- |
-| T3 Code desktop windows (5 processes) | 1132 MB | 15.0% of one core |
-| t3term (1 process) | 49 MB | 1.0% of one core |
+| T3 Code desktop windows (5 processes) | 1161 MB | 11.1% of one core |
+| t3term (1 process) | 53 MB | 0.8% of one core |
 
 Run `python3 benchmarks/compare_clients.py` with both clients open and it prints that table for your own machine. Memory is a sum of RSS, which overcounts pages the processes share, so read it as an upper bound.
 
-Neither row counts what runs whichever client you use: T3's server itself used 449 MB, and the agents it had spawned used 2961 MB across 58 processes. The agents are the expensive part, and nothing here changes that. t3term replaces the window, not the engine.
+Neither row counts what runs whichever client you use: T3's server itself used 449 MB, and the agents it had spawned used 2774 MB across 63 to 66 processes. The agents are the expensive part, and nothing here changes that. t3term replaces the window, not the engine.
 
 **It is scriptable.** Every subcommand takes `--json`, and `t3term threads --limit 1` answers in 30 to 50 ms using the saved login. Send a prompt from a git hook, wait for the turn, approve what it asks, read the result. One gap: when the agent asks a question rather than for approval, `requests` lists it but only the TUI can answer it.
 
