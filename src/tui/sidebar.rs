@@ -20,10 +20,12 @@
 //! next wake and the event loop sets one timer for it.
 //!
 //! Done and Woke compare against the shell's `lastVisitedAt`, which the server keeps for every
-//! client. t3term reads it but doesn't send `thread.visit` yet, so opening a thread here doesn't
-//! clear either word. The GUI keeps a visit time of its own for a server that leaves the field
-//! out. t3term has none, so on such a server a thread is never Done, and a woken thread stays
-//! Woke until it is settled or the server clears its snooze, as a new message does.
+//! client. The GUI's visit records the thread's `updatedAt`, so a timer wake outlasts a visit,
+//! and dismissing Woke records a visit at the wake time. t3term reads the field but doesn't send
+//! `thread.visit` yet, so opening a thread here doesn't clear either word. The GUI keeps a visit
+//! time of its own for a server that leaves the field out. t3term has none, so on such a server
+//! a thread is never Done, and a woken thread stays Woke until it is settled or the server
+//! clears its snooze, as a new message does.
 
 use std::cmp::Reverse;
 
@@ -1888,11 +1890,14 @@ mod tests {
         let visited = |at: Value| slept(json!({"lastVisitedAt": at}));
         assert_eq!(word_of(slept(json!({}))), Some(Word::Woke), "never visited");
         assert_eq!(word_of(visited(Value::Null)), Some(Word::Woke));
+        // The GUI's visit records the thread's `updatedAt`, which a timer wake doesn't move,
+        // so a visit after a timer wake still lands before it.
         assert_eq!(
             word_of(visited(json!("2026-10-08T11:00:00.000Z"))),
             Some(Word::Woke),
             "visited before the wake"
         );
+        // Dismissing Woke in the GUI records a visit at the wake time.
         assert_eq!(word_of(visited(json!("2026-10-08T11:30:00.000Z"))), None);
         assert_eq!(word_of(visited(json!("2026-10-08T11:45:00.000Z"))), None);
         assert_eq!(
