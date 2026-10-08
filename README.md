@@ -96,7 +96,7 @@ The TUI follows the desktop app closely, because muscle memory is worth more tha
 | Composer | Enter send (queues if the thread is busy), Alt+Enter or Ctrl+J newline, Ctrl+R swap in an unsent message, Esc to transcript |
 | Transcript | ↑/↓ scroll, g/G top/bottom, t open or close every row of tool calls, Enter compose, Esc sidebar |
 
-The wheel scrolls the transcript and the sidebar. Clicking a thread opens it, clicking the Working or Settled heading opens or closes that shelf, clicking a chip under the composer opens its menu, and clicking a row of tool calls opens that row.
+The wheel scrolls the transcript and the sidebar. Clicking a thread opens it, clicking the Working heading or the Settled footer opens or closes that shelf, clicking a chip under the composer opens its menu, and clicking a row of tool calls opens that row.
 
 On macOS the Alt keys need Option to send Meta: "Use Option as Meta key" in Terminal, "Esc+" for the Option key in iTerm2, or `macos-option-as-alt = true` in Ghostty.
 
