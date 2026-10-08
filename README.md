@@ -53,16 +53,18 @@ Tested against T3 Code `0.0.46-nightly.20261007.2787` on orchestration protocol 
 
 **You already live in the terminal.** The agents T3 Code drives are terminal programs. Your editor is one window over. A whole desktop app to watch them is one window too many.
 
-**It costs less to leave open.** Both clients on the same Mac, pointed at the same server, with 14 projects and 122 threads in it. Over the same minute, while a turn streamed into both:
+**It costs less to leave open.** Both clients open on the same thread, on the same Mac, against one server holding 14 projects and 123 threads. Sampled every 5 seconds across a minute:
 
 | | Memory | CPU |
 | --- | --- | --- |
-| T3 Code desktop windows | 1075 MB | 15.7% of one core |
-| t3term with a thread open | 45 MB | 1.0% of one core |
+| T3 Code desktop windows (5 processes) | 1132 MB | 15.0% of one core |
+| t3term (1 process) | 49 MB | 1.0% of one core |
 
-T3's own server keeps running either way, and it was using 429 MB throughout. This replaces the window, not the engine.
+Run `python3 benchmarks/compare_clients.py` with both clients open and it prints that table for your own machine. Memory is a sum of RSS, which overcounts pages the processes share, so read it as an upper bound.
 
-**It is scriptable.** Everything the TUI does has a subcommand, every subcommand takes `--json`, and a command answers in 30 to 50 ms. Send a prompt from a git hook, wait for the turn, read the result.
+Neither row counts what runs whichever client you use: T3's server itself used 449 MB, and the agents it had spawned used 2961 MB across 58 processes. The agents are the expensive part, and nothing here changes that. t3term replaces the window, not the engine.
+
+**It is scriptable.** Every subcommand takes `--json`, and `t3term threads --limit 1` answers in 30 to 50 ms using the saved login. Send a prompt from a git hook, wait for the turn, approve what it asks, read the result. One gap: when the agent asks a question rather than for approval, `requests` lists it but only the TUI can answer it.
 
 **It is a client, not a fork.** t3term opens no database and starts no server. A thread you start here is the thread the desktop app and the phone app show.
 
@@ -183,6 +185,7 @@ The unit tests cover the reducers, Markdown wrapping, the composer, the model me
 
 ## Not done yet
 
+- Answering a question from the CLI. `requests` lists one and the TUI can answer it, but there is no `answer` subcommand yet, so a script that hits a question has to hand over to a person.
 - Loading older history for long threads. The TUI opens a bounded recent window.
 - New threads, diffs and checkpoints, worktrees, attachments, embedded terminals and queue management.
 - A check of the reducer's output against T3's TypeScript reducer on recorded event streams.

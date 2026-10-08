@@ -17,9 +17,12 @@ Both use headless output. They do not include terminal-emulator rendering, image
 Read-only optional live samplers:
 
 ```sh
+python3 benchmarks/compare_clients.py [seconds]
 python3 benchmarks/measure_t3.py
 python3 benchmarks/measure_battery.py
 ```
+
+`compare_clients.py` is the measurement behind the table in the main README. Open the T3 Code desktop app and t3term on the same thread first, then run it. It samples every 5 seconds for a minute by default and reports four groups: the app's window processes, t3term, T3's server on its own, and the agents that server has spawned. The last two run whichever client you use, so only the first two are a fair comparison. It picks the windowed app by looking for a Renderer helper, so a headless server started from the same bundle does not confuse it, and it refuses to guess when more than one t3term is open. Results go to `research/client-comparison.json`.
 
 The first expects one running T3 Nightly app, identifies its server child, and samples CPU time and RSS for 30 seconds. It reads process names, not arguments or environments. CPU deltas exclude new or exited PIDs; summed RSS includes shared pages.
 

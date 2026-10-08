@@ -1,0 +1,39 @@
+{
+  "timestamp_utc": "2026-10-08T04:44:30.826197+00:00",
+  "window_seconds": 60.7,
+  "server_workload": {
+    "projects": 14,
+    "threads": 123
+  },
+  "note": "CPU is a cumulative-time delta, 100% is one core. RSS sums overcount shared pages. Processes that start or exit inside the window are excluded from the CPU delta. Both clients must be open on the same thread for the comparison to mean anything.",
+  "summary": {
+    "t3code_desktop_windows": {
+      "cpu_percent_one_core": 14.97,
+      "mean_rss_mib": 1132.4,
+      "min_rss_mib": 1127.8,
+      "max_rss_mib": 1137.2,
+      "stable_process_count": 5
+    },
+    "t3code_server": {
+      "cpu_percent_one_core": 5.57,
+      "mean_rss_mib": 449.1,
+      "min_rss_mib": 440.5,
+      "max_rss_mib": 478.9,
+      "stable_process_count": 1
+    },
+    "agents_the_server_spawned": {
+      "cpu_percent_one_core": 6.89,
+      "mean_rss_mib": 2961.2,
+      "min_rss_mib": 2931.5,
+      "max_rss_mib": 3025.2,
+      "stable_process_count": 58
+    },
+    "t3term": {
+      "cpu_percent_one_core": 0.99,
+      "mean_rss_mib": 49.0,
+      "min_rss_mib": 48.9,
+      "max_rss_mib": 49.0,
+      "stable_process_count": 1
+    }
+  }
+}
