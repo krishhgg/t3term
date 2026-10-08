@@ -8,6 +8,9 @@
 //!   `apps/web/src/components/Sidebar.tsx`.
 //! - The order inside each shelf comes from `packages/client-runtime/src/state/threadSort.ts`.
 //! - Snooze is `effectiveSnoozed` in `packages/client-runtime/src/state/threadSettled.ts`.
+//! - The Working shelf, a setting that is off by default, is `isThreadWorking`,
+//!   `sortInboxThreadsByReturn`, `sortWorkingThreadsBySend` and `createInboxReturnTracker` in
+//!   `packages/client-runtime/src/state/threadInbox.ts`.
 //! - A card's status word is `resolveSidebarThreadStatus` and `resolveSidebarV2TopStatus` in
 //!   `Sidebar.logic.ts`, with the labels, colors and Woke test of `SidebarThreadRow` in
 //!   `Sidebar.tsx` and the wake time from `threadWokeAt` in `threadSettled.ts`.
@@ -28,6 +31,7 @@
 //! clears its snooze, as a new message does.
 
 use std::cmp::Reverse;
+use std::collections::{HashMap, HashSet};
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -64,6 +68,8 @@ impl Capabilities {
 enum Shelf {
     Pinned,
     Active,
+    /// Threads busy without the user, when the Working shelf is on.
+    Working,
     Snoozed,
     Settled,
 }
@@ -73,6 +79,7 @@ impl Shelf {
         match self {
             Shelf::Pinned => "Pinned",
             Shelf::Active => "Active",
+            Shelf::Working => "Working",
             Shelf::Snoozed => "Snoozed",
             Shelf::Settled => "Settled",
         }
@@ -459,30 +466,156 @@ fn settled_ms(thread: &Value) -> i64 {
         .unwrap_or(0)
 }
 
+// ---- working ----
+
+/// `isThreadWorking`: the agent is busy and nothing waits on the user. That is a run under
+/// way, or one stopped with background work that will wake it. A request for the user, a
+/// failure and a plan waiting for a reply keep the thread in Active. An auth refresh isn't the
+/// user's to answer, so a thread waiting on one can still be working.
+fn belongs_in_working(thread: &Value) -> bool {
+    if pending(thread).is_some() {
+        return false;
+    }
+    if !matches!(
+        runtime_status(thread),
+        Some("preparing" | "queued" | "starting" | "running" | "waiting" | "idle")
+    ) {
+        return false;
+    }
+    // A plan the user has to answer outranks background work still pending. `presentThreadShell`
+    // gives the latest run the thread's status, with idle read as completed.
+    let run_settled = !thread["latestRunId"].is_null()
+        && !matches!(
+            status(thread),
+            "preparing" | "queued" | "starting" | "running" | "waiting"
+        )
+        && thread["activeRunId"] != thread["latestRunId"];
+    !(thread["interactionMode"] == "plan"
+        && thread["hasActionableProposedPlan"] == true
+        && run_settled)
+}
+
+/// `createInboxReturnTracker`: when this client saw each thread leave the Working shelf. The
+/// server stamps a run's request and its finish, but nothing marks an approval asked partway
+/// through a run or background work ending, so the moment t3term sees the change stands in.
+/// The stamps last as long as t3term runs.
+#[derive(Debug, Default)]
+struct Returns {
+    /// The threads that belonged in Working at the last look, or None before the first.
+    working: Option<HashSet<String>>,
+    at: HashMap<String, i64>,
+}
+
+impl Returns {
+    /// Looks at every thread the shell has, listed or not, at `now`. The first look only notes
+    /// which threads are working, so starting t3term stamps nothing and moves no card.
+    fn observe(&mut self, threads: &[Value], now: i64) {
+        let present: HashSet<&str> = threads.iter().map(id).collect();
+        let working: HashSet<String> = threads
+            .iter()
+            .filter(|t| belongs_in_working(t))
+            .map(|t| id(t).to_string())
+            .collect();
+        // A thread that has gone takes its stamp with it, so the map holds only live threads.
+        self.at.retain(|key, _| present.contains(key.as_str()));
+        for left in self.working.iter().flatten() {
+            if present.contains(left.as_str()) && !working.contains(left) {
+                self.at.insert(left.clone(), now);
+            }
+        }
+        self.working = Some(working);
+    }
+
+    fn returned_at(&self, thread: &Value) -> Option<i64> {
+        self.at.get(id(thread)).copied()
+    }
+}
+
+/// `sortInboxThreadsByReturn`: with the Working shelf on, Active lists threads newest first by
+/// when each last came back to the user, so a thread that leaves Working lands on top. The
+/// order the user arranged doesn't apply. Ties go by id.
+fn sort_by_return(threads: &mut [&Value], returns: &Returns) {
+    threads.sort_by_cached_key(|&t| (Reverse(returned_ms(t, returns)), id(t)));
+}
+
+/// When the thread last came back: created, reopened, its latest run asked for or finished, or
+/// seen leaving Working, whichever is latest.
+fn returned_ms(thread: &Value, returns: &Returns) -> i64 {
+    let at = |key: &str| instant(&thread[key]).unwrap_or(0);
+    let run = latest_run(thread);
+    let run_times = run
+        .iter()
+        .flat_map(|run| [run.requested_at, run.completed_at])
+        .filter_map(instant);
+    [
+        at("createdAt"),
+        at("unsettledAt"),
+        returns.returned_at(thread).unwrap_or(0),
+    ]
+    .into_iter()
+    .chain(run_times)
+    .max()
+    .unwrap_or(0)
+}
+
+/// `sortWorkingThreadsBySend`: Working lists threads newest first by the last message the user
+/// sent, so a run finishing or waking again doesn't move a card. Ties go by id.
+fn sort_by_send(threads: &mut [&Value]) {
+    threads.sort_by_cached_key(|&t| (Reverse(sent_ms(t)), id(t)));
+}
+
+/// When the user last sent the thread a message, or when it was created if that is later. A
+/// server that leaves out `latestUserAuthoredMessageAt` gives the latest run's request time
+/// instead, which a wake moves. One that sends it as null gives 0.
+fn sent_ms(thread: &Value) -> i64 {
+    let sent = match thread.get("latestUserAuthoredMessageAt") {
+        Some(at) => instant(at),
+        None => latest_run(thread).and_then(|run| instant(run.requested_at)),
+    };
+    instant(&thread["createdAt"])
+        .unwrap_or(0)
+        .max(sent.unwrap_or(0))
+}
+
 /// The visible threads on each shelf, in the order the GUI lists them.
 #[derive(Default)]
 struct Shelves<'a> {
     pinned: Vec<&'a Value>,
     active: Vec<&'a Value>,
+    working: Vec<&'a Value>,
     snoozed: Vec<&'a Value>,
     settled: Vec<&'a Value>,
 }
 
-/// The partition in `Sidebar.tsx`, less the Working shelf, a beta setting that is off by
-/// default.
-fn shelves(threads: &[Value], capabilities: Capabilities, now: i64) -> Shelves<'_> {
+/// The partition in `Sidebar.tsx`. `returns` is None while the Working shelf is off. With it
+/// on, threads in Active that belong in Working go there instead. Only Active folds away: a
+/// pinned, snoozed or settled thread keeps its shelf while it works.
+fn shelves<'a>(
+    threads: &'a [Value],
+    capabilities: Capabilities,
+    now: i64,
+    returns: Option<&Returns>,
+) -> Shelves<'a> {
     let mut shelves = Shelves::default();
     for thread in threads.iter().filter(|t| visible(t)) {
         let list = match shelf(thread, capabilities, now) {
             Shelf::Pinned => &mut shelves.pinned,
+            Shelf::Active if returns.is_some() && belongs_in_working(thread) => {
+                &mut shelves.working
+            }
             Shelf::Active => &mut shelves.active,
+            Shelf::Working => &mut shelves.working,
             Shelf::Snoozed => &mut shelves.snoozed,
             Shelf::Settled => &mut shelves.settled,
         };
         list.push(thread);
     }
     sort_pinned(&mut shelves.pinned);
-    sort_active(&mut shelves.active);
+    match returns {
+        Some(returns) => sort_by_return(&mut shelves.active, returns),
+        None => sort_active(&mut shelves.active),
+    }
+    sort_by_send(&mut shelves.working);
     // Soonest wake first. Every wake here parses, or the thread wouldn't be snoozed.
     shelves
         .snoozed
@@ -550,6 +683,13 @@ pub struct Sidebar {
     /// Settled threads stay behind the `Settled (N)` footer until it is opened.
     pub show_settled: bool,
     settled_count: usize,
+    /// Whether busy threads leave Active for the Working shelf. The settings decide it at start.
+    working_enabled: bool,
+    /// Whether the Working shelf lists its cards. Closed, it lists only the open thread's.
+    working_expanded: bool,
+    working_count: usize,
+    /// When threads came back from Working, for Active's order while the shelf is on.
+    returns: Returns,
     /// When the soonest snooze ends, in milliseconds. No server event marks it, so the event
     /// loop wakes for it.
     pub next_wake: Option<i64>,
@@ -561,13 +701,30 @@ pub struct Sidebar {
     cards: Vec<(u16, u16, String)>,
     /// Whether the last frame drew a card that reads Working or Goal.
     drew_working: bool,
+    /// The screen row the last frame drew the Working shelf's heading on.
+    working_heading: Option<u16>,
 }
 
 impl Sidebar {
+    /// An empty sidebar, with the Working shelf on or off and open or closed as the settings
+    /// say.
+    pub fn with_working(enabled: bool, expanded: bool) -> Sidebar {
+        Sidebar {
+            working_enabled: enabled,
+            working_expanded: expanded,
+            ..Sidebar::default()
+        }
+    }
+
     /// Lays the shelves out as rows: a heading over each shelf that has cards, then the cards.
     /// Settled cards show only while the shelf is open, except the open thread's, which never
-    /// hides there (`renderedSettledThreads` in `Sidebar.tsx`). The highlight follows its
-    /// thread, and the top row stays on top unless the list was scrolled to its start.
+    /// hides there (`renderedSettledThreads` in `Sidebar.tsx`). A closed Working shelf works
+    /// the same way (`visibleWorkingThreads`), and keeps its heading, which counts its cards.
+    /// The highlight follows its thread, and the top row stays on top unless the list was
+    /// scrolled to its start.
+    ///
+    /// With the Working shelf on, each call also looks for threads that have left it since the
+    /// last, as the GUI does each time it lays out its list.
     pub fn rebuild(
         &mut self,
         threads: &[Value],
@@ -575,8 +732,16 @@ impl Sidebar {
         open_id: Option<&str>,
         now: i64,
     ) {
-        let shelves = shelves(threads, capabilities, now);
+        let returns = if self.working_enabled {
+            self.returns.observe(threads, now);
+            Some(&self.returns)
+        } else {
+            self.returns = Returns::default();
+            None
+        };
+        let shelves = shelves(threads, capabilities, now, returns);
         self.settled_count = shelves.settled.len();
+        self.working_count = shelves.working.len();
         self.next_wake = shelves
             .snoozed
             .first()
@@ -586,6 +751,15 @@ impl Sidebar {
         } else {
             shelves
                 .settled
+                .into_iter()
+                .filter(|t| open_id == Some(id(t)))
+                .collect()
+        };
+        let working = if self.working_expanded {
+            shelves.working
+        } else {
+            shelves
+                .working
                 .into_iter()
                 .filter(|t| open_id == Some(id(t)))
                 .collect()
@@ -603,10 +777,13 @@ impl Sidebar {
         for (shelf, list) in [
             (Shelf::Pinned, &shelves.pinned),
             (Shelf::Active, &shelves.active),
+            (Shelf::Working, &working),
             (Shelf::Snoozed, &shelves.snoozed),
             (Shelf::Settled, &settled),
         ] {
-            if list.is_empty() {
+            // A closed Working shelf keeps its heading, which counts the cards it hides.
+            let counted = shelf == Shelf::Working && self.working_count > 0;
+            if list.is_empty() && !counted {
                 continue;
             }
             let gap = !self.rows.is_empty();
@@ -687,10 +864,56 @@ impl Sidebar {
     }
 
     /// Whether the last frame drew a card that reads Working or Goal, whose spinner and clock
-    /// need the event loop's tick. A card scrolled out of view, behind the closed Settled
-    /// shelf or left out of the sidebar has nothing on screen to move, so it doesn't count.
+    /// need the event loop's tick. A card scrolled out of view, behind the closed Settled or
+    /// Working shelf or left out of the sidebar has nothing on screen to move, so it doesn't
+    /// count.
     pub fn drew_working(&self) -> bool {
         self.drew_working
+    }
+
+    /// Whether the list has the Working shelf's heading, which `w` and a click open and close.
+    pub fn has_working(&self) -> bool {
+        self.working_count > 0
+    }
+
+    /// Whether the last frame drew the Working shelf's heading on screen row `y`.
+    pub fn working_heading_at(&self, y: u16) -> bool {
+        self.working_heading == Some(y)
+    }
+
+    /// Opens or closes the Working shelf, and returns whether it is open now. None, and nothing
+    /// changes, when the list has no Working heading. The caller runs `rebuild` next. Closing the shelf moves the highlight
+    /// and the top row off its cards to its heading first, so `rebuild` puts the highlight on
+    /// the first card below the heading and keeps the heading where it was. Otherwise both
+    /// would land on whatever rows fill the old positions, which can be far down the list.
+    pub fn toggle_working(&mut self) -> Option<bool> {
+        if !self.has_working() {
+            return None;
+        }
+        self.working_expanded = !self.working_expanded;
+        let heading = self.rows.iter().position(|row| {
+            matches!(
+                row,
+                Row::Heading {
+                    shelf: Shelf::Working,
+                    ..
+                }
+            )
+        });
+        if let Some(heading) = heading.filter(|_| !self.working_expanded) {
+            let end = self.rows[heading + 1..]
+                .iter()
+                .position(|row| matches!(row, Row::Heading { .. }))
+                .map_or(self.rows.len(), |next| heading + 1 + next);
+            let cards = heading + 1..end;
+            if cards.contains(&self.selected) {
+                self.selected = heading;
+            }
+            if cards.contains(&self.offset) {
+                self.offset = heading;
+            }
+        }
+        Some(self.working_expanded)
     }
 
     /// Scrolls so the highlighted card fits in `height` rows, with its shelf's heading when
@@ -734,6 +957,7 @@ impl Sidebar {
         frame.render_widget(Block::new().style(Style::new().bg(t.sidebar_bg)), area);
         self.cards.clear();
         self.drew_working = false;
+        self.working_heading = None;
         if area.width < 6 || area.height < 4 {
             // Nothing is drawn, so nothing there should take clicks.
             self.list = Rect::default();
@@ -793,7 +1017,19 @@ impl Sidebar {
                     if *gap {
                         lines.push(Line::default());
                     }
-                    lines.push(heading(*shelf, width, t));
+                    if *shelf == Shelf::Working {
+                        if lines.len() < height {
+                            self.working_heading = Some(list.y + lines.len() as u16);
+                        }
+                        lines.push(working_heading(
+                            self.working_count,
+                            self.working_expanded,
+                            width,
+                            t,
+                        ));
+                    } else {
+                        lines.push(heading(*shelf, width, t));
+                    }
                 }
                 Row::Thread(id) => {
                     let top = list.y + lines.len() as u16;
@@ -842,6 +1078,24 @@ fn heading(shelf: Shelf, width: usize, t: &Theme) -> Line<'static> {
             "─".repeat(width.saturating_sub(label.width() + 2)),
             Style::new().fg(t.sidebar_border),
         ),
+    ])
+}
+
+/// The Working shelf's heading, which opens and closes like the Settled footer. Closed, it
+/// counts the cards it hides, as the GUI's `Working (N)` does.
+fn working_heading(count: usize, expanded: bool, width: usize, t: &Theme) -> Line<'static> {
+    let (label, chevron) = if expanded {
+        ("Working".to_string(), "⌄")
+    } else {
+        (format!("Working ({count})"), "›")
+    };
+    Line::from(vec![
+        Span::styled(format!("{label} "), Style::new().fg(t.sidebar_muted)),
+        Span::styled(
+            "─".repeat(width.saturating_sub(label.width() + 3)),
+            Style::new().fg(t.sidebar_border),
+        ),
+        Span::styled(format!(" {chevron}"), Style::new().fg(t.sidebar_muted)),
     ])
 }
 
@@ -1149,7 +1403,7 @@ mod tests {
         ];
         // Capabilities don't change the pinned order.
         for capabilities in [ALL, Capabilities::default()] {
-            let shelves = shelves(&threads, capabilities, now());
+            let shelves = shelves(&threads, capabilities, now(), None);
             assert_eq!(ids(&shelves.pinned), ["k2", "k3", "k1", "n2", "n1", "n3"]);
         }
     }
@@ -1176,7 +1430,7 @@ mod tests {
                 json!({"createdAt": "2026-10-04T00:00:00.000Z"}),
             ),
         ];
-        let shelves = shelves(&threads, ALL, now());
+        let shelves = shelves(&threads, ALL, now(), None);
         assert_eq!(ids(&shelves.active), ["a2", "a3", "a4", "a1", "k2", "k1"]);
     }
 
@@ -1206,7 +1460,7 @@ mod tests {
             settled("s4", json!({"updatedAt": "bad", "createdAt": "bad"})),
             settled("s1", json!({"settledAt": "2026-10-05T00:00:00.000Z"})),
         ];
-        let shelves = shelves(&threads, ALL, now());
+        let shelves = shelves(&threads, ALL, now(), None);
         assert_eq!(ids(&shelves.settled), ["s2", "s1", "s5", "s3", "s4"]);
         assert_eq!(settled_ms(&threads[2]), ms("2026-10-06T00:00:00.000Z"));
         assert_eq!(settled_ms(&threads[3]), 0);
@@ -1335,7 +1589,7 @@ mod tests {
             wake("z3", "2026-10-08T13:00:00.000Z"),
         ];
         assert_eq!(
-            ids(&shelves(&threads, ALL, now()).snoozed),
+            ids(&shelves(&threads, ALL, now(), None).snoozed),
             ["z2", "z3", "z1"]
         );
 
@@ -1396,7 +1650,7 @@ mod tests {
         assert!(!visible(&subagent));
         assert!(visible(&fork));
         let threads = vec![thread("a"), archived, subagent, fork];
-        let shelves = shelves(&threads, ALL, now());
+        let shelves = shelves(&threads, ALL, now(), None);
         let mut shown = ids(&shelves.active);
         shown.sort();
         assert_eq!(shown, ["a", "fork"]);
