@@ -1,8 +1,8 @@
 //! Messages that failed to send, kept so that none is lost and none goes out twice.
 //!
 //! A send that times out can still reach T3 once the server recovers. Each failed message keeps
-//! the id it went out under, even after Ctrl+R brings it back, so when the thread later shows
-//! that id, the copy kept for a retry comes out.
+//! its thread and the id it went out under wherever Ctrl+R moves it, so when that thread later
+//! shows the id, the copy kept for a retry comes out.
 
 use std::collections::HashMap;
 
@@ -12,20 +12,29 @@ use super::composer::Composer;
 /// composer text that never went out.
 #[derive(Clone, Debug, PartialEq)]
 pub struct Failed {
+    /// The thread it was sent to.
+    pub thread_id: String,
     pub message_id: Option<String>,
     pub text: String,
 }
 
+impl Failed {
+    /// Whether this is a message that `thread_id` now shows.
+    fn landed(&self, thread_id: &str, in_thread: impl Fn(&str) -> bool) -> bool {
+        self.thread_id == thread_id && self.message_id.as_deref().is_some_and(in_thread)
+    }
+}
+
 /// Failed messages now in the composer, and the text they made there.
 struct Restored {
-    thread_id: String,
     messages: Vec<Failed>,
     text: String,
 }
 
 #[derive(Default)]
 pub struct Unsent {
-    /// Failed messages waiting for Ctrl+R or for their thread to open, by thread.
+    /// Failed messages waiting for Ctrl+R or for a thread to open, by that thread. Ctrl+R can
+    /// put one thread's message in another's list.
     saved: HashMap<String, Vec<Failed>>,
     restored: Option<Restored>,
 }
@@ -52,11 +61,10 @@ impl Unsent {
     }
 
     /// Replaces the composer's text with failed messages and remembers which they were.
-    pub fn restore(&mut self, composer: &mut Composer, thread_id: &str, messages: Vec<Failed>) {
+    pub fn restore(&mut self, composer: &mut Composer, messages: Vec<Failed>) {
         composer.clear();
         composer.insert_str(&join(&messages));
         self.restored = Some(Restored {
-            thread_id: thread_id.to_string(),
             messages,
             // What the composer holds, which drops carriage returns.
             text: composer.text(),
@@ -69,7 +77,7 @@ impl Unsent {
         if composer.is_empty()
             && let Some(messages) = self.saved.remove(thread_id)
         {
-            self.restore(composer, thread_id, messages);
+            self.restore(composer, messages);
         }
     }
 
@@ -81,10 +89,12 @@ impl Unsent {
         };
         let current = composer.text();
         let outgoing = match self.restored.take() {
-            // Failed messages that are still as they came back keep their ids.
-            Some(r) if r.thread_id == thread_id && r.text == current => r.messages,
+            // Failed messages that are still as they came back keep their thread and id, even
+            // when they came from another thread.
+            Some(r) if r.text == current => r.messages,
             _ if current.trim().is_empty() => Vec::new(),
             _ => vec![Failed {
+                thread_id: thread_id.to_string(),
                 message_id: None,
                 text: current,
             }],
@@ -92,7 +102,7 @@ impl Unsent {
         if !outgoing.is_empty() {
             self.saved.insert(thread_id.to_string(), outgoing);
         }
-        self.restore(composer, thread_id, messages);
+        self.restore(composer, messages);
         true
     }
 
@@ -102,28 +112,27 @@ impl Unsent {
         self.restored = None;
     }
 
-    /// Removes every kept copy of a message the thread now shows. `in_thread` says whether the
-    /// thread has a message id. Returns a status line note and whether it is a warning.
+    /// Removes every kept copy of a message the thread now shows, wherever Ctrl+R has put it.
+    /// `in_thread` says whether the thread has a message id. Returns a status line note and
+    /// whether it is a warning.
     pub fn drop_landed(
         &mut self,
         composer: &mut Composer,
         thread_id: &str,
         in_thread: impl Fn(&str) -> bool,
     ) -> Option<(String, bool)> {
-        let landed = |m: &Failed| m.message_id.as_deref().is_some_and(&in_thread);
+        let landed = |m: &Failed| m.landed(thread_id, &in_thread);
         let mut removed = None;
-        if let Some(saved) = self.saved.get_mut(thread_id) {
+        for saved in self.saved.values_mut() {
             let before = saved.len();
             saved.retain(|m| !landed(m));
             if saved.len() < before {
                 removed = Some("dropped its saved copy");
             }
-            if saved.is_empty() {
-                self.saved.remove(thread_id);
-            }
         }
+        self.saved.retain(|_, saved| !saved.is_empty());
         let mut warning = None;
-        if let Some(restored) = self.restored.as_mut().filter(|r| r.thread_id == thread_id)
+        if let Some(restored) = self.restored.as_mut()
             && restored.messages.iter().any(landed)
         {
             restored.messages.retain(|m| !landed(m));
@@ -160,7 +169,12 @@ mod tests {
     use super::*;
 
     fn failed(id: &str, text: &str) -> Failed {
+        sent_to("t", id, text)
+    }
+
+    fn sent_to(thread_id: &str, id: &str, text: &str) -> Failed {
         Failed {
+            thread_id: thread_id.to_string(),
             message_id: Some(id.to_string()),
             text: text.to_string(),
         }
@@ -210,14 +224,14 @@ mod tests {
     fn edited_text_is_left_alone_with_a_warning() {
         let mut unsent = Unsent::default();
         let mut composer = Composer::default();
-        unsent.restore(&mut composer, "t", vec![failed("m1", "one")]);
+        unsent.restore(&mut composer, vec![failed("m1", "one")]);
         composer.insert_str(" more");
 
         let note = unsent.drop_landed(&mut composer, "t", |_| true);
         assert!(note.is_some_and(|(_, warning)| warning));
         assert_eq!(composer.text(), "one more");
         // Another thread's messages are not checked against this one.
-        unsent.save("other", failed("m2", "two"));
+        unsent.save("other", sent_to("other", "m2", "two"));
         assert!(unsent.drop_landed(&mut composer, "t", |_| true).is_none());
         assert!(unsent.has_saved("other"));
     }
@@ -226,9 +240,34 @@ mod tests {
     fn text_that_went_out_stops_being_tracked() {
         let mut unsent = Unsent::default();
         let mut composer = Composer::default();
-        unsent.restore(&mut composer, "t", vec![failed("m1", "one")]);
+        unsent.restore(&mut composer, vec![failed("m1", "one")]);
         unsent.forget_composer();
         composer.clear();
         assert!(unsent.drop_landed(&mut composer, "t", |_| true).is_none());
+    }
+
+    #[test]
+    fn a_message_swapped_into_another_thread_keeps_its_thread_and_id() {
+        // A failed message for thread a is in the composer, and thread b has its own.
+        let mut unsent = Unsent::default();
+        let mut composer = Composer::default();
+        unsent.restore(&mut composer, vec![sent_to("a", "m1", "for a")]);
+        unsent.save("b", sent_to("b", "m2", "for b"));
+
+        // Ctrl+R in b swaps them, so a's message waits in b's list.
+        assert!(unsent.swap(&mut composer, "b"));
+        assert_eq!(composer.text(), "for b");
+        assert!(unsent.has_saved("b"));
+
+        // b showing the same id doesn't count. a showing it does.
+        assert!(
+            unsent
+                .drop_landed(&mut composer, "b", |id| id == "m1")
+                .is_none()
+        );
+        let note = unsent.drop_landed(&mut composer, "a", |id| id == "m1");
+        assert!(note.is_some_and(|(text, _)| text.contains("saved copy")));
+        assert!(!unsent.has_saved("b"));
+        assert_eq!(composer.text(), "for b");
     }
 }

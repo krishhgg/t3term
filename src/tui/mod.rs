@@ -798,6 +798,7 @@ impl App {
                     }
                 }
                 let message = Failed {
+                    thread_id: thread_id.clone(),
                     message_id: Some(message_id),
                     text,
                 };
@@ -829,8 +830,7 @@ impl App {
     /// message was for another thread, it waits for Ctrl+R or for that thread.
     fn give_back(&mut self, thread_id: &str, message: Failed, error: String) {
         if self.open.as_ref().is_some_and(|o| o.id == thread_id) && self.composer.is_empty() {
-            self.unsent
-                .restore(&mut self.composer, thread_id, vec![message]);
+            self.unsent.restore(&mut self.composer, vec![message]);
             self.message = Some((error, true));
             return;
         }
