@@ -31,7 +31,7 @@ use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
 
 use crate::client::{Client, IfBusy, WatchEvent};
-use crate::models::{self, Choice, Plan};
+use crate::models::Choice;
 use crate::projection::{Applied, ShellState, ThreadState, is_active_status, status};
 use crate::settings::Settings;
 use crate::transcript::{self, BlockKind};
@@ -223,6 +223,8 @@ struct App {
     drawn_scroll: usize,
     /// Shows every reasoning block and tool call in full. Saved between runs.
     verbose: bool,
+    /// Offers Build and Plan, from the settings file at start. Off, messages run in Build.
+    plan_mode_enabled: bool,
     /// What each tool printed, for the rows verbose mode is showing.
     outputs: Outputs,
     cache: HashMap<String, Cached>,
@@ -300,6 +302,7 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
         anchor: None,
         drawn_scroll: 0,
         verbose: settings.verbose,
+        plan_mode_enabled: settings.plan_mode_enabled,
         outputs: Outputs::default(),
         cache: HashMap::new(),
         message: None,
@@ -806,10 +809,8 @@ impl App {
         self.verbose = !self.verbose;
         self.cache.clear();
         self.open_bundles.clear();
-        Settings {
-            verbose: self.verbose,
-        }
-        .save();
+        let verbose = self.verbose;
+        Settings::update(move |settings| settings.verbose = verbose);
         self.message = Some((
             if self.verbose {
                 "Verbose mode on: every tool call stays open, with its output.".into()
@@ -978,7 +979,10 @@ impl App {
         else {
             return;
         };
-        if models::plan(config, thread, draft).is_ok_and(|plan| plan == Plan::default()) {
+        if matches!(
+            picker::spent(config, thread, draft, self.plan_mode_enabled),
+            Ok(true)
+        ) {
             let id = open.id.clone();
             self.drafts.remove(&id);
         }
@@ -1003,7 +1007,12 @@ impl App {
         let thread = self.open_thread_json()?;
         let empty = Choice::default();
         let draft = self.drafts.get(&open.id).unwrap_or(&empty);
-        Some(picker::view(self.config.as_ref(), thread, draft))
+        Some(picker::view(
+            self.config.as_ref(),
+            thread,
+            draft,
+            self.plan_mode_enabled,
+        ))
     }
 
     fn picker_items(&self) -> Vec<Item> {
@@ -1160,12 +1169,12 @@ impl App {
         let mut draft = self.drafts.get(&id).cloned().unwrap_or_default();
         picker::apply(&mut draft, thread, pick);
         // Check the draft now, so a choice T3 would refuse fails here rather than at send.
-        match models::plan(config, thread, &draft) {
+        match picker::spent(config, thread, &draft, self.plan_mode_enabled) {
             Err(e) => self.message = Some((e.to_string(), true)),
-            Ok(plan) if plan == Plan::default() => {
+            Ok(true) => {
                 self.drafts.remove(&id);
             }
-            Ok(_) => {
+            Ok(false) => {
                 self.drafts.insert(id, draft);
             }
         }
@@ -1239,19 +1248,34 @@ impl App {
         // The draft goes out with this message and stays until the thread shows it. A check
         // that fails here leaves the text in the composer.
         let thread_id = open.id.clone();
-        let plan = match (self.config.as_ref(), self.drafts.get(&thread_id)) {
-            (Some(config), Some(draft)) => match models::plan(config, state.thread(), draft) {
-                Ok(plan) => plan,
-                Err(e) => {
-                    self.message = Some((e.to_string(), true));
-                    return;
-                }
-            },
-            _ => Plan::default(),
+        let empty = Choice::default();
+        let draft = self.drafts.get(&thread_id).unwrap_or(&empty);
+        let plan = match picker::send_plan(
+            self.config.as_ref(),
+            state.thread(),
+            draft,
+            self.plan_mode_enabled,
+        ) {
+            Ok(plan) => plan,
+            Err(e) => {
+                self.message = Some((e.to_string(), true));
+                return;
+            }
         };
-        // The client refuses this too, but its message names the run id.
+        // The client refuses this too, but its message names the run id. Alt+P can't undo a
+        // switch from Plan to Build where Plan isn't offered, so that message leaves it out.
         if plan.changes_modes() && state.active_run().is_some() {
-            let error = "T3 can't change the mode during a run. Send again when it finishes, or set the mode back with Alt+P.";
+            let selection = plan
+                .model_selection
+                .as_ref()
+                .unwrap_or(&state.thread()["modelSelection"]);
+            let error = if plan.interaction_mode.is_some()
+                && !picker::offers_plan(self.config.as_ref(), selection, self.plan_mode_enabled)
+            {
+                "This message would move the thread from Plan to Build, and T3 can't change the mode during a run. Send again when it finishes."
+            } else {
+                "T3 can't change the mode during a run. Send again when it finishes, or set the mode back with Alt+P."
+            };
             self.message = Some((error.into(), true));
             return;
         }

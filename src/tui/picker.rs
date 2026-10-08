@@ -1,6 +1,7 @@
 //! The composer's model, effort and mode pickers. As in the desktop app, a choice stays in a
 //! draft for the thread and reaches T3 with the next message.
 
+use anyhow::Result;
 use serde_json::{Value, json};
 
 use crate::models::{self, Choice, Plan};
@@ -49,24 +50,96 @@ impl Item {
 pub struct View {
     pub selection: Value,
     pub runtime_mode: String,
+    /// `plan` only while Build and Plan are offered.
     pub interaction_mode: String,
+    /// Whether the mode menu offers Build and Plan.
+    pub offers_plan: bool,
     pub prompt_effort: Option<String>,
     /// What sending now would change.
     pub plan: Plan,
 }
 
-pub fn view(config: Option<&Value>, thread: &Value, draft: &Choice) -> View {
-    let plan = match config {
-        Some(config) if !draft.is_empty() => {
-            models::plan(config, thread, draft).unwrap_or_default()
-        }
+/// Whether the composer offers Build and Plan for a thread on `selection`, decided as the
+/// desktop's `resolveComposerInteractionMode` does in apps/web/src/components/ChatView.logic.ts:
+/// only with the legacy plan setting on, and only for a provider that shows the toggle. Before
+/// T3's model list arrives the provider is unknown, and t3term keeps offering the thread's mode
+/// rather than switching it. The desktop can't send at all then, so it never has to choose.
+pub fn offers_plan(config: Option<&Value>, selection: &Value, plan_mode_enabled: bool) -> bool {
+    plan_mode_enabled
+        && config
+            .and_then(|config| {
+                models::providers(config)
+                    .iter()
+                    .find(|provider| provider["instanceId"] == selection["instanceId"])
+            })
+            .is_none_or(|provider| provider["showInteractionModeToggle"] != false)
+}
+
+/// What sending a message now changes: the draft, checked against `config`, and the mode the
+/// desktop would send. Where Build and Plan aren't offered, that mode is Build, as in the
+/// desktop's `persistThreadSettingsForNextTurn` in ChatView.tsx. A Plan pick in the draft then
+/// waits unused, and a thread left in Plan goes back to Build with this message, so a hidden
+/// control never leaves a turn planning.
+pub fn send_plan(
+    config: Option<&Value>,
+    thread: &Value,
+    draft: &Choice,
+    plan_mode_enabled: bool,
+) -> Result<Plan> {
+    // `models::plan` checks a mode pick as Build, since whether Plan is allowed depends on the
+    // provider the draft ends up on. It still refuses a provider T3 has turned off.
+    let mut choice = draft.clone();
+    let picked = choice.interaction_mode.take();
+    choice.interaction_mode = picked.as_ref().map(|_| "default".to_string());
+    let mut plan = match config {
+        Some(config) if !choice.is_empty() => models::plan(config, thread, &choice)?,
         _ => Plan::default(),
     };
+    let selection = plan
+        .model_selection
+        .as_ref()
+        .unwrap_or(&thread["modelSelection"]);
+    let current = thread["interactionMode"].as_str().unwrap_or("default");
+    let mode = if offers_plan(config, selection, plan_mode_enabled) {
+        picked.as_deref().unwrap_or(current)
+    } else {
+        "default"
+    };
+    // Only a change is sent, so a thread already in Build gets no command.
+    plan.interaction_mode = (mode != current).then(|| mode.to_string());
+    Ok(plan)
+}
+
+/// Whether a message would change the same with or without `draft`, so the draft can go. The
+/// switch to Build that every message sends a thread left in Plan doesn't keep a draft alive.
+pub fn spent(
+    config: &Value,
+    thread: &Value,
+    draft: &Choice,
+    plan_mode_enabled: bool,
+) -> Result<bool> {
+    let with = send_plan(Some(config), thread, draft, plan_mode_enabled)?;
+    let without = send_plan(Some(config), thread, &Choice::default(), plan_mode_enabled)?;
+    Ok(with == without)
+}
+
+pub fn view(
+    config: Option<&Value>,
+    thread: &Value,
+    draft: &Choice,
+    plan_mode_enabled: bool,
+) -> View {
+    // A draft T3 would now refuse, say for a provider turned off since, shows as no draft.
+    let plan = send_plan(config, thread, draft, plan_mode_enabled)
+        .or_else(|_| send_plan(config, thread, &Choice::default(), plan_mode_enabled))
+        .unwrap_or_default();
+    let selection = plan
+        .model_selection
+        .clone()
+        .unwrap_or_else(|| thread["modelSelection"].clone());
     View {
-        selection: plan
-            .model_selection
-            .clone()
-            .unwrap_or_else(|| thread["modelSelection"].clone()),
+        offers_plan: offers_plan(config, &selection, plan_mode_enabled),
+        selection,
         runtime_mode: plan.runtime_mode.clone().unwrap_or_else(|| {
             thread["runtimeMode"]
                 .as_str()
@@ -221,7 +294,7 @@ fn mode_items(config: &Value, view: &View) -> Vec<Item> {
             pick: Pick::Mode(id.to_string()),
         });
     }
-    if provider.is_none_or(|p| p["showInteractionModeToggle"] != false) {
+    if view.offers_plan {
         items.push(heading("Plan mode"));
         for (text, on) in [("On", true), ("Off", false)] {
             items.push(Item::Entry {
@@ -360,6 +433,10 @@ mod tests {
         ]})
     }
 
+    /// The legacy plan setting, off by default as in the nightly.
+    const PLAN_OFF: bool = false;
+    const PLAN_ON: bool = true;
+
     fn thread() -> Value {
         json!({
             "modelSelection": {"instanceId": "claudeAgent", "model": "claude-opus-5-5",
@@ -367,6 +444,23 @@ mod tests {
             "runtimeMode": "approval-required",
             "interactionMode": "default"
         })
+    }
+
+    /// A thread put in Plan by the CLI, the desktop or an earlier t3term.
+    fn planning() -> Value {
+        let mut thread = thread();
+        thread["interactionMode"] = json!("plan");
+        thread
+    }
+
+    fn headings(items: &[Item]) -> Vec<&str> {
+        items
+            .iter()
+            .filter_map(|item| match item {
+                Item::Heading { text, .. } => Some(text.as_str()),
+                Item::Entry { .. } => None,
+            })
+            .collect()
     }
 
     fn entries(items: &[Item]) -> Vec<(String, bool)> {
@@ -392,7 +486,7 @@ mod tests {
     #[test]
     fn models_list_enabled_providers_and_filter() {
         let (config, thread) = (config(), thread());
-        let view = view(Some(&config), &thread, &Choice::default());
+        let view = view(Some(&config), &thread, &Choice::default(), PLAN_OFF);
         let items = items(Kind::Model, &config, &view, "");
         assert_eq!(
             entries(&items),
@@ -418,12 +512,12 @@ mod tests {
     fn picks_build_a_draft_that_the_chips_reflect() {
         let (config, thread) = (config(), thread());
         let mut draft = Choice::default();
-        let base = view(Some(&config), &thread, &draft);
+        let base = view(Some(&config), &thread, &draft, PLAN_OFF);
         assert_eq!(traits_label(&config, &base).as_deref(), Some("Low"));
 
         let traits = items(Kind::Traits, &config, &base, "");
         apply(&mut draft, &thread, &pick(&traits, "Ultrathink"));
-        let ultra = view(Some(&config), &thread, &draft);
+        let ultra = view(Some(&config), &thread, &draft, PLAN_OFF);
         assert_eq!(ultra.prompt_effort.as_deref(), Some("ultrathink"));
         assert_eq!(traits_label(&config, &ultra).as_deref(), Some("Ultrathink"));
         let marked = entries(&items(Kind::Traits, &config, &ultra, ""));
@@ -439,14 +533,14 @@ mod tests {
             &thread,
             &Pick::Option("fastMode".into(), "on".into()),
         );
-        let high = view(Some(&config), &thread, &draft);
+        let high = view(Some(&config), &thread, &draft, PLAN_OFF);
         assert_eq!(high.prompt_effort, None);
         assert_eq!(traits_label(&config, &high).as_deref(), Some("High Fast"));
 
         // Choosing the current model again leaves only the other choices in the draft.
         let models = items(Kind::Model, &config, &high, "");
         apply(&mut draft, &thread, &pick(&models, "Claude Haiku 4.5"));
-        let haiku = view(Some(&config), &thread, &draft);
+        let haiku = view(Some(&config), &thread, &draft, PLAN_OFF);
         assert_eq!(haiku.selection["model"], "claude-haiku-4-5");
         assert_eq!(
             traits_label(&config, &haiku).as_deref(),
@@ -460,17 +554,18 @@ mod tests {
     fn modes_follow_the_providers_support() {
         let config = config();
         let mut draft = Choice::default();
-        let claude = view(Some(&config), &thread(), &draft);
+        let claude = view(Some(&config), &thread(), &draft, PLAN_ON);
         let items = items(Kind::Mode, &config, &claude, "");
         assert_eq!(entries(&items).len(), 4 + 2);
         apply(&mut draft, &thread(), &pick(&items, "Full access"));
-        apply(&mut draft, &thread(), &Pick::Plan(true));
-        let changed = view(Some(&config), &thread(), &draft);
+        apply(&mut draft, &thread(), &pick(&items, "On"));
+        let changed = view(Some(&config), &thread(), &draft, PLAN_ON);
         assert_eq!(changed.plan.runtime_mode.as_deref(), Some("full-access"));
+        assert_eq!(changed.plan.interaction_mode.as_deref(), Some("plan"));
         assert_eq!(changed.interaction_mode, "plan");
 
         let codex_thread = json!({"modelSelection": {"instanceId": "codex", "model": "gpt-6"}});
-        let codex = view(Some(&config), &codex_thread, &Choice::default());
+        let codex = view(Some(&config), &codex_thread, &Choice::default(), PLAN_ON);
         assert_eq!(
             entries(&super::items(Kind::Mode, &config, &codex, "")),
             [
@@ -479,5 +574,133 @@ mod tests {
             ]
         );
         assert_eq!(traits_label(&config, &codex), None);
+    }
+
+    #[test]
+    fn plan_mode_shows_only_with_the_setting_and_a_provider_that_has_it() {
+        let config = config();
+        let none = Choice::default();
+        // By default the menu has the access modes alone, which still work as before.
+        let off = view(Some(&config), &thread(), &none, PLAN_OFF);
+        assert!(!off.offers_plan);
+        let menu = items(Kind::Mode, &config, &off, "");
+        assert_eq!(headings(&menu), ["Access"]);
+        assert_eq!(entries(&menu).len(), 4);
+        let mut draft = Choice::default();
+        apply(&mut draft, &thread(), &pick(&menu, "Full access"));
+        assert_eq!(
+            send_plan(Some(&config), &thread(), &draft, PLAN_OFF).unwrap(),
+            Plan {
+                runtime_mode: Some("full-access".into()),
+                ..Plan::default()
+            }
+        );
+
+        let on = view(Some(&config), &thread(), &none, PLAN_ON);
+        assert!(on.offers_plan);
+        assert_eq!(
+            headings(&items(Kind::Mode, &config, &on, "")),
+            ["Access", "Plan mode"]
+        );
+
+        // Codex hides the toggle, and the setting doesn't bring it back.
+        let codex_thread = json!({"modelSelection": {"instanceId": "codex", "model": "gpt-6"}});
+        let codex = view(Some(&config), &codex_thread, &none, PLAN_ON);
+        assert!(!codex.offers_plan);
+        assert_eq!(
+            headings(&items(Kind::Mode, &config, &codex, "")),
+            ["Access"]
+        );
+    }
+
+    #[test]
+    fn a_thread_left_in_plan_goes_back_to_build_unless_plan_is_offered() {
+        let config = config();
+        let none = Choice::default();
+        let build = Plan {
+            interaction_mode: Some("default".into()),
+            ..Plan::default()
+        };
+        // Off, the next message switches it, even before T3's model list arrives, and the
+        // view's mode, which the Plan chip reads, is Build.
+        for list in [Some(&config), None] {
+            assert_eq!(
+                send_plan(list, &planning(), &none, PLAN_OFF).unwrap(),
+                build
+            );
+            let view = view(list, &planning(), &none, PLAN_OFF);
+            assert_eq!(view.interaction_mode, "default");
+        }
+        // On, it keeps planning and nothing more is sent.
+        assert_eq!(
+            send_plan(Some(&config), &planning(), &none, PLAN_ON).unwrap(),
+            Plan::default()
+        );
+        assert_eq!(
+            view(Some(&config), &planning(), &none, PLAN_ON).interaction_mode,
+            "plan"
+        );
+        // A thread already in Build gets no command either way.
+        for setting in [PLAN_OFF, PLAN_ON] {
+            assert_eq!(
+                send_plan(Some(&config), &thread(), &none, setting).unwrap(),
+                Plan::default()
+            );
+        }
+    }
+
+    #[test]
+    fn a_provider_without_plan_mode_sends_build_with_the_setting_on() {
+        let config = config();
+        // Moving a planning thread to Codex takes it to Build. The Plan pick doesn't fail the
+        // draft, as it did when t3term checked it against Codex.
+        let draft = Choice {
+            model: Some("codex/gpt-6".into()),
+            interaction_mode: Some("plan".into()),
+            ..Choice::default()
+        };
+        let plan = send_plan(Some(&config), &planning(), &draft, PLAN_ON).unwrap();
+        assert_eq!(plan.model_selection.unwrap()["instanceId"], "codex");
+        assert_eq!(plan.interaction_mode.as_deref(), Some("default"));
+
+        // A Codex thread another client left in Plan goes to Build too, but not before the
+        // model list says Codex has no plan mode.
+        let codex_planning = json!({"modelSelection": {"instanceId": "codex", "model": "gpt-6"},
+                                    "interactionMode": "plan"});
+        let none = Choice::default();
+        let plan = send_plan(Some(&config), &codex_planning, &none, PLAN_ON).unwrap();
+        assert_eq!(plan.interaction_mode.as_deref(), Some("default"));
+        assert_eq!(
+            send_plan(None, &codex_planning, &none, PLAN_ON).unwrap(),
+            Plan::default()
+        );
+
+        // A provider T3 has turned off still refuses a mode pick.
+        let pi_thread = json!({"modelSelection": {"instanceId": "pi", "model": "pi-1"}});
+        let plan_on = Choice {
+            interaction_mode: Some("plan".into()),
+            ..Choice::default()
+        };
+        assert!(send_plan(Some(&config), &pi_thread, &plan_on, PLAN_ON).is_err());
+    }
+
+    #[test]
+    fn a_draft_is_spent_once_the_thread_has_it_though_plan_still_switches() {
+        let config = config();
+        let mut draft = Choice::default();
+        apply(&mut draft, &planning(), &Pick::Mode("full-access".into()));
+        assert!(!spent(&config, &planning(), &draft, PLAN_OFF).unwrap());
+        // The thread now runs with full access but is still in Plan. The switch to Build is
+        // every message's, so it doesn't keep the draft around to undo a later change.
+        let mut applied = planning();
+        applied["runtimeMode"] = json!("full-access");
+        assert!(spent(&config, &applied, &draft, PLAN_OFF).unwrap());
+        assert_eq!(
+            send_plan(Some(&config), &applied, &draft, PLAN_OFF)
+                .unwrap()
+                .interaction_mode
+                .as_deref(),
+            Some("default")
+        );
     }
 }
