@@ -1,12 +1,12 @@
 <h1 align="center">t3term</h1>
 
 <p align="center">
-  <strong>T3 Code in your terminal. 9 MB, not 939.</strong>
+  <strong>T3 Code without the window.</strong>
 </p>
 
 <p align="center">
-  Same threads. Same server. Same agents.<br>
-  One Rust binary where an Electron window used to be.
+  A terminal client in Rust. One 5.4 MB binary: the whole interface with no arguments,<br>
+  a CLI you can script with a subcommand. Your threads are the ones the app already shows.
 </p>
 
 <p align="center">
@@ -28,7 +28,7 @@
   <img src="docs/screenshots/demo.gif" alt="Opening a thread in t3term, sending a prompt, watching the agent run a command and answer, then pressing t to open the tool call and see its output" width="940">
 </p>
 
-**New to T3 Code?** [It](https://github.com/pingdotgg/t3code) runs coding agents for you. Claude Code, Codex, Cursor, Grok and others each work in their own thread, on one of your projects, with approvals, permission modes and branches. It ships as a desktop app. t3term opens those same threads from a terminal you already have open, and talks to the same server, so the app and your phone stay in step.
+**New to T3 Code?** [It](https://github.com/pingdotgg/t3code) runs coding agents on your machine. Claude Code, Codex, Cursor, Grok and others, each working in its own thread on one of your projects, with approvals, permission modes and branches. It ships as an Electron desktop app, plus a web app and a phone app. t3term is the same thing as a terminal program. It connects to the T3 server you already run rather than starting one, so a thread you open here is the same thread the desktop app shows.
 
 ## Try it
 
@@ -45,17 +45,26 @@ cargo build --release
 
 `cargo install --path .` puts `t3term` on your PATH instead.
 
-You need T3 Code already running, either the desktop app or `t3` from [their installer](https://github.com/pingdotgg/t3code#installation), plus a Rust toolchain. macOS for now: Linux and Windows are not tested yet. t3term finds the server on its own and logs itself in, so there is nothing to configure. If `doctor` is unhappy it says which step failed.
+You need T3 Code already running, either the desktop app or `t3` from [their installer](https://github.com/pingdotgg/t3code#installation), plus a Rust toolchain. t3term finds the server on its own and logs itself in, so there is nothing to configure. If `doctor` fails it names the step that failed.
+
+Tested against T3 Code `0.0.46-nightly.20261007.2787` on orchestration protocol 2, on macOS. Linux and Windows have not been tried.
 
 ## Why it exists
 
-**9 MB against 939.** Measured over 30 seconds with one thread running: the desktop app's windows took 12.3% of a core and 939 MB. t3term with the same thread open takes about 9 MB and no CPU time I can measure. To be straight about it, T3's own server keeps running either way, so this replaces the window, not the engine.
+**You already live in the terminal.** The agents T3 Code drives are terminal programs. Your editor is one window over. A whole desktop app to watch them is one window too many.
 
-**You already live in the terminal.** The agents T3 Code drives are terminal programs. Your editor is one window over. A separate app to watch them is one window too many.
+**It costs less to leave open.** Both clients on the same Mac, pointed at the same server, with 14 projects and 122 threads in it. Over the same minute, while a turn streamed into both:
 
-**It is scriptable.** Everything the TUI does has a subcommand, every subcommand takes `--json`, and a command answers in about 20 ms. Send a prompt from a git hook, wait for the turn, read the result.
+| | Memory | CPU |
+| --- | --- | --- |
+| T3 Code desktop windows | 1075 MB | 15.7% of one core |
+| t3term with a thread open | 45 MB | 1.0% of one core |
 
-**It is the same threads.** t3term is a client, not a fork. It opens no database and starts no server of its own, so nothing drifts out of sync with the app or the phone.
+T3's own server keeps running either way, and it was using 429 MB throughout. This replaces the window, not the engine.
+
+**It is scriptable.** Everything the TUI does has a subcommand, every subcommand takes `--json`, and a command answers in 30 to 50 ms. Send a prompt from a git hook, wait for the turn, read the result.
+
+**It is a client, not a fork.** t3term opens no database and starts no server. A thread you start here is the thread the desktop app and the phone app show.
 
 <p align="center">
   <img src="docs/screenshots/gui-vs-tui.png" alt="The T3 Code desktop app on the left and t3term on the right, showing the same thread with the same answer and code block" width="940">
@@ -156,7 +165,7 @@ The choices on `send` and `settings` are `--model`, `--effort`, `--option ID=VAL
 <details>
 <summary><strong>More on the saved login</strong></summary>
 
-`doctor --json` reports the session's `scopes` and where its `login` came from: `saved`, `newly saved` or `temporary`. With the saved login, a CLI command uses about 15 ms of CPU. Issuing a session costs about 0.8 s, because it runs `t3 auth session issue` through the running server's own binary. t3term finds that binary from the server pid, since the `t3` on your PATH can be a different version. Override it with `T3TERM_T3_COMMAND`.
+`doctor --json` reports the session's `scopes` and where its `login` came from: `saved`, `newly saved` or `temporary`. With the saved login a CLI command uses under 20 ms of CPU, and the session check against the server takes about 27 ms. Issuing a new session costs about 0.8 s, because it runs `t3 auth session issue` through the running server's own binary. t3term finds that binary from the server pid, since the `t3` on your PATH can be a different version. Override it with `T3TERM_T3_COMMAND`.
 
 Set `T3TERM_NO_SAVED_LOGIN=1` to use a session that lasts one run instead. t3term revokes it on exit, including after Ctrl+C, `kill` or a closed terminal window.
 
