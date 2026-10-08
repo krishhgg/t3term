@@ -9,8 +9,7 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
-use textwrap::{Options, WordSeparator, WrapAlgorithm};
-use unicode_width::UnicodeWidthStr;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::theme::Theme;
 use super::{fit, row};
@@ -340,7 +339,13 @@ fn summary(tasks: &Tasks, open: bool, width: usize, theme: &Theme) -> Line<'stat
     let room = width - label.width() - right_width;
     if room > 1 {
         let step = &tasks.steps[tasks.current].text;
-        left.push(Span::styled(fit(step, room - 1), Style::new().fg(theme.fg)));
+        // `fit` can end a column over when it cuts after a wide character. A column less then
+        // keeps the space before the count.
+        let mut text = fit(step, room - 1);
+        if text.width() > room - 1 {
+            text = fit(step, room - 2);
+        }
+        left.push(Span::styled(text, Style::new().fg(theme.fg)));
     }
     row(left, right, width)
 }
@@ -358,9 +363,6 @@ fn step_rows(tasks: &Tasks, width: usize, theme: &Theme) -> Vec<Line<'static>> {
         0
     };
     let text_width = width.saturating_sub(2 + column).max(1);
-    let options = Options::new(text_width)
-        .word_separator(WordSeparator::AsciiSpace)
-        .wrap_algorithm(WrapAlgorithm::FirstFit);
     let mut lines = Vec::new();
     for (step, time) in tasks.steps.iter().zip(times) {
         let (mark, text_color) = match step.status {
@@ -369,16 +371,13 @@ fn step_rows(tasks: &Tasks, width: usize, theme: &Theme) -> Vec<Line<'static>> {
             StepStatus::Pending => ("○ ", theme.muted),
         };
         let mark_style = Style::new().fg(status_color(step.status, theme));
-        for (index, part) in textwrap::wrap(&step.text, &options).into_iter().enumerate() {
+        for (index, part) in wrap(&step.text, text_width).into_iter().enumerate() {
             let lead = if index == 0 {
                 Span::styled(mark, mark_style)
             } else {
                 Span::raw("  ")
             };
-            let left = vec![
-                lead,
-                Span::styled(part.into_owned(), Style::new().fg(text_color)),
-            ];
+            let left = vec![lead, Span::styled(part, Style::new().fg(text_color))];
             let right = if index == 0 && column > 0 && !time.is_empty() {
                 vec![Span::styled(time.clone(), muted)]
             } else {
@@ -388,6 +387,63 @@ fn step_rows(tasks: &Tasks, width: usize, theme: &Theme) -> Vec<Line<'static>> {
         }
     }
     lines
+}
+
+/// `text` in rows of at most `width` columns, broken at spaces, or inside a word too long for a
+/// row as the GUI's `wrap-anywhere` breaks it. Each piece `clusters` finds is measured whole, as
+/// the terminal draws it, so ⚠ with U+FE0F counts two columns, though ⚠ alone counts one. A
+/// break drops its space, and a run of spaces inside a row reads as one.
+fn wrap(text: &str, width: usize) -> Vec<String> {
+    let mut rows = Vec::new();
+    for line in text.split('\n') {
+        let mut row = String::new();
+        let mut used = 0;
+        for word in line.split(' ').filter(|word| !word.is_empty()) {
+            let pieces = clusters(word);
+            let word_width: usize = pieces.iter().map(|piece| piece.width()).sum();
+            if !row.is_empty() {
+                if used + 1 + word_width <= width {
+                    row.push(' ');
+                    row.push_str(word);
+                    used += 1 + word_width;
+                    continue;
+                }
+                rows.push(std::mem::take(&mut row));
+                used = 0;
+            }
+            for piece in pieces {
+                let piece_width = piece.width();
+                if used > 0 && used + piece_width > width {
+                    rows.push(std::mem::take(&mut row));
+                    used = 0;
+                }
+                row.push_str(piece);
+                used += piece_width;
+            }
+        }
+        rows.push(row);
+    }
+    rows
+}
+
+/// `text` cut where a terminal starts a new character: before each character with a width,
+/// except a skin tone and the character after a zero-width joiner. So an accent stays on its
+/// letter, U+FE0F on its emoji, and a joined emoji such as 👩‍💻 stays whole.
+fn clusters(text: &str) -> Vec<&str> {
+    let mut clusters = Vec::new();
+    let mut start = 0;
+    let mut joined = false;
+    for (index, c) in text.char_indices() {
+        let width = UnicodeWidthChar::width(c).unwrap_or(0);
+        let skin_tone = matches!(c, '\u{1F3FB}'..='\u{1F3FF}');
+        if index > 0 && width > 0 && !joined && !skin_tone {
+            clusters.push(&text[start..index]);
+            start = index;
+        }
+        joined = c == '\u{200D}';
+    }
+    clusters.push(&text[start..]);
+    clusters
 }
 
 #[cfg(test)]
@@ -797,8 +853,93 @@ mod tests {
         assert!(rows[1].starts_with("✓ Step 1"), "{}", rows[1]);
     }
 
+    /// ⚠ and U+FE0F, which a terminal draws two columns wide, though ⚠ alone is one.
+    const WARN: &str = "⚠\u{fe0f}";
+    /// 👩‍💻, two emoji and the zero-width joiner between them, two columns wide.
+    const CODER: &str = "👩\u{200d}💻";
+    /// 👍 with a skin tone, two columns wide.
+    const THUMBS: &str = "👍\u{1f3fd}";
+
+    /// Steps a terminal draws at a width other than their characters' sum, or wider than one
+    /// column each: emoji with a variation selector, a joiner or a skin tone, CJK with no
+    /// spaces, combining accents, and CJK mixed with ASCII. The second step runs.
+    fn unicode_list() -> Tasks {
+        let (warnings, coders) = (WARN.repeat(10), CODER.repeat(3));
+        let emoji = format!("Ship 🚀 then flag {warnings} for {coders}{THUMBS} review");
+        let cjk = "修复解析器中的游标错误并在重新连接后保留会话状态";
+        let accents = "Check the cafe\u{301} menu in Tie\u{302}\u{301}ng Vie\u{323}\u{302}t";
+        let mixed = "检查 README 的 日本語 セクション";
+        let steps = [
+            (emoji.as_str(), "completed"),
+            (cjk, "running"),
+            (accents, "pending"),
+            (mixed, "pending"),
+        ];
+        let mut plan = list("p1", Some("r1"), &steps);
+        plan["steps"][0]["durationMs"] = json!(3_661_000);
+        tasks_of(&plan)
+    }
+
+    /// `text` without its spaces, which a row break drops.
+    fn squeeze(text: &str) -> String {
+        text.replace(' ', "")
+    }
+
+    /// Lays out `tasks`, open, at every width up to 90 columns. No row runs past the drawer,
+    /// the summary keeps a space before the `count`, and however narrow, each step's rows hold
+    /// all of its text after one mark for its state.
+    fn check_every_width(tasks: &Tasks, count: &str) {
+        let theme = Theme::new(Depth::TrueColor);
+        let expected: Vec<(String, String)> = tasks
+            .steps
+            .iter()
+            .map(|step| {
+                let mark = match step.status {
+                    StepStatus::Completed => "✓ ",
+                    StepStatus::Running => "◉ ",
+                    StepStatus::Pending => "○ ",
+                };
+                (mark.to_string(), squeeze(&step.text))
+            })
+            .collect();
+        let gap = format!(" {count}");
+        for width in 0..=90 {
+            let mut drawer = Drawer {
+                open: true,
+                ..Drawer::default()
+            };
+            let rows = text(&drawer.lay_out(Some(tasks), width, 40, 60, &theme));
+            if width < MIN_WIDTH {
+                assert!(rows.is_empty(), "{width}");
+                continue;
+            }
+            for row in &rows {
+                assert!(row.width() <= width, "{width}: {row:?}");
+            }
+            assert!(rows[0].contains(&gap), "{width}: {:?}", rows[0]);
+            let list = step_rows(tasks, width, &theme);
+            for row in text(&list) {
+                assert!(row.width() <= width, "{width}: {row:?}");
+            }
+            // A row that opens with a mark starts a step, and a row that opens with spaces
+            // goes on with the step above it.
+            let mut steps: Vec<(String, String)> = Vec::new();
+            for line in &list {
+                let lead: &str = &line.spans[0].content;
+                let part = squeeze(&line.spans[1].content);
+                if lead == "  " {
+                    let (_, whole) = steps.last_mut().expect("a step above");
+                    whole.push_str(&part);
+                } else {
+                    steps.push((lead.to_string(), part));
+                }
+            }
+            assert_eq!(steps, expected, "{width}");
+        }
+    }
+
     #[test]
-    fn every_row_keeps_inside_the_drawer_at_any_width() {
+    fn every_row_keeps_inside_the_drawer_and_every_step_keeps_its_text() {
         let theme = Theme::new(Depth::TrueColor);
         let steps = [
             (
@@ -814,27 +955,9 @@ mod tests {
         let mut plan = list("p1", Some("r1"), &steps);
         plan["steps"][0]["durationMs"] = json!(3_661_000);
         let tasks = tasks_of(&plan);
-        for width in 0..=90 {
-            let mut drawer = Drawer {
-                open: true,
-                ..Drawer::default()
-            };
-            let rows = text(&drawer.lay_out(Some(&tasks), width, 40, 60, &theme));
-            if width < MIN_WIDTH {
-                assert!(rows.is_empty(), "{width}");
-                continue;
-            }
-            for row in &rows {
-                assert!(row.width() <= width, "{width}: {row:?}");
-            }
-            // However narrow, each step keeps its rows, and only its first row has a mark.
-            let list = text(&step_rows(&tasks, width, &theme));
-            for row in &list {
-                assert!(row.width() <= width, "{width}: {row:?}");
-            }
-            let marked = list.iter().filter(|row| !row.starts_with(' ')).count();
-            assert_eq!(marked, 3, "{width}");
-        }
+        check_every_width(&tasks, "1/3");
+        check_every_width(&unicode_list(), "1/4");
+
         let mut drawer = Drawer {
             open: true,
             ..Drawer::default()
@@ -848,6 +971,45 @@ mod tests {
         // At 8 columns the summary row keeps the icon, the count and the chevron.
         let rows = text(&drawer.lay_out(Some(&tasks), 8, 40, 60, &theme));
         assert_eq!(rows[0], "≡ 1/3 ▾");
+
+        // At 30 columns the running CJK step is cut a column short of where `fit` would cut it,
+        // so a space stays before the count.
+        let rows = text(&drawer.lay_out(Some(&unicode_list()), 30, 40, 60, &theme));
+        assert_eq!(rows[0], "≡ Tasks 修复解析器中的…  1/4 ▾");
+        // Each ⚠️ takes two of the step's 19 columns, so nine fit on a row.
+        assert_eq!(rows[1], "✓ Ship 🚀 then flag   1h 1m 1s");
+        assert_eq!(rows[2].trim_end(), format!("  {}", WARN.repeat(9)));
+        let joined = format!("  {WARN} for {}{THUMBS}", CODER.repeat(3));
+        assert_eq!(rows[3].trim_end(), joined);
+        assert!(rows[5].starts_with("◉ 修复解析器中的游标"), "{}", rows[5]);
+        assert!(rows[5].ends_with("now"), "{}", rows[5]);
+    }
+
+    #[test]
+    fn steps_wrap_by_the_columns_a_terminal_draws() {
+        // CJK with no spaces breaks between characters, two columns each, so nine fit in 19.
+        let cjk = "修复解析器中的游标错误并在重新连接后保留会话状态";
+        let chars: Vec<char> = cjk.chars().collect();
+        let rows: Vec<String> = chars.chunks(9).map(|row| row.iter().collect()).collect();
+        assert_eq!(rows.len(), 3);
+        assert_eq!(wrap(cjk, 19), rows);
+        // Ten ⚠️ take 20 columns, not the 10 their visible characters would.
+        let flagged = format!("flag {} for", WARN.repeat(10));
+        let rows = [
+            "flag".to_string(),
+            WARN.repeat(6),
+            format!("{} for", WARN.repeat(4)),
+        ];
+        assert_eq!(wrap(&flagged, 12), rows);
+        // A joined emoji and a skin tone stay whole, and accents stay on their letters.
+        let team = format!("{CODER}{CODER}{CODER}{THUMBS}");
+        let rows = [CODER.repeat(2), format!("{CODER}{THUMBS}")];
+        assert_eq!(wrap(&team, 5), rows);
+        let accented = wrap("Re\u{301}sume\u{301}", 3);
+        assert_eq!(accented, ["Re\u{301}s", "ume\u{301}"]);
+        // A break drops its space, and an empty step still has its row.
+        assert_eq!(wrap("Run the tests", 7), ["Run the", "tests"]);
+        assert_eq!(wrap("", 7), [""]);
     }
 
     #[test]
