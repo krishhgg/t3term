@@ -387,7 +387,8 @@ impl Sidebar {
                 .collect()
         };
         let selected = self.selected_thread_id().map(str::to_string);
-        // At the start of the list, new threads come in above the reader, as in the GUI.
+        // The top row stays on top, so a change above it doesn't move the cards in view. A
+        // list scrolled to its start stays there, so new threads at the top show up.
         let top = self
             .rows
             .get(self.offset)
@@ -1490,7 +1491,7 @@ mod tests {
             json!({"pinnedAt": "2026-10-03T00:00:00.000Z"}),
         ));
         sidebar.rebuild(&more, ALL, None, now());
-        assert_eq!(sidebar.offset, 4);
+        assert_eq!(sidebar.offset, 3);
         assert_eq!(
             sidebar.rows[sidebar.offset],
             heading_row(Shelf::Active, true)
