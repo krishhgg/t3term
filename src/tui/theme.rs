@@ -5,7 +5,6 @@
 //! degrades to the nearest xterm-256 color at startup, so drawing never pays for the mapping.
 
 use std::collections::HashMap;
-use std::path::Path;
 
 use ratatui::style::{Color, Style};
 
@@ -239,30 +238,21 @@ pub fn runtime_mode_label(mode: &str) -> &str {
     }
 }
 
-/// Reads `userdata/model-manifest.json` from the T3 home, mapping model slugs to display names.
-pub fn load_model_names(t3_home: &Path) -> HashMap<String, String> {
-    let mut names = HashMap::new();
-    let Ok(raw) = std::fs::read(t3_home.join("userdata").join("model-manifest.json")) else {
-        return names;
-    };
-    let Ok(json) = serde_json::from_slice::<serde_json::Value>(&raw) else {
-        return names;
-    };
-    let providers = json["manifest"]["providers"]
-        .as_object()
-        .cloned()
-        .unwrap_or_default();
-    for provider in providers.values() {
-        for model in provider["models"].as_array().into_iter().flatten() {
-            if let (Some(slug), Some(name)) = (model["slug"].as_str(), model["name"].as_str()) {
-                names.insert(slug.to_string(), name.to_string());
-            }
-        }
-    }
-    names
+/// Model display names by slug, from T3's `server.getConfig` reply.
+pub fn model_names(config: &serde_json::Value) -> HashMap<String, String> {
+    crate::models::providers(config)
+        .iter()
+        .flat_map(crate::models::models)
+        .filter_map(|model| {
+            Some((
+                model["slug"].as_str()?.to_string(),
+                model["name"].as_str()?.to_string(),
+            ))
+        })
+        .collect()
 }
 
-/// The manifest name when known, else a readable form of the slug (`claude-haiku-4-5` becomes
+/// T3's name for the model when known, else a readable form of the slug (`claude-haiku-4-5` becomes
 /// `Claude Haiku 4.5`).
 pub fn model_display_name(slug: &str, names: &HashMap<String, String>) -> String {
     if let Some(name) = names.get(slug) {
@@ -415,6 +405,24 @@ mod tests {
             project_color_index("ABC"),
             "case does not change the color"
         );
+    }
+
+    #[test]
+    fn reads_model_names_from_the_server_config() {
+        let config = serde_json::json!({"providers": [
+            {"instanceId": "codex", "models": [{"slug": "gpt-6-astra", "name": "GPT-6-Astra"}]},
+            {"instanceId": "claudeAgent", "models": [
+                {"slug": "claude-opus-5-5", "name": "Claude Opus 5.5"},
+                {"slug": "unnamed"}
+            ]}
+        ]});
+        let names = model_names(&config);
+        assert_eq!(names.len(), 2);
+        assert_eq!(
+            model_display_name("claude-opus-5-5", &names),
+            "Claude Opus 5.5"
+        );
+        assert_eq!(model_display_name("unnamed", &names), "Unnamed");
     }
 
     #[test]

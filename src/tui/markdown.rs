@@ -46,6 +46,7 @@ fn inline_segments(text: &str, styles: &Styles, base: Style) -> Vec<(String, Sty
     let mut current = String::new();
     let (mut bold, mut italic, mut code) = (false, false, false);
     let chars: Vec<char> = text.chars().collect();
+    let partners = Partners::scan(&chars);
     let style = |bold: bool, italic: bool, code: bool| {
         if code {
             return styles.code;
@@ -77,7 +78,7 @@ fn inline_segments(text: &str, styles: &Styles, base: Style) -> Vec<(String, Sty
         }
         if (c == '*' || c == '_') && next == Some(c) {
             // An opening pair with no closing pair after it is literal text.
-            if bold || closes_at(&chars, i + 2, &[c, c]) {
+            if bold || partners.pair_at_or_after(c, i + 2) {
                 segments.push((std::mem::take(&mut current), style(bold, italic, code)));
                 bold = !bold;
                 i += 2;
@@ -98,9 +99,8 @@ fn inline_segments(text: &str, styles: &Styles, base: Style) -> Vec<(String, Sty
         {
             // A lone star next to spaces is a bullet or math, not emphasis. So is one with no
             // closing star after it, as in `*.rs` or `2*3`.
-            let opens = !italic
-                && next.is_some_and(|n| !n.is_whitespace())
-                && italic_closes_after(&chars, i, c);
+            let opens =
+                !italic && next.is_some_and(|n| !n.is_whitespace()) && partners.closes_single(c, i);
             let closes = italic && prev.is_some_and(|p| !p.is_whitespace());
             if opens || closes {
                 segments.push((std::mem::take(&mut current), style(bold, italic, code)));
@@ -110,7 +110,7 @@ fn inline_segments(text: &str, styles: &Styles, base: Style) -> Vec<(String, Sty
             }
         }
         if c == '['
-            && let Some((label, url, end)) = link_at(&chars, i)
+            && let Some((label, url, end)) = link_at(&chars, i, &partners)
         {
             segments.push((std::mem::take(&mut current), style(bold, italic, code)));
             // The terminal can't open the label, so the destination stays readable and
@@ -152,32 +152,89 @@ fn inline_segments(text: &str, styles: &Styles, base: Style) -> Vec<(String, Sty
     out
 }
 
-/// Whether `marker` appears at or after `from`.
-fn closes_at(chars: &[char], from: usize, marker: &[char]) -> bool {
-    chars
-        .get(from..)
-        .is_some_and(|rest| rest.windows(marker.len()).any(|window| window == marker))
+/// Where each marker's possible partners sit on a line, found in one pass. Searching the rest
+/// of the line from every opening marker instead takes quadratic time on a long line full of
+/// markers that never close.
+struct Partners {
+    /// Start of the last `**` and of the last `__`.
+    last_pair: [Option<usize>; 2],
+    /// The last `*` and the last `_` that can close an italic: right after text, and for `_`
+    /// not inside a word.
+    last_single: [Option<usize>; 2],
+    /// For each index, the first `]` and the first `)` at or after it.
+    next_bracket: Vec<Option<usize>>,
+    next_paren: Vec<Option<usize>>,
 }
 
-/// Whether a single `*` or `_` opening at `open` has a closing one later on the line: the same
-/// marker right after text, and for `_` not inside a word.
-fn italic_closes_after(chars: &[char], open: usize, marker: char) -> bool {
-    (open + 2..chars.len()).any(|j| {
-        chars[j] == marker
-            && chars[j - 1] != marker
-            && !chars[j - 1].is_whitespace()
-            && (marker == '*' || chars.get(j + 1).is_none_or(|n| !n.is_alphanumeric()))
-    })
+impl Partners {
+    fn scan(chars: &[char]) -> Self {
+        let mut partners = Partners {
+            last_pair: [None; 2],
+            last_single: [None; 2],
+            next_bracket: vec![None; chars.len() + 1],
+            next_paren: vec![None; chars.len() + 1],
+        };
+        for (j, &c) in chars.iter().enumerate() {
+            let Some(slot) = emphasis_slot(c) else {
+                continue;
+            };
+            if chars.get(j + 1) == Some(&c) {
+                partners.last_pair[slot] = Some(j);
+            }
+            if j > 0
+                && chars[j - 1] != c
+                && !chars[j - 1].is_whitespace()
+                && (c == '*' || chars.get(j + 1).is_none_or(|n| !n.is_alphanumeric()))
+            {
+                partners.last_single[slot] = Some(j);
+            }
+        }
+        for j in (0..chars.len()).rev() {
+            partners.next_bracket[j] = if chars[j] == ']' {
+                Some(j)
+            } else {
+                partners.next_bracket[j + 1]
+            };
+            partners.next_paren[j] = if chars[j] == ')' {
+                Some(j)
+            } else {
+                partners.next_paren[j + 1]
+            };
+        }
+        partners
+    }
+
+    /// Whether a `**` or `__` starts at or after `from`.
+    fn pair_at_or_after(&self, marker: char, from: usize) -> bool {
+        emphasis_slot(marker)
+            .and_then(|slot| self.last_pair[slot])
+            .is_some_and(|j| j >= from)
+    }
+
+    /// Whether a single `*` or `_` opening at `open` has a closing one later on the line.
+    fn closes_single(&self, marker: char, open: usize) -> bool {
+        emphasis_slot(marker)
+            .and_then(|slot| self.last_single[slot])
+            .is_some_and(|j| j >= open + 2)
+    }
+}
+
+fn emphasis_slot(c: char) -> Option<usize> {
+    match c {
+        '*' => Some(0),
+        '_' => Some(1),
+        _ => None,
+    }
 }
 
 /// `[label](url)` starting at `start`: the label, the destination and the index after the
 /// closing paren.
-fn link_at(chars: &[char], start: usize) -> Option<(String, String, usize)> {
-    let close = chars[start + 1..].iter().position(|c| *c == ']')? + start + 1;
+fn link_at(chars: &[char], start: usize, partners: &Partners) -> Option<(String, String, usize)> {
+    let close = partners.next_bracket[start + 1]?;
     if chars.get(close + 1) != Some(&'(') {
         return None;
     }
-    let end = chars[close + 2..].iter().position(|c| *c == ')')? + close + 2;
+    let end = partners.next_paren[close + 2]?;
     let label: String = chars[start + 1..close].iter().collect();
     if label.is_empty() {
         return None;
@@ -525,6 +582,17 @@ mod tests {
             span_style(&lines, "both"),
             styles.text.add_modifier(Modifier::BOLD | Modifier::ITALIC)
         );
+    }
+
+    #[test]
+    fn long_lines_of_unmatched_markers_render_in_linear_time() {
+        // Each opening marker used to search the rest of the line for a partner, so a line
+        // like this took minutes.
+        let text = "_name *star [link ".repeat(20_000);
+        let started = std::time::Instant::now();
+        let lines = render(&text, 80, &styles(), 0);
+        assert!(started.elapsed() < std::time::Duration::from_secs(2));
+        assert!(plain(&lines)[0].starts_with("_name *star [link _name"));
     }
 
     #[test]

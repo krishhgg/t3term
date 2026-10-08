@@ -74,6 +74,8 @@ struct Cached {
 enum ActionResult {
     Info(String),
     Error(String),
+    /// Model display names by slug, from T3's `server.getConfig`.
+    ModelNames(HashMap<String, String>),
 }
 
 struct OpenThread {
@@ -157,14 +159,18 @@ impl Drop for Screen {
 async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>) -> Result<()> {
     let (actions, mut action_results) = mpsc::unbounded_channel();
     let mut shell_events = client.watch_shell(None);
-    let t3_home = client.runtime.t3_home.clone();
-    let model_names = tokio::task::spawn_blocking(move || theme::load_model_names(&t3_home))
-        .await
-        .unwrap_or_default();
+    // Model names come from T3. Until they arrive, or if T3 can't send them, the composer shows
+    // a readable form of the slug.
+    let (config_client, results) = (client.clone(), actions.clone());
+    tokio::spawn(async move {
+        if let Ok(config) = config_client.server_config().await {
+            let _ = results.send(ActionResult::ModelNames(theme::model_names(&config)));
+        }
+    });
     let mut app = App {
         client,
         theme: Theme::detect(),
-        model_names,
+        model_names: HashMap::new(),
         shell: None,
         shell_connection: "connecting".into(),
         rows: Vec::new(),
@@ -227,10 +233,11 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
                 dirty = true;
             }
             Some(result) = action_results.recv() => {
-                app.message = Some(match result {
-                    ActionResult::Info(text) => (text, false),
-                    ActionResult::Error(text) => (text, true),
-                });
+                match result {
+                    ActionResult::Info(text) => app.message = Some((text, false)),
+                    ActionResult::Error(text) => app.message = Some((text, true)),
+                    ActionResult::ModelNames(names) => app.model_names = names,
+                }
                 dirty = true;
             }
             // Only armed while a draw is waiting out the frame budget.
