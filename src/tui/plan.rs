@@ -12,7 +12,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
-use super::{RenderContext, fit, markdown};
+use super::{RenderContext, markdown};
 use crate::transcript;
 
 /// A plan longer than this many UTF-16 code units starts collapsed (`ProposedPlanCard.tsx:77`).
@@ -184,6 +184,97 @@ fn printable(text: &str) -> String {
         .collect()
 }
 
+/// `spans` cut to `width` columns, ending in `…` where anything was cut, each span keeping its
+/// style. The `…` is measured with the rest, so a character two columns wide just before the
+/// cut can't push the result a column over, as it can with `fit`.
+fn cut(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
+    let all: String = spans.iter().map(|s| s.content.as_ref()).collect();
+    if all.width() <= width {
+        return spans;
+    }
+    let mut kept = String::new();
+    let mut shown = Vec::new();
+    for span in spans {
+        let mut piece = String::new();
+        for c in span.content.chars() {
+            kept.push(c);
+            // No room left for this character and the `…`.
+            if kept.width() >= width {
+                if width > 0 {
+                    piece.push('…');
+                }
+                if !piece.is_empty() {
+                    shown.push(Span::styled(piece, span.style));
+                }
+                return shown;
+            }
+            piece.push(c);
+        }
+        shown.push(Span::styled(piece, span.style));
+    }
+    shown
+}
+
+/// `text` as a chip no wider than `width`: with a space on each side when they fit, bare when
+/// only the text does, and cut when not even that fits.
+fn chip_in(text: &str, style: Style, width: usize) -> Vec<Span<'static>> {
+    let padded = format!(" {text} ");
+    let text = if padded.width() <= width {
+        padded
+    } else {
+        text.to_string()
+    };
+    cut(vec![Span::styled(text, style)], width)
+}
+
+/// `line` broken into rows no wider than `width`, each span keeping its style. The Markdown
+/// renderer wraps at no fewer than eight columns, more after a bullet or a number, and can
+/// start an indented line a few columns in and still give its first word the whole width.
+/// What it leaves too wide breaks here mid-word rather than run past the card's edge. A
+/// character wider than a whole row, which only happens below two columns, is left out.
+fn split(line: Line<'static>, width: usize) -> Vec<Line<'static>> {
+    let all: String = line.spans.iter().map(|s| s.content.as_ref()).collect();
+    if all.width() <= width {
+        return vec![line];
+    }
+    let mut rows = Vec::new();
+    let mut spans = Vec::new();
+    // The text of the row being filled, measured whole so that a character joining the one
+    // before it is counted as the terminal draws the pair.
+    let mut row = String::new();
+    for span in line.spans {
+        let mut piece = String::new();
+        for c in span.content.chars() {
+            row.push(c);
+            if row.width() <= width {
+                piece.push(c);
+                continue;
+            }
+            row.pop();
+            if !row.is_empty() {
+                if !piece.is_empty() {
+                    spans.push(Span::styled(std::mem::take(&mut piece), span.style));
+                }
+                rows.push(Line::from(std::mem::take(&mut spans)));
+                row.clear();
+            }
+            row.push(c);
+            if row.width() <= width {
+                piece.push(c);
+            } else {
+                row.clear();
+            }
+        }
+        if !piece.is_empty() {
+            spans.push(Span::styled(piece, span.style));
+        }
+    }
+    if !row.is_empty() || rows.is_empty() {
+        rows.push(Line::from(spans));
+    }
+    rows
+}
+
 /// A proposed plan drawn as a card.
 pub struct Card {
     pub lines: Vec<Line<'static>>,
@@ -191,67 +282,89 @@ pub struct Card {
     pub toggle: Option<(usize, usize)>,
 }
 
+/// The narrowest card drawn with its frame, which is as wide as the Collapse plan button and
+/// a corner on each side of it.
+const FRAMED: usize = 17;
+
 /// The card: a frame with a Plan chip and the plan's title on top and the plan inside as
 /// Markdown. A long plan shows its preview until it is expanded, with an Expand plan or
 /// Collapse plan button in the bottom edge. The GUI also fades and clips the preview, which
 /// a terminal can't, so the `...` line marks the cut.
+///
+/// Narrower than `FRAMED`, the card drops its frame. The chip and the title head it, the body
+/// follows at the full width, and a long plan's button ends it, each cut or broken to fit. No
+/// row is ever wider than `width`.
 pub fn card(markdown: &str, width: usize, context: &RenderContext, expanded: bool) -> Card {
     let t = context.theme;
     let edge = Style::new().fg(t.border_strong);
     let chip = Style::new().fg(t.fg).bg(t.chip_bg);
+    let bold = Style::new().fg(t.fg).add_modifier(Modifier::BOLD);
     let collapsible = can_collapse(markdown);
     let body = if collapsible && !expanded {
         collapsed_preview(markdown, PREVIEW_LINES)
     } else {
         strip_displayed(markdown)
     };
+    let name = printable(&title(markdown).unwrap_or_else(|| "Proposed plan".into()));
+    let label = if expanded {
+        "Collapse plan"
+    } else {
+        "Expand plan"
+    };
+    let framed = width >= FRAMED;
     let mut lines = vec![Line::default()];
 
-    // The title is cut to leave room for a space, one dash and the corner after it.
-    let name = title(markdown).unwrap_or_else(|| "Proposed plan".into());
-    let mut top = vec![
-        Span::styled("╭─", edge),
-        Span::styled(" Plan ", chip),
-        Span::raw(" "),
-    ];
-    let room = width.saturating_sub(12);
-    if room > 0 {
-        top.push(Span::styled(
-            fit(&printable(&name), room),
-            Style::new().fg(t.fg).add_modifier(Modifier::BOLD),
-        ));
+    if framed {
+        // The title is cut to leave room for a space, one dash and the corner after it.
+        let mut top = vec![
+            Span::styled("╭─", edge),
+            Span::styled(" Plan ", chip),
+            Span::raw(" "),
+        ];
+        top.extend(cut(vec![Span::styled(name, bold)], width - 12));
         top.push(Span::raw(" "));
+        let used: usize = top.iter().map(|span| span.content.width()).sum();
+        let dashes = "─".repeat(width.saturating_sub(used + 1));
+        top.push(Span::styled(format!("{dashes}╮"), edge));
+        lines.push(Line::from(top));
+    } else {
+        // The title starts after the padded chip and a space, once there's a column for it.
+        let mut top = chip_in("Plan", chip, width);
+        if width > 7 {
+            top.push(Span::raw(" "));
+            top.extend(cut(vec![Span::styled(name, bold)], width - 7));
+        }
+        lines.push(Line::from(top));
     }
-    let used: usize = top.iter().map(|span| span.content.width()).sum();
-    let dashes = "─".repeat(width.saturating_sub(used + 1));
-    top.push(Span::styled(format!("{dashes}╮"), edge));
-    lines.push(Line::from(top));
 
-    let inner = width.saturating_sub(4);
+    let inner = if framed { width - 4 } else { width };
     for line in markdown::render(&printable(&body), inner, &context.text, 0) {
-        let used = line.width();
-        let mut spans = vec![Span::styled("│ ", edge)];
-        spans.extend(line.spans);
-        spans.push(Span::raw(" ".repeat(inner.saturating_sub(used))));
-        spans.push(Span::styled(" │", edge));
-        lines.push(Line::from(spans));
+        for row in split(line, inner) {
+            if framed {
+                let used = row.width();
+                let mut spans = vec![Span::styled("│ ", edge)];
+                spans.extend(row.spans);
+                spans.push(Span::raw(" ".repeat(inner.saturating_sub(used))));
+                spans.push(Span::styled(" │", edge));
+                lines.push(Line::from(spans));
+            } else {
+                lines.push(row);
+            }
+        }
     }
 
-    if collapsible {
-        let label = if expanded {
-            " Collapse plan "
-        } else {
-            " Expand plan "
-        };
-        let label = fit(label, width.saturating_sub(2));
+    if collapsible && framed {
+        let label = format!(" {label} ");
         let side = width.saturating_sub(label.width() + 2);
         lines.push(Line::from(vec![
             Span::styled(format!("╰{}", "─".repeat(side / 2)), edge),
             Span::styled(label, chip),
             Span::styled(format!("{}╯", "─".repeat(side - side / 2)), edge),
         ]));
-    } else {
-        let bottom = format!("╰{}╯", "─".repeat(width.saturating_sub(2)));
+    } else if collapsible {
+        lines.push(Line::from(chip_in(label, chip, width)));
+    } else if framed {
+        let bottom = format!("╰{}╯", "─".repeat(width - 2));
         lines.push(Line::styled(bottom, edge));
     }
     let toggle = collapsible.then_some((1, lines.len() - 1));
@@ -588,6 +701,124 @@ mod tests {
         assert!(tabbed[1].contains(" A B "), "{tabbed:?}");
         assert!(tabbed[2].starts_with("│ x y "), "{tabbed:?}");
         assert_eq!(tabbed[2].width(), 20);
+    }
+
+    #[test]
+    fn no_row_runs_past_the_card_at_any_width() {
+        let theme = Theme::new(Depth::TrueColor);
+        let context = context(&theme);
+        let steps: Vec<String> = (1..=24).map(|i| format!("- 手順 {i}")).collect();
+        let unicode = format!(
+            "# 計画をターミナルで読むための長い題名 ✅\n\n本文が続きます。Café déjà vu 🚀\n\n{}",
+            steps.join("\n")
+        );
+        let assorted = [
+            format!("# {}", "A title that goes on and on ".repeat(4)),
+            "1. Numbered\n   - Nested\n> Quoted\n\n---".to_string(),
+            "```rust\nfn main() {}\n```".to_string(),
+            format!("   {}\n\tTabbed", "x".repeat(35)),
+        ]
+        .join("\n\n");
+        for plan in [long_plan(), unicode, assorted] {
+            for width in [0, 1, 2, 3, 4, 5, 6, 7, 8, 10, 12, 13, 16, 17, 18, 40] {
+                for expanded in [false, true] {
+                    let shown = card(&plan, width, &context, expanded);
+                    for (line, row) in shown.lines.iter().zip(rows(&shown)) {
+                        assert!(
+                            line.width() <= width && row.width() <= width,
+                            "{row:?} is wider than {width}"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    #[test]
+    fn a_narrow_card_drops_its_frame_but_keeps_its_text_and_controls() {
+        let theme = Theme::new(Depth::TrueColor);
+        let context = context(&theme);
+        let steps: Vec<String> = (1..=24).map(|i| format!("- Step {i}")).collect();
+        let steps = steps.join("\n");
+        let plan = format!("# 計画: ターミナルで読む\n\n本文はここ。**Café** 🚀\n\n{steps}");
+        // What the rows say, without the spaces and the frame, which change with the width.
+        let squeeze = |lines: &[String]| -> String {
+            lines
+                .concat()
+                .chars()
+                .filter(|c| !c.is_whitespace() && *c != '│')
+                .collect()
+        };
+        let preview: String = (1..=9).map(|i| format!("•Step{i}")).collect();
+        let every: String = (1..=24).map(|i| format!("•Step{i}")).collect();
+        let states = [
+            (false, format!("{preview}..."), "Expand plan"),
+            (true, every, "Collapse plan"),
+        ];
+        for width in [2, 3, 5, 8, 10, 12, 16, 17, 24] {
+            for (expanded, items, label) in &states {
+                let shown = card(&plan, width, &context, *expanded);
+                let text = rows(&shown);
+                let last = text.len() - 2;
+                // The header and the button keep their own rows, for a click or `p` to find.
+                assert_eq!(shown.toggle, Some((1, last)), "{text:?} at {width}");
+                if width >= 4 {
+                    assert!(text[1].contains("Plan"), "{text:?} at {width}");
+                }
+                if width >= 10 {
+                    assert!(text[1].contains('計'), "{text:?} at {width}");
+                }
+                // Every character of the body is there, broken to the width where it has to be.
+                let body = squeeze(&text[2..last]);
+                assert_eq!(body, format!("本文はここ。Café🚀{items}"), "at {width}");
+                // The bold word stays bold in each piece it breaks into.
+                let bold: String = shown.lines[2..last]
+                    .iter()
+                    .flat_map(|line| &line.spans)
+                    .filter(|span| span.style.add_modifier.contains(Modifier::BOLD))
+                    .map(|span| span.content.as_ref())
+                    .collect();
+                assert_eq!(bold, "Café", "at {width}");
+                // The button says what it does, cut only where the width can't hold it.
+                let button = text[last].trim_matches([' ', '─', '╰', '╯']);
+                if width >= label.width() {
+                    assert_eq!(button, *label, "at {width}");
+                } else {
+                    let kept = button.strip_suffix('…').expect("a cut label");
+                    assert!(label.starts_with(kept), "{button:?} at {width}");
+                }
+            }
+        }
+        // Even with no room to read it, a long card keeps the rows a click or `p` acts on.
+        for width in [0, 1] {
+            let shown = card(&plan, width, &context, false);
+            assert_eq!(shown.toggle, Some((1, shown.lines.len() - 2)));
+        }
+
+        let narrow = card(&plan, 12, &context, false);
+        let text = rows(&narrow);
+        assert_eq!(text[1], " Plan  計画…");
+        let title = narrow.lines[1].spans.last().expect("a title");
+        assert!(title.style.add_modifier.contains(Modifier::BOLD));
+        assert_eq!(text[text.len() - 2], "Expand plan");
+        let text = rows(&card(&plan, 12, &context, true));
+        assert_eq!(text[text.len() - 2], "Collapse pl…");
+    }
+
+    #[test]
+    fn an_indented_word_the_renderer_overruns_stays_inside_the_frame() {
+        let theme = Theme::new(Depth::TrueColor);
+        let context = context(&theme);
+        // The Markdown renderer starts this row three columns in and still gives the word the
+        // whole width, so the row would run two columns past a 36-column body.
+        let word = "x".repeat(35);
+        let text = rows(&card(&format!("# T\n\n   {word}"), 40, &context, false));
+        for row in &text[1..text.len() - 1] {
+            assert_eq!(row.width(), 40, "{row:?}");
+            assert!(row.ends_with(['│', '╮', '╯']), "{row:?}");
+        }
+        let body: String = text.concat().chars().filter(|c| *c == 'x').collect();
+        assert_eq!(body, word);
     }
 
     #[test]
