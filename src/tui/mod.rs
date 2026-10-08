@@ -979,7 +979,10 @@ impl App {
         else {
             return;
         };
-        if picker::spent(config, thread, draft, self.plan_mode_enabled).is_ok_and(|spent| spent) {
+        if matches!(
+            picker::spent(config, thread, draft, self.plan_mode_enabled),
+            Ok(true)
+        ) {
             let id = open.id.clone();
             self.drafts.remove(&id);
         }
@@ -1259,8 +1262,8 @@ impl App {
                 return;
             }
         };
-        // The client refuses this too, but its message names the run id. A thread left in Plan
-        // where Plan isn't offered can't be set back, so it waits for the run to end.
+        // The client refuses this too, but its message names the run id. Alt+P can't undo a
+        // switch from Plan to Build where Plan isn't offered, so that message leaves it out.
         if plan.changes_modes() && state.active_run().is_some() {
             let selection = plan
                 .model_selection
@@ -1269,7 +1272,7 @@ impl App {
             let error = if plan.interaction_mode.is_some()
                 && !picker::offers_plan(self.config.as_ref(), selection, self.plan_mode_enabled)
             {
-                "Plan mode is off, so this message would switch the thread from Plan to Build, and T3 can't change the mode during a run. Send again when it finishes."
+                "This message would move the thread from Plan to Build, and T3 can't change the mode during a run. Send again when it finishes."
             } else {
                 "T3 can't change the mode during a run. Send again when it finishes, or set the mode back with Alt+P."
             };
