@@ -21,15 +21,26 @@ t3term projects
 t3term threads [--project P] [--all] [--limit N]
 t3term read <thread> [--last N] [--reasoning]
 t3term watch <thread>               live events; --json prints one item per line
-t3term send <thread> [prompt] [--wait] [--timeout S] [--if-busy refuse|queue|steer]
+t3term send <thread> [prompt] [--wait] [--timeout S] [--if-busy refuse|queue|steer] [choices]
 t3term wait <thread>                stream the current turn until it ends
 t3term requests <thread>            pending approvals and questions
 t3term approve <thread> [--request ID] [--decision accept|accept-for-session|decline|cancel]
 t3term interrupt <thread>
+t3term models [--all]               providers, models and each model's options
+t3term settings <thread> [choices]  show a thread's model and modes, or change them
 t3term logout                       revoke the saved login and remove it from the Keychain
 ```
 
 `<thread>` takes a full id, the 8-character prefix `threads` prints, or an exact title. `send` reads stdin when you omit the prompt. Add `--json` to any command for machine-readable output.
+
+The choices on `send` and `settings` are `--model`, `--effort`, `--option ID=VALUE`, `--mode` and `--plan` or `--no-plan`. Anything left out keeps the thread's current value.
+
+- `--model` takes `provider/model` (for example `claudeAgent/claude-opus-5-5`), a model id, or a model name. A model id that two providers share needs the `provider/` part.
+- `--effort` sets whichever reasoning option the model has: `effort` on Claude, `reasoningEffort` on Codex and Grok, `reasoning` on Cursor. `--effort ultrathink` adds `Ultrathink:` to the start of the message, as the desktop app does, and leaves the thread's effort alone.
+- `--option` sets any other option the model lists, such as `fastMode=on` or `contextWindow=1m`.
+- `--mode` is `approval-required` (also `supervised`), `auto-accept-edits`, `auto` or `full-access`.
+
+`t3term models` lists the values each model accepts, marking defaults with `*`. t3term reads them from the server, so new models need no update. Like the desktop app, `send` changes modes with their own commands just before the message and carries the model on the message itself. `settings` applies the change right away. While a run is active, `settings` refuses any change and `send` refuses a mode change, because T3 can restart the agent's session to apply them. `send` can still carry a new model on a queued or steered message.
 
 Exit codes: 0 success, 1 failure or a turn that ended without completing, 2 usage, 3 not found, 4 rejected or unsupported protocol, 5 server unavailable, 6 timeout, 7 the turn is waiting for an approval or answer.
 
@@ -63,7 +74,7 @@ The unit tests cover the reducers, Markdown wrapping, the composer and auth comm
 
 ## Not done yet
 
-- Model, reasoning-effort and mode selection in the TUI. The CLI has no settings commands either.
+- Model, reasoning-effort and mode selection in the TUI. The CLI has them.
 - Loading older history for long threads. The TUI opens a bounded recent window.
 - New threads, diffs and checkpoints, worktrees, attachments, embedded terminals and queue management.
 - A check of the reducer's output against T3's TypeScript reducer on recorded event streams.

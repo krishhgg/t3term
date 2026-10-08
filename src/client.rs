@@ -13,6 +13,7 @@ use crate::auth::{LoginSource, Scope, Session};
 use crate::discovery::{self, Runtime};
 use crate::error::{err, err_exit, exit};
 use crate::http::Api;
+use crate::models::Plan;
 use crate::projection::{ShellState, ThreadState};
 use crate::rpc::{RpcClient, RpcError};
 
@@ -136,14 +137,35 @@ impl Client {
             })
     }
 
+    /// The server's configuration, including every provider and model it offers.
+    pub async fn server_config(&self) -> Result<Value> {
+        Ok(self
+            .rpc()
+            .await?
+            .call("server.getConfig", json!({}), DISPATCH_TIMEOUT)
+            .await?)
+    }
+
     pub async fn send_message(
         &self,
         state: &ThreadState,
         text: &str,
         if_busy: IfBusy,
     ) -> Result<SendReceipt> {
-        let text = text.trim();
-        if text.is_empty() {
+        self.send_message_with(state, text, if_busy, &Plan::default())
+            .await
+    }
+
+    /// Sends a message after applying a model and mode plan, the way the desktop composer does:
+    /// mode changes go first as their own commands, and the model rides on the message.
+    pub async fn send_message_with(
+        &self,
+        state: &ThreadState,
+        text: &str,
+        if_busy: IfBusy,
+        plan: &Plan,
+    ) -> Result<SendReceipt> {
+        if text.trim().is_empty() {
             return Err(err_exit(
                 "PROMPT_REQUIRED",
                 exit::USAGE,
@@ -178,25 +200,93 @@ impl Client {
                 ));
             }
         };
+        self.check_plan(state, plan)?;
+        self.dispatch_modes(state.thread_id(), plan).await?;
         let message_id = uuid::Uuid::new_v4().to_string();
-        let sequence = self
-            .dispatch(json!({
-                "type": "message.dispatch",
-                "threadId": state.thread_id(),
-                "messageId": message_id,
-                "text": text,
-                "attachments": [],
-                // T3 has no creation source for terminal clients; its own CLI reports "web" too.
-                "createdBy": "user",
-                "creationSource": "web",
-                "dispatchMode": dispatch_mode,
-            }))
-            .await?;
+        let mut command = json!({
+            "type": "message.dispatch",
+            "threadId": state.thread_id(),
+            "messageId": message_id,
+            "text": plan.message_text(text),
+            "attachments": [],
+            // T3 has no creation source for terminal clients; its own CLI reports "web" too.
+            "createdBy": "user",
+            "creationSource": "web",
+            "dispatchMode": dispatch_mode,
+        });
+        if let Some(selection) = &plan.model_selection {
+            command["modelSelection"] = selection.clone();
+        }
+        let sequence = self.dispatch(command).await?;
         Ok(SendReceipt {
             message_id,
             sequence,
             dispatch_mode: mode_name,
         })
+    }
+
+    /// Changes the thread's model and modes now, without sending a message.
+    pub async fn apply_settings(&self, state: &ThreadState, plan: &Plan) -> Result<()> {
+        if plan.prompt_effort.is_some() {
+            return Err(err_exit(
+                "INVALID_CHOICE",
+                exit::USAGE,
+                "That effort applies to one message. Pass it to `t3term send` instead.",
+            ));
+        }
+        if let Some(run) = state.active_run().filter(|_| *plan != Plan::default()) {
+            return Err(busy_for_settings(run));
+        }
+        self.check_plan(state, plan)?;
+        if let Some(selection) = &plan.model_selection {
+            self.dispatch(json!({
+                "type": "thread.model-selection.set",
+                "threadId": state.thread_id(),
+                "modelSelection": selection,
+            }))
+            .await?;
+        }
+        self.dispatch_modes(state.thread_id(), plan).await
+    }
+
+    fn check_plan(&self, state: &ThreadState, plan: &Plan) -> Result<()> {
+        if plan.changes_modes()
+            && let Some(run) = state.active_run()
+        {
+            return Err(busy_for_settings(run));
+        }
+        let switches_provider = plan.model_selection.as_ref().is_some_and(|selection| {
+            selection["instanceId"] != state.thread()["modelSelection"]["instanceId"]
+        });
+        // Older servers need a separate provider.switch command, which t3term does not send.
+        if switches_provider && !self.runtime.has_capability("serverResolvedCommandContext") {
+            return Err(err_exit(
+                "UNSUPPORTED_SERVER",
+                exit::REJECTED,
+                "This T3 server is too old to switch a thread's provider from t3term. Update T3 Code.",
+            ));
+        }
+        Ok(())
+    }
+
+    async fn dispatch_modes(&self, thread_id: &str, plan: &Plan) -> Result<()> {
+        if let Some(mode) = &plan.runtime_mode {
+            self.dispatch(json!({
+                "type": "thread.runtime-mode.set",
+                "threadId": thread_id,
+                "runtimeMode": mode,
+            }))
+            .await?;
+        }
+        if let Some(mode) = &plan.interaction_mode {
+            self.dispatch(json!({
+                "type": "thread.interaction-mode.set",
+                "threadId": thread_id,
+                "interactionMode": mode,
+            }))
+            .await?;
+        }
+        Ok(())
     }
 
     pub async fn respond(&self, thread_id: &str, request_id: &str, decision: &str) -> Result<u64> {
@@ -264,6 +354,19 @@ impl Client {
             after_sequence,
         )
     }
+}
+
+/// T3 can restart the agent's session to apply these settings, so t3term changes them only
+/// while the thread is idle.
+fn busy_for_settings(run: &Value) -> anyhow::Error {
+    err_exit(
+        "THREAD_BUSY",
+        exit::REJECTED,
+        format!(
+            "The thread is working on run {}. Changing its model or mode can restart the agent, so wait for the run to finish.",
+            run["id"].as_str().unwrap_or("?")
+        ),
+    )
 }
 
 #[derive(Debug, Clone)]
