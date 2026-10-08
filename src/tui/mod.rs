@@ -7,6 +7,8 @@
 mod composer;
 mod markdown;
 mod picker;
+mod plan;
+mod scroll;
 mod sidebar;
 mod theme;
 mod unsent;
@@ -38,6 +40,7 @@ use crate::transcript::{self, BlockKind};
 use composer::Composer;
 use markdown::Styles;
 use picker::{Item, Kind, Pick};
+use scroll::Scroll;
 use sidebar::{Capabilities, Sidebar, View};
 use theme::{
     Theme, duration_label, model_display_name, monogram, now_ms, parse_iso_ms, runtime_mode_label,
@@ -62,6 +65,8 @@ enum Focus {
 struct Cached {
     key: (u64, u16),
     lines: Vec<Line<'static>>,
+    /// The header row and the button's row of a proposed plan long enough to collapse.
+    toggle: Option<(usize, usize)>,
 }
 
 /// What tools printed, for the rows verbose mode is showing. T3 leaves tool output out of a
@@ -210,12 +215,16 @@ struct App {
     open: Option<OpenThread>,
     focus: Focus,
     composer: Composer,
-    /// Rows scrolled up from the bottom. Zero follows new output.
-    scroll: usize,
+    /// How far the transcript is scrolled, and a plan header waiting for the next frame.
+    scroll: Scroll,
     /// Runs of tool calls the reader has opened, by the item id of the first call.
     open_bundles: HashSet<String>,
     /// The screen row of each run-of-calls row drawn, with the run it opens.
     bundle_rows: Vec<(u16, String)>,
+    /// Proposed plans the reader has expanded, by item id. Opening another thread forgets them.
+    expanded_plans: HashSet<String>,
+    /// Each plan long enough to collapse that the last frame drew, in transcript order.
+    drawn_plans: Vec<plan::Drawn>,
     /// The item at the top of the last frame and the row of it that was showing, so a block
     /// that grows under the reader doesn't move the text.
     anchor: Option<(String, usize)>,
@@ -299,9 +308,11 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
         open: None,
         focus: Focus::Sidebar,
         composer: Composer::default(),
-        scroll: 0,
+        scroll: Scroll::default(),
         open_bundles: HashSet::new(),
         bundle_rows: Vec::new(),
+        expanded_plans: HashSet::new(),
+        drawn_plans: Vec::new(),
         anchor: None,
         drawn_scroll: 0,
         verbose: settings.verbose,
@@ -540,7 +551,9 @@ impl App {
         self.outputs.clear();
         self.open_bundles.clear();
         self.bundle_rows.clear();
-        self.scroll = 0;
+        self.expanded_plans.clear();
+        self.drawn_plans.clear();
+        self.scroll.set(0);
         self.picker = None;
         self.focus = Focus::Composer;
         if let Some(open) = self.open.as_ref() {
@@ -623,9 +636,11 @@ impl App {
                         self.panel_scroll = self.panel_scroll.saturating_sub(1)
                     }
                     MouseEventKind::ScrollDown if inside(self.panel_area) => self.panel_scroll += 1,
-                    MouseEventKind::ScrollUp if inside(self.transcript_area) => self.scroll += 3,
+                    MouseEventKind::ScrollUp if inside(self.transcript_area) => {
+                        self.scroll.set(self.scroll.rows() + 3)
+                    }
                     MouseEventKind::ScrollDown if inside(self.transcript_area) => {
-                        self.scroll = self.scroll.saturating_sub(3)
+                        self.scroll.set(self.scroll.rows().saturating_sub(3))
                     }
                     MouseEventKind::ScrollUp if inside(self.sidebar.list) => {
                         self.sidebar.move_selection(-1)
@@ -639,10 +654,13 @@ impl App {
                             .iter()
                             .find(|(y, _)| *y == mouse.row)
                             .map(|(_, id)| id.clone());
-                        match bundle {
-                            Some(id) => self.toggle_bundle(id),
+                        let card = plan::at(&self.drawn_plans, mouse.row)
+                            .map(|card| (card.id.clone(), card.header));
+                        match (bundle, card) {
+                            (Some(id), _) => self.toggle_bundle(id),
+                            (None, Some((id, header))) => self.toggle_plan(id, header),
                             // A click in the transcript is also a way to read it.
-                            None => self.focus = Focus::Transcript,
+                            (None, None) => self.focus = Focus::Transcript,
                         }
                     }
                     MouseEventKind::Down(MouseButton::Left) if inside(self.sidebar.footer) => {
@@ -743,11 +761,12 @@ impl App {
                 return;
             }
             KeyCode::PageUp => {
-                self.scroll += self.page();
+                self.scroll.set(self.scroll.rows() + self.page());
                 return;
             }
             KeyCode::PageDown => {
-                self.scroll = self.scroll.saturating_sub(self.page());
+                self.scroll
+                    .set(self.scroll.rows().saturating_sub(self.page()));
                 return;
             }
             _ => {}
@@ -778,13 +797,13 @@ impl App {
                     // Past the first line, the arrow scrolls the transcript instead.
                     let moved = self.composer.up();
                     if !moved {
-                        self.scroll += 1;
+                        self.scroll.set(self.scroll.rows() + 1);
                     }
                 }
                 KeyCode::Down => {
                     let moved = self.composer.down();
                     if !moved {
-                        self.scroll = self.scroll.saturating_sub(1);
+                        self.scroll.set(self.scroll.rows().saturating_sub(1));
                     }
                 }
                 _ => {}
@@ -800,11 +819,14 @@ impl App {
             },
             Focus::Transcript => match key.code {
                 KeyCode::Char('q') => self.quit = true,
-                KeyCode::Up | KeyCode::Char('k') => self.scroll += 1,
-                KeyCode::Down | KeyCode::Char('j') => self.scroll = self.scroll.saturating_sub(1),
-                KeyCode::Char('g') | KeyCode::Home => self.scroll = usize::MAX / 2,
-                KeyCode::Char('G') | KeyCode::End => self.scroll = 0,
+                KeyCode::Up | KeyCode::Char('k') => self.scroll.set(self.scroll.rows() + 1),
+                KeyCode::Down | KeyCode::Char('j') => {
+                    self.scroll.set(self.scroll.rows().saturating_sub(1))
+                }
+                KeyCode::Char('g') | KeyCode::Home => self.scroll.set(usize::MAX / 2),
+                KeyCode::Char('G') | KeyCode::End => self.scroll.set(0),
                 KeyCode::Char('t') => self.toggle_verbose(),
+                KeyCode::Char('p') => self.toggle_first_plan(),
                 KeyCode::Char('a') => self.respond("accept"),
                 KeyCode::Char('s') => self.respond("acceptForSession"),
                 KeyCode::Char('d') => self.respond("decline"),
@@ -820,6 +842,26 @@ impl App {
         self.focus = Focus::Transcript;
         if !self.open_bundles.remove(&id) {
             self.open_bundles.insert(id);
+        }
+    }
+
+    /// Expands or collapses one proposed plan, as its button in the GUI does. Only this
+    /// window remembers it: nothing goes to T3 or the settings file. The next frame keeps the
+    /// card's header on the row it was on, so the click doesn't move the text, unless a key
+    /// or the wheel moves the transcript before that frame.
+    fn toggle_plan(&mut self, id: String, header: isize) {
+        self.focus = Focus::Transcript;
+        let row = plan::flip(&mut self.expanded_plans, &id, header);
+        self.scroll.pin(id, row);
+    }
+
+    /// `p` expands or collapses the first long plan in view, reading down from the top of the
+    /// transcript. A card counts while any of it shows, even when its header has scrolled
+    /// off. With none in view, `p` does nothing.
+    fn toggle_first_plan(&mut self) {
+        if let Some(first) = self.drawn_plans.first() {
+            let (id, header) = (first.id.clone(), first.header);
+            self.toggle_plan(id, header);
         }
     }
 
@@ -1301,7 +1343,7 @@ impl App {
         }
         self.composer.clear();
         self.unsent.forget_composer();
-        self.scroll = 0;
+        self.scroll.set(0);
         // As in the desktop app, ultrathink applies to one message. This send takes it out of
         // the draft now, so a second message sent before this one lands doesn't reuse it.
         let mut reserved = Vec::new();
@@ -1535,6 +1577,8 @@ impl App {
     fn draw_transcript(&mut self, frame: &mut Frame, area: Rect) {
         let t = self.theme.clone();
         let muted = Style::new().fg(t.muted);
+        // Clicks and `p` act on the plans this frame draws, so the last frame's go first.
+        self.drawn_plans.clear();
         let Some((state, run_changes)) = self
             .open
             .as_ref()
@@ -1556,6 +1600,8 @@ impl App {
                 block.body = text.to_string();
             }
         }
+        // A plan that has left the thread forgets that it was expanded.
+        plan::keep_present(&mut self.expanded_plans, &blocks);
         let active_run = state.active_run().map(|r| str_of(r, "id").to_string());
         let context = RenderContext {
             theme: &t,
@@ -1609,6 +1655,9 @@ impl App {
                 }
                 _ => String::new(),
             };
+            // A proposed plan draws its preview or all of it, so which one joins the key.
+            let expanded =
+                block.item_type == "proposed_plan" && self.expanded_plans.contains(&block.item_id);
             let key = (
                 hash(
                     &[
@@ -1622,13 +1671,22 @@ impl App {
                         &head,
                         clock,
                         &decision,
+                        if expanded { "expanded" } else { "" },
                     ],
                     stamp,
                 ),
                 width,
             );
             let fresh = self.cache.get(&block.item_id).is_none_or(|c| c.key != key);
-            if fresh {
+            if fresh && block.item_type == "proposed_plan" {
+                let card = plan::card(&block.body, width as usize, &context, expanded);
+                let cached = Cached {
+                    key,
+                    lines: card.lines,
+                    toggle: card.toggle,
+                };
+                self.cache.insert(block.item_id.clone(), cached);
+            } else if fresh {
                 let extra = match (block.kind, &bundle) {
                     (BlockKind::User, _) => self
                         .fold_for(state, &block.run_id)
@@ -1644,33 +1702,41 @@ impl App {
                     _ => Extra::None,
                 };
                 let lines = render_block(block, width as usize, &context, &extra);
-                self.cache
-                    .insert(block.item_id.clone(), Cached { key, lines });
+                let cached = Cached {
+                    key,
+                    lines,
+                    toggle: None,
+                };
+                self.cache.insert(block.item_id.clone(), cached);
             }
             heights.push(self.cache[&block.item_id].lines.len());
         }
         let total: usize = heights.iter().sum();
         let height = area.height as usize;
+        // A plan just expanded or collapsed keeps its header on the row it had, so the click
+        // doesn't move the text, even while the view follows the bottom. A key or the wheel
+        // that moved the transcript after the toggle has already cancelled this.
+        let pinned = self.scroll.take_pin().and_then(|(id, row)| {
+            let header = self.cache.get(&id)?.toggle?.0;
+            scroll_to(&blocks, &heights, &id, header, row, height)
+        });
         // Scrolled up, the view stays on the row it was reading: output that arrives for a
         // block on screen makes it taller, and without this the text would slide away. The
         // anchor is dropped as soon as anything else moves the scroll, so keys and the wheel
         // still win, and following the bottom is untouched.
-        if self.scroll > 0
-            && self.scroll == self.drawn_scroll
-            && let Some((item_id, within)) = self.anchor.clone()
-        {
-            let mut above = 0;
-            for (block, block_height) in blocks.iter().zip(&heights) {
-                if block.item_id == item_id {
-                    let top = above + within.min(block_height.saturating_sub(1));
-                    self.scroll = total.saturating_sub(top + height);
-                    break;
-                }
-                above += block_height;
-            }
+        let anchored = if self.scroll.rows() > 0 && self.scroll.rows() == self.drawn_scroll {
+            self.anchor.as_ref().and_then(|(item_id, within)| {
+                scroll_to(&blocks, &heights, item_id, *within, 0, height)
+            })
+        } else {
+            None
+        };
+        if let Some(scroll) = pinned.or(anchored) {
+            self.scroll.set(scroll);
         }
-        self.scroll = self.scroll.min(total.saturating_sub(height));
-        let end = total - self.scroll;
+        let scroll = self.scroll.rows().min(total.saturating_sub(height));
+        self.scroll.set(scroll);
+        let end = total - scroll;
         let start = end.saturating_sub(height);
 
         // Copy only the rows in view.
@@ -1681,9 +1747,10 @@ impl App {
         let mut wanted = Vec::new();
         let mut anchor = None;
         let mut rows = Vec::new();
+        let mut plans = Vec::new();
         for ((block, block_height), bundle) in blocks.iter().zip(&heights).zip(&bundles) {
             if *block_height > 0 && offset + block_height > start && offset < end {
-                let cached = &self.cache[&block.item_id].lines;
+                let cached = &self.cache[&block.item_id];
                 let from = start.saturating_sub(offset);
                 let to = (end - offset).min(*block_height);
                 // The row a run of calls is drawn as, so a click on it can open the run.
@@ -1693,7 +1760,14 @@ impl App {
                 {
                     rows.push((area.y + lines.len() as u16, head.id.clone()));
                 }
-                lines.extend(cached[from..to].iter().cloned());
+                // A long plan in view, whose header and button a click or `p` toggles.
+                if let Some(toggle) = cached.toggle
+                    && let Some(card) =
+                        plan::drawn(&block.item_id, toggle, from, to, lines.len(), area.y)
+                {
+                    plans.push(card);
+                }
+                lines.extend(cached.lines[from..to].iter().cloned());
                 anchor.get_or_insert_with(|| (block.item_id.clone(), from));
                 if block.output_omitted && self.outputs.wanted(&block.item_id, &block.updated_at) {
                     wanted.push((block.item_id.clone(), block.updated_at.clone()));
@@ -1705,9 +1779,10 @@ impl App {
             }
         }
         self.bundle_rows = rows;
+        self.drawn_plans = plans;
         frame.render_widget(Paragraph::new(lines), area);
-        if self.scroll > 0 {
-            let label = format!(" ↓ {} more ", self.scroll);
+        if scroll > 0 {
+            let label = format!(" ↓ {scroll} more ");
             let x = area.x + area.width.saturating_sub(label.width() as u16 + 1);
             frame.render_widget(
                 Paragraph::new(Line::styled(
@@ -1717,8 +1792,8 @@ impl App {
                 Rect::new(x, area.y + area.height - 1, label.width() as u16, 1),
             );
         }
-        self.anchor = anchor.filter(|_| self.scroll > 0);
-        self.drawn_scroll = self.scroll;
+        self.anchor = anchor.filter(|_| scroll > 0);
+        self.drawn_scroll = scroll;
         for (item_id, revision) in wanted {
             self.fetch_output(item_id, revision);
         }
@@ -2233,6 +2308,7 @@ impl App {
             .open
             .as_ref()
             .is_some_and(|o| self.unsent.has_saved(&o.id));
+        let hint;
         let keys = match (self.focus, self.picker.as_ref().map(|p| p.kind)) {
             (_, Some(Kind::Model)) => "Type to search · ↑↓ choose · Enter select · Esc close",
             (_, Some(_)) => "↑↓ choose · Enter select · Esc close",
@@ -2243,11 +2319,13 @@ impl App {
             (Focus::Composer, None) => {
                 "Enter send · Alt+Enter newline · Alt+M model · Alt+E effort · Alt+P mode · Ctrl+X interrupt"
             }
-            (Focus::Transcript, None) if self.verbose => {
-                "↑↓/PgUp scroll · G bottom · click a row of calls · t close them · Esc sidebar"
-            }
             (Focus::Transcript, None) => {
-                "↑↓/PgUp scroll · G bottom · click a row of calls · t open all · Esc sidebar"
+                let plan = self
+                    .drawn_plans
+                    .first()
+                    .map(|card| self.expanded_plans.contains(&card.id));
+                hint = transcript_keys(self.verbose, plan);
+                hint.as_str()
             }
         };
         let head = fit(&format!("{connection}  ·  "), width.saturating_sub(2));
@@ -2266,6 +2344,45 @@ impl App {
         }
         Line::from(spans)
     }
+}
+
+/// The keys the status line offers while the transcript has focus. `plan` is whether the
+/// first long plan in view, the one `p` toggles, is expanded, when there is one.
+fn transcript_keys(verbose: bool, plan: Option<bool>) -> String {
+    let plan = match plan {
+        Some(true) => " · p collapse plan",
+        Some(false) => " · p expand plan",
+        None => "",
+    };
+    let calls = if verbose {
+        "t close them"
+    } else {
+        "t open all"
+    };
+    format!("↑↓/PgUp scroll · G bottom{plan} · click a row of calls · {calls} · Esc sidebar")
+}
+
+/// The scroll, in rows up from the bottom, that puts row `within` of block `id` on screen row
+/// `row`, which is negative above the screen. None when the block isn't in the thread.
+fn scroll_to(
+    blocks: &[transcript::Block],
+    heights: &[usize],
+    id: &str,
+    within: usize,
+    row: isize,
+    height: usize,
+) -> Option<usize> {
+    let total: usize = heights.iter().sum();
+    let mut above = 0;
+    for (block, block_height) in blocks.iter().zip(heights) {
+        if block.item_id == id {
+            let top = above + within.min(block_height.saturating_sub(1));
+            let start = top.saturating_add_signed(-row);
+            return Some(total.saturating_sub(start + height));
+        }
+        above += block_height;
+    }
+    None
 }
 
 // ---- block rendering ----
@@ -3225,5 +3342,83 @@ mod tests {
             vec![thread("busy", json!({}))],
         );
         assert!(open_shelf.drew_working());
+    }
+
+    #[test]
+    fn a_toggled_plan_keeps_its_header_on_its_row() {
+        let blocks: Vec<transcript::Block> = ["a", "plan", "c"]
+            .into_iter()
+            .map(|id| {
+                let mut block = block(BlockKind::Plan, "proposed_plan", "Proposed plan", "");
+                block.item_id = id.into();
+                block
+            })
+            .collect();
+        // The card's header is its row 1, so transcript row 11. Twenty rows showing the bottom
+        // start at row 7, which puts the header on screen row 4.
+        let collapsed = [10, 12, 5];
+        let expanded = [10, 40, 5];
+        // Expanded, the header stays on row 4 and the view leaves the bottom.
+        let scroll = scroll_to(&blocks, &expanded, "plan", 1, 4, 20).expect("the plan");
+        assert_eq!(scroll, 28);
+        assert_eq!(55 - scroll - 20, 7, "the same rows above the header");
+        // Collapsed again from there, the view is back at the bottom.
+        assert_eq!(scroll_to(&blocks, &collapsed, "plan", 1, 4, 20), Some(0));
+
+        // Five rows showing rows 20..25, inside the collapsed card: the header is 9 rows above
+        // the screen. Expanding keeps it there, so the same rows stay in view.
+        let mut plans = HashSet::new();
+        let row = plan::flip(&mut plans, "plan", -9);
+        let scroll = scroll_to(&blocks, &expanded, "plan", 1, row, 5).expect("the plan");
+        assert_eq!(55 - scroll - 5, 20);
+        // Collapsing from the bottom of the expanded card, its header 24 rows up, brings the
+        // header to the top row rather than leaving the shorter card above the screen.
+        let row = plan::flip(&mut plans, "plan", -24);
+        assert_eq!(row, 0);
+        let scroll = scroll_to(&blocks, &collapsed, "plan", 1, row, 5).expect("the plan");
+        assert_eq!(27 - scroll - 5, 11);
+
+        // Row 0 is the reading anchor, which this helper replaced with the same arithmetic.
+        assert_eq!(scroll_to(&blocks, &collapsed, "a", 3, 0, 5), Some(19));
+        assert_eq!(scroll_to(&blocks, &collapsed, "a", 50, 0, 5), Some(13));
+        assert_eq!(scroll_to(&blocks, &collapsed, "c", 2, 0, 5), Some(0));
+        assert_eq!(scroll_to(&blocks, &collapsed, "gone", 0, 0, 5), None);
+    }
+
+    #[test]
+    fn the_transcript_hint_offers_p_only_with_a_long_plan_in_view() {
+        assert_eq!(
+            transcript_keys(false, None),
+            "↑↓/PgUp scroll · G bottom · click a row of calls · t open all · Esc sidebar"
+        );
+        assert_eq!(
+            transcript_keys(true, None),
+            "↑↓/PgUp scroll · G bottom · click a row of calls · t close them · Esc sidebar"
+        );
+        assert!(transcript_keys(false, Some(false)).contains("G bottom · p expand plan · click"));
+        assert!(transcript_keys(true, Some(true)).contains("G bottom · p collapse plan · click"));
+    }
+
+    #[test]
+    fn a_checklist_keeps_its_plain_plan_rows() {
+        let theme = Theme::new(Depth::TrueColor);
+        let context = RenderContext {
+            theme: &theme,
+            text: Styles::new(&theme, theme.text()),
+            bubble: Styles::new(&theme, theme.text()),
+            reasoning: Styles::new(&theme, Style::new().fg(theme.muted)).dimmed(),
+        };
+        let todo = block(
+            BlockKind::Plan,
+            "todo_list",
+            "Plan",
+            "[x] Read the log\n[ ] Patch it",
+        );
+        let rows = text(&render_block(&todo, 40, &context, &Extra::None));
+        assert_eq!(rows[1], "Plan");
+        assert_eq!(rows[2].trim_end(), "  [x] Read the log");
+        assert_eq!(rows[3].trim_end(), "  [ ] Patch it");
+        let all = rows.concat();
+        assert!(!all.contains('╭') && !all.contains("Expand"));
     }
 }
