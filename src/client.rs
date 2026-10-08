@@ -165,6 +165,21 @@ impl Client {
         if_busy: IfBusy,
         plan: &Plan,
     ) -> Result<SendReceipt> {
+        let message_id = uuid::Uuid::new_v4().to_string();
+        self.send_message_as(&message_id, state, text, if_busy, plan)
+            .await
+    }
+
+    /// `send_message_with` under a message id the caller chose. A send that times out can still
+    /// reach T3, and the id is how the caller finds out.
+    pub async fn send_message_as(
+        &self,
+        message_id: &str,
+        state: &ThreadState,
+        text: &str,
+        if_busy: IfBusy,
+        plan: &Plan,
+    ) -> Result<SendReceipt> {
         if text.trim().is_empty() {
             return Err(err_exit(
                 "PROMPT_REQUIRED",
@@ -202,7 +217,6 @@ impl Client {
         };
         self.check_plan(state, plan)?;
         self.dispatch_modes(state.thread_id(), plan).await?;
-        let message_id = uuid::Uuid::new_v4().to_string();
         let mut command = json!({
             "type": "message.dispatch",
             "threadId": state.thread_id(),
@@ -219,7 +233,7 @@ impl Client {
         }
         let sequence = self.dispatch(command).await?;
         Ok(SendReceipt {
-            message_id,
+            message_id: message_id.to_string(),
             sequence,
             dispatch_mode: mode_name,
         })

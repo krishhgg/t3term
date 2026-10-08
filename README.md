@@ -53,14 +53,14 @@ Exit codes: 0 success, 1 failure or a turn that ended without completing, 2 usag
 | Anywhere, thread open | Alt+M model, Alt+E reasoning effort and other model options, Alt+P access and plan mode |
 | Open menu | ↑/↓ choose, Enter select, Esc close. In the model menu, type to search |
 | Sidebar | ↑/↓ or j/k select, Enter open, e show or hide the Settled shelf, q quit |
-| Composer | Enter send (queues if the thread is busy), Alt+Enter or Ctrl+J newline, Esc to transcript |
+| Composer | Enter send (queues if the thread is busy), Alt+Enter or Ctrl+J newline, Ctrl+R swap in an unsent message, Esc to transcript |
 | Transcript | ↑/↓ scroll, g/G top/bottom, t show activity for finished turns and tool output, Enter compose, Esc sidebar |
 
 On macOS, the Alt keys need Option to send Meta: "Use Option as Meta key" in Terminal, "Esc+" for the Option key in iTerm2, or `macos-option-as-alt = true` in Ghostty.
 
 The mouse wheel scrolls the transcript and the sidebar, and clicking a thread opens it. Clicking a chip under the composer opens its menu. When a question is pending, the composer becomes the answer box: type an option number or your own text.
 
-A menu choice turns its chip blue and goes to T3 with the thread's next message, as in the desktop app. Ultrathink applies to that one message. T3 refuses a mode change while a run is active, so the TUI leaves that message in the composer to send once the run ends.
+A menu choice turns its chip blue and goes to T3 with the thread's next message, as in the desktop app. Ultrathink applies to that one message, and comes back only if that message fails to send. T3 refuses a mode change while a run is active, so the TUI leaves that message in the composer to send once the run ends. A message that fails after you have typed something else or opened another thread is kept. The status line says so, Ctrl+R swaps it with the composer's text, and opening its thread with an empty composer brings it back. A send that times out can still reach T3. If the thread later shows it, the TUI removes the kept copy so it can't go out twice.
 
 ![Choosing a model, effort and mode in the TUI, then sending](docs/screenshots/picker.gif)
 

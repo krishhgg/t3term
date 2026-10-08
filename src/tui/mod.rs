@@ -32,7 +32,7 @@ use crate::projection::{Applied, ShellState, ThreadState, is_active_status, stat
 use crate::transcript::{self, BlockKind};
 use composer::Composer;
 use markdown::Styles;
-use picker::{Item, Kind};
+use picker::{Item, Kind, Pick};
 use theme::{
     Theme, duration_label, model_display_name, monogram, now_ms, parse_iso_ms, relative_time,
     runtime_mode_label,
@@ -80,16 +80,16 @@ enum ActionResult {
     /// T3's provider and model list, from `server.getConfig`.
     Config(Value),
     Sent {
-        thread_id: String,
         note: String,
-        /// The message-text effort that went out with the message, such as ultrathink.
-        prompt_effort: Option<String>,
     },
     /// A send that failed. The composer gets its text back.
     SendFailed {
         thread_id: String,
+        message_id: String,
         text: String,
         error: String,
+        /// One-message draft options this send took, such as ultrathink, to put back.
+        reserved: Vec<(String, String)>,
     },
 }
 
@@ -115,12 +115,23 @@ struct OpenThread {
     run_changes: HashMap<String, u64>,
 }
 
+/// A message whose send failed. If the send timed out, T3 may still have it.
+struct Unconfirmed {
+    thread_id: String,
+    message_id: String,
+    text: String,
+}
+
 struct App {
     client: Arc<Client>,
     theme: Theme,
     config: Option<Value>,
     /// Model, effort and mode choices per thread, sent with the thread's next message.
     drafts: HashMap<String, Choice>,
+    /// Messages that failed to send while the composer held other text, by thread.
+    unsent: HashMap<String, Vec<String>>,
+    /// Failed sends to look for in their thread, in case they reached T3 after all.
+    unconfirmed: Vec<Unconfirmed>,
     picker: Option<Picker>,
     shell: Option<ShellState>,
     shell_connection: String,
@@ -199,6 +210,8 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
         theme: Theme::detect(),
         config: None,
         drafts: HashMap::new(),
+        unsent: HashMap::new(),
+        unconfirmed: Vec::new(),
         picker: None,
         shell: None,
         shell_connection: "connecting".into(),
@@ -334,6 +347,7 @@ impl App {
                     _ => {}
                 }
                 self.settle_draft();
+                self.drop_landed();
             }
             WatchEvent::Reconnecting { reason, .. } => {
                 open.connection = format!("reconnecting: {reason}")
@@ -464,6 +478,11 @@ impl App {
         self.scroll = 0;
         self.picker = None;
         self.focus = Focus::Composer;
+        if self.composer.is_empty()
+            && let Some(texts) = self.open.as_ref().and_then(|o| self.unsent.remove(&o.id))
+        {
+            self.composer.insert_str(&texts.join("\n\n"));
+        }
     }
 
     // ---- input ----
@@ -625,6 +644,10 @@ impl App {
                 });
                 return;
             }
+            KeyCode::Char('r') if ctrl => {
+                self.swap_unsent();
+                return;
+            }
             KeyCode::Tab => {
                 self.focus = match self.focus {
                     Focus::Sidebar => Focus::Composer,
@@ -744,44 +767,118 @@ impl App {
             ActionResult::Info(text) => self.message = Some((text, false)),
             ActionResult::Error(text) => self.message = Some((text, true)),
             ActionResult::Config(config) => {
-                let first = self.config.is_none();
+                // A refresh can add or drop rows, so the highlight follows its entry, not
+                // its row number.
+                let previous = self.selected_pick();
                 self.config = Some(config);
-                // A menu opened before the list arrived starts on the current choice.
-                if first && let Some(kind) = self.picker.as_ref().map(|p| p.kind) {
-                    self.open_picker(kind);
+                if self.picker.is_some() {
+                    self.select_pick(previous);
                 }
             }
-            ActionResult::Sent {
-                thread_id,
-                note,
-                prompt_effort,
-            } => {
-                // As in the desktop app, ultrathink applies to one message.
-                if let Some(effort) = prompt_effort
-                    && let Some(draft) = self.drafts.get_mut(&thread_id)
-                {
-                    draft.options.retain(|(_, value)| *value != effort);
-                    if draft.is_empty() {
-                        self.drafts.remove(&thread_id);
-                    }
-                }
+            ActionResult::Sent { note } => {
                 self.settle_draft();
                 self.message = Some((note, false));
             }
             ActionResult::SendFailed {
                 thread_id,
+                message_id,
                 text,
                 error,
-            } => self.give_back(&thread_id, &text, error),
+                reserved,
+            } => {
+                // The one-message choice didn't go out, so it waits for the next try, unless
+                // the user has picked another value for it since.
+                if !reserved.is_empty() {
+                    let draft = self.drafts.entry(thread_id.clone()).or_default();
+                    for (id, value) in reserved {
+                        if !draft.options.iter().any(|(other, _)| *other == id) {
+                            draft.options.push((id, value));
+                        }
+                    }
+                }
+                self.unconfirmed.push(Unconfirmed {
+                    thread_id: thread_id.clone(),
+                    message_id,
+                    text: text.clone(),
+                });
+                self.give_back(&thread_id, &text, error);
+            }
         }
     }
 
-    /// Puts an unsent message back in the composer.
+    /// A send that timed out can still reach T3. Once the open thread shows one, the copy kept
+    /// for a retry goes, so it isn't sent twice.
+    fn drop_landed(&mut self) {
+        let Some(open) = self.open.as_ref() else {
+            return;
+        };
+        let Some(state) = open.state.as_ref() else {
+            return;
+        };
+        let (landed, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.unconfirmed)
+            .into_iter()
+            .partition(|m| m.thread_id == open.id && state.has_message(&m.message_id));
+        self.unconfirmed = waiting;
+        for message in landed {
+            let saved = self.unsent.get_mut(&message.thread_id);
+            let removed = if let Some(texts) = saved
+                && let Some(index) = texts.iter().position(|t| *t == message.text)
+            {
+                texts.remove(index);
+                if texts.is_empty() {
+                    self.unsent.remove(&message.thread_id);
+                }
+                "dropped its saved copy"
+            } else if self.composer.text() == message.text {
+                self.composer.clear();
+                "cleared it from the composer"
+            } else {
+                continue;
+            };
+            self.message = Some((
+                format!("The message that failed reached T3 after all, so t3term {removed}."),
+                false,
+            ));
+        }
+    }
+
+    /// Puts an unsent message back in the composer. If the composer holds other text, or the
+    /// message was for another thread, it waits in `unsent` for Ctrl+R or for that thread.
     fn give_back(&mut self, thread_id: &str, text: &str, error: String) {
         if self.open.as_ref().is_some_and(|o| o.id == thread_id) && self.composer.is_empty() {
             self.composer.insert_str(text);
+            self.message = Some((error, true));
+            return;
         }
-        self.message = Some((error, true));
+        self.unsent
+            .entry(thread_id.to_string())
+            .or_default()
+            .push(text.to_string());
+        self.message = Some((
+            format!(
+                "{}. The message is saved. Ctrl+R in its thread brings it back.",
+                error.trim_end().trim_end_matches('.')
+            ),
+            true,
+        ));
+    }
+
+    /// Swaps the composer's text with the open thread's unsent message, so neither is lost.
+    fn swap_unsent(&mut self) {
+        let Some(id) = self.open.as_ref().map(|o| o.id.clone()) else {
+            return;
+        };
+        let Some(unsent) = self.unsent.remove(&id) else {
+            self.message = Some(("This thread has no unsent message.".into(), false));
+            return;
+        };
+        let current = self.composer.text();
+        self.composer.clear();
+        self.composer.insert_str(&unsent.join("\n\n"));
+        if !current.trim().is_empty() {
+            self.unsent.insert(id, vec![current]);
+        }
+        self.focus = Focus::Composer;
     }
 
     /// Drops the open thread's draft once the thread has every choice in it, so the next
@@ -852,13 +949,36 @@ impl App {
             selected: 0,
             offset: 0,
         });
+        self.select_pick(None);
+    }
+
+    /// The pick under the menu's highlight.
+    fn selected_pick(&self) -> Option<Pick> {
+        let selected = self.picker.as_ref()?.selected;
+        match self.picker_items().get(selected)? {
+            Item::Entry { pick, .. } => Some(pick.clone()),
+            Item::Heading { .. } => None,
+        }
+    }
+
+    /// Highlights `pick` if the menu still has it, else the current choice, else the first
+    /// entry.
+    fn select_pick(&mut self, pick: Option<Pick>) {
         let items = self.picker_items();
-        let start = items
-            .iter()
-            .position(|i| matches!(i, Item::Entry { current: true, .. }))
+        let index = pick
+            .and_then(|pick| {
+                items
+                    .iter()
+                    .position(|i| matches!(i, Item::Entry { pick: p, .. } if *p == pick))
+            })
+            .or_else(|| {
+                items
+                    .iter()
+                    .position(|i| matches!(i, Item::Entry { current: true, .. }))
+            })
             .or_else(|| items.iter().position(Item::is_entry));
-        if let (Some(picker), Some(start)) = (self.picker.as_mut(), start) {
-            picker.selected = start;
+        if let Some(picker) = self.picker.as_mut() {
+            picker.selected = index.unwrap_or(0);
         }
     }
 
@@ -1044,24 +1164,40 @@ impl App {
             let error = "T3 can't change the mode during a run. Send again when it finishes, or set the mode back with Alt+P.";
             return self.give_back(&thread_id, &text, error.into());
         }
+        // As in the desktop app, ultrathink applies to one message. This send takes it out of
+        // the draft now, so a second message sent before this one lands doesn't reuse it.
+        let mut reserved = Vec::new();
+        if let Some(effort) = &plan.prompt_effort
+            && let Some(draft) = self.drafts.get_mut(&thread_id)
+        {
+            let (taken, kept) = std::mem::take(&mut draft.options)
+                .into_iter()
+                .partition(|(_, value)| value == effort);
+            draft.options = kept;
+            reserved = taken;
+            if draft.is_empty() {
+                self.drafts.remove(&thread_id);
+            }
+        }
         let (client, results) = (self.client.clone(), self.actions.clone());
+        let message_id = uuid::Uuid::new_v4().to_string();
         tokio::spawn(async move {
             let sent = client
-                .send_message_with(&state, &text, IfBusy::Queue, &plan)
+                .send_message_as(&message_id, &state, &text, IfBusy::Queue, &plan)
                 .await;
             let _ = results.send(match sent {
                 Ok(receipt) => ActionResult::Sent {
-                    thread_id,
                     note: match receipt.dispatch_mode {
                         "queue_after_active" => "Queued after the running turn.".into(),
                         _ => "Sent.".into(),
                     },
-                    prompt_effort: plan.prompt_effort,
                 },
                 Err(e) => ActionResult::SendFailed {
                     thread_id,
+                    message_id,
                     text,
                     error: e.to_string(),
+                    reserved,
                 },
             });
         });
@@ -2099,6 +2235,10 @@ impl App {
             return Line::styled(fit(text, width), Style::new().fg(color));
         }
         let (connection, color) = self.connection_state();
+        let unsent = self
+            .open
+            .as_ref()
+            .is_some_and(|o| self.unsent.contains_key(&o.id));
         let keys = match (self.focus, self.picker.as_ref().map(|p| p.kind)) {
             (_, Some(Kind::Model)) => "Type to search · ↑↓ choose · Enter select · Esc close",
             (_, Some(_)) => "↑↓ choose · Enter select · Esc close",
@@ -2110,13 +2250,21 @@ impl App {
                 "↑↓/PgUp scroll · G bottom · t activity · Enter compose · Esc sidebar"
             }
         };
-        Line::from(vec![
+        let head = fit(&format!("{connection}  ·  "), width.saturating_sub(2));
+        let mut room = width.saturating_sub(2 + head.width());
+        let mut spans = vec![
             Span::styled("● ", Style::new().fg(color)),
-            Span::styled(
-                fit(&format!("{connection}  ·  {keys}"), width.saturating_sub(2)),
-                Style::new().fg(t.muted),
-            ),
-        ])
+            Span::styled(head, Style::new().fg(t.muted)),
+        ];
+        if unsent && self.picker.is_none() && room > 0 {
+            let note = fit("Unsent message: Ctrl+R  ·  ", room);
+            room -= note.width();
+            spans.push(Span::styled(note, Style::new().fg(t.warning_fg)));
+        }
+        if room > 0 {
+            spans.push(Span::styled(fit(keys, room), Style::new().fg(t.muted)));
+        }
+        Line::from(spans)
     }
 }
 

@@ -206,6 +206,18 @@ impl ThreadState {
         self.list("runs").iter().max_by_key(|r| ordinal(r))
     }
 
+    /// Whether the thread holds the user message with this id.
+    pub fn has_message(&self, message_id: &str) -> bool {
+        let id = Some(message_id);
+        self.list("messages")
+            .iter()
+            .any(|m| m.get("id").and_then(Value::as_str) == id)
+            || self
+                .list("runs")
+                .iter()
+                .any(|r| r.get("userMessageId").and_then(Value::as_str) == id)
+    }
+
     pub fn run_for_message(&self, message_id: &str) -> Option<&Value> {
         let runs = self.list("runs");
         if let Some(run) = runs
@@ -457,6 +469,21 @@ mod tests {
         assert_eq!(items.len(), 2);
         assert_eq!(items[1]["text"], "Hello");
         assert_eq!(state.list("turnItems").len(), 2);
+    }
+
+    #[test]
+    fn finds_a_message_by_its_run_or_its_message_row() {
+        let mut state = ThreadState::default();
+        state.apply(&snapshot());
+        assert!(state.has_message("m1"));
+        assert!(!state.has_message("m9"));
+        // A message T3 took late, after the send had given up waiting.
+        state.apply(&event(
+            11,
+            "message.updated",
+            json!({"id": "m9", "role": "user", "text": "late"}),
+        ));
+        assert!(state.has_message("m9"));
     }
 
     #[test]
