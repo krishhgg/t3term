@@ -67,16 +67,9 @@ Each group is one PR, or a short series if it's big. Sizes are rough estimates f
 
 ## Keeping up with new nightlies
 
-A new nightly changes two kinds of things, and only one of them needs work in t3term.
+Automated nightly synchronization is deferred and is not part of the current sprint. Nothing checks for new nightlies on a schedule, and the pin file, daily Action and version warning sketched here earlier are not being built. This document stays pinned to `v0.0.46-nightly.20261007.2787` until someone updates it by hand.
 
-**Server and agent changes reach t3term on their own.** t3term doesn't bundle T3. It talks to whatever server your desktop app or `t3` is running, so when a nightly fixes a provider, changes how agents run or adds a model, t3term gets it as soon as your server updates. The model picker reads the model list from the server, so new models show up without a t3term release.
-
-**Anything a client has to draw or send needs code.** A new command, API call, setting, shortcut or kind of timeline row only shows up in t3term once someone builds it. Nothing can write that UI unattended and get it right, so the goal is to never miss one:
-
-1. A file called `T3CODE_NIGHTLY` records the nightly t3term was last checked against.
-2. A GitHub Action runs once a day. When pingdotgg/t3code has a nightly tag newer than that file, it fetches the command list, the API list, the settings and the default shortcuts at both tags, and opens an issue listing what was added and what was removed.
-3. Each issue becomes a PR that builds what's new and moves `T3CODE_NIGHTLY` forward. To get closer to automatic, a daily T3 scheduled task can pick up each new issue and open that PR, and you review it like any other UI change.
-4. `t3term doctor` and the TUI's status line compare your server's version with `T3CODE_NIGHTLY` and say when the server is newer. The existing check stays as it is: if the server moves past orchestration protocol 2, t3term refuses to connect and tells you to update, instead of guessing.
+Server and agent changes still reach t3term without a release, because it talks to whatever T3 server is running. If a server moves past orchestration protocol 2, t3term refuses to connect and says so.
 
 ## Every feature, by group
 
