@@ -1515,7 +1515,9 @@ impl App {
             open.and_then(|open| open.state.as_ref()),
             open.is_some_and(|open| open.connection == "live"),
         );
-        let tasks_room = main.height.saturating_sub(2 + 3 + composer_height + 1 + panel_height);
+        let tasks_room = main
+            .height
+            .saturating_sub(2 + 3 + composer_height + 1 + panel_height);
         let tasks = self.tasks.lay_out(
             checklist.as_ref(),
             main.width.saturating_sub(4) as usize,

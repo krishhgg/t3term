@@ -68,7 +68,10 @@ impl Tasks {
 
 /// Run statuses that leave a run unsettled (`isLatestRunSettled`, `session-logic.ts:220`).
 fn unsettled(status: &str) -> bool {
-    matches!(status, "preparing" | "queued" | "starting" | "running" | "waiting")
+    matches!(
+        status,
+        "preparing" | "queued" | "starting" | "running" | "waiting"
+    )
 }
 
 fn run_of(plan: &Value) -> Option<&str> {
@@ -134,12 +137,16 @@ pub fn format_duration(ms: f64) -> String {
         return format!("{}s", (ms / 1_000.0).round() as u64);
     }
     let total = (ms / 1_000.0).round() as u64;
-    [(total / 3_600, "h"), (total % 3_600 / 60, "m"), (total % 60, "s")]
-        .iter()
-        .filter(|(count, _)| *count > 0)
-        .map(|(count, unit)| format!("{count}{unit}"))
-        .collect::<Vec<_>>()
-        .join(" ")
+    [
+        (total / 3_600, "h"),
+        (total % 3_600 / 60, "m"),
+        (total % 60, "s"),
+    ]
+    .iter()
+    .filter(|(count, _)| *count > 0)
+    .map(|(count, unit)| format!("{count}{unit}"))
+    .collect::<Vec<_>>()
+    .join(" ")
 }
 
 /// A step's time column: what it took once T3 has recorded it, `now` while it runs.
@@ -271,7 +278,10 @@ impl Drawer {
                 )
             };
             lines.extend(list.into_iter().skip(self.scroll).take(shown));
-            lines.push(Line::styled(fit(&hint, width), Style::new().fg(theme.muted)));
+            lines.push(Line::styled(
+                fit(&hint, width),
+                Style::new().fg(theme.muted),
+            ));
         }
         lines
     }
@@ -781,8 +791,14 @@ mod tests {
     fn every_row_keeps_inside_the_drawer_at_any_width() {
         let theme = Theme::new(Depth::TrueColor);
         let steps = [
-            ("Read every log under /var/log/agent and note the failures", "completed"),
-            ("Patch src/projection_reducer_with_a_long_name.rs so the cursor stays", "running"),
+            (
+                "Read every log under /var/log/agent and note the failures",
+                "completed",
+            ),
+            (
+                "Patch src/projection_reducer_with_a_long_name.rs so the cursor stays",
+                "running",
+            ),
             ("Run the tests", "pending"),
         ];
         let mut plan = list("p1", Some("r1"), &steps);
