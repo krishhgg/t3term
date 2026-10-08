@@ -49,7 +49,7 @@ Exit codes: 0 success, 1 failure or a turn that ended without completing, 2 usag
 | Where | Keys |
 | --- | --- |
 | Anywhere | Tab / Shift+Tab move focus, PgUp/PgDn scroll, Ctrl+X interrupt, Ctrl+C quit |
-| Anywhere, approval pending | Alt+A accept, Alt+S accept for session, Alt+D decline |
+| Anywhere, approval pending | Alt+A accept, Alt+S accept for session, Alt+D decline. Alt+↑/↓ or the mouse wheel scrolls a request too long for its panel |
 | Sidebar | ↑/↓ or j/k select, Enter open, e show or hide the Settled shelf, q quit |
 | Composer | Enter send (queues if the thread is busy), Alt+Enter or Ctrl+J newline, Esc to transcript |
 | Transcript | ↑/↓ scroll, g/G top/bottom, t show activity for finished turns and tool output, Enter compose, Esc sidebar |

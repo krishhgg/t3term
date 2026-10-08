@@ -76,8 +76,14 @@ fn inline_segments(text: &str, styles: &Styles, base: Style) -> Vec<(String, Sty
             continue;
         }
         if (c == '*' || c == '_') && next == Some(c) {
-            segments.push((std::mem::take(&mut current), style(bold, italic, code)));
-            bold = !bold;
+            // An opening pair with no closing pair after it is literal text.
+            if bold || closes_at(&chars, i + 2, &[c, c]) {
+                segments.push((std::mem::take(&mut current), style(bold, italic, code)));
+                bold = !bold;
+                i += 2;
+                continue;
+            }
+            current.push_str(&format!("{c}{c}"));
             i += 2;
             continue;
         }
@@ -90,8 +96,11 @@ fn inline_segments(text: &str, styles: &Styles, base: Style) -> Vec<(String, Sty
                     boundary(prev)
                 }))
         {
-            // A lone star next to spaces is a bullet or math, not emphasis.
-            let opens = !italic && next.is_some_and(|n| !n.is_whitespace());
+            // A lone star next to spaces is a bullet or math, not emphasis. So is one with no
+            // closing star after it, as in `*.rs` or `2*3`.
+            let opens = !italic
+                && next.is_some_and(|n| !n.is_whitespace())
+                && italic_closes_after(&chars, i, c);
             let closes = italic && prev.is_some_and(|p| !p.is_whitespace());
             if opens || closes {
                 segments.push((std::mem::take(&mut current), style(bold, italic, code)));
@@ -101,10 +110,19 @@ fn inline_segments(text: &str, styles: &Styles, base: Style) -> Vec<(String, Sty
             }
         }
         if c == '['
-            && let Some((label, end)) = link_at(&chars, i)
+            && let Some((label, url, end)) = link_at(&chars, i)
         {
             segments.push((std::mem::take(&mut current), style(bold, italic, code)));
+            // The terminal can't open the label, so the destination stays readable and
+            // copyable after it.
+            let shown = url
+                .trim_start_matches("https://")
+                .trim_start_matches("http://");
+            let same = label == url || label == shown;
             segments.push((label, styles.link));
+            if !same && !url.is_empty() {
+                segments.push((format!(" ({url})"), styles.bullet));
+            }
             i = end;
             continue;
         }
@@ -134,8 +152,27 @@ fn inline_segments(text: &str, styles: &Styles, base: Style) -> Vec<(String, Sty
     out
 }
 
-/// `[label](url)` starting at `start`: the label and the index after the closing paren.
-fn link_at(chars: &[char], start: usize) -> Option<(String, usize)> {
+/// Whether `marker` appears at or after `from`.
+fn closes_at(chars: &[char], from: usize, marker: &[char]) -> bool {
+    chars
+        .get(from..)
+        .is_some_and(|rest| rest.windows(marker.len()).any(|window| window == marker))
+}
+
+/// Whether a single `*` or `_` opening at `open` has a closing one later on the line: the same
+/// marker right after text, and for `_` not inside a word.
+fn italic_closes_after(chars: &[char], open: usize, marker: char) -> bool {
+    (open + 2..chars.len()).any(|j| {
+        chars[j] == marker
+            && chars[j - 1] != marker
+            && !chars[j - 1].is_whitespace()
+            && (marker == '*' || chars.get(j + 1).is_none_or(|n| !n.is_alphanumeric()))
+    })
+}
+
+/// `[label](url)` starting at `start`: the label, the destination and the index after the
+/// closing paren.
+fn link_at(chars: &[char], start: usize) -> Option<(String, String, usize)> {
     let close = chars[start + 1..].iter().position(|c| *c == ']')? + start + 1;
     if chars.get(close + 1) != Some(&'(') {
         return None;
@@ -145,7 +182,8 @@ fn link_at(chars: &[char], start: usize) -> Option<(String, usize)> {
     if label.is_empty() {
         return None;
     }
-    Some((label, end + 1))
+    let url: String = chars[close + 2..end].iter().collect();
+    Some((label, url.trim().to_string(), end + 1))
 }
 
 /// Greedy word wrap that keeps each word's style. `prefix` starts the first row, `indent` the rest.
@@ -165,6 +203,7 @@ fn wrap(
         for word in text.split_inclusive(' ') {
             let word_width = word.trim_end().width();
             if line_has_word && used + word_width > width {
+                trim_end(&mut spans);
                 lines.push(Line::from(std::mem::take(&mut spans)));
                 spans.push(Span::raw(" ".repeat(indent)));
                 used = indent;
@@ -200,8 +239,21 @@ fn wrap(
             line_has_word = true;
         }
     }
+    if line_has_word {
+        trim_end(&mut spans);
+    }
     lines.push(Line::from(spans));
     lines
+}
+
+/// Drops the space after a row's last word, which would otherwise stick out past the width.
+fn trim_end(spans: &mut [Span<'static>]) {
+    if let Some(last) = spans.last_mut() {
+        let trimmed = last.content.trim_end();
+        if trimmed.len() < last.content.len() {
+            last.content = trimmed.to_string().into();
+        }
+    }
 }
 
 fn pad_to(text: &str, width: usize) -> String {
@@ -259,7 +311,8 @@ pub fn render(text: &str, width: usize, styles: &Styles, margin: usize) -> Vec<L
             lines.push(Line::default());
             continue;
         }
-        let leading = raw.len() - trimmed.len();
+        // Deep indentation keeps at least 8 columns for text, so no row grows past `width`.
+        let leading = (raw.len() - trimmed.len()).min(width.saturating_sub(margin + 13));
         if is_rule(trimmed) {
             lines.push(Line::from(vec![
                 Span::styled(pad.clone(), base),
@@ -430,9 +483,60 @@ mod tests {
         assert_eq!(span_style(&lines, "snake_case"), styles.text);
         assert_eq!(
             plain(&lines)[0],
-            "See docs or https://t3.gg now, soft snake_case"
+            "See docs (https://example.com) or https://t3.gg now, soft snake_case"
         );
         assert_eq!(plain(&lines)[1], "▎ quoted");
         assert_eq!(span_style(&lines, "quoted"), styles.quote);
+    }
+
+    #[test]
+    fn keeps_link_destinations_and_unmatched_markers() {
+        let styles = styles();
+        let lines = render(
+            "Read [the docs](https://example.com/a) or [t3.gg](https://t3.gg)",
+            80,
+            &styles,
+            0,
+        );
+        assert_eq!(
+            plain(&lines)[0],
+            "Read the docs (https://example.com/a) or t3.gg"
+        );
+        assert_eq!(span_style(&lines, "docs"), styles.link);
+
+        let lines = render(
+            "Match *.rs files\n2*3 is six\n**open bold\nbut *this* and ***both***",
+            80,
+            &styles,
+            0,
+        );
+        assert_eq!(
+            plain(&lines),
+            [
+                "Match *.rs files",
+                "2*3 is six",
+                "**open bold",
+                "but this and both"
+            ]
+        );
+        let italic = |text| span_style(&lines, text).add_modifier(Modifier::ITALIC);
+        assert_eq!(italic("this"), span_style(&lines, "this"));
+        assert_eq!(
+            span_style(&lines, "both"),
+            styles.text.add_modifier(Modifier::BOLD | Modifier::ITALIC)
+        );
+    }
+
+    #[test]
+    fn deep_indentation_stays_inside_the_width() {
+        let text = format!("{}- a deeply nested list item with words", " ".repeat(24));
+        for width in [20, 28, 40] {
+            let lines = render(&text, width, &styles(), 0);
+            assert!(
+                lines.iter().all(|l| l.width() <= width),
+                "{width}: {:?}",
+                plain(&lines)
+            );
+        }
     }
 }

@@ -83,6 +83,8 @@ struct OpenThread {
     connection: String,
     /// Answers collected so far for the pending question request.
     answers: serde_json::Map<String, Value>,
+    /// The event sequence of each run's last change, which keys the clock row under its prompt.
+    run_changes: HashMap<String, u64>,
 }
 
 struct App {
@@ -113,6 +115,10 @@ struct App {
     sidebar_list: Rect,
     sidebar_footer: Rect,
     transcript_area: Rect,
+    panel_area: Rect,
+    /// Rows the request panel's text is scrolled down, and the request that applies to.
+    panel_scroll: usize,
+    panel_key: String,
     quit: bool,
 }
 
@@ -151,7 +157,10 @@ impl Drop for Screen {
 async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>) -> Result<()> {
     let (actions, mut action_results) = mpsc::unbounded_channel();
     let mut shell_events = client.watch_shell(None);
-    let model_names = theme::load_model_names(&client.runtime.t3_home);
+    let t3_home = client.runtime.t3_home.clone();
+    let model_names = tokio::task::spawn_blocking(move || theme::load_model_names(&t3_home))
+        .await
+        .unwrap_or_default();
     let mut app = App {
         client,
         theme: Theme::detect(),
@@ -175,6 +184,9 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
         sidebar_list: Rect::default(),
         sidebar_footer: Rect::default(),
         transcript_area: Rect::default(),
+        panel_area: Rect::default(),
+        panel_scroll: 0,
+        panel_key: String::new(),
         quit: false,
     };
     let mut input = EventStream::new();
@@ -237,10 +249,11 @@ fn str_of<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or_default()
 }
 
-fn hash(parts: &[&str]) -> u64 {
+fn hash(parts: &[&str], stamp: u64) -> u64 {
     use std::hash::{Hash, Hasher};
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
     parts.hash(&mut hasher);
+    stamp.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -273,6 +286,13 @@ impl App {
                 match state.apply(&item) {
                     Applied::Synchronized => open.connection = "live".into(),
                     Applied::Snapshot => self.cache.clear(),
+                    Applied::Event(kind) if kind.starts_with("run.") => {
+                        if let Some(run_id) =
+                            item.pointer("/event/payload/id").and_then(Value::as_str)
+                        {
+                            open.run_changes.insert(run_id.to_string(), state.sequence);
+                        }
+                    }
                     _ => {}
                 }
             }
@@ -288,9 +308,11 @@ impl App {
 
     /// Whether any thread is working, which is when the clocks need a tick.
     fn running(&self) -> bool {
+        // A closed watch never hears that its run finished, so its last state can't count.
         if self
             .open
             .as_ref()
+            .filter(|o| o.connection != "closed")
             .and_then(|o| o.state.as_ref())
             .is_some_and(|s| s.active_run().is_some())
         {
@@ -397,6 +419,7 @@ impl App {
             events,
             connection: "connecting".into(),
             answers: Default::default(),
+            run_changes: HashMap::new(),
         });
         self.cache.clear();
         self.scroll = 0;
@@ -425,6 +448,10 @@ impl App {
                         && mouse.row < area.y + area.height
                 };
                 match mouse.kind {
+                    MouseEventKind::ScrollUp if inside(self.panel_area) => {
+                        self.panel_scroll = self.panel_scroll.saturating_sub(1)
+                    }
+                    MouseEventKind::ScrollDown if inside(self.panel_area) => self.panel_scroll += 1,
                     MouseEventKind::ScrollUp if inside(self.transcript_area) => self.scroll += 3,
                     MouseEventKind::ScrollDown if inside(self.transcript_area) => {
                         self.scroll = self.scroll.saturating_sub(3)
@@ -496,6 +523,15 @@ impl App {
                     's' => "acceptForSession",
                     _ => "decline",
                 });
+                return;
+            }
+            // Scroll a request panel too long to show at once.
+            KeyCode::Up if alt && self.panel_area.height > 0 => {
+                self.panel_scroll = self.panel_scroll.saturating_sub(1);
+                return;
+            }
+            KeyCode::Down if alt && self.panel_area.height > 0 => {
+                self.panel_scroll += 1;
                 return;
             }
             KeyCode::Tab => {
@@ -776,7 +812,14 @@ impl App {
         let (composer_rows, cursor) = self.composer.layout(main.width.saturating_sub(4) as usize);
         // Text rows, a spacer, the chips row and two borders.
         let composer_height = composer_rows.len().clamp(1, COMPOSER_MAX_ROWS) as u16 + 4;
-        let panel = self.request_panel_lines(main.width.saturating_sub(4) as usize);
+        // The panel leaves the header, three transcript rows, the composer and the status line
+        // their space, less its own two borders.
+        let panel_width = main.width.saturating_sub(4) as usize;
+        let panel_room = main.height.saturating_sub(2 + 3 + composer_height + 1 + 2);
+        let panel = match self.request_panel(panel_width) {
+            Some(panel) => self.panel_rows(panel, panel_width, panel_room as usize),
+            None => Vec::new(),
+        };
         let panel_height = if panel.is_empty() {
             0
         } else {
@@ -797,6 +840,7 @@ impl App {
         );
         self.transcript_area = body;
         self.draw_transcript(frame, body);
+        self.panel_area = panel_area;
         if !panel.is_empty() {
             self.draw_request_panel(frame, panel_area, panel);
         }
@@ -811,6 +855,9 @@ impl App {
         let t = self.theme.clone();
         frame.render_widget(Block::new().style(Style::new().bg(t.sidebar_bg)), area);
         if area.width < 6 || area.height < 4 {
+            // Nothing is drawn, so nothing there should take clicks.
+            self.sidebar_list = Rect::default();
+            self.sidebar_footer = Rect::default();
             return;
         }
         // A one-column strip stands in for the GUI's 1px border.
@@ -1077,7 +1124,11 @@ impl App {
     fn draw_transcript(&mut self, frame: &mut Frame, area: Rect) {
         let t = self.theme.clone();
         let muted = Style::new().fg(t.muted);
-        let Some(state) = self.open.as_ref().and_then(|o| o.state.as_ref()) else {
+        let Some((state, run_changes)) = self
+            .open
+            .as_ref()
+            .and_then(|o| Some((o.state.as_ref()?, &o.run_changes)))
+        else {
             let hint = if self.open.is_some() {
                 "Loading thread…"
             } else {
@@ -1109,25 +1160,42 @@ impl App {
                 heights.push(0);
                 continue;
             }
-            let extra = match block.kind {
-                BlockKind::User => self
-                    .fold_for(state, &block.run_id)
-                    .map_or(Extra::None, Extra::Fold),
-                BlockKind::Request => Extra::Decision(decision_for(state, &block.request_id)),
-                _ => Extra::None,
+            // A prompt's clock row comes from its run. The running prompt's ticks each second;
+            // a finished one changes only with its run, so it is rebuilt only then.
+            let (clock, stamp) = match block.kind {
+                BlockKind::User if active_run.as_deref() == Some(block.run_id.as_str()) => {
+                    ("live", (self.now / 1000) as u64)
+                }
+                BlockKind::User => ("done", run_changes.get(&block.run_id).copied().unwrap_or(0)),
+                _ => ("", 0),
+            };
+            let decision = match block.kind {
+                BlockKind::Request => decision_for(state, &block.request_id),
+                _ => String::new(),
             };
             let key = (
-                hash(&[
-                    &block.header,
-                    &block.body,
-                    &block.status,
-                    if expand { "1" } else { "0" },
-                    &extra.key(),
-                ]),
+                hash(
+                    &[
+                        &block.header,
+                        &block.body,
+                        &block.status,
+                        if expand { "1" } else { "0" },
+                        clock,
+                        &decision,
+                    ],
+                    stamp,
+                ),
                 width,
             );
             let fresh = self.cache.get(&block.item_id).is_none_or(|c| c.key != key);
             if fresh {
+                let extra = match block.kind {
+                    BlockKind::User => self
+                        .fold_for(state, &block.run_id)
+                        .map_or(Extra::None, Extra::Fold),
+                    BlockKind::Request => Extra::Decision(decision),
+                    _ => Extra::None,
+                };
                 let lines = render_block(block, width as usize, &context, &extra);
                 self.cache
                     .insert(block.item_id.clone(), Cached { key, lines });
@@ -1201,25 +1269,19 @@ impl App {
         })
     }
 
-    /// The input of the newest command that has not finished, which is the one an approval is for.
-    fn pending_command(&self) -> Option<String> {
+    /// The command an approval request gates. It must be the same request that Alt+A answers,
+    /// so it comes from the request's own node, never from what else is running.
+    fn pending_command(&self, request_id: &str) -> Option<String> {
         let state = self.open.as_ref()?.state.as_ref()?;
-        state
-            .items()
-            .into_iter()
-            .rev()
-            .find(|item| {
-                str_of(item, "type") == "command_execution"
-                    && !crate::projection::is_terminal_status(status(item))
-            })
-            .map(|item| str_of(item, "input").to_string())
-            .filter(|input| !input.trim().is_empty())
+        let item = state.request_subject(request_id)?;
+        if str_of(item, "type") != "command_execution" {
+            return None;
+        }
+        Some(str_of(item, "input").to_string()).filter(|input| !input.trim().is_empty())
     }
 
-    fn request_panel_lines(&self, width: usize) -> Vec<Line<'static>> {
-        let Some((request, item)) = self.pending_request() else {
-            return Vec::new();
-        };
+    fn request_panel(&self, width: usize) -> Option<RequestPanel> {
+        let (request, item) = self.pending_request()?;
         let t = &self.theme;
         let muted = Style::new().fg(t.muted);
         let text = Style::new().fg(t.fg);
@@ -1227,19 +1289,8 @@ impl App {
         if request["kind"] == "user_input" {
             let answered = self.open.as_ref().map_or(0, |o| o.answers.len());
             let questions = item["questions"].as_array().cloned().unwrap_or_default();
-            let Some(question) = questions.get(answered) else {
-                return Vec::new();
-            };
-            let mut lines = vec![Line::styled(
-                format!("◈ Question {} of {}", answered + 1, questions.len()),
-                Style::new().fg(t.indigo).add_modifier(Modifier::BOLD),
-            )];
-            lines.extend(markdown::render(
-                str_of(question, "question"),
-                width,
-                &Styles::new(t, text),
-                2,
-            ));
+            let question = questions.get(answered)?;
+            let mut choices = Vec::new();
             for (index, option) in question["options"]
                 .as_array()
                 .into_iter()
@@ -1255,13 +1306,26 @@ impl App {
                 if !description.is_empty() {
                     spans.push(Span::styled(format!("  {description}"), muted));
                 }
-                lines.push(Line::from(spans));
+                choices.push(Line::from(spans));
             }
-            lines.push(Line::styled(
+            choices.push(Line::styled(
                 "  Type a number or your own answer, then Enter.",
                 muted,
             ));
-            return lines;
+            return Some(RequestPanel {
+                key: format!("{}#{answered}", str_of(&request, "id")),
+                title: vec![Span::styled(
+                    format!("◈ Question {} of {}", answered + 1, questions.len()),
+                    Style::new().fg(t.indigo).add_modifier(Modifier::BOLD),
+                )],
+                text: markdown::render(
+                    str_of(question, "question"),
+                    width,
+                    &Styles::new(t, text),
+                    2,
+                ),
+                choices,
+            });
         }
         let kind = str_of(&request, "kind");
         let title = match kind {
@@ -1269,20 +1333,20 @@ impl App {
             "file" | "edit" | "file_change" => "Edit approval".to_string(),
             other => format!("{} approval", capitalize(other)),
         };
-        let mut lines = vec![Line::styled(
-            format!("◈ {title}"),
-            Style::new().fg(t.warning_fg).add_modifier(Modifier::BOLD),
-        )];
+        let mut lines = Vec::new();
         let prompt = str_of(&item, "prompt");
         if !prompt.is_empty() {
             lines.extend(markdown::render(prompt, width, &Styles::new(t, muted), 2));
         }
-        // The command waiting on this approval, as the GUI shows it under the label.
+        // The command waiting on this approval, as the GUI shows it under the label. All of
+        // it, wrapped rather than cut, since this is what Alt+A runs.
         if kind == "command"
-            && let Some(command) = self.pending_command()
+            && let Some(command) = self.pending_command(str_of(&request, "id"))
         {
-            for line in command.lines().take(4) {
-                lines.push(Line::styled(fit(&format!("  {line}"), width), text));
+            for line in command.lines() {
+                for part in wrap_chars(line, width.saturating_sub(2)) {
+                    lines.push(Line::styled(format!("  {part}"), text));
+                }
             }
         }
         let button = |label: &str, primary: bool| {
@@ -1296,7 +1360,7 @@ impl App {
             };
             Span::styled(format!(" {label} "), style)
         };
-        lines.push(Line::from(vec![
+        let choices = vec![Line::from(vec![
             Span::raw("  "),
             button("Approve", true),
             Span::styled(" Alt+A   ", muted),
@@ -1304,8 +1368,26 @@ impl App {
             Span::styled(" Alt+S   ", muted),
             button("Decline", false),
             Span::styled(" Alt+D", muted),
-        ]));
-        lines
+        ])];
+        Some(RequestPanel {
+            key: str_of(&request, "id").to_string(),
+            title: vec![Span::styled(
+                format!("◈ {title}"),
+                Style::new().fg(t.warning_fg).add_modifier(Modifier::BOLD),
+            )],
+            text: lines,
+            choices,
+        })
+    }
+
+    /// The panel's rows within `rows` lines of room, scrolled to where the user left it.
+    fn panel_rows(&mut self, panel: RequestPanel, width: usize, rows: usize) -> Vec<Line<'static>> {
+        if panel.key != self.panel_key {
+            self.panel_key = panel.key.clone();
+            self.panel_scroll = 0;
+        }
+        let muted = Style::new().fg(self.theme.muted);
+        lay_out_panel(panel, width, rows, &mut self.panel_scroll, muted)
     }
 
     fn draw_request_panel(&self, frame: &mut Frame, area: Rect, lines: Vec<Line<'static>>) {
@@ -1481,21 +1563,20 @@ struct Fold {
     expanded: bool,
 }
 
-/// Per-block state that lives outside the block, and so joins its cache key.
+/// A pending request's panel, in the parts that lay out differently when space is short.
+struct RequestPanel {
+    /// Changes when the panel shows a different request or question, which resets its scroll.
+    key: String,
+    title: Vec<Span<'static>>,
+    text: Vec<Line<'static>>,
+    choices: Vec<Line<'static>>,
+}
+
+/// Per-block state that lives outside the block. What it is made from joins the cache key.
 enum Extra {
     None,
     Fold(Fold),
     Decision(String),
-}
-
-impl Extra {
-    fn key(&self) -> String {
-        match self {
-            Extra::None => String::new(),
-            Extra::Fold(fold) => format!("{}|{}|{}", fold.label, fold.tone as u8, fold.expanded),
-            Extra::Decision(decision) => decision.clone(),
-        }
-    }
 }
 
 /// What became of a runtime request, for the row that shows it in the transcript.
@@ -1543,13 +1624,65 @@ fn row(left: Vec<Span<'static>>, right: Vec<Span<'static>>, width: usize) -> Lin
     let left_width: usize = left.iter().map(|s| s.content.width()).sum();
     let right_width: usize = right.iter().map(|s| s.content.width()).sum();
     let mut spans = left;
-    if right_width > 0 && left_width + right_width < width {
+    if right_width > 0 && left_width + right_width <= width {
         spans.push(Span::raw(" ".repeat(width - left_width - right_width)));
         spans.extend(right);
     } else {
         spans.push(Span::raw(" ".repeat(width.saturating_sub(left_width))));
     }
     Line::from(spans)
+}
+
+/// A request panel within `rows` lines of room. The title and the choices always show. The
+/// text between them scrolls with Alt+↑/↓ or the wheel when it doesn't fit, and `scroll` is
+/// clamped to what can scroll.
+fn lay_out_panel(
+    panel: RequestPanel,
+    width: usize,
+    rows: usize,
+    scroll: &mut usize,
+    muted: Style,
+) -> Vec<Line<'static>> {
+    let text_rows = rows.saturating_sub(1 + panel.choices.len());
+    let total = panel.text.len();
+    let mut lines = Vec::with_capacity(rows);
+    if total <= text_rows {
+        *scroll = 0;
+        lines.push(Line::from(panel.title));
+        lines.extend(panel.text);
+    } else {
+        *scroll = (*scroll).min(total - text_rows);
+        let hint = if text_rows == 0 {
+            "Make the window taller to read this".to_string()
+        } else {
+            format!(
+                "Lines {}-{} of {total} · Alt+↑/↓ scroll",
+                *scroll + 1,
+                *scroll + text_rows
+            )
+        };
+        lines.push(row(panel.title, vec![Span::styled(hint, muted)], width));
+        lines.extend(panel.text.into_iter().skip(*scroll).take(text_rows));
+    }
+    lines.extend(panel.choices);
+    lines
+}
+
+/// Breaks `text` into rows of at most `width` columns, by character.
+fn wrap_chars(text: &str, width: usize) -> Vec<String> {
+    let width = width.max(1);
+    let mut rows = vec![String::new()];
+    let mut used = 0;
+    for c in text.chars() {
+        let w = unicode_width::UnicodeWidthChar::width(c).unwrap_or(0);
+        if used + w > width && used > 0 {
+            rows.push(String::new());
+            used = 0;
+        }
+        rows.last_mut().expect("one row").push(c);
+        used += w;
+    }
+    rows
 }
 
 fn fit(text: &str, width: usize) -> String {
@@ -1890,6 +2023,20 @@ mod tests {
         );
         assert!(text(&long).iter().all(|r| r.width() <= 40));
         assert!(long.len() > 5);
+
+        // Deeply indented lists stay inside the pane too.
+        let nested = format!("{}- a nested item with several words", " ".repeat(24));
+        let nested = render_block(
+            &block(BlockKind::User, "user_message", "You", &nested),
+            40,
+            &context,
+            &Extra::None,
+        );
+        assert!(
+            text(&nested).iter().all(|r| r.width() <= 40),
+            "{:?}",
+            text(&nested)
+        );
     }
 
     #[test]
@@ -1931,11 +2078,49 @@ mod tests {
     }
 
     #[test]
+    fn long_requests_scroll_their_text_and_keep_the_choices() {
+        let panel = || RequestPanel {
+            key: "q1".into(),
+            title: vec![Span::raw("◈ Command approval")],
+            text: (1..=30).map(|n| Line::raw(format!("line {n}"))).collect(),
+            choices: vec![Line::raw("Approve")],
+        };
+        let mut scroll = 0;
+        let rows = text(&lay_out_panel(panel(), 60, 8, &mut scroll, Style::new()));
+        assert_eq!(rows.len(), 8);
+        assert!(rows[0].starts_with("◈ Command approval"));
+        assert!(
+            rows[0].ends_with("Lines 1-6 of 30 · Alt+↑/↓ scroll"),
+            "{}",
+            rows[0]
+        );
+        assert_eq!(rows[1], "line 1");
+        assert_eq!(rows[7], "Approve");
+
+        // Scrolling past the end stops at the last line.
+        scroll = 100;
+        let rows = text(&lay_out_panel(panel(), 60, 8, &mut scroll, Style::new()));
+        assert_eq!(scroll, 24);
+        assert_eq!(rows[6], "line 30");
+        assert_eq!(rows[7], "Approve");
+
+        // A panel that fits shows everything and doesn't scroll.
+        let rows = text(&lay_out_panel(panel(), 60, 40, &mut scroll, Style::new()));
+        assert_eq!((rows.len(), scroll), (32, 0));
+        assert_eq!(rows[0], "◈ Command approval");
+
+        assert_eq!(wrap_chars("abcdefg", 3), ["abc", "def", "g"]);
+    }
+
+    #[test]
     fn rows_pad_between_left_and_right_and_drop_an_overflowing_right() {
         let line = row(vec![Span::raw("left")], vec![Span::raw("right")], 12);
         assert_eq!(text(std::slice::from_ref(&line))[0], "left   right");
         let line = row(vec![Span::raw("left")], vec![Span::raw("a long right")], 12);
         assert_eq!(text(&[line])[0], "left        ");
+        // Labels that fill the row exactly both stay.
+        let line = row(vec![Span::raw("left")], vec![Span::raw("right")], 9);
+        assert_eq!(text(&[line])[0], "leftright");
         assert_eq!(fit("abcdef", 4), "abc…");
     }
 }

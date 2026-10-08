@@ -55,7 +55,8 @@ pub fn nearest_256(r: u8, g: u8, b: u8) -> u8 {
     let cube_distance = (rv - r as i32).pow(2) + (gv - g as i32).pow(2) + (bv - b as i32).pow(2);
 
     let average = (r as i32 + g as i32 + b as i32) / 3;
-    let gray_step = ((average - 8).max(0) / 10).min(23);
+    // Ramp steps are 8, 18, ..., 238. Adding half a step rounds to the nearest one.
+    let gray_step = ((average - 3).max(0) / 10).min(23);
     let gray_value = 8 + gray_step * 10;
     let gray_distance = (gray_value - r as i32).pow(2)
         + (gray_value - g as i32).pow(2)
@@ -390,6 +391,8 @@ mod tests {
         assert_eq!(nearest_256(0x0a, 0x0a, 0x0a), 232);
         assert_eq!(nearest_256(0xf5, 0xf5, 0xf5), 255);
         assert_eq!(nearest_256(0x81, 0x81, 0x81), 244);
+        // 26 is closer to step 234 (28) than to 233 (18).
+        assert_eq!(nearest_256(26, 26, 26), 234);
         // T3's primary blue lands in the cube, not on the gray ramp.
         let blue = nearest_256(0x34, 0x6b, 0xf1);
         assert!((16..232).contains(&blue), "{blue}");
