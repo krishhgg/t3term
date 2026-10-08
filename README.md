@@ -1,15 +1,12 @@
 <h1 align="center">t3term</h1>
 
 <p align="center">
-  <strong>T3 Code, without leaving the terminal.</strong>
+  <strong>T3 Code in your terminal. 9 MB, not 939.</strong>
 </p>
 
 <p align="center">
-  <a href="https://github.com/pingdotgg/t3code">T3 Code</a> runs coding agents for you. Claude Code, Codex, Cursor, Grok and others each work in their own thread, on one of your projects, with approvals, permission modes and branches. It comes as a desktop app. t3term is those same threads in a terminal you already have open.
-</p>
-
-<p align="center">
-  One 5.4 MB Rust binary. Run it with no arguments and it is a full TUI. Give it a subcommand and it is a CLI. It talks to the T3 server you are already running, so a thread you start here shows up in the app, and the other way round.
+  Same threads. Same server. Same agents.<br>
+  One Rust binary where an Electron window used to be.
 </p>
 
 <p align="center">
@@ -31,6 +28,8 @@
   <img src="docs/screenshots/demo.gif" alt="Opening a thread in t3term, sending a prompt, watching the agent run a command and answer, then pressing t to open the tool call and see its output" width="940">
 </p>
 
+**New to T3 Code?** [It](https://github.com/pingdotgg/t3code) runs coding agents for you. Claude Code, Codex, Cursor, Grok and others each work in their own thread, on one of your projects, with approvals, permission modes and branches. It ships as a desktop app. t3term opens those same threads from a terminal you already have open, and talks to the same server, so the app and your phone stay in step.
+
 ## Try it
 
 There are no prebuilt binaries yet, so build it:
@@ -50,11 +49,11 @@ You need T3 Code already running, either the desktop app or `t3` from [their ins
 
 ## Why it exists
 
+**9 MB against 939.** Measured over 30 seconds with one thread running: the desktop app's windows took 12.3% of a core and 939 MB. t3term with the same thread open takes about 9 MB and no CPU time I can measure. To be straight about it, T3's own server keeps running either way, so this replaces the window, not the engine.
+
 **You already live in the terminal.** The agents T3 Code drives are terminal programs. Your editor is one window over. A separate app to watch them is one window too many.
 
-**It is small.** Measured over 30 seconds with one thread running, the desktop app's windows used 12.3% of a core and 939 MB of memory. t3term with the same thread open uses about 9 MB and no CPU time I can measure. A CLI command answers in about 20 ms. T3's own server keeps running either way, so this replaces the window, not the engine.
-
-**It is scriptable.** Everything the TUI does has a subcommand, and every subcommand takes `--json`. Send a prompt from a git hook, wait for the turn, read the result.
+**It is scriptable.** Everything the TUI does has a subcommand, every subcommand takes `--json`, and a command answers in about 20 ms. Send a prompt from a git hook, wait for the turn, read the result.
 
 **It is the same threads.** t3term is a client, not a fork. It opens no database and starts no server of its own, so nothing drifts out of sync with the app or the phone.
 
