@@ -14,12 +14,15 @@ The Ratatui probe uses the committed Cargo lockfile and Ratatui 0.30.2. It compa
 
 Both use headless output. They do not include terminal-emulator rendering, images, Markdown, provider traffic or energy measurement. RSS figures describe these small probes, not real clients. Cold-launch timings include process/runtime launch and `/usr/bin/time`; they do not describe time to an interactive client.
 
-Read-only optional live samplers:
+Optional live samplers. They read from running processes rather than synthetic data, and they change no files of yours, though `compare_clients.py` runs `t3term doctor`, which can issue and save a login:
 
 ```sh
+python3 benchmarks/compare_clients.py [seconds]
 python3 benchmarks/measure_t3.py
 python3 benchmarks/measure_battery.py
 ```
+
+`compare_clients.py` is the measurement behind the table in the main README. Open the T3 Code desktop app and t3term on the same thread first, then run it. It samples every 5 seconds for a minute by default and reports four groups: the app's window processes, t3term, T3's server on its own, and the agents that server has spawned. The last two run whichever client you use, so only the first two are a fair comparison. It picks the windowed app by looking for a Renderer helper, so a headless server started from the same bundle does not confuse it, and it refuses to guess when more than one t3term is open. It reads each process's executable path and never its arguments. Memory is grouped again on every sample, so an agent that T3's server starts mid-window counts from then on, while the CPU delta covers only the processes in a group at both ends. The JSON reports both counts. Results go to `research/client-comparison.json`.
 
 The first expects one running T3 Nightly app, identifies its server child, and samples CPU time and RSS for 30 seconds. It reads process names, not arguments or environments. CPU deltas exclude new or exited PIDs; summed RSS includes shared pages.
 
