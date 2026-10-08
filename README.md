@@ -50,11 +50,21 @@ Exit codes: 0 success, 1 failure or a turn that ended without completing, 2 usag
 | --- | --- |
 | Anywhere | Tab / Shift+Tab move focus, PgUp/PgDn scroll, Ctrl+X interrupt, Ctrl+C quit |
 | Anywhere, approval pending | Alt+A accept, Alt+S accept for session, Alt+D decline |
-| Sidebar | ↑/↓ or j/k select, Enter open, q quit |
+| Sidebar | ↑/↓ or j/k select, Enter open, e show or hide the Settled shelf, q quit |
 | Composer | Enter send (queues if the thread is busy), Alt+Enter or Ctrl+J newline, Esc to transcript |
-| Transcript | ↑/↓ scroll, g/G top/bottom, t show tool output, Enter compose, Esc sidebar |
+| Transcript | ↑/↓ scroll, g/G top/bottom, t show activity for finished turns and tool output, Enter compose, Esc sidebar |
 
 The mouse wheel scrolls the transcript and the sidebar, and clicking a thread opens it. When a question is pending, the composer becomes the answer box: type an option number or your own text.
+
+## Look
+
+The TUI follows the T3 Code desktop app. The sidebar lists threads as cards with the project monogram, status or age, title, branch and provider glyph. Finished threads move to a Settled shelf at the bottom. The header shows the project and thread title. User prompts are right-aligned bubbles, and each turn folds its tool activity under a "Worked for" row that opens with `t`. Approvals and questions appear in a panel above the composer with their keys printed on the buttons. The composer shows the provider, model, runtime mode and a send hint.
+
+Colors come from T3's dark theme tokens. When `COLORTERM` reports truecolor the TUI uses the exact hex values. Otherwise, or when `T3TERM_COLOR=256` is set, it maps each color to the nearest entry in the 256-color palette.
+
+![The desktop app and t3term showing the same thread](docs/screenshots/gui-vs-tui.png)
+
+`docs/screenshots/` also has `before-tui.png`, `after-tui.png`, `approval.png` and `streaming.gif`.
 
 ## How it works
 
@@ -62,7 +72,7 @@ The mouse wheel scrolls the transcript and the sidebar, and clicking a thread op
 - **Auth.** On macOS, t3term saves one login per T3 server in the login Keychain under the service `t3term`. The login lasts 30 days, the same as T3's default session length, and has only `orchestration:read` and `orchestration:operate`. Each run checks it against `/api/auth/session`. If it expires within a day or the server rejects it, t3term issues a new one and revokes the old one, so you never log in by hand. `t3term logout` revokes it and deletes it. `doctor --json` reports the session's `scopes` and where its `login` came from: `saved`, `newly saved` or `temporary`. With the saved login, a CLI command uses about 15 ms of CPU. Issuing a session costs about 0.8 s, because it runs `t3 auth session issue` through the running server's own binary. t3term finds that binary from the server pid, since the `t3` on PATH can be a different version. Override it with `T3TERM_T3_COMMAND`. Set `T3TERM_NO_SAVED_LOGIN=1` to use a session that lasts one run instead. t3term revokes it on exit, including after Ctrl+C, `kill` or a closed terminal window.
 - **RPC.** Effect RPC runs over one `/ws` connection. The client acks every stream chunk and pings every 10 seconds. If no frame arrives for 30 seconds, it treats the socket as dead.
 - **State.** Each V2 event carries the whole updated entity, so the reducer upserts it by id. After a dropped connection, the client resubscribes with `afterSequence` and skips any replayed event it already applied.
-- **Rendering.** The TUI draws only after input or a server event, at most 30 times a second. Each transcript block keeps its wrapped lines until its content or the width changes. Only the visible rows are copied into each frame.
+- **Rendering.** The TUI draws only after input or a server event, at most 30 times a second. Each transcript block keeps its wrapped lines until its content or the width changes. Only the visible rows are copied into each frame. While a turn is running, a once-a-second tick advances the spinner and the elapsed clock. The tick stops when the turn ends, so an idle TUI wakes only for input or server events.
 
 ## Tests
 
@@ -79,4 +89,5 @@ The unit tests cover the reducers, Markdown wrapping, the composer and auth comm
 - New threads, diffs and checkpoints, worktrees, attachments, embedded terminals and queue management.
 - A check of the reducer's output against T3's TypeScript reducer on recorded event streams.
 - Linux and Windows. The code has Linux pid lookup, but only macOS has been tested. The saved login needs the macOS Keychain, so other systems issue a new session on every run.
-- Resource numbers beyond one 60-second idle check: 0.03% of one core, 13.5 MB RSS.
+- Resource numbers beyond one 60-second idle check with a thread open: no measurable CPU time (under 10 ms over the minute) and 7.6 MB RSS, as reported by `ps`.
+- Syntax highlighting in code blocks, the thinking-level chip, the project and git panel, and the Pinned and Snoozed shelves from the desktop app.
