@@ -1652,8 +1652,8 @@ impl App {
                 _ => String::new(),
             };
             // A proposed plan draws its preview or all of it, so which one joins the key.
-            let expanded = block.item_type == "proposed_plan"
-                && self.expanded_plans.contains(&block.item_id);
+            let expanded =
+                block.item_type == "proposed_plan" && self.expanded_plans.contains(&block.item_id);
             let key = (
                 hash(
                     &[
@@ -2348,7 +2348,11 @@ fn transcript_keys(verbose: bool, plan: Option<bool>) -> String {
         Some(false) => " · p expand plan",
         None => "",
     };
-    let calls = if verbose { "t close them" } else { "t open all" };
+    let calls = if verbose {
+        "t close them"
+    } else {
+        "t open all"
+    };
     format!("↑↓/PgUp scroll · G bottom{plan} · click a row of calls · {calls} · Esc sidebar")
 }
 
