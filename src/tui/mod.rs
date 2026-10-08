@@ -292,7 +292,10 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
         picker: None,
         shell: None,
         shell_connection: "connecting".into(),
-        sidebar: Sidebar::default(),
+        sidebar: Sidebar::with_working(
+            settings.sidebar_working_shelf_enabled,
+            settings.sidebar_working_shelf_expanded,
+        ),
         open: None,
         focus: Focus::Sidebar,
         composer: Composer::default(),
@@ -498,6 +501,16 @@ impl App {
         self.rebuild_rows();
     }
 
+    /// Opens or closes the Working shelf and remembers it, as the GUI does. Nothing happens
+    /// while the list has no Working heading.
+    fn toggle_working(&mut self) {
+        let Some(expanded) = self.sidebar.toggle_working() else {
+            return;
+        };
+        Settings::update(move |settings| settings.sidebar_working_shelf_expanded = expanded);
+        self.rebuild_rows();
+    }
+
     fn shell_thread(&self, id: &str) -> Option<&Value> {
         sidebar::find_thread(self.shell.as_ref()?, id)
     }
@@ -634,6 +647,12 @@ impl App {
                     }
                     MouseEventKind::Down(MouseButton::Left) if inside(self.sidebar.footer) => {
                         self.toggle_settled()
+                    }
+                    MouseEventKind::Down(MouseButton::Left)
+                        if inside(self.sidebar.list)
+                            && self.sidebar.working_heading_at(mouse.row) =>
+                    {
+                        self.toggle_working()
                     }
                     MouseEventKind::Down(MouseButton::Left) if inside(self.sidebar.list) => {
                         if let Some(id) = self.sidebar.thread_at(mouse.row).map(str::to_string)
@@ -776,6 +795,7 @@ impl App {
                 KeyCode::Down | KeyCode::Char('j') => self.sidebar.move_selection(1),
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.open_selected(),
                 KeyCode::Char('e') => self.toggle_settled(),
+                KeyCode::Char('w') => self.toggle_working(),
                 _ => {}
             },
             Focus::Transcript => match key.code {
@@ -2216,6 +2236,9 @@ impl App {
         let keys = match (self.focus, self.picker.as_ref().map(|p| p.kind)) {
             (_, Some(Kind::Model)) => "Type to search · ↑↓ choose · Enter select · Esc close",
             (_, Some(_)) => "↑↓ choose · Enter select · Esc close",
+            (Focus::Sidebar, None) if self.sidebar.has_working() => {
+                "↑↓ select · Enter open · w working · e settled · Tab focus · q quit"
+            }
             (Focus::Sidebar, None) => "↑↓ select · Enter open · e settled · Tab focus · q quit",
             (Focus::Composer, None) => {
                 "Enter send · Alt+Enter newline · Alt+M model · Alt+E effort · Alt+P mode · Ctrl+X interrupt"
@@ -3112,15 +3135,14 @@ mod tests {
         use ratatui::backend::TestBackend;
 
         let theme = Theme::new(Depth::TrueColor);
-        // The sidebar as the event loop holds it after drawing a frame of `threads`.
-        let drawn = |threads: Vec<Value>| {
+        // `sidebar` as the event loop holds it after drawing a frame of `threads`.
+        let drawn_by = |mut sidebar: Sidebar, threads: Vec<Value>| {
             let shell = ShellState {
                 sequence: 1,
                 projects: Vec::new(),
                 threads,
                 synchronized: true,
             };
-            let mut sidebar = Sidebar::default();
             sidebar.rebuild(&shell.threads, Capabilities::default(), None, now_ms());
             let view = View {
                 theme: &theme,
@@ -3139,6 +3161,7 @@ mod tests {
                 .unwrap();
             sidebar
         };
+        let drawn = |threads: Vec<Value>| drawn_by(Sidebar::default(), threads);
         let thread = |id: &str, lineage: Value| {
             json!({
                 "id": id,
@@ -3188,5 +3211,19 @@ mod tests {
         // finished run has no clock to move.
         assert!(!needs_tick(Some(&open("closed", "running")), &hidden));
         assert!(!needs_tick(Some(&open("live", "completed")), &hidden));
+
+        // A closed Working shelf hides the busy card behind its heading, so it needs no tick.
+        // Open, the card shows and ticks.
+        let closed = drawn_by(
+            Sidebar::with_working(true, false),
+            vec![thread("busy", json!({}))],
+        );
+        assert!(!closed.drew_working());
+        assert!(!needs_tick(None, &closed));
+        let open_shelf = drawn_by(
+            Sidebar::with_working(true, true),
+            vec![thread("busy", json!({}))],
+        );
+        assert!(open_shelf.drew_working());
     }
 }

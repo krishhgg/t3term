@@ -80,7 +80,7 @@ Rust is a big part of why it stays that low, since there's no runtime or garbage
 
 ## What you get
 
-The TUI follows the desktop app closely, because muscle memory is worth more than a new idea here. The sidebar lists threads as cards with the project monogram, a status word or the thread's age, title, branch and provider glyph. The status words, their order and their colors are the desktop's. Approval and Input mean the agent waits on you, and they come first. Working has a spinner and a clock, and reads Goal while a `/goal` is active. Waiting means background work will wake the agent. Limited is a run that hit a usage limit and Failed is any other failure. Woke marks a snooze that ended, until someone dismisses it in the desktop app or the thread moves on. Done marks a finished run nobody has looked at since. A card with no word shows the time of its last message. The cards sit on the desktop's Pinned, Active, Snoozed and Settled shelves, in the desktop's order, each under its own heading. A snoozed thread comes back to its shelf when the snooze ends, and the Settled shelf stays closed until you open it. Forks are listed like any other thread. Archived threads and subagents are not. Your prompts are right-aligned bubbles. Approvals and questions open a panel above the composer with their keys printed on the buttons.
+The TUI follows the desktop app closely, because muscle memory is worth more than a new idea here. The sidebar lists threads as cards with the project monogram, a status word or the thread's age, title, branch and provider glyph. The status words, their order and their colors are the desktop's. Approval and Input mean the agent waits on you, and they come first. Working has a spinner and a clock, and reads Goal while a `/goal` is active. Waiting means background work will wake the agent. Limited is a run that hit a usage limit and Failed is any other failure. Woke marks a snooze that ended, until someone dismisses it in the desktop app or the thread moves on. Done marks a finished run nobody has looked at since. A card with no word shows the time of its last message. The cards sit on the desktop's Pinned, Active, Snoozed and Settled shelves, in the desktop's order, each under its own heading. A Working shelf between Active and Snoozed is off unless you turn it on, as below. A snoozed thread comes back to its shelf when the snooze ends, and the Settled shelf stays closed until you open it. Forks are listed like any other thread. Archived threads and subagents are not. Your prompts are right-aligned bubbles. Approvals and questions open a panel above the composer with their keys printed on the buttons.
 
 <p align="center">
   <img src="docs/screenshots/tui.png" alt="t3term with a thread open: the sidebar on the left, a turn showing a command and its output, the answer, and the composer with model, effort and mode chips" width="940">
@@ -92,11 +92,11 @@ The TUI follows the desktop app closely, because muscle memory is worth more tha
 | Anywhere, approval pending | Alt+A accept, Alt+S accept for session, Alt+D decline. Alt+↑/↓ or the wheel scrolls a long request |
 | Anywhere, thread open | Alt+M model, Alt+E reasoning effort and other model options, Alt+P access, and plan mode once it's turned on |
 | Open menu | ↑/↓ choose, Enter select, Esc close. In the model menu, type to search |
-| Sidebar | ↑/↓ or j/k select, Enter open, e show or hide the Settled shelf, q quit |
+| Sidebar | ↑/↓ or j/k select, Enter open, w open or close the Working shelf once it's turned on, e show or hide the Settled shelf, q quit |
 | Composer | Enter send (queues if the thread is busy), Alt+Enter or Ctrl+J newline, Ctrl+R swap in an unsent message, Esc to transcript |
 | Transcript | ↑/↓ scroll, g/G top/bottom, t open or close every row of tool calls, Enter compose, Esc sidebar |
 
-The wheel scrolls the transcript and the sidebar. Clicking a thread opens it, clicking a chip under the composer opens its menu, and clicking a row of tool calls opens that row.
+The wheel scrolls the transcript and the sidebar. Clicking a thread opens it, clicking the Working heading or the Settled footer opens or closes that shelf, clicking a chip under the composer opens its menu, and clicking a row of tool calls opens that row.
 
 On macOS the Alt keys need Option to send Meta: "Use Option as Meta key" in Terminal, "Esc+" for the Option key in iTerm2, or `macos-option-as-alt = true` in Ghostty.
 
@@ -113,6 +113,14 @@ Ultrathink applies to that one message and comes back only if that message fails
 Build and Plan are hidden by default, as in the nightly desktop app, which moved them behind a legacy setting. To bring them back, add `"planModeEnabled": true` to `~/.config/t3term/settings.json` and restart t3term. The desktop's "Plan mode (legacy)" switch uses the same key, though each app keeps its own copy. The Alt+P menu then has a Plan mode section, and a Plan chip shows while a thread plans. Providers without plan mode, such as Pi and Grok, never show either.
 
 While Plan is hidden, the TUI sends every message in Build. A thread that the CLI, the desktop or an earlier t3term left in Plan goes back to Build with its next message from the TUI, as it would in the desktop. A model's Plan agent, such as OpenCode's, is hidden the same way. Alt+E leaves it out, and a thread saved on it sends its next message with the agent Alt+E shows, or with no agent when Plan was the only one. The setting changes nothing in the CLI, where `--plan`, `--no-plan` and `--option agent=plan` work either way.
+
+### The Working shelf
+
+The nightly desktop app has a "Working shelf" setting, off by default, that moves threads busy without you out of Active. To turn it on in t3term, add `"sidebarWorkingShelfEnabled": true` to `~/.config/t3term/settings.json` and restart t3term. The desktop's switch uses the same key, though each app keeps its own copy. With it off, the sidebar is as described above.
+
+With it on, a thread on the Active shelf moves to Working while a run is under way, or while background work will wake the agent, as long as nothing waits on you. An approval, a question, a failure or a plan waiting for your reply keeps it in Active. Pinned, snoozed and settled threads stay on their own shelves while they work. Working sits between Active and Snoozed and lists the thread you last sent a message to first, so a run finishing or waking again doesn't move a card. Active then lists the thread that most recently came back to you first. That is the latest of when it was created or reopened, when its latest run was requested or finished, and when it left Working, such as for an approval partway through a run. No server field records when a thread left Working, so t3term notes the moment it sees it happen. It forgets those moments when it quits, and it notes none for threads that were already waiting when it started.
+
+The shelf starts closed, with its heading counting the threads in it. The open thread's card stays under the heading while it works, so sending a message doesn't hide it. `w` in the sidebar, or a click on the heading, opens or closes the shelf. t3term saves that choice in the same file, under `sidebarWorkingShelfExpanded`.
 
 ### Tool calls and reasoning
 
@@ -201,7 +209,7 @@ The unit tests cover the reducers, Markdown wrapping, the composer, the model me
 - A check of the reducer's output against T3's TypeScript reducer on recorded event streams.
 - Linux and Windows. The code has Linux pid lookup, but only macOS has been tested, and the saved login needs the macOS Keychain, so other systems would issue a new session every run.
 - Syntax highlighting in code blocks and the project and git panel.
-- Pinning, snoozing, settling and reordering threads. The sidebar shows the shelves, but moving a thread between them still takes the desktop app. The Snoozed shelf also stays open, where the desktop starts it closed, and there is no Working shelf. Snoozed and settled threads are full cards, where the desktop shows a one-line row with the wake or settle time.
+- Pinning, snoozing, settling and reordering threads. The sidebar shows the shelves, but moving a thread between them still takes the desktop app. The Snoozed shelf also stays open, where the desktop starts it closed. Snoozed and settled threads are full cards, where the desktop shows a one-line row with the wake or settle time.
 - Marking threads seen. The sidebar reads Done and Woke against the visit time the server keeps for each thread, but t3term doesn't report a visit when you open one, so only the desktop or another client clears those words. A server too old to keep visit times gets no Done from t3term at all, because the desktop's fallback is a visit time saved in the browser.
 
 ## Credit

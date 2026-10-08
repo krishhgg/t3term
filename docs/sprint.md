@@ -25,6 +25,7 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 | 3 | https://github.com/krishhgg/t3term/pull/10 | The desktop's status words on sidebar cards | |
 | 4 | https://github.com/krishhgg/t3term/pull/11 | Build and Plan hidden unless the legacy plan setting turns them on | |
 | 5 | https://github.com/krishhgg/t3term/pull/12 | The Plan agent hidden in model options unless the same setting turns it on | |
+| 6 | https://github.com/krishhgg/t3term/pull/13 | An opt-in Working shelf for threads busy without the user | |
 
 ## Maintenance review PRs
 
