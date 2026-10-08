@@ -260,7 +260,8 @@ fn fits(descriptor: &Value, value: &Value) -> bool {
 }
 
 /// Applies one `--effort` or `--option` value. A value T3 sends through the message text, such
-/// as ultrathink, becomes the plan's prompt effort instead of an option.
+/// as ultrathink, becomes the plan's prompt effort instead of an option. The last value given for
+/// a descriptor wins, as in the desktop app's picker.
 fn choose(plan: &mut Plan, options: &mut Vec<Value>, descriptor: &Value, raw: &str) -> Result<()> {
     let value = option_value(descriptor, raw)?;
     match value.as_str().filter(|v| prompt_injected(descriptor, v)) {
@@ -270,11 +271,20 @@ fn choose(plan: &mut Plan, options: &mut Vec<Value>, descriptor: &Value, raw: &s
                 "T3 applies {other} through the message text in a way t3term does not support yet."
             )));
         }
-        None => set_option(
-            options,
-            descriptor["id"].as_str().unwrap_or_default(),
-            value,
-        ),
+        None => {
+            // A regular value replaces an earlier message-only one for the same descriptor.
+            if descriptor["promptInjectedValues"]
+                .as_array()
+                .is_some_and(|values| !values.is_empty())
+            {
+                plan.prompt_effort = None;
+            }
+            set_option(
+                options,
+                descriptor["id"].as_str().unwrap_or_default(),
+                value,
+            );
+        }
     }
     Ok(())
 }
@@ -624,6 +634,37 @@ mod tests {
             assert_eq!(plan.model_selection, None);
             assert_eq!(plan.prompt_effort.as_deref(), Some(ULTRATHINK));
         }
+    }
+
+    #[test]
+    fn the_last_effort_given_wins() {
+        let efforts = |values: [&str; 2]| {
+            plan(
+                &config(),
+                &thread(),
+                &Choice {
+                    options: values
+                        .iter()
+                        .map(|v| ("effort".to_string(), v.to_string()))
+                        .collect(),
+                    ..choice()
+                },
+            )
+            .unwrap()
+        };
+        let regular_last = efforts(["ultrathink", "low"]);
+        assert_eq!(regular_last.prompt_effort, None);
+        assert_eq!(
+            regular_last.model_selection.unwrap()["options"],
+            json!([{"id": "fastMode", "value": true}, {"id": "effort", "value": "low"}])
+        );
+        // Like the desktop app, ultrathink after a regular effort keeps that effort and adds the prefix.
+        let ultrathink_last = efforts(["low", "ultrathink"]);
+        assert_eq!(ultrathink_last.prompt_effort.as_deref(), Some(ULTRATHINK));
+        assert_eq!(
+            ultrathink_last.model_selection.unwrap()["options"],
+            json!([{"id": "fastMode", "value": true}, {"id": "effort", "value": "low"}])
+        );
     }
 
     #[test]
