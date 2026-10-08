@@ -6,6 +6,7 @@ mod composer;
 mod markdown;
 mod picker;
 mod theme;
+mod unsent;
 
 use std::collections::HashMap;
 use std::sync::Arc;
@@ -37,6 +38,7 @@ use theme::{
     Theme, duration_label, model_display_name, monogram, now_ms, parse_iso_ms, relative_time,
     runtime_mode_label,
 };
+use unsent::{Failed, Unsent};
 
 const FRAME: Duration = Duration::from_millis(33);
 /// While a run is active, elapsed-time labels advance once a second.
@@ -115,23 +117,14 @@ struct OpenThread {
     run_changes: HashMap<String, u64>,
 }
 
-/// A message whose send failed. If the send timed out, T3 may still have it.
-struct Unconfirmed {
-    thread_id: String,
-    message_id: String,
-    text: String,
-}
-
 struct App {
     client: Arc<Client>,
     theme: Theme,
     config: Option<Value>,
     /// Model, effort and mode choices per thread, sent with the thread's next message.
     drafts: HashMap<String, Choice>,
-    /// Messages that failed to send while the composer held other text, by thread.
-    unsent: HashMap<String, Vec<String>>,
-    /// Failed sends to look for in their thread, in case they reached T3 after all.
-    unconfirmed: Vec<Unconfirmed>,
+    /// Messages that failed to send, until they go out or reach T3 late.
+    unsent: Unsent,
     picker: Option<Picker>,
     shell: Option<ShellState>,
     shell_connection: String,
@@ -210,8 +203,7 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
         theme: Theme::detect(),
         config: None,
         drafts: HashMap::new(),
-        unsent: HashMap::new(),
-        unconfirmed: Vec::new(),
+        unsent: Unsent::default(),
         picker: None,
         shell: None,
         shell_connection: "connecting".into(),
@@ -478,10 +470,8 @@ impl App {
         self.scroll = 0;
         self.picker = None;
         self.focus = Focus::Composer;
-        if self.composer.is_empty()
-            && let Some(texts) = self.open.as_ref().and_then(|o| self.unsent.remove(&o.id))
-        {
-            self.composer.insert_str(&texts.join("\n\n"));
+        if let Some(open) = self.open.as_ref() {
+            self.unsent.restore_saved(&mut self.composer, &open.id);
         }
     }
 
@@ -494,8 +484,16 @@ impl App {
                 true
             }
             Event::Paste(text) => {
-                if self.focus == Focus::Composer {
-                    self.composer.insert_str(&text);
+                // An open menu covers the composer, so a paste goes to the model search or
+                // nowhere.
+                match self.picker.as_ref().map(|p| p.kind) {
+                    Some(Kind::Model) => {
+                        let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
+                        self.set_filter(|filter| filter.push_str(&line));
+                    }
+                    Some(_) => {}
+                    None if self.focus == Focus::Composer => self.composer.insert_str(&text),
+                    None => {}
                 }
                 true
             }
@@ -683,7 +681,10 @@ impl App {
                 KeyCode::Char('j') if ctrl => self.composer.insert('\n'),
                 KeyCode::Enter => self.submit(),
                 KeyCode::Char('w') if ctrl => self.composer.delete_word(),
-                KeyCode::Char('u') if ctrl => self.composer.clear(),
+                KeyCode::Char('u') if ctrl => {
+                    self.composer.clear();
+                    self.unsent.forget_composer();
+                }
                 KeyCode::Char('a') if ctrl => self.composer.home(),
                 KeyCode::Char('e') if ctrl => self.composer.end(),
                 KeyCode::Char(c) if !ctrl && !alt => self.composer.insert(c),
@@ -796,18 +797,19 @@ impl App {
                         }
                     }
                 }
-                self.unconfirmed.push(Unconfirmed {
-                    thread_id: thread_id.clone(),
-                    message_id,
-                    text: text.clone(),
-                });
-                self.give_back(&thread_id, &text, error);
+                let message = Failed {
+                    message_id: Some(message_id),
+                    text,
+                };
+                self.give_back(&thread_id, message, error);
+                // The thread may have shown the message before this result arrived.
+                self.drop_landed();
             }
         }
     }
 
     /// A send that timed out can still reach T3. Once the open thread shows one, the copy kept
-    /// for a retry goes, so it isn't sent twice.
+    /// for a retry comes out, so it isn't sent twice.
     fn drop_landed(&mut self) {
         let Some(open) = self.open.as_ref() else {
             return;
@@ -815,45 +817,24 @@ impl App {
         let Some(state) = open.state.as_ref() else {
             return;
         };
-        let (landed, waiting): (Vec<_>, Vec<_>) = std::mem::take(&mut self.unconfirmed)
-            .into_iter()
-            .partition(|m| m.thread_id == open.id && state.has_message(&m.message_id));
-        self.unconfirmed = waiting;
-        for message in landed {
-            let saved = self.unsent.get_mut(&message.thread_id);
-            let removed = if let Some(texts) = saved
-                && let Some(index) = texts.iter().position(|t| *t == message.text)
-            {
-                texts.remove(index);
-                if texts.is_empty() {
-                    self.unsent.remove(&message.thread_id);
-                }
-                "dropped its saved copy"
-            } else if self.composer.text() == message.text {
-                self.composer.clear();
-                "cleared it from the composer"
-            } else {
-                continue;
-            };
-            self.message = Some((
-                format!("The message that failed reached T3 after all, so t3term {removed}."),
-                false,
-            ));
+        if let Some(note) = self
+            .unsent
+            .drop_landed(&mut self.composer, &open.id, |id| state.has_message(id))
+        {
+            self.message = Some(note);
         }
     }
 
-    /// Puts an unsent message back in the composer. If the composer holds other text, or the
-    /// message was for another thread, it waits in `unsent` for Ctrl+R or for that thread.
-    fn give_back(&mut self, thread_id: &str, text: &str, error: String) {
+    /// Puts a failed message back in the composer. If the composer holds other text, or the
+    /// message was for another thread, it waits for Ctrl+R or for that thread.
+    fn give_back(&mut self, thread_id: &str, message: Failed, error: String) {
         if self.open.as_ref().is_some_and(|o| o.id == thread_id) && self.composer.is_empty() {
-            self.composer.insert_str(text);
+            self.unsent
+                .restore(&mut self.composer, thread_id, vec![message]);
             self.message = Some((error, true));
             return;
         }
-        self.unsent
-            .entry(thread_id.to_string())
-            .or_default()
-            .push(text.to_string());
+        self.unsent.save(thread_id, message);
         self.message = Some((
             format!(
                 "{}. The message is saved. Ctrl+R in its thread brings it back.",
@@ -868,17 +849,11 @@ impl App {
         let Some(id) = self.open.as_ref().map(|o| o.id.clone()) else {
             return;
         };
-        let Some(unsent) = self.unsent.remove(&id) else {
+        if self.unsent.swap(&mut self.composer, &id) {
+            self.focus = Focus::Composer;
+        } else {
             self.message = Some(("This thread has no unsent message.".into(), false));
-            return;
-        };
-        let current = self.composer.text();
-        self.composer.clear();
-        self.composer.insert_str(&unsent.join("\n\n"));
-        if !current.trim().is_empty() {
-            self.unsent.insert(id, vec![current]);
         }
-        self.focus = Focus::Composer;
     }
 
     /// Drops the open thread's draft once the thread has every choice in it, so the next
@@ -1135,6 +1110,7 @@ impl App {
                 open.answers
                     .insert(str_of(question, "id").to_string(), answer);
                 self.composer.clear();
+                self.unsent.forget_composer();
                 if open.answers.len() < questions.len() {
                     return;
                 }
@@ -1148,22 +1124,28 @@ impl App {
             }
         }
 
-        self.composer.clear();
-        self.scroll = 0;
-        // The draft goes out with this message and stays until the thread shows it.
+        // The draft goes out with this message and stays until the thread shows it. A check
+        // that fails here leaves the text in the composer.
         let thread_id = open.id.clone();
         let plan = match (self.config.as_ref(), self.drafts.get(&thread_id)) {
             (Some(config), Some(draft)) => match models::plan(config, state.thread(), draft) {
                 Ok(plan) => plan,
-                Err(e) => return self.give_back(&thread_id, &text, e.to_string()),
+                Err(e) => {
+                    self.message = Some((e.to_string(), true));
+                    return;
+                }
             },
             _ => Plan::default(),
         };
         // The client refuses this too, but its message names the run id.
         if plan.changes_modes() && state.active_run().is_some() {
             let error = "T3 can't change the mode during a run. Send again when it finishes, or set the mode back with Alt+P.";
-            return self.give_back(&thread_id, &text, error.into());
+            self.message = Some((error.into(), true));
+            return;
         }
+        self.composer.clear();
+        self.unsent.forget_composer();
+        self.scroll = 0;
         // As in the desktop app, ultrathink applies to one message. This send takes it out of
         // the draft now, so a second message sent before this one lands doesn't reuse it.
         let mut reserved = Vec::new();
@@ -2238,7 +2220,7 @@ impl App {
         let unsent = self
             .open
             .as_ref()
-            .is_some_and(|o| self.unsent.contains_key(&o.id));
+            .is_some_and(|o| self.unsent.has_saved(&o.id));
         let keys = match (self.focus, self.picker.as_ref().map(|p| p.kind)) {
             (_, Some(Kind::Model)) => "Type to search · ↑↓ choose · Enter select · Esc close",
             (_, Some(_)) => "↑↓ choose · Enter select · Esc close",
