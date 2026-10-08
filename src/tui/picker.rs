@@ -54,6 +54,8 @@ pub struct View {
     pub interaction_mode: String,
     /// Whether the mode menu offers Build and Plan.
     pub offers_plan: bool,
+    /// The legacy plan setting, which also decides whether the options menu offers the Plan agent.
+    pub plan_mode_enabled: bool,
     pub prompt_effort: Option<String>,
     /// What sending now would change.
     pub plan: Plan,
@@ -75,11 +77,87 @@ pub fn offers_plan(config: Option<&Value>, selection: &Value, plan_mode_enabled:
             .is_none_or(|provider| provider["showInteractionModeToggle"] != false)
 }
 
+/// The Plan agent's id in an `agent` select, such as OpenCode's.
+const PLAN_AGENT: &str = "plan";
+
+fn is_agent_select(descriptor: &Value) -> bool {
+    descriptor["id"] == "agent" && descriptor["type"] == "select"
+}
+
+/// A model's options as the composer offers them. With the legacy plan setting off, the
+/// desktop's `getProviderModelCapabilities` in apps/web/src/providerModels.ts takes Plan out of
+/// every `agent` select, whatever the provider, and drops a select left with no choices. The
+/// select's current value stays if it is still offered, else it moves to the default, else to the
+/// first choice left.
+fn offered_descriptors(model: &Value, plan_mode_enabled: bool) -> Vec<Value> {
+    models::descriptors(model)
+        .iter()
+        .filter_map(|descriptor| {
+            if plan_mode_enabled || !is_agent_select(descriptor) {
+                return Some(descriptor.clone());
+            }
+            let choices: Vec<Value> = descriptor["options"]
+                .as_array()
+                .into_iter()
+                .flatten()
+                .filter(|choice| choice["id"] != PLAN_AGENT)
+                .cloned()
+                .collect();
+            let current = choices
+                .iter()
+                .find(|choice| choice["id"] == descriptor["currentValue"])
+                .or_else(|| choices.iter().find(|choice| choice["isDefault"] == true))
+                .or_else(|| choices.first())?["id"]
+                .clone();
+            let mut offered = descriptor.clone();
+            offered["options"] = Value::Array(choices);
+            offered["currentValue"] = current;
+            Some(offered)
+        })
+        .collect()
+}
+
+/// `selection` without the Plan agent, or `None` when it doesn't pick Plan. As in the desktop's
+/// `getComposerProviderState` in apps/web/src/components/chat/composerProviderState.tsx, a saved
+/// `agent: plan` takes the agent select's current value from `offered_descriptors`, or goes when
+/// the model has no agent left. For a model T3 doesn't list it goes too, and the other options
+/// stay, as the desktop keeps them for an OpenCode model missing from the list.
+fn without_plan_agent(config: Option<&Value>, selection: &Value) -> Option<Value> {
+    let picks_plan = |option: &Value| option["id"] == "agent" && option["value"] == PLAN_AGENT;
+    let options = selection["options"].as_array()?;
+    if !options.iter().any(picks_plan) {
+        return None;
+    }
+    let agent = config
+        .and_then(|config| selected_model(config, selection))
+        .and_then(|(_, model)| {
+            offered_descriptors(model, false)
+                .into_iter()
+                .find(is_agent_select)
+        })
+        .map(|descriptor| descriptor["currentValue"].clone());
+    let options = options
+        .iter()
+        .filter_map(|option| {
+            if !picks_plan(option) {
+                return Some(option.clone());
+            }
+            let mut kept = option.clone();
+            kept["value"] = agent.clone()?;
+            Some(kept)
+        })
+        .collect();
+    let mut selection = selection.clone();
+    selection["options"] = Value::Array(options);
+    Some(selection)
+}
+
 /// What sending a message now changes: the draft, checked against `config`, and the mode the
 /// desktop would send. Where Build and Plan aren't offered, that mode is Build, as in the
 /// desktop's `persistThreadSettingsForNextTurn` in ChatView.tsx. A Plan pick in the draft then
 /// waits unused, and a thread left in Plan goes back to Build with this message, so a hidden
-/// control never leaves a turn planning.
+/// control never leaves a turn planning. The Plan agent is hidden the same way: with the setting
+/// off, a thread saved on it, or a model switch that carries it over, sends another agent.
 pub fn send_plan(
     config: Option<&Value>,
     thread: &Value,
@@ -95,6 +173,17 @@ pub fn send_plan(
         Some(config) if !choice.is_empty() => models::plan(config, thread, &choice)?,
         _ => Plan::default(),
     };
+    // Every message sends the selection without the Plan agent, as every message switches a
+    // thread left in Plan to Build, so neither keeps a draft alive.
+    if !plan_mode_enabled {
+        let selection = plan
+            .model_selection
+            .as_ref()
+            .unwrap_or(&thread["modelSelection"]);
+        if let Some(selection) = without_plan_agent(config, selection) {
+            plan.model_selection = Some(selection);
+        }
+    }
     let selection = plan
         .model_selection
         .as_ref()
@@ -139,6 +228,7 @@ pub fn view(
         .unwrap_or_else(|| thread["modelSelection"].clone());
     View {
         offers_plan: offers_plan(config, &selection, plan_mode_enabled),
+        plan_mode_enabled,
         selection,
         runtime_mode: plan.runtime_mode.clone().unwrap_or_else(|| {
             thread["runtimeMode"]
@@ -231,7 +321,7 @@ fn trait_items(config: &Value, view: &View) -> Vec<Item> {
         return Vec::new();
     };
     let mut items = Vec::new();
-    for descriptor in models::descriptors(model) {
+    for descriptor in &offered_descriptors(model, view.plan_mode_enabled) {
         let id = str_of(descriptor, "id");
         let label = descriptor["label"].as_str().unwrap_or(id);
         let current = models::effective_value(descriptor, &view.selection);
@@ -347,7 +437,7 @@ pub fn traits_label(config: &Value, view: &View) -> Option<String> {
     let mut labels: Vec<String> = Vec::new();
     let mut effort_index = None;
     let mut fast = None;
-    for descriptor in models::descriptors(model) {
+    for descriptor in &offered_descriptors(model, view.plan_mode_enabled) {
         let id = str_of(descriptor, "id");
         let value = models::effective_value(descriptor, &view.selection);
         let label = match descriptor["type"].as_str() {
