@@ -94,6 +94,8 @@ enum Command {
     },
     /// Interrupt the thread's running turn.
     Interrupt { thread: String },
+    /// Revoke the saved login for this server and remove it from the Keychain.
+    Logout,
 }
 
 #[derive(Clone, Copy, ValueEnum)]
@@ -130,13 +132,15 @@ fn main() {
         .build()
         .expect("tokio runtime");
     let code = runtime.block_on(async move {
-        // Racing Ctrl-C lets destructors run, which revokes the session.
+        // Racing signals lets destructors run, which revokes the session. A closed terminal
+        // window sends SIGHUP.
         tokio::select! {
             result = run(cli) => match result {
                 Ok(code) => code,
                 Err(error) => report(&error, json_mode),
             },
             _ = tokio::signal::ctrl_c() => 130,
+            code = hangup_or_terminate() => code,
         }
     });
     runtime.shutdown_timeout(Duration::from_millis(200));
@@ -145,18 +149,42 @@ fn main() {
     std::process::exit(code);
 }
 
+/// Resolves to the shell exit code for SIGHUP or SIGTERM, whichever arrives first.
+#[cfg(unix)]
+async fn hangup_or_terminate() -> i32 {
+    use tokio::signal::unix::{SignalKind, signal};
+    let (Ok(mut hangup), Ok(mut terminate)) = (
+        signal(SignalKind::hangup()),
+        signal(SignalKind::terminate()),
+    ) else {
+        return std::future::pending().await;
+    };
+    tokio::select! {
+        _ = hangup.recv() => 129,
+        _ = terminate.recv() => 143,
+    }
+}
+
+#[cfg(not(unix))]
+async fn hangup_or_terminate() -> i32 {
+    std::future::pending().await
+}
+
 fn report(error: &anyhow::Error, json_mode: bool) -> i32 {
     let (code, exit_code) = match error.downcast_ref::<T3Error>() {
         Some(t3) => (t3.code, t3.exit_code),
         None => ("ERROR", exit::FAILURE),
     };
+    // `println!` panics when the terminal is gone, and a panic here would skip the revoke in
+    // `main`, so write without panicking.
     if json_mode {
-        println!(
+        let _ = writeln!(
+            std::io::stdout(),
             "{}",
             json!({"ok": false, "error": {"code": code, "message": error.to_string()}})
         );
     } else {
-        eprintln!("t3term: {error} [{code}]");
+        let _ = writeln!(std::io::stderr(), "t3term: {error} [{code}]");
     }
     exit_code
 }
@@ -191,6 +219,7 @@ async fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Command::Doctor => doctor(json_mode).await,
+        Command::Logout => logout(json_mode).await,
         Command::Projects => {
             let client = connect(READ, "10m").await?;
             let shell = client.shell().await?;
@@ -702,7 +731,7 @@ async fn doctor(json_mode: bool) -> Result<i32> {
             );
         }
         Ok(client) => {
-            checks.insert("auth".into(), json!({"ok": true, "scopes": ["orchestration:read"], "ms": started.elapsed().as_millis()}));
+            checks.insert("auth".into(), json!({"ok": true, "scopes": client.scopes().iter().map(|s| s.as_str()).collect::<Vec<_>>(), "login": client.login_source().as_str(), "ms": started.elapsed().as_millis()}));
             match client.shell().await {
                 Ok(shell) => checks.insert("http".into(), json!({"ok": true, "projects": shell.projects.len(), "threads": shell.threads.len()})),
                 Err(error) => {
@@ -730,6 +759,33 @@ async fn doctor(json_mode: bool) -> Result<i32> {
         }
     }
     finish_doctor(checks, ok, json_mode)
+}
+
+async fn logout(json_mode: bool) -> Result<i32> {
+    let message = match discovery::discover().await {
+        Ok(runtime) => match t3term::auth::logout(&runtime).await? {
+            Some(session) => {
+                format!(
+                    "Logged out of {}. Revoked session {session}.",
+                    runtime.origin
+                )
+            }
+            None => format!("No saved login for {}.", runtime.origin),
+        },
+        // Without the server there is no environment id to pick one login, so remove them all.
+        Err(_) => match t3term::keychain::delete(None).await? {
+            0 => "No saved logins.".to_string(),
+            removed => format!(
+                "Removed {removed} saved login(s) from the Keychain. T3 is not running, so they could not be revoked; each expires within 30 days of being issued."
+            ),
+        },
+    };
+    if json_mode {
+        print_json(&json!({"ok": true, "message": message}));
+    } else {
+        println!("{message}");
+    }
+    Ok(0)
 }
 
 fn finish_doctor(checks: serde_json::Map<String, Value>, ok: bool, json_mode: bool) -> Result<i32> {
