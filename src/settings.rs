@@ -3,6 +3,9 @@
 //! These are preferences, not state T3 owns, so a missing or unreadable file is not an error:
 //! it means the defaults. A save that fails is dropped for the same reason, since losing a
 //! preference must not interrupt what the user is doing.
+//!
+//! Both calls touch the filesystem, so they run on a blocking thread and never hold up the
+//! event loop.
 
 use std::path::PathBuf;
 
@@ -26,25 +29,32 @@ fn path() -> PathBuf {
 
 impl Settings {
     /// The saved settings, or the defaults when there is no readable file.
-    pub fn load() -> Self {
-        std::fs::read(path())
-            .ok()
-            .and_then(|raw| serde_json::from_slice(&raw).ok())
-            .unwrap_or_default()
+    pub async fn load() -> Self {
+        tokio::task::spawn_blocking(|| {
+            std::fs::read(path())
+                .ok()
+                .and_then(|raw| serde_json::from_slice(&raw).ok())
+                .unwrap_or_default()
+        })
+        .await
+        .unwrap_or_default()
     }
 
-    /// Writes the settings, ignoring a filesystem that won't take them.
-    pub fn save(&self) {
-        let path = path();
-        let Some(dir) = path.parent() else {
-            return;
-        };
-        if std::fs::create_dir_all(dir).is_err() {
-            return;
-        }
-        if let Ok(text) = serde_json::to_string_pretty(self) {
-            let _ = std::fs::write(path, text + "\n");
-        }
+    /// Writes the settings on a blocking thread, ignoring a filesystem that won't take them.
+    /// The caller does not wait: a preference is not worth a pause.
+    pub fn save(self) {
+        tokio::task::spawn_blocking(move || {
+            let path = path();
+            let Some(dir) = path.parent() else {
+                return;
+            };
+            if std::fs::create_dir_all(dir).is_err() {
+                return;
+            }
+            if let Ok(text) = serde_json::to_string_pretty(&self) {
+                let _ = std::fs::write(path, text + "\n");
+            }
+        });
     }
 }
 

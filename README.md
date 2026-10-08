@@ -54,11 +54,11 @@ Exit codes: 0 success, 1 failure or a turn that ended without completing, 2 usag
 | Open menu | ↑/↓ choose, Enter select, Esc close. In the model menu, type to search |
 | Sidebar | ↑/↓ or j/k select, Enter open, e show or hide the Settled shelf, q quit |
 | Composer | Enter send (queues if the thread is busy), Alt+Enter or Ctrl+J newline, Ctrl+R swap in an unsent message, Esc to transcript |
-| Transcript | ↑/↓ scroll, g/G top/bottom, t verbose mode on or off, Enter compose, Esc sidebar |
+| Transcript | ↑/↓ scroll, g/G top/bottom, t open or close every row of tool calls, Enter compose, Esc sidebar |
 
 On macOS, the Alt keys need Option to send Meta: "Use Option as Meta key" in Terminal, "Esc+" for the Option key in iTerm2, or `macos-option-as-alt = true` in Ghostty.
 
-The mouse wheel scrolls the transcript and the sidebar, and clicking a thread opens it. Clicking a chip under the composer opens its menu. When a question is pending, the composer becomes the answer box: type an option number or your own text.
+The mouse wheel scrolls the transcript and the sidebar, and clicking a thread opens it. Clicking a chip under the composer opens its menu, and clicking a row of tool calls opens that row. When a question is pending, the composer becomes the answer box: type an option number or your own text.
 
 A menu choice turns its chip blue and goes to T3 with the thread's next message, as in the desktop app. Ultrathink applies to that one message, and comes back only if that message fails to send. T3 refuses a mode change while a run is active, so the TUI leaves that message in the composer to send once the run ends. A message that fails after you have typed something else or opened another thread is kept. The status line says so, Ctrl+R swaps it with the composer's text, and opening its thread with an empty composer brings it back. A send that times out can still reach T3. If the thread later shows it, the TUI removes the kept copy so it can't go out twice.
 
@@ -66,7 +66,7 @@ A menu choice turns its chip blue and goes to T3 with the thread's next message,
 
 ## Look
 
-The TUI follows the T3 Code desktop app. The sidebar lists threads as cards with the project monogram, status or age, title, branch and provider glyph. Finished threads move to a Settled shelf at the bottom. The header shows the project and thread title. User prompts are right-aligned bubbles, and each turn folds its tool activity under a "Worked for" row that opens with `t`, which turns on verbose mode. Approvals and questions appear in a panel above the composer with their keys printed on the buttons. The composer has chips for the model, the reasoning effort and other model options, the runtime mode and plan mode, plus a send hint. Each chip opens a menu.
+The TUI follows the T3 Code desktop app. The sidebar lists threads as cards with the project monogram, status or age, title, branch and provider glyph. Finished threads move to a Settled shelf at the bottom. The header shows the project and thread title. User prompts are right-aligned bubbles, and each turn folds its tool calls into one row you click to open. Approvals and questions appear in a panel above the composer with their keys printed on the buttons. The composer has chips for the model, the reasoning effort and other model options, the runtime mode and plan mode, plus a send hint. Each chip opens a menu.
 
 Colors come from T3's dark theme tokens. When `COLORTERM` reports truecolor the TUI uses the exact hex values. Otherwise, or when `T3TERM_COLOR=256` is set, it maps each color to the nearest entry in the 256-color palette.
 
@@ -74,15 +74,19 @@ Colors come from T3's dark theme tokens. When `COLORTERM` reports truecolor the 
 
 `docs/screenshots/` also has `before-tui.png`, `after-tui.png`, `approval.png`, `streaming.gif` and `picker-model.png`.
 
-## Verbose mode
+## Tool calls and reasoning
 
-`t` turns on verbose mode, t3term's version of Conductor's Gary's Mode: every turn stays open, finished ones included. Each tool call is one row with its icon, what it did and a chip holding the file, command or query it did it to, with the output quoted under it and a red `exit N` after a failure. Reasoning is laid out as prose in grey, so the model's own answers stay the brightest text on screen.
+Reasoning is always there to read. It is laid out as prose in grey, so the model's own answers stay the brightest text on screen. Tool calls are not: a run of them folds into one row saying how many there were and which tools ran, which keeps a turn short enough to read without hiding what it did.
 
-![A turn in verbose mode: two tool rows with their output, the reasoning in grey, then the answer](docs/screenshots/verbose.png)
+![A turn with its tool calls folded into one row, the reasoning in grey, then the answer](docs/screenshots/tool-calls.png)
 
-The same turn with verbose mode off is one "Worked for" row. The setting is saved in `~/.config/t3term/settings.json`, so it survives a restart. That file is t3term's own, not T3's.
+Click the row to open it. Each call is then one row with its icon, what it did and a chip holding the file, command or query it did it to, with the output quoted under it and a red `exit N` after a failure. Clicking the row again closes it. What you are reading stays where it is on screen while the rows above it grow.
 
-T3 leaves tool output out of a thread's projection so a large result can't stall the socket, and marks the item instead. Verbose mode asks for it with `orchestration.getTurnItem`, only for the rows on screen, and keeps the answer until the item changes. Each row shows twelve lines of it: the first twelve of a file or a search, the last twelve of a command, where its result is.
+![The same turn with the row open: a file read and a search, each with its output](docs/screenshots/tool-calls-open.png)
+
+`t` opens every row at once and keeps new turns open as they arrive, which is t3term's version of Conductor's Gary's Mode. `t` again closes them all. The setting is saved in `~/.config/t3term/settings.json`, so it survives a restart. That file is t3term's own, not T3's.
+
+T3 leaves tool output out of a thread's projection so a large result can't stall the socket, and marks the item instead. t3term asks for it with `orchestration.getTurnItem`, only for the rows on screen, and keeps the answer until the item changes. Each row shows twelve lines of it: the first twelve of a file or a search, the last twelve of a command, where its result is.
 
 ## How it works
 

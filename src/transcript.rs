@@ -7,6 +7,8 @@ use crate::projection::ThreadState;
 /// Lines of a tool's output one row shows. Enough to see what happened, little enough that a
 /// long one doesn't bury the turn around it.
 const MAX_OUTPUT_LINES: usize = 12;
+/// What one row's output can weigh, since a single line has no length of its own to bound.
+const MAX_OUTPUT_BYTES: usize = 4096;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockKind {
@@ -90,15 +92,30 @@ fn tool_argument(item: &Value) -> String {
 /// projection so a large result can't stall the socket, and hands it over one item at a time,
 /// in whatever shape the tool returned it.
 pub fn tool_output(item: &Value) -> String {
-    match item.get("output") {
-        None | Some(Value::Null) => String::new(),
+    let lines = match item.get("output") {
+        None | Some(Value::Null) => return String::new(),
         // A command prints its result at the end, so a long one keeps its tail. Anything
         // else, such as a file a reader returned, starts at the top.
         Some(value @ Value::String(_)) => {
             truncate_lines(output_text(value).trim_end(), MAX_OUTPUT_LINES)
         }
         Some(value) => head_lines(output_text(value).trim_end(), MAX_OUTPUT_LINES),
+    };
+    // A line has no length limit of its own: one long enough to matter is a record printed
+    // as a single line. The row can only show a screen's worth of it anyway.
+    truncate_bytes(lines, MAX_OUTPUT_BYTES)
+}
+
+/// The text cut to a byte budget, on a character boundary.
+fn truncate_bytes(text: String, max_bytes: usize) -> String {
+    if text.len() <= max_bytes {
+        return text;
     }
+    let mut end = max_bytes;
+    while end > 0 && !text.is_char_boundary(end) {
+        end -= 1;
+    }
+    format!("{}…", &text[..end])
 }
 
 /// The text inside a tool's result. Tools answer with a string, with the content blocks an
