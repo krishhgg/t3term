@@ -3442,6 +3442,7 @@ mod tests {
             run_id: "run".into(),
             tool_name: String::new(),
             request_id: String::new(),
+            change: None,
         }
     }
 

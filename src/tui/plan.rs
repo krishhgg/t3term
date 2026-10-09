@@ -917,6 +917,7 @@ mod tests {
             run_id: String::new(),
             tool_name: String::new(),
             request_id: String::new(),
+            change: None,
         };
         let mut expanded: HashSet<String> = ["kept", "gone", "todo"]
             .into_iter()

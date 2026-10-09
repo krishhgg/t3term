@@ -18,6 +18,11 @@ const MAX_ENDPOINT_WIDTH: usize = 64;
 /// Bytes of a model or provider id that are read at all, enough for `MAX_ENDPOINT_WIDTH`
 /// columns in any script.
 const MAX_ENDPOINT_BYTES: usize = 1024;
+/// Operations of one file change that its row lists before a count stands for the rest.
+const MAX_CHANGED_FILES: usize = 12;
+/// Bytes of a file change's path, operation or file kind that are read at all. A path is far
+/// shorter.
+const MAX_NAME_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockKind {
@@ -56,6 +61,45 @@ pub struct Block {
     pub tool_name: String,
     /// For request items: the runtime request they show.
     pub request_id: String,
+    /// For `file_change` items: what the TUI shows under the row. `t3term read` prints only
+    /// the header.
+    pub change: Option<FileChange>,
+}
+
+/// What one line under a file change's row is, which picks its color in the TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeLine {
+    /// One structured operation, such as `move /repo/old.ts → /repo/new.ts`.
+    Operation,
+    /// A failed edit's error, which T3 sends where a patch would be.
+    Error,
+    /// A patch's `diff `, `index `, `--- ` or `+++ ` line outside a hunk, or a
+    /// `\ No newline at end of file` marker.
+    Meta,
+    /// A hunk header, such as `@@ -1,3 +1,4 @@`.
+    Hunk,
+    Added,
+    Removed,
+    /// A line both sides of a hunk share, or any other line of the text.
+    Context,
+    /// What t3term left out, such as `… 3 more files`.
+    Note,
+}
+
+/// What the TUI shows under a `file_change` row: the item's counts, its structured operations
+/// and the text it carries, cleaned and bounded by `describe`. The fields come from
+/// `OrchestrationV2TurnItem` and `OrchestrationV2FileChangeDetail` in the nightly's
+/// `packages/contracts/src/orchestrationV2.ts`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FileChange {
+    /// How many operations the item's `changes` lists, or 0 when none of those shown has a
+    /// path. With more than one, the row is named for them, `Changed 3 files`, as the
+    /// nightly's work log names it.
+    pub operations: usize,
+    /// T3's counts for the whole item, such as `+12 -3`, or nothing when it sent neither.
+    pub counts: String,
+    /// The lines under the row, each with what it is.
+    pub lines: Vec<(ChangeLine, String)>,
 }
 
 fn str_of<'a>(item: &'a Value, key: &str) -> &'a str {
@@ -588,6 +632,217 @@ fn truncate_lines(text: &str, max_lines: usize) -> String {
     )
 }
 
+/// A file name, path, operation or file kind from a file change as one line that is safe to
+/// print: without control characters, with line breaks read as spaces, and cut with `…` past
+/// `MAX_NAME_BYTES`. Empty when no text is left.
+fn name_text(raw: &str) -> String {
+    let mut end = raw.len().min(MAX_NAME_BYTES);
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    let text = without_controls(&raw[..end]).replace('\n', " ");
+    let text = text.trim();
+    if text.is_empty() || end == raw.len() {
+        return text.to_string();
+    }
+    format!("{text}…")
+}
+
+/// What the TUI shows under a file change's row, in the order the nightly's
+/// `V2ItemInspector.tsx` shows it: a failed edit's error, then the item's operations, then,
+/// for an edit that didn't fail, the start of the patch T3 sent.
+fn file_change(item: &Value, counts: String) -> FileChange {
+    let failed = str_of(item, "status") == "failed";
+    let text = str_of(item, "diffStr");
+    let mut lines = Vec::new();
+    // The nightly's `WireProjection.ts` keeps `diffStr` only for a failed edit, where it holds
+    // the provider's error rather than a patch.
+    if failed {
+        let (shown, note) = change_text(text);
+        lines.extend(shown.into_iter().map(|line| (ChangeLine::Error, line)));
+        lines.extend(note.map(|note| (ChangeLine::Note, note)));
+    }
+    let changes: &[Value] = item
+        .get("changes")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    // Only the operations the row lists are read.
+    let listed: Vec<String> = changes
+        .iter()
+        .take(MAX_CHANGED_FILES)
+        .filter_map(operation)
+        .collect();
+    // Without one operation that names a path, the row stands for `fileName` alone, as it does
+    // when T3 sends no `changes`.
+    let operations = if listed.is_empty() { 0 } else { changes.len() };
+    if operations > 0 {
+        let hidden = changes.len() - listed.len();
+        lines.extend(listed.into_iter().map(|line| (ChangeLine::Operation, line)));
+        if hidden > 0 {
+            let noun = if hidden == 1 { "file" } else { "files" };
+            lines.push((ChangeLine::Note, format!("… {hidden} more {noun}")));
+        }
+    }
+    if !failed {
+        let (shown, note) = change_text(text);
+        lines.extend(patch_kinds(&shown).into_iter().zip(shown));
+        lines.extend(note.map(|note| (ChangeLine::Note, note)));
+    }
+    FileChange {
+        operations,
+        counts,
+        lines,
+    }
+}
+
+/// One entry of a file change's `changes` as the nightly's `V2ItemInspector.tsx` lists it,
+/// such as `move /repo/old.ts → /repo/new.ts (text)`. `None` when it isn't a record with a
+/// path.
+fn operation(change: &Value) -> Option<String> {
+    let path = name_text(str_of(change, "path"));
+    if path.is_empty() {
+        return None;
+    }
+    let mut line = name_text(str_of(change, "operation"));
+    if !line.is_empty() {
+        line.push(' ');
+    }
+    let old_path = name_text(str_of(change, "oldPath"));
+    if !old_path.is_empty() {
+        line.push_str(&format!("{old_path} → "));
+    }
+    line.push_str(&path);
+    let kinds: Vec<String> = ["fileType", "mimeType"]
+        .into_iter()
+        .map(|key| name_text(str_of(change, key)))
+        .filter(|kind| !kind.is_empty())
+        .collect();
+    if !kinds.is_empty() {
+        line.push_str(&format!(" ({})", kinds.join(", ")));
+    }
+    Some(line)
+}
+
+/// The first `MAX_OUTPUT_LINES` lines of a text a file change carries, without control
+/// characters, and a note when there was more. The cut to `MAX_OUTPUT_BYTES` comes first, so a
+/// long patch is never scanned or copied whole. Nothing when the text is blank.
+fn change_text(raw: &str) -> (Vec<String>, Option<String>) {
+    let mut end = raw.len().min(MAX_OUTPUT_BYTES);
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = end < raw.len();
+    let text = without_controls(&raw[..end]);
+    // Line breaks before the first line or after the last carry nothing.
+    let text = text.trim_start_matches('\n').trim_end();
+    let (shown, hidden) = if text.is_empty() {
+        (Vec::new(), 0)
+    } else {
+        let mut lines = text.split('\n');
+        let shown: Vec<String> = lines
+            .by_ref()
+            .take(MAX_OUTPUT_LINES)
+            .map(String::from)
+            .collect();
+        (shown, lines.count())
+    };
+    let note = match (hidden, cut) {
+        (0, false) => None,
+        (0, true) => Some(format!("… the text goes on past {MAX_OUTPUT_BYTES} bytes")),
+        (_, false) => Some(format!("… {hidden} more lines")),
+        (_, true) => Some(format!(
+            "… {hidden} more lines, and the text goes on past {MAX_OUTPUT_BYTES} bytes"
+        )),
+    };
+    (shown, note)
+}
+
+/// What each line of a patch is. Outside a hunk, a line is a file header or plain text. Inside
+/// one, its first character says which side it belongs to, and the counts in the hunk's header
+/// say where the hunk ends. So a removed line that reads `-- note` is a removed line rather
+/// than a file header, and a text that isn't a patch reads as plain text.
+fn patch_kinds(lines: &[String]) -> Vec<ChangeLine> {
+    const HEADERS: [&str; 16] = [
+        "diff ",
+        "index ",
+        "--- ",
+        "+++ ",
+        "new file mode",
+        "deleted file mode",
+        "old mode",
+        "new mode",
+        "similarity index",
+        "dissimilarity index",
+        "rename from",
+        "rename to",
+        "copy from",
+        "copy to",
+        "Binary files",
+        "\\",
+    ];
+    // The old and new lines the current hunk has left, or `None` outside a hunk. A header
+    // whose counts don't parse leaves the hunk open until a line no hunk has.
+    let mut left: Option<(u64, u64)> = None;
+    lines
+        .iter()
+        .map(|line| {
+            if line.starts_with("@@") {
+                left = match hunk_counts(line) {
+                    Some((0, 0)) => None,
+                    Some(counts) => Some(counts),
+                    None => Some((u64::MAX, u64::MAX)),
+                };
+                return ChangeLine::Hunk;
+            }
+            if let Some((old, new)) = left.as_mut() {
+                let kind = match line.chars().next() {
+                    Some('+') => {
+                        *new = new.saturating_sub(1);
+                        Some(ChangeLine::Added)
+                    }
+                    Some('-') => {
+                        *old = old.saturating_sub(1);
+                        Some(ChangeLine::Removed)
+                    }
+                    // Some tools trim the space from a blank line both sides share.
+                    Some(' ') | None => {
+                        *old = old.saturating_sub(1);
+                        *new = new.saturating_sub(1);
+                        Some(ChangeLine::Context)
+                    }
+                    Some('\\') => Some(ChangeLine::Meta),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    if (*old, *new) == (0, 0) {
+                        left = None;
+                    }
+                    return kind;
+                }
+                left = None;
+            }
+            if HEADERS.iter().any(|header| line.starts_with(header)) {
+                ChangeLine::Meta
+            } else {
+                ChangeLine::Context
+            }
+        })
+        .collect()
+}
+
+/// The old and new line counts of a hunk header, `@@ -12,3 +12,4 @@`. A range without a count
+/// has one line.
+fn hunk_counts(line: &str) -> Option<(u64, u64)> {
+    let (ranges, _) = line.strip_prefix("@@ -")?.split_once(" @@")?;
+    let (old, new) = ranges.split_once(" +")?;
+    let count = |range: &str| match range.split_once(',') {
+        Some((start, lines)) => start.parse::<u64>().ok().and(lines.parse::<u64>().ok()),
+        None => range.parse::<u64>().ok().map(|_| 1),
+    };
+    Some((count(old)?, count(new)?))
+}
+
 /// The block for one turn item. `runs` are the runs of the item's thread, which
 /// `ThreadState::runs_for` gives. A handoff that T3 stamped no models on reads its models from
 /// them.
@@ -616,6 +871,7 @@ pub fn describe(item: &Value, runs: &[Value]) -> Option<Block> {
         run_id: str_of(item, "runId").to_string(),
         tool_name: str_of(item, "toolName").to_string(),
         request_id: str_of(item, "requestId").to_string(),
+        change: None,
     };
     Some(match item_type {
         "user_message" => block(
@@ -675,19 +931,21 @@ pub fn describe(item: &Value, runs: &[Value]) -> Option<Block> {
             }
         }
         "file_change" => {
-            let name = str_of(item, "fileName").to_string();
-            let mut header = format!("edit {name}");
+            let name = name_text(str_of(item, "fileName"));
             let additions = item.get("additions").and_then(Value::as_u64);
             let deletions = item.get("deletions").and_then(Value::as_u64);
-            if additions.is_some() || deletions.is_some() {
-                header.push_str(&format!(
-                    "  +{} -{}",
-                    additions.unwrap_or(0),
-                    deletions.unwrap_or(0)
-                ));
+            // T3's counts are for the whole item. It sends none per operation.
+            let counts = match (additions, deletions) {
+                (None, None) => String::new(),
+                _ => format!("+{} -{}", additions.unwrap_or(0), deletions.unwrap_or(0)),
+            };
+            let mut header = format!("edit {name}");
+            if !counts.is_empty() {
+                header.push_str(&format!("  {counts}"));
             }
             Block {
                 detail: name,
+                change: Some(file_change(item, counts)),
                 ..block(BlockKind::Tool, header, String::new())
             }
         }
