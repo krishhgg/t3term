@@ -46,6 +46,12 @@ pub struct Settings {
     /// so it opens with the sidebar shown each time, and this key is t3term's. A file without it
     /// shows the sidebar.
     pub sidebar_hidden: bool,
+    /// The main sidebar's width in columns, once a drag of its right edge or `[` and `]` in the
+    /// sidebar have chosen one. A file without it, and `0` in the sidebar, which removes it, give
+    /// the width t3term picks from the terminal's. The desktop keeps its width in pixels in the
+    /// browser's storage, under `chat_thread_sidebar_width`, so this key is t3term's.
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub sidebar_width: Option<u16>,
 }
 
 fn path() -> PathBuf {
@@ -329,6 +335,7 @@ mod tests {
                 sidebar_working_shelf_enabled: true,
                 sidebar_working_shelf_expanded: true,
                 sidebar_hidden: false,
+                sidebar_width: None,
             }
         );
 
@@ -379,6 +386,7 @@ mod tests {
             sidebar_working_shelf_enabled: true,
             sidebar_working_shelf_expanded: true,
             sidebar_hidden: false,
+            sidebar_width: Some(42),
         };
         std::fs::write(&path, serde_json::to_string(&others).unwrap()).unwrap();
         update_at(&path, |settings| settings.sidebar_hidden = true).unwrap();
@@ -402,6 +410,76 @@ mod tests {
         // Showing it again leaves the rest alone.
         update_at(&path, |settings| settings.sidebar_hidden = false).unwrap();
         assert_eq!(read(&path), others);
+    }
+
+    #[test]
+    fn the_sidebar_width_starts_unset_and_its_key_is_t3terms() {
+        // A file from before the key, an empty one, one from a later version and a null leave
+        // the width to the terminal.
+        for raw in [
+            r#"{"verbose": true, "sidebarHidden": true}"#,
+            "{}",
+            r#"{"future": 3}"#,
+            r#"{"sidebarWidth": null}"#,
+        ] {
+            let settings: Settings = serde_json::from_str(raw).unwrap();
+            assert_eq!(settings.sidebar_width, None, "{raw}");
+        }
+        let chosen: Settings = serde_json::from_str(r#"{"sidebarWidth": 42}"#).unwrap();
+        assert_eq!(
+            chosen,
+            Settings {
+                sidebar_width: Some(42),
+                ..Settings::default()
+            }
+        );
+        assert_eq!(serde_json::to_value(&chosen).unwrap()["sidebarWidth"], 42);
+        // Unset, the key stays out of the file, so saving another setting writes what it did.
+        let unset = serde_json::to_value(Settings::default()).unwrap();
+        assert!(unset.get("sidebarWidth").is_none(), "{unset}");
+        // A width that isn't a whole number of columns fails like a wrong value for any other
+        // key, and `load` then uses the defaults.
+        for raw in [r#"{"sidebarWidth": -1}"#, r#"{"sidebarWidth": 42.5}"#] {
+            assert!(serde_json::from_str::<Settings>(raw).is_err(), "{raw}");
+        }
+    }
+
+    #[test]
+    fn resizing_the_sidebar_keeps_the_other_settings() {
+        // Every other setting turned on by hand, then the sidebar's edge dragged in the TUI.
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("settings.json");
+        let others = Settings {
+            verbose: true,
+            plan_mode_enabled: true,
+            sidebar_working_shelf_enabled: true,
+            sidebar_working_shelf_expanded: true,
+            sidebar_hidden: true,
+            sidebar_width: None,
+        };
+        std::fs::write(&path, serde_json::to_string(&others).unwrap()).unwrap();
+        update_at(&path, |settings| settings.sidebar_width = Some(42)).unwrap();
+        let resized = Settings {
+            sidebar_width: Some(42),
+            ..others
+        };
+        assert_eq!(read(&path), resized);
+
+        // `]` and then `0` pressed in the sidebar, with the second press's thread started first.
+        // The first save takes both, in the order they were pressed, so the width ends unset.
+        let widen: Change = Box::new(|settings: &mut Settings| settings.sidebar_width = Some(44));
+        let reset: Change = Box::new(|settings: &mut Settings| settings.sidebar_width = None);
+        let queue = Queue::new();
+        queue.push(widen);
+        queue.push(reset);
+        queue.save(&path);
+        queue.save(&path);
+        assert_eq!(read(&path), others, "the presses were saved out of order");
+        // The reset takes the key out of the file rather than writing a null.
+        let saved: serde_json::Value =
+            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        assert!(saved.get("sidebarWidth").is_none(), "{saved}");
+        assert_eq!(saved["sidebarHidden"], true);
     }
 
     #[test]

@@ -1,9 +1,9 @@
 //! The interactive client. It draws only after input or a server event, at most 30 times a
-//! second. Hiding or showing the sidebar draws at once, so a click that follows lands on the new
-//! layout. Two timers can wake it besides: a one-second tick, armed while the open thread has a
-//! run going or a sidebar card on screen reads Working or Goal, so the elapsed-time labels and
-//! spinners advance, and a one-shot timer for the moment the soonest snooze ends, which no
-//! server event marks. An idle TUI uses no CPU.
+//! second. Hiding, showing or resizing the sidebar draws at once, so a click that follows lands
+//! on the new layout. Two timers can wake it besides: a one-second tick, armed while the open
+//! thread has a run going or a sidebar card on screen reads Working or Goal, so the elapsed-time
+//! labels and spinners advance, and a one-shot timer for the moment the soonest snooze ends,
+//! which no server event marks. An idle TUI uses no CPU.
 
 mod composer;
 mod markdown;
@@ -57,12 +57,31 @@ const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "�
 const COMPOSER_MAX_ROWS: usize = 6;
 /// The button that hides and shows the sidebar, after the panel icon on the desktop's.
 const TOGGLE: &str = " ◧ ";
+/// The narrowest width the sidebar can be given, in columns. The desktop's is 13rem against a
+/// 16rem default. Twenty columns keep the wordmark and a card's first words.
+const NARROWEST_SIDEBAR: u16 = 20;
+/// The columns the sidebar always leaves the conversation, as the layout did before the
+/// sidebar could be resized. The desktop keeps 40rem, which would be most of an 80-column
+/// terminal.
+const NARROWEST_MAIN: u16 = 20;
+/// How far `[` and `]` move the sidebar's edge, in columns.
+const SIDEBAR_STEP: u16 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Sidebar,
     Transcript,
     Composer,
+}
+
+/// A drag of the sidebar's right edge, from the left button going down on it until it comes
+/// up.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Drag {
+    /// The sidebar's width at the press, which comes back when the drag ends without a release.
+    from: u16,
+    /// The width the pointer has dragged the sidebar to.
+    width: u16,
 }
 
 /// Wrapped lines for one transcript block, valid for one width and content version.
@@ -364,8 +383,15 @@ struct App {
     /// Whether the sidebar is hidden, which gives the main column its width. Saved between
     /// runs. Focus never rests on a hidden sidebar.
     sidebar_hidden: bool,
-    /// Set when the sidebar is hidden or shown, so the next frame draws at once instead of
-    /// waiting out the frame budget. Until it does, clicks would land on the old layout.
+    /// The sidebar's width as a drag of its edge or `[` and `]` left it, or `None` for the
+    /// width t3term picks from the screen's. Saved between runs. A screen too narrow for it
+    /// draws the sidebar narrower and leaves it as it is.
+    sidebar_width: Option<u16>,
+    /// A drag of the sidebar's edge under way.
+    drag: Option<Drag>,
+    /// Set when the sidebar is hidden, shown or resized, so the next frame draws at once
+    /// instead of waiting out the frame budget. Until it does, clicks would land on the old
+    /// layout.
     layout_changed: bool,
     open: Option<OpenThread>,
     focus: Focus,
@@ -412,6 +438,9 @@ struct App {
     picker_rows: Vec<(u16, usize)>,
     /// The button at the top left of the conversation that hides and shows the sidebar.
     sidebar_toggle: Rect,
+    /// The whole screen the last frame drew, which a drag and `[` and `]` work out the
+    /// sidebar's width against.
+    screen: Rect,
     quit: bool,
 }
 
@@ -533,16 +562,39 @@ fn needs_tick(open: Option<&OpenThread>, sidebar: &Sidebar) -> bool {
     open_run || sidebar.drew_working()
 }
 
-/// The sidebar's column and the main column. A hidden sidebar's column has no width, and the
-/// main column takes the whole screen.
-fn columns(area: Rect, sidebar_hidden: bool) -> (Rect, Rect) {
-    if sidebar_hidden {
-        return (Rect { width: 0, ..area }, area);
-    }
-    let sidebar_width = (area.width / 4).clamp(26, 34).min(area.width / 2);
-    let widths = [Constraint::Length(sidebar_width), Constraint::Min(20)];
-    let [sidebar, main] = Layout::horizontal(widths).areas(area);
+/// The sidebar's column, `sidebar_width` columns wide, and the main column, which takes the
+/// rest. A hidden sidebar's column has no width, and the main column takes the whole screen.
+fn columns(area: Rect, sidebar_width: u16) -> (Rect, Rect) {
+    let sidebar_width = sidebar_width.min(area.width);
+    let sidebar = Rect {
+        width: sidebar_width,
+        ..area
+    };
+    let main = Rect {
+        x: area.x + sidebar_width,
+        width: area.width - sidebar_width,
+        ..area
+    };
     (sidebar, main)
+}
+
+/// The widest the sidebar gets on a screen `width` columns wide: half of it, and less when that
+/// would leave the conversation fewer than `NARROWEST_MAIN` columns.
+fn widest_sidebar(width: u16) -> u16 {
+    (width / 2).min(width.saturating_sub(NARROWEST_MAIN))
+}
+
+/// How wide the sidebar draws on a screen `width` columns wide. With no width chosen it takes a
+/// quarter of the screen, from 26 to 34 columns. A chosen width draws as chosen when the screen
+/// has room for it and as wide as the screen allows when it hasn't, so it comes back when the
+/// screen grows. A screen too narrow for `NARROWEST_SIDEBAR` gets the widest it allows either
+/// way.
+fn sidebar_width(width: u16, chosen: Option<u16>) -> u16 {
+    let wanted = match chosen {
+        Some(chosen) => chosen.max(NARROWEST_SIDEBAR),
+        None => (width / 4).clamp(26, 34),
+    };
+    wanted.min(widest_sidebar(width))
 }
 
 /// The pane Tab moves focus to from `focus`, or BackTab when `forward` is false. A hidden
@@ -597,6 +649,8 @@ impl App {
                 settings.sidebar_working_shelf_expanded,
             ),
             sidebar_hidden: settings.sidebar_hidden,
+            sidebar_width: settings.sidebar_width,
+            drag: None,
             layout_changed: false,
             open: None,
             focus: if settings.sidebar_hidden {
@@ -629,6 +683,7 @@ impl App {
             picker_area: Rect::default(),
             picker_rows: Vec::new(),
             sidebar_toggle: Rect::default(),
+            screen: Rect::default(),
             quit: false,
         }
     }
@@ -719,6 +774,8 @@ impl App {
     /// on a sidebar being hidden moves to the transcript when a thread is open, or else to the
     /// composer. The rows, the highlight, the open thread and the composer stay as they are.
     fn toggle_sidebar(&mut self) {
+        // A drag under way ends without its width, which the sidebar shows again next time.
+        self.end_drag(false);
         self.sidebar_hidden = !self.sidebar_hidden;
         if self.sidebar_hidden && self.focus == Focus::Sidebar {
             self.focus = if self.open.is_some() {
@@ -738,6 +795,99 @@ impl App {
             self.toggle_sidebar();
         }
         self.focus = Focus::Sidebar;
+    }
+
+    /// How wide the sidebar draws on a screen `width` columns wide: not at all while hidden,
+    /// as far as a drag has taken it during one, and otherwise as chosen or picked from the
+    /// screen's width.
+    fn sidebar_columns(&self, width: u16) -> u16 {
+        if self.sidebar_hidden {
+            return 0;
+        }
+        let chosen = self.drag.map(|drag| drag.width).or(self.sidebar_width);
+        sidebar_width(width, chosen)
+    }
+
+    /// Starts a drag of the sidebar's edge from the width the last frame drew. The press
+    /// itself changes nothing on screen.
+    fn start_drag(&mut self) {
+        let from = self.sidebar_columns(self.screen.width);
+        self.drag = Some(Drag { from, width: from });
+    }
+
+    /// Moves the dragged edge to the pointer's column, as far as the sidebar's width allows,
+    /// and says whether the sidebar's width changed.
+    fn drag_to(&mut self, column: u16) -> bool {
+        let screen = self.screen;
+        let Some(drag) = self.drag.as_mut() else {
+            return false;
+        };
+        // The edge is the sidebar's last column, so the width reaches one past the pointer.
+        let wanted = column.saturating_add(1).saturating_sub(screen.x);
+        let width = sidebar_width(screen.width, Some(wanted));
+        if width == drag.width {
+            return false;
+        }
+        drag.width = width;
+        self.layout_changed = true;
+        true
+    }
+
+    /// Ends a drag of the sidebar's edge, if one is under way, and says whether the screen
+    /// needs drawing again. With `keep`, when the button comes up, the sidebar keeps the width
+    /// it was dragged to and saves it once, if it differs from the width at the press. A press
+    /// and release without a change of width saves nothing, so the width t3term picks stays
+    /// its pick. Without `keep` the width at the press comes back and nothing is saved.
+    fn end_drag(&mut self, keep: bool) -> bool {
+        let Some(drag) = self.drag.take() else {
+            return false;
+        };
+        if drag.width == drag.from {
+            return false;
+        }
+        if keep {
+            self.sidebar_width = Some(drag.width);
+            Settings::update(move |settings| settings.sidebar_width = Some(drag.width));
+            // The last frame already drew this width.
+            return false;
+        }
+        self.layout_changed = true;
+        true
+    }
+
+    /// Moves the sidebar's edge `SIDEBAR_STEP` columns right, or left when `wider` is false, as
+    /// `]` and `[` do, and saves the width it lands on. The step starts from the width on
+    /// screen, so it moves the edge even when the screen has narrowed the chosen width. At
+    /// either limit nothing changes and nothing is saved.
+    fn step_sidebar(&mut self, wider: bool) {
+        if self.sidebar_hidden {
+            return;
+        }
+        let width = self.screen.width;
+        let now = self.sidebar_columns(width);
+        let wanted = if wider {
+            now.saturating_add(SIDEBAR_STEP)
+        } else {
+            now.saturating_sub(SIDEBAR_STEP)
+        };
+        let next = sidebar_width(width, Some(wanted));
+        if next == now {
+            return;
+        }
+        self.sidebar_width = Some(next);
+        self.layout_changed = true;
+        Settings::update(move |settings| settings.sidebar_width = Some(next));
+    }
+
+    /// Forgets the chosen width, as `0` in the sidebar does and a double-click on the
+    /// desktop's edge does, so the sidebar takes the width t3term picks from the screen's.
+    fn reset_sidebar_width(&mut self) {
+        if self.sidebar_hidden || self.sidebar_width.is_none() {
+            return;
+        }
+        self.sidebar_width = None;
+        self.layout_changed = true;
+        Settings::update(|settings| settings.sidebar_width = None);
     }
 
     /// Opens or closes the Working shelf and remembers it, as the GUI does. Nothing happens
@@ -817,6 +967,29 @@ impl App {
                         && mouse.row < area.y + area.height
                 };
                 let click = mouse.kind == MouseEventKind::Down(MouseButton::Left);
+                if self.drag.is_some() {
+                    match mouse.kind {
+                        MouseEventKind::Drag(MouseButton::Left) => {
+                            return self.drag_to(mouse.column);
+                        }
+                        // The release moves the edge to its column, as the desktop's does, and
+                        // ends the drag. It does nothing else, wherever it lands.
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            let moved = self.drag_to(mouse.column);
+                            self.end_drag(true);
+                            return moved;
+                        }
+                        // The button came up where the terminal didn't report it, such as
+                        // outside the window, so the drag ends as a release would. A press
+                        // then goes on to do what it does.
+                        MouseEventKind::Moved => return self.end_drag(true),
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            self.end_drag(true);
+                        }
+                        // The wheel and the other buttons wait for the drag to end.
+                        _ => return false,
+                    }
+                }
                 let chip = self
                     .chips
                     .iter()
@@ -848,6 +1021,13 @@ impl App {
                         _ => return false,
                     }
                     return true;
+                }
+                // The left button on the sidebar's edge starts a drag of it, after a click that
+                // closes a menu. The press does nothing else, so a click there leaves focus,
+                // the highlight and the open thread alone.
+                if click && inside(self.sidebar.border) {
+                    self.start_drag();
+                    return false;
                 }
                 if let Some(kind) = chip.filter(|_| click) {
                     self.focus = Focus::Composer;
@@ -919,6 +1099,11 @@ impl App {
             }
             Event::Resize(..) => {
                 self.cache.clear();
+                // A drag's columns don't line up with the new screen, so it ends without its
+                // width. The edge may have moved, so it takes no press until the next frame
+                // draws it.
+                self.end_drag(false);
+                self.sidebar.border = Rect::default();
                 true
             }
             _ => false,
@@ -928,6 +1113,14 @@ impl App {
     fn on_key(&mut self, key: KeyEvent) {
         // Status messages are toasts: the next key dismisses them.
         self.message = None;
+        // A key during a drag of the sidebar's edge puts its width back first. Esc does
+        // nothing else.
+        if self.drag.is_some() {
+            self.end_drag(false);
+            if key.code == KeyCode::Esc {
+                return;
+            }
+        }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
         match key.code {
@@ -1042,6 +1235,9 @@ impl App {
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.open_selected(),
                 KeyCode::Char('e') => self.toggle_settled(),
                 KeyCode::Char('w') => self.toggle_working(),
+                KeyCode::Char('[') => self.step_sidebar(false),
+                KeyCode::Char(']') => self.step_sidebar(true),
+                KeyCode::Char('0') => self.reset_sidebar_width(),
                 _ => {}
             },
             Focus::Transcript => match key.code {
@@ -1684,7 +1880,8 @@ impl App {
         let area = frame.area();
         frame.render_widget(Block::new().style(Style::new().bg(self.theme.bg)), area);
         self.layout_changed = false;
-        let (sidebar, main) = columns(area, self.sidebar_hidden);
+        self.screen = area;
+        let (sidebar, main) = columns(area, self.sidebar_columns(area.width));
         // The wake timer usually moves a woken thread first, but it runs on a clock that
         // stops while the machine sleeps. A hidden sidebar keeps its rows current too, so it
         // comes back as T3 has it.
@@ -2589,10 +2786,10 @@ impl App {
             (_, Some(Kind::Model)) => "Type to search · ↑↓ choose · Enter select · Esc close",
             (_, Some(_)) => "↑↓ choose · Enter select · Esc close",
             (Focus::Sidebar, None) if self.sidebar.has_working() => {
-                "↑↓ select · Enter open · w working · e settled · Ctrl+B hide · Tab focus · q quit"
+                "↑↓ select · Enter open · w working · e settled · [ ] width · Ctrl+B hide · Tab focus · q quit"
             }
             (Focus::Sidebar, None) => {
-                "↑↓ select · Enter open · e settled · Ctrl+B hide · Tab focus · q quit"
+                "↑↓ select · Enter open · e settled · [ ] width · Ctrl+B hide · Tab focus · q quit"
             }
             (Focus::Composer, None) => {
                 "Enter send · Alt+Enter newline · Alt+M model · Alt+E effort · Alt+P mode · Ctrl+X interrupt"
@@ -4733,9 +4930,17 @@ mod tests {
 
     #[test]
     fn any_screen_size_draws_with_the_sidebar_shown_or_hidden() {
-        for start_hidden in [false, true] {
+        let starts = [
+            (false, None),
+            (true, None),
+            (false, Some(0)),
+            (false, Some(45)),
+            (true, Some(u16::MAX)),
+        ];
+        for (start_hidden, chosen) in starts {
             let settings = Settings {
                 sidebar_hidden: start_hidden,
+                sidebar_width: chosen,
                 ..Settings::default()
             };
             let mut app = tui(&settings);
@@ -4763,17 +4968,504 @@ mod tests {
                         app.picker_area,
                         app.sidebar.list,
                         app.sidebar.footer,
+                        app.sidebar.border,
                     ];
                     for area in drawn {
                         assert_eq!(area.intersection(whole), area, "{width}x{height}");
                     }
                     if app.sidebar_hidden {
                         assert_eq!(app.sidebar.list, Rect::default());
+                        assert_eq!(app.sidebar.border, Rect::default());
                         assert!(!app.sidebar.drew_working());
+                    } else if app.sidebar.border != Rect::default() {
+                        // The edge is the sidebar's last column. The conversation takes the
+                        // rest, starting with its column of padding.
+                        let sidebar = app.sidebar.border.right();
+                        assert_eq!(app.composer_area.x, sidebar + 1, "{width} {chosen:?}");
+                        assert!(width - sidebar >= NARROWEST_MAIN, "{width}x{height}");
                     }
                     ctrl_b(&mut app);
                 }
             }
         }
+    }
+
+    // ---- resizing the sidebar ----
+
+    /// An open mode menu, at its first item.
+    fn mode_menu() -> Picker {
+        Picker {
+            kind: Kind::Mode,
+            filter: String::new(),
+            selected: 0,
+            offset: 0,
+        }
+    }
+
+    /// Presses the left button on the sidebar's edge and drags it to column `to`, then draws
+    /// as the event loop would. The button stays down.
+    fn drag_edge(app: &mut App, to: u16) {
+        let Rect { width, height, .. } = app.screen;
+        let edge = app.sidebar.border;
+        mouse(app, CLICK, edge.x, edge.y + 5);
+        assert!(app.drag.is_some(), "no drag started at {edge:?}");
+        mouse(app, MouseEventKind::Drag(MouseButton::Left), to, edge.y + 5);
+        screen(app, width, height);
+        assert_eq!(app.sidebar.border.x, to);
+    }
+
+    #[test]
+    fn with_no_width_chosen_the_sidebar_is_as_wide_as_before() {
+        // Before a width could be chosen, ratatui's layout solver split the screen. With none
+        // chosen, the sidebar gets the same columns at every width, the tiny ones included.
+        for width in 0..=300 {
+            let area = Rect::new(0, 0, width, 24);
+            let old = (width / 4).clamp(26, 34).min(width / 2);
+            let widths = [Constraint::Length(old), Constraint::Min(20)];
+            let [sidebar, main] = Layout::horizontal(widths).areas(area);
+            let drawn = columns(area, sidebar_width(width, None));
+            assert_eq!(drawn, (sidebar, main), "{width}");
+        }
+        // Hidden, the sidebar has no width and the conversation has the screen.
+        let area = Rect::new(0, 0, 80, 24);
+        assert_eq!(columns(area, 0), (Rect { width: 0, ..area }, area));
+    }
+
+    #[test]
+    fn a_chosen_width_draws_where_the_screen_has_room_and_comes_back_when_it_grows() {
+        assert_eq!(sidebar_width(120, Some(45)), 45);
+        // No narrower than 20 columns and no wider than half the screen.
+        assert_eq!(sidebar_width(120, Some(0)), 20);
+        assert_eq!(sidebar_width(80, Some(45)), 40);
+        assert_eq!(sidebar_width(120, Some(u16::MAX)), 60);
+        // A screen too narrow for both leaves the conversation its 20 columns first.
+        assert_eq!(sidebar_width(30, Some(45)), 10);
+        assert_eq!(sidebar_width(30, Some(0)), 10);
+        assert_eq!(sidebar_width(0, Some(45)), 0);
+        assert_eq!(sidebar_width(u16::MAX, Some(u16::MAX)), u16::MAX / 2);
+
+        // Saved at 50, it draws at 50 on a wide screen and at 40 on an 80-column one, and the
+        // narrow screen doesn't change the 50, so it comes back when the screen grows.
+        let chosen = Settings {
+            sidebar_width: Some(50),
+            ..Settings::default()
+        };
+        let mut app = tui(&chosen);
+        for (width, drawn) in [(120, 50), (80, 40), (120, 50)] {
+            screen(&mut app, width, 24);
+            let edge = Rect::new(drawn - 1, 0, 1, 24);
+            assert_eq!(app.sidebar.border, edge, "{width}");
+            assert_eq!(app.composer_area.x, drawn + 1, "{width}");
+            assert_eq!(app.sidebar_width, Some(50));
+        }
+        assert_eq!(crate::settings::saved_in_test(), Settings::default());
+    }
+
+    #[test]
+    fn dragging_the_edge_resizes_the_sidebar_and_saves_once_on_release() {
+        let mut app = tui(&Settings::default());
+        let threads = vec![listed("a", "Alpha", "idle"), listed("b", "Bravo", "idle")];
+        app.on_shell_event(shell_snapshot(threads));
+        assert!(app.sidebar.select("b"));
+        app.open = Some(long_thread());
+        // A draft with the cursor between its two letters.
+        app.focus = Focus::Composer;
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Left);
+        screen(&mut app, 120, 30);
+        // A quarter of 120 columns, with the edge in the last of them.
+        assert_eq!(app.sidebar.border, Rect::new(29, 0, 1, 30));
+
+        // The press starts the drag and changes nothing on screen.
+        assert!(!mouse(&mut app, CLICK, 29, 12));
+        assert_eq!(app.drag.map(|d| (d.from, d.width)), Some((30, 30)));
+        assert!(!app.layout_changed);
+        // The edge follows the pointer between 20 columns and half the screen. Each move that
+        // changes the width draws at once, so the edge is where the next report expects it.
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        for (x, width) in [(39, 40), (u16::MAX, 60), (2, 20)] {
+            assert!(mouse(&mut app, drag, x, 3), "{x}");
+            assert!(app.layout_changed);
+            screen(&mut app, 120, 30);
+            assert_eq!(app.sidebar.border.x + 1, width, "{x}");
+            assert_eq!(app.composer_area.x, width + 1, "{x}");
+        }
+        // Past the narrowest width the edge stays put, and nothing needs drawing.
+        assert!(!mouse(&mut app, drag, 0, 3));
+        assert!(!app.layout_changed);
+        assert!(mouse(&mut app, drag, 44, 3));
+        screen(&mut app, 120, 30);
+
+        // Nothing is saved until the release, which saves the width once.
+        assert_eq!(app.sidebar_width, None);
+        assert_eq!(crate::settings::saved_in_test(), Settings::default());
+        let up = MouseEventKind::Up(MouseButton::Left);
+        assert!(!mouse(&mut app, up, 44, 3));
+        assert_eq!(app.drag, None);
+        assert_eq!(app.sidebar_width, Some(45));
+        assert_eq!(crate::settings::saved_in_test().sidebar_width, Some(45));
+
+        // Focus, the highlight, the open thread, the draft and its cursor are as they were.
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("b"));
+        assert_eq!(app.open.as_ref().map(|open| open.id.as_str()), Some("t"));
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(app.composer.text(), "hid");
+        // The cards take clicks at their new width.
+        let rows = screen(&mut app, 120, 30);
+        assert_eq!(app.sidebar.list.width, 45 - 3);
+        let bravo = row_showing(&rows, "Bravo");
+        assert_eq!(app.sidebar.thread_at(bravo), Some("b"));
+
+        // A release over Alpha's card, with the edge held at the narrowest, ends the drag and
+        // opens nothing.
+        mouse(&mut app, CLICK, 44, 3);
+        mouse(&mut app, drag, 0, 3);
+        let rows = screen(&mut app, 120, 30);
+        let alpha = row_showing(&rows, "Alpha");
+        assert_eq!(app.sidebar.thread_at(alpha), Some("a"));
+        assert!(!mouse(&mut app, up, 5, alpha));
+        assert_eq!(app.drag, None);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("b"));
+        assert_eq!(app.open.as_ref().map(|open| open.id.as_str()), Some("t"));
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(crate::settings::saved_in_test().sidebar_width, Some(20));
+    }
+
+    #[test]
+    fn a_click_on_the_edge_opens_nothing_and_saves_nothing() {
+        let mut app = tui(&Settings::default());
+        let threads = vec![listed("a", "Alpha", "idle"), listed("b", "Bravo", "idle")];
+        app.on_shell_event(shell_snapshot(threads));
+        assert!(app.sidebar.select("a"));
+        let rows = screen(&mut app, 80, 24);
+        let bravo = row_showing(&rows, "Bravo");
+        let edge = app.sidebar.border.x;
+        assert_eq!(edge, 25);
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        let up = MouseEventKind::Up(MouseButton::Left);
+
+        // Pressed and released on the edge beside Bravo's card, it opens nothing and moves
+        // neither the highlight nor focus. It doesn't save the width t3term picked, either.
+        assert!(!mouse(&mut app, CLICK, edge, bravo));
+        assert!(!mouse(&mut app, up, edge, bravo));
+        assert_eq!(app.drag, None);
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert!(app.open.is_none());
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a"));
+        // Nor does a drag that comes back to where it started.
+        mouse(&mut app, CLICK, edge, bravo);
+        assert!(mouse(&mut app, drag, edge + 9, bravo));
+        assert!(mouse(&mut app, drag, edge, bravo));
+        assert!(!mouse(&mut app, up, edge, bravo));
+        assert_eq!(app.sidebar_width, None);
+        assert_eq!(crate::settings::saved_in_test(), Settings::default());
+
+        // Motion or a release with no press on the edge first, and the other buttons, start no
+        // drag, and a left drag that follows them moves nothing.
+        let others = [
+            drag,
+            up,
+            MouseEventKind::Moved,
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Down(MouseButton::Middle),
+            MouseEventKind::Drag(MouseButton::Right),
+        ];
+        for kind in others {
+            mouse(&mut app, kind, edge, bravo);
+            assert_eq!(app.drag, None, "{kind:?}");
+            assert!(!mouse(&mut app, drag, 50, bravo), "{kind:?}");
+        }
+        screen(&mut app, 80, 24);
+        assert_eq!(app.sidebar.border.x, edge);
+        // The column left of the edge is the cards' padding, not the edge.
+        mouse(&mut app, CLICK, edge - 1, bravo);
+        assert_eq!(app.drag, None);
+
+        // During a drag the wheel and the other buttons do nothing, so the transcript under the
+        // pointer doesn't scroll, and only the left button's release ends it.
+        mouse(&mut app, CLICK, edge, bravo);
+        mouse(&mut app, drag, edge + 5, bravo);
+        let waiting = [
+            MouseEventKind::ScrollUp,
+            MouseEventKind::ScrollDown,
+            MouseEventKind::Down(MouseButton::Right),
+            MouseEventKind::Drag(MouseButton::Right),
+            MouseEventKind::Up(MouseButton::Right),
+            MouseEventKind::Up(MouseButton::Middle),
+        ];
+        let transcript = app.transcript_area;
+        for kind in waiting {
+            assert!(!mouse(&mut app, kind, transcript.x + 2, transcript.y + 2));
+        }
+        assert_eq!(app.drag.map(|d| (d.from, d.width)), Some((26, 31)));
+        assert_eq!(app.scroll.rows(), 0);
+        assert!(app.open.is_none());
+    }
+
+    #[test]
+    fn a_drag_ends_without_its_width_on_a_key_ctrl_b_or_a_resize() {
+        let mut app = tui(&Settings::default());
+        app.focus = Focus::Composer;
+        screen(&mut app, 80, 24);
+        assert_eq!(app.sidebar.border.x, 25);
+
+        // Esc puts the width back and does nothing else, so focus stays in the composer.
+        drag_edge(&mut app, 35);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.drag, None);
+        assert!(app.layout_changed, "the old width draws at once");
+        assert_eq!(app.focus, Focus::Composer);
+        screen(&mut app, 80, 24);
+        assert_eq!(app.sidebar.border.x, 25);
+
+        // Another key puts it back and then does what it always does.
+        drag_edge(&mut app, 35);
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.drag, None);
+        assert_eq!(app.composer.text(), "x");
+        // A release after that belongs to no drag.
+        let up = MouseEventKind::Up(MouseButton::Left);
+        assert!(!mouse(&mut app, up, 35, 5));
+        screen(&mut app, 80, 24);
+        assert_eq!(app.sidebar.border.x, 25);
+
+        // Ctrl+B hides the sidebar, which comes back at its width from before the drag.
+        drag_edge(&mut app, 35);
+        ctrl_b(&mut app);
+        assert!(app.sidebar_hidden);
+        assert_eq!(app.drag, None);
+        screen(&mut app, 80, 24);
+        assert_eq!(app.sidebar.border, Rect::default());
+        ctrl_b(&mut app);
+        screen(&mut app, 80, 24);
+        assert_eq!(app.sidebar.border.x, 25);
+
+        // A resize ends it too. Until the next frame draws the new edge, the old one takes no
+        // press.
+        drag_edge(&mut app, 35);
+        assert!(app.on_terminal_event(Event::Resize(120, 30)));
+        assert_eq!(app.drag, None);
+        assert_eq!(app.sidebar.border, Rect::default());
+        mouse(&mut app, CLICK, 35, 5);
+        assert_eq!(app.drag, None);
+        screen(&mut app, 120, 30);
+        assert_eq!(app.sidebar.border.x, 29);
+
+        // None of them saved a width.
+        assert_eq!(app.sidebar_width, None);
+        assert_eq!(crate::settings::saved_in_test().sidebar_width, None);
+    }
+
+    #[test]
+    fn a_release_the_terminal_never_reported_ends_the_drag_as_one_would() {
+        let mut app = tui(&Settings::default());
+        app.open = Some(long_thread());
+        app.focus = Focus::Composer;
+        screen(&mut app, 80, 24);
+
+        // Motion with no button held means the button came up unreported, outside the window
+        // say. The drag ends with the width it reached.
+        drag_edge(&mut app, 35);
+        assert!(!mouse(&mut app, MouseEventKind::Moved, 70, 5));
+        assert_eq!(app.drag, None);
+        assert_eq!(app.sidebar_width, Some(36));
+        assert_eq!(crate::settings::saved_in_test().sidebar_width, Some(36));
+
+        // So does a new press, which then does what it does. In the transcript it focuses it.
+        drag_edge(&mut app, 39);
+        let transcript = app.transcript_area;
+        assert!(mouse(&mut app, CLICK, transcript.x + 2, transcript.y + 2));
+        assert_eq!(app.drag, None);
+        assert_eq!(app.focus, Focus::Transcript);
+        assert_eq!(app.sidebar_width, Some(40));
+        assert_eq!(crate::settings::saved_in_test().sidebar_width, Some(40));
+    }
+
+    #[test]
+    fn brackets_in_the_sidebar_resize_it_and_zero_puts_back_the_default() {
+        let mut app = tui(&Settings::default());
+        assert_eq!(app.focus, Focus::Sidebar);
+        let rows = screen(&mut app, 120, 30);
+        assert!(rows[29].contains("[ ] width"), "{:?}", rows[29]);
+        assert_eq!(app.sidebar.border.x + 1, 30);
+
+        // Each press moves the edge two columns, saves the width and draws at once.
+        press(&mut app, KeyCode::Char(']'));
+        assert!(app.layout_changed);
+        assert_eq!(app.sidebar_width, Some(32));
+        assert_eq!(crate::settings::saved_in_test().sidebar_width, Some(32));
+        screen(&mut app, 120, 30);
+        assert_eq!(app.sidebar.border.x + 1, 32);
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Char('['));
+        }
+        assert_eq!(app.sidebar_width, Some(26));
+        // It stops at 20 columns and at half the screen. A press there changes nothing.
+        for _ in 0..10 {
+            press(&mut app, KeyCode::Char('['));
+        }
+        assert_eq!(app.sidebar_width, Some(20));
+        screen(&mut app, 120, 30);
+        press(&mut app, KeyCode::Char('['));
+        assert!(!app.layout_changed);
+        for _ in 0..30 {
+            press(&mut app, KeyCode::Char(']'));
+        }
+        assert_eq!(app.sidebar_width, Some(60));
+        assert_eq!(crate::settings::saved_in_test().sidebar_width, Some(60));
+
+        // `0` forgets the width, and the sidebar takes a quarter of the screen again.
+        press(&mut app, KeyCode::Char('0'));
+        assert!(app.layout_changed);
+        assert_eq!(app.sidebar_width, None);
+        assert_eq!(crate::settings::saved_in_test().sidebar_width, None);
+        screen(&mut app, 120, 30);
+        assert_eq!(app.sidebar.border.x + 1, 30);
+        press(&mut app, KeyCode::Char('0'));
+        assert!(!app.layout_changed, "there was nothing to forget");
+
+        // The composer types them, the transcript ignores them, and an open menu takes them.
+        app.focus = Focus::Composer;
+        for c in ['[', ']', '0'] {
+            press(&mut app, KeyCode::Char(c));
+        }
+        assert_eq!(app.composer.text(), "[]0");
+        app.focus = Focus::Transcript;
+        for c in ['[', ']', '0'] {
+            press(&mut app, KeyCode::Char(c));
+        }
+        app.focus = Focus::Sidebar;
+        app.picker = Some(mode_menu());
+        press(&mut app, KeyCode::Char(']'));
+        assert!(app.picker.is_some());
+        assert_eq!(app.sidebar_width, None);
+        assert!(!app.layout_changed);
+
+        // Saved wider than 80 columns allow, `]` has nowhere to go and keeps the 50 for a
+        // wider screen. `[` starts from the 40 columns on screen.
+        let chosen = Settings {
+            sidebar_width: Some(50),
+            ..Settings::default()
+        };
+        let mut app = tui(&chosen);
+        screen(&mut app, 80, 24);
+        press(&mut app, KeyCode::Char(']'));
+        assert_eq!(app.sidebar_width, Some(50));
+        press(&mut app, KeyCode::Char('['));
+        assert_eq!(app.sidebar_width, Some(38));
+    }
+
+    #[test]
+    fn resizing_the_sidebar_rewraps_the_transcript_and_keeps_the_reader_in_place() {
+        let mut app = tui(&Settings::default());
+        app.open = Some(long_thread());
+        app.composer.insert_str("draft");
+        app.focus = Focus::Transcript;
+        screen(&mut app, 80, 24);
+        for _ in 0..3 {
+            press(&mut app, KeyCode::PageUp);
+        }
+        screen(&mut app, 80, 24);
+        let (top, _) = app.anchor.clone().expect("scrolled up");
+        let prepared = &app.open.as_ref().unwrap().prepared;
+        let (made, versions) = (prepared.made, prepared.versions.clone());
+        let up = MouseEventKind::Up(MouseButton::Left);
+
+        // The sidebar wider and then narrower than at the start, so the transcript narrows and
+        // then widens.
+        for (to, narrower) in [(35, true), (21, false)] {
+            let before = app.transcript_area.width;
+            drag_edge(&mut app, to);
+            assert!(!mouse(&mut app, up, to, 5));
+            assert_eq!(app.focus, Focus::Transcript, "the transcript keeps focus");
+            screen(&mut app, 80, 24);
+            assert_eq!(app.transcript_area.width < before, narrower);
+            // Every block is wrapped again at the new width, from the blocks already made.
+            let width = app.transcript_area.width - 1;
+            assert!(app.cache.values().all(|cached| cached.key.1 == width));
+            let prepared = &app.open.as_ref().unwrap().prepared;
+            assert_eq!(prepared.made, made, "a block was made again");
+            assert_eq!(prepared.versions, versions);
+            // The same answer is at the top, and the transcript is still scrolled up.
+            assert_eq!(app.anchor.as_ref().map(|(id, _)| id), Some(&top));
+            assert!(app.scroll.rows() > 0);
+            assert_eq!(app.composer.text(), "draft");
+        }
+    }
+
+    #[test]
+    fn the_conversation_follows_the_edge_and_an_open_menu_takes_the_first_press() {
+        let mut app = tui(&Settings::default());
+        app.open = Some(long_thread());
+        app.focus = Focus::Composer;
+        app.picker = Some(mode_menu());
+        screen(&mut app, 120, 30);
+        let (chips, menu) = (app.chips.clone(), app.picker_area);
+        assert!(!chips.is_empty());
+        let edge = app.sidebar.border.x;
+
+        // With the menu open, a press on the edge only closes it, as a press anywhere outside
+        // the menu does.
+        assert!(mouse(&mut app, CLICK, edge, 5));
+        assert!(app.picker.is_none());
+        assert_eq!(app.drag, None);
+
+        // The next press drags the edge 20 columns right.
+        drag_edge(&mut app, edge + 20);
+        let up = MouseEventKind::Up(MouseButton::Left);
+        mouse(&mut app, up, edge + 20, 5);
+        app.picker = Some(mode_menu());
+        screen(&mut app, 120, 30);
+        // The conversation starts a column of padding after the edge, and all of it moved.
+        let x = app.sidebar.border.right() + 1;
+        assert_eq!(x, edge + 22);
+        let parts = [
+            app.sidebar_toggle,
+            app.transcript_area,
+            app.panel_area,
+            app.composer_area,
+        ];
+        for area in parts {
+            assert_eq!(area.x, x, "{area:?}");
+        }
+        assert_eq!(app.tasks.area.x, x + 1);
+        let composer = app.composer_area;
+        assert_eq!(app.chips.len(), chips.len());
+        for ((area, kind), (before, _)) in app.chips.iter().zip(&chips) {
+            assert!(area.x > before.x, "{kind:?} stayed at {before:?}");
+            assert!(area.x > composer.x && area.right() < composer.right());
+        }
+        assert!(app.picker_area.x > menu.x);
+        assert!(app.picker_area.right() <= composer.right());
+    }
+
+    #[test]
+    fn a_hidden_sidebar_has_no_edge_and_keeps_its_width_for_later() {
+        let saved = Settings {
+            sidebar_hidden: true,
+            sidebar_width: Some(40),
+            ..Settings::default()
+        };
+        let mut app = tui(&saved);
+        screen(&mut app, 120, 30);
+        assert_eq!(app.sidebar.border, Rect::default());
+        assert_eq!(app.composer_area.x, 1);
+        // A press where the edge would be is the conversation's.
+        mouse(&mut app, CLICK, 39, 5);
+        assert_eq!(app.drag, None);
+        // Called while hidden, what `[`, `]` and `0` do changes nothing.
+        app.step_sidebar(true);
+        app.step_sidebar(false);
+        app.reset_sidebar_width();
+        assert!(!app.layout_changed);
+        assert_eq!(app.sidebar_width, Some(40));
+
+        // Shown again, it has the width it was given.
+        ctrl_b(&mut app);
+        screen(&mut app, 120, 30);
+        assert_eq!(app.sidebar.border, Rect::new(39, 0, 1, 30));
+        assert_eq!(app.composer_area.x, 41);
     }
 }

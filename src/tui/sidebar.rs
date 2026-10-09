@@ -696,6 +696,9 @@ pub struct Sidebar {
     // Last drawn geometry, for mouse hit-testing.
     pub list: Rect,
     pub footer: Rect,
+    /// The one-column strip on the right that stands in for the GUI's border, which a drag
+    /// resizes the sidebar by.
+    pub border: Rect,
     /// The screen rows each drawn card covers, top inclusive and bottom exclusive, with its
     /// thread.
     cards: Vec<(u16, u16, String)>,
@@ -958,6 +961,7 @@ impl Sidebar {
     pub fn forget_drawn(&mut self) {
         self.list = Rect::default();
         self.footer = Rect::default();
+        self.border = Rect::default();
         self.cards.clear();
         self.drew_working = false;
         self.working_heading = None;
@@ -973,9 +977,10 @@ impl Sidebar {
             return;
         }
         // A one-column strip stands in for the GUI's 1px border.
+        self.border = Rect::new(area.right() - 1, area.y, 1, area.height);
         frame.render_widget(
             Block::new().style(Style::new().bg(t.sidebar_border)),
-            Rect::new(area.right() - 1, area.y, 1, area.height),
+            self.border,
         );
         let inner = Rect::new(area.x + 1, area.y, area.width - 3, area.height);
         let width = inner.width as usize;
@@ -2972,6 +2977,8 @@ mod tests {
         assert!(sidebar.working_heading_at(row_of(&lines, "Working ─")));
         assert_ne!(sidebar.list, Rect::default());
         assert_ne!(sidebar.footer, Rect::default());
+        // The edge a drag resizes it by is its last column, top to bottom.
+        assert_eq!(sidebar.border, Rect::new(29, 0, 1, 24));
         assert!(sidebar.drew_working());
 
         // Hidden, the frame draws no sidebar, so nothing it drew before takes a click, the
@@ -2983,6 +2990,7 @@ mod tests {
         }
         assert_eq!(sidebar.list, Rect::default());
         assert_eq!(sidebar.footer, Rect::default());
+        assert_eq!(sidebar.border, Rect::default());
         assert!(!sidebar.drew_working());
 
         // While it is hidden, `b` is renamed and `c` arrives. Shown again, it lists both, with
@@ -3002,6 +3010,12 @@ mod tests {
         assert_eq!(sidebar.thread_at(row_of(&lines, "Renamed b")), Some("b"));
         assert_eq!(sidebar.thread_at(row_of(&lines, "Thread c")), Some("c"));
         assert!(sidebar.drew_working());
+        assert_eq!(sidebar.border, Rect::new(29, 0, 1, 24));
+
+        // Too narrow to draw, it has no edge to drag either.
+        render(&mut sidebar, Some(&after), None, (5, 24));
+        assert_eq!(sidebar.border, Rect::default());
+        assert_eq!(sidebar.list, Rect::default());
     }
 
     // ---- the Working shelf ----
