@@ -1118,6 +1118,274 @@ mod tests {
         assert_eq!(body, format!("{}\n…", "界".repeat(1_365)));
     }
 
+    /// A `handoff` item as the nightly sends it (`OrchestrationV2TurnItem` in
+    /// packages/contracts/src/orchestrationV2.ts and `Orchestrator.ts:1636`), from codex_personal
+    /// to claudeAgent in run `target`, without the stamped models of newer servers. `fields`
+    /// replaces or adds fields.
+    fn handoff_item(fields: Value) -> Value {
+        let mut item = json!({
+            "id": "handoff-1",
+            "threadId": "t",
+            "runId": "target",
+            "type": "handoff",
+            "ordinal": 299,
+            "status": "completed",
+            "title": "Provider handoff",
+            "contextHandoffId": "context-handoff-1",
+            "fromProviderThreadIds": ["provider-thread-1"],
+            "toProviderThreadId": "provider-thread-2",
+            "fromProviderInstanceIds": ["codex_personal"],
+            "toProviderInstanceId": "claudeAgent",
+            "strategy": "full_thread_summary",
+            "summary": "Full conversation context for provider handoff.",
+            "updatedAt": "2026-10-08T10:00:00.000Z",
+        });
+        if let (Some(item), Some(fields)) = (item.as_object_mut(), fields.as_object()) {
+            item.extend(fields.clone());
+        }
+        item
+    }
+
+    /// A finished run on `instance` with `model`.
+    fn run(id: &str, ordinal: u64, instance: &str, model: &str) -> Value {
+        json!({"id": id, "ordinal": ordinal, "status": "completed", "providerInstanceId": instance,
+            "modelSelection": {"instanceId": instance, "model": model}})
+    }
+
+    fn detail(item: &Value, runs: &[Value]) -> String {
+        describe(item, runs).expect("a handoff has a row").body
+    }
+
+    #[test]
+    fn every_handoff_is_a_context_handoff_marker_whatever_its_title() {
+        // Untitled, and with the titles T3 gives a provider switch and imported context. None
+        // shows its title or its summary.
+        let stamped = json!({
+            "fromModelSelections": [{"instanceId": "codex_personal", "model": "gpt-5.6-sol"}],
+            "toModel": "claude-fable-5",
+        });
+        for title in [
+            Value::Null,
+            json!("Provider handoff"),
+            json!("Imported context"),
+        ] {
+            let mut item = handoff_item(stamped.clone());
+            item["title"] = title;
+            let block = describe(&item, &[]).expect("a handoff has a row");
+            assert_eq!(block.kind, BlockKind::Notice, "{item}");
+            assert_eq!(
+                (block.header.as_str(), block.body.as_str()),
+                ("Context handoff", "gpt-5.6-sol → claude-fable-5"),
+                "{item}"
+            );
+        }
+
+        // `t3term read` prints each marker and its endpoints, a failed handoff's too. The
+        // projection that `--json` prints keeps the items as T3 sent them.
+        let mut untitled = handoff_item(stamped);
+        untitled["title"] = Value::Null;
+        let failed = handoff_item(json!({
+            "id": "handoff-2",
+            "ordinal": 399,
+            "status": "failed",
+            "runId": null,
+        }));
+        let state = ThreadState::from_snapshot(&json!({
+            "snapshotSequence": 1,
+            "projection": {"thread": {"id": "t"}, "turnItems": [untitled.clone(), failed.clone()]},
+        }))
+        .expect("a snapshot");
+        assert_eq!(
+            plain_text(&state, None, false),
+            "  · Context handoff\n    gpt-5.6-sol → claude-fable-5\n  · Context handoff\n    codex_personal → claudeAgent\n"
+        );
+        assert_eq!(state.list("turnItems"), [untitled, failed]);
+    }
+
+    #[test]
+    fn stamped_endpoints_keep_every_source_model_and_win_over_the_runs() {
+        // As in the nightly's handoff.test.ts: two models from one provider, and a target that
+        // the handoff run would name differently.
+        let runs = [run("target", 2, "claudeAgent", "later-model")];
+        let two_models = json!([
+            {"instanceId": "codex_personal", "model": "source-a"},
+            {"instanceId": "codex_personal", "model": "source-b"},
+        ]);
+        let item = handoff_item(json!({
+            "fromModelSelections": two_models,
+            "toModel": "destination",
+        }));
+        assert_eq!(detail(&item, &runs), "source-a, source-b → destination");
+
+        // Sources keep T3's order, a repeat included, and one with a blank model is named by
+        // its provider.
+        let item = handoff_item(json!({
+            "fromModelSelections": [
+                {"instanceId": "cursor", "model": "composer-2"},
+                {"instanceId": "codex_personal", "model": "source-a"},
+                {"instanceId": "opencode", "model": " \t"},
+                {"instanceId": "cursor", "model": "composer-2"},
+            ],
+            "toModel": "destination",
+        }));
+        assert_eq!(
+            detail(&item, &runs),
+            "composer-2, source-a, opencode, composer-2 → destination"
+        );
+
+        // A stamped target model with no text still stands, so the provider names the target,
+        // as the nightly's `??` keeps it.
+        let item = handoff_item(json!({"fromModelSelections": two_models, "toModel": "  "}));
+        assert_eq!(detail(&item, &runs), "source-a, source-b → claudeAgent");
+
+        // With no stamped sources, the runs name them, and the stamped target still wins.
+        let runs = [
+            run("source", 1, "codex_personal", "source-model"),
+            run("target", 2, "claudeAgent", "later-model"),
+        ];
+        let item = handoff_item(json!({"fromModelSelections": [], "toModel": "destination"}));
+        assert_eq!(detail(&item, &runs), "source-model → destination");
+    }
+
+    #[test]
+    fn a_handoff_without_stamped_models_reads_them_from_the_runs() {
+        // As in the nightly's handoff.test.ts: the target's model is the handoff run's, and the
+        // source's is that of the newest run on its provider before the handoff run, wherever
+        // the runs come in the list.
+        let runs = [
+            run("later", 4, "codex_personal", "wrong-later-model"),
+            run("old", 1, "codex_personal", "old-model"),
+            run("target", 3, "claudeAgent", "destination"),
+            run("source", 2, "codex_personal", "source-model"),
+        ];
+        let item = handoff_item(json!({}));
+        assert_eq!(detail(&item, &runs), "source-model → destination");
+        // Stamped sources alone still leave the target to the handoff run.
+        let item = handoff_item(json!({
+            "fromModelSelections": [{"instanceId": "codex_personal", "model": "gpt-5.5"}],
+        }));
+        assert_eq!(detail(&item, &runs), "gpt-5.5 → destination");
+        // With no handoff run, nothing bounds the sources, so the newest run on a source's
+        // provider names it, as in the nightly, and the target keeps its provider.
+        let item = handoff_item(json!({"runId": null}));
+        assert_eq!(detail(&item, &runs), "wrong-later-model → claudeAgent");
+        // With no source at all, the target stands alone, without the arrow.
+        let item = handoff_item(json!({"fromProviderInstanceIds": []}));
+        assert_eq!(detail(&item, &runs), "destination");
+
+        // Several sources keep T3's order, and one with no run before the handoff run keeps its
+        // provider.
+        let runs = [
+            run("cursor", 1, "cursor", "composer-2"),
+            run("source", 2, "codex_personal", "source-model"),
+            run("target", 3, "claudeAgent", "destination"),
+            run("too-late", 4, "opencode", "too-late-model"),
+        ];
+        let item = handoff_item(json!({
+            "fromProviderInstanceIds": ["cursor", "opencode", "codex_personal"],
+        }));
+        assert_eq!(
+            detail(&item, &runs),
+            "composer-2, opencode, source-model → destination"
+        );
+
+        // A handoff run on another provider names no target, and without runs both ends keep
+        // their providers.
+        let item = handoff_item(json!({}));
+        let runs = [run("target", 2, "codex_personal", "wrong-model")];
+        assert_eq!(detail(&item, &runs), "codex_personal → claudeAgent");
+        assert_eq!(detail(&item, &[]), "codex_personal → claudeAgent");
+    }
+
+    #[test]
+    fn an_inherited_handoff_keeps_its_providers() {
+        // A fork inherits its parent's items but not its runs. This thread's runs would name
+        // both ends of the parent's handoff, so it keeps its providers, as the nightly's
+        // timeline does for an item from another thread.
+        let runs = [
+            run("source", 1, "codex_personal", "source-model"),
+            run("target", 2, "claudeAgent", "destination"),
+        ];
+        let mut inherited = handoff_item(json!({}));
+        inherited["threadId"] = json!("parent");
+        let local = handoff_item(json!({"id": "handoff-2", "ordinal": 399}));
+        let state = ThreadState::from_snapshot(&json!({
+            "snapshotSequence": 1,
+            "projection": {
+                "thread": {"id": "t"},
+                "runs": runs,
+                "turnItems": [local],
+                "visibleTurnItems": [
+                    {"position": 0, "visibility": "inherited", "sourceThreadId": "parent",
+                        "sourceItemId": "handoff-1", "item": inherited},
+                    {"position": 1, "visibility": "local", "sourceThreadId": "t",
+                        "sourceItemId": "handoff-2", "item": local},
+                ],
+            },
+        }))
+        .expect("a snapshot");
+        let bodies: Vec<String> = blocks(&state).into_iter().map(|b| b.body).collect();
+        assert_eq!(
+            bodies,
+            ["codex_personal → claudeAgent", "source-model → destination"]
+        );
+    }
+
+    #[test]
+    fn a_handoffs_endpoints_are_bounded_and_never_move_the_cursor() {
+        let stamped = |source: &str, target: &str| {
+            handoff_item(json!({
+                "fromModelSelections": [{"instanceId": "codex_personal", "model": source}],
+                "toModel": target,
+            }))
+        };
+        // Made-up ids: an Esc that clears the screen, a C1 CSI, BEL, a line break and a tab,
+        // then CJK, a joined emoji and a combining accent, which a terminal draws as they are.
+        let item = stamped(
+            "gpt\u{1b}[2J-5.6\u{9b}31m\u{7}\n\tsol",
+            "日本語 👩\u{200d}💻 cafe\u{301}",
+        );
+        assert_eq!(
+            detail(&item, &[]),
+            "gpt[2J-5.631m sol → 日本語 👩\u{200d}💻 cafe\u{301}"
+        );
+
+        // A model that is only controls or blanks gives way to the provider id, which is
+        // cleaned the same way. With nothing left of either, the end reads `?`.
+        let mut item = stamped("\u{1b}\u{7}", " ");
+        item["fromModelSelections"][0]["instanceId"] = json!("codex\u{9b}2J\r\npersonal");
+        item["toProviderInstanceId"] = json!("\u{7f}");
+        assert_eq!(detail(&item, &[]), "codex2J personal → ?");
+
+        // Past 64 columns an id is cut where a terminal starts a character, and … ends it. 界
+        // and 👩‍💻 take two columns each.
+        let coder = "👩\u{200d}💻";
+        let cases = [
+            ("m".repeat(200), format!("{}…", "m".repeat(63))),
+            ("界".repeat(100), format!("{}…", "界".repeat(31))),
+            (
+                format!("a{}", coder.repeat(40)),
+                format!("a{}…", coder.repeat(31)),
+            ),
+            // Only the first 1,024 bytes are read, so … also says there was more after them.
+            (format!("a{}", "\u{7}".repeat(2_000)), "a…".to_string()),
+        ];
+        for (raw, kept) in cases {
+            assert!(kept.width() <= MAX_ENDPOINT_WIDTH, "{kept}");
+            assert_eq!(detail(&stamped(&raw, "x"), &[]), format!("{kept} → x"));
+        }
+
+        // Past twelve sources, a count stands for the rest.
+        let selections: Vec<Value> = (1..=15)
+            .map(|n| json!({"instanceId": "codex_personal", "model": format!("m{n}")}))
+            .collect();
+        let item = handoff_item(json!({"fromModelSelections": selections, "toModel": "x"}));
+        assert_eq!(
+            detail(&item, &[]),
+            "m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, +3 more → x"
+        );
+    }
+
     #[test]
     fn a_long_output_says_what_it_dropped_and_keeps_the_end_that_matters() {
         let lines = (1..=30)

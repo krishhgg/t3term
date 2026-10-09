@@ -144,12 +144,18 @@ fn serve(
 /// thread `id` as `GET /api/orchestration/threads/:id` returns it, with only the fields `read`
 /// uses. Returns the server's origin.
 fn serve_thread(id: &str, title: &str, turn_items: Value) -> String {
-    let snapshot = json!({"snapshotSequence": 3, "projection": {
+    let projection = json!({
         "thread": {"id": id, "title": title},
         "runs": [],
         "runtimeRequests": [],
         "turnItems": turn_items,
-    }});
+    });
+    serve_projection(id, projection)
+}
+
+/// Serves thread `id` as `serve_thread` does, with `projection` in its snapshot.
+fn serve_projection(id: &str, projection: Value) -> String {
+    let snapshot = json!({"snapshotSequence": 3, "projection": projection});
     let descriptor = json!({"environmentId": "env-test", "label": "Fake",
         "platform": {"os": "darwin", "arch": "arm64"}, "serverVersion": "0.0.0-test",
         "capabilities": {}, "orchestrationProtocolVersion": 2});
@@ -318,6 +324,107 @@ fn read_shows_compactions_without_a_title_and_json_keeps_them_as_sent() {
     let control = printed.chars().find(|c| c.is_control() && *c != '\n');
     assert_eq!(control, None, "{printed:?}");
     assert_eq!(json_stdout(&read)["projection"]["turnItems"], items);
+}
+
+#[test]
+fn read_names_where_each_handoff_went_and_json_keeps_them_as_sent() {
+    // Handoffs as the nightly sends them (`OrchestrationV2TurnItem` in
+    // packages/contracts/src/orchestrationV2.ts), in a thread forked from another. The first is
+    // the parent's, which T3 stamped no models on and whose runs stay with the parent, so its
+    // providers name both ends. Then one T3 stamped with two models from one provider, under
+    // the title T3 gives imported context, an untitled one that this thread's runs name, and a
+    // failed one whose made-up model ids hold controls or run long.
+    let id = "9c4e2a71-5b3d-4e8f-a1c6-3d7b9e0f2a54";
+    let handoff = |item_id: &str, ordinal: u64, status: &str| {
+        json!({"id": item_id, "threadId": id, "type": "handoff", "ordinal": ordinal,
+            "status": status, "title": null, "fromProviderInstanceIds": ["codex_personal"],
+            "toProviderInstanceId": "claudeAgent", "strategy": "full_thread_summary",
+            "summary": "Full conversation context.", "updatedAt": "2026-10-08T10:00:00.000Z"})
+    };
+    let mut inherited = handoff("h0", 1, "completed");
+    inherited["threadId"] = json!("4b1d7c93-2e6a-4f05-9d8c-6a0e3f5b1c27");
+    inherited["runId"] = json!("parent-run");
+    inherited["title"] = json!("Provider handoff");
+    let mut stamped = handoff("h1", 3, "completed");
+    stamped["runId"] = json!("r2");
+    stamped["title"] = json!("Imported context");
+    stamped["fromModelSelections"] = json!([
+        {"instanceId": "codex_personal", "model": "gpt-5.5"},
+        {"instanceId": "codex_personal", "model": "gpt-5.4"},
+    ]);
+    stamped["toModel"] = json!("claude-fable-5");
+    let mut legacy = handoff("h2", 5, "completed");
+    legacy["runId"] = json!("r4");
+    legacy["fromProviderInstanceIds"] = json!(["cursor", "codex_personal"]);
+    let mut failed = handoff("h3", 6, "failed");
+    failed["fromModelSelections"] = json!([
+        {"instanceId": "codex_personal", "model": "gpt\u{1b}[2J-5.5\u{9b}31m\r\nmini"},
+        {"instanceId": "codex_personal", "model": "m".repeat(100)},
+    ]);
+    failed["toModel"] = json!("\u{1b}\u{7}");
+
+    // The thread's runs. The cursor run after the legacy handoff's run names nothing.
+    let run = |run_id: &str, ordinal: u64, instance: &str, model: &str| {
+        json!({"id": run_id, "ordinal": ordinal, "status": "completed",
+            "providerInstanceId": instance,
+            "modelSelection": {"instanceId": instance, "model": model}})
+    };
+    let entry = |position: u64, visibility: &str, item: &Value| {
+        json!({"position": position, "visibility": visibility,
+            "sourceThreadId": item["threadId"], "sourceItemId": item["id"],
+            "item": item})
+    };
+    let projection = json!({
+        "thread": {"id": id, "title": "Handoffs"},
+        "runs": [
+            run("r1", 1, "codex_personal", "gpt-5.5"),
+            run("r2", 2, "claudeAgent", "claude-fable-5"),
+            run("r3", 3, "cursor", "composer-2"),
+            run("r4", 4, "claudeAgent", "claude-fable-5-1"),
+            run("r5", 5, "cursor", "composer-3"),
+        ],
+        "runtimeRequests": [],
+        "turnItems": [stamped, legacy, failed],
+        "visibleTurnItems": [
+            entry(0, "inherited", &inherited),
+            entry(1, "local", &stamped),
+            entry(2, "local", &legacy),
+            entry(3, "local", &failed),
+        ],
+    });
+    let origin = serve_projection(id, projection.clone());
+    let home = Home::new();
+    home.record_server(&origin);
+    let t3 = home.fake_t3();
+
+    let read = home.run_with(&["read", id], &t3);
+    assert_eq!(read.status.code(), Some(0), "{read:?}");
+    let printed = String::from_utf8(read.stdout).expect("UTF-8");
+    let control = printed.chars().find(|c| c.is_control() && *c != '\n');
+    assert_eq!(control, None, "{printed:?}");
+    let long = "m".repeat(63);
+    let failed_row = format!("    gpt[2J-5.531m mini, {long}… → claudeAgent");
+    let rows = [
+        "  · Context handoff",
+        "    codex_personal → claudeAgent",
+        "  · Context handoff",
+        "    gpt-5.5, gpt-5.4 → claude-fable-5",
+        "  · Context handoff",
+        "    composer-2, gpt-5.5 → claude-fable-5-1",
+        "  · Context handoff",
+        failed_row.as_str(),
+    ];
+    let expected = format!("# Handoffs  ({id})\n{}\n", rows.join("\n"));
+    assert_eq!(printed, expected);
+
+    // `--json` prints the projection as T3 sent it, runs and both lists of items included,
+    // with each control as a JSON escape.
+    let read = home.run_with(&["--json", "read", id], &t3);
+    assert_eq!(read.status.code(), Some(0), "{read:?}");
+    let printed = std::str::from_utf8(&read.stdout).expect("UTF-8");
+    let control = printed.chars().find(|c| c.is_control() && *c != '\n');
+    assert_eq!(control, None, "{printed:?}");
+    assert_eq!(json_stdout(&read)["projection"], projection);
 }
 
 #[test]

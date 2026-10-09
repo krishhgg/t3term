@@ -3875,4 +3875,264 @@ mod tests {
         assert_eq!(ids(frame(&mut open)), ["c9"]);
         assert_eq!(open.prepared.made, 1);
     }
+
+    /// A handoff from codex_personal to claudeAgent in run `r2`, with no title and without the
+    /// models newer servers stamp on it, so the runs name both ends.
+    fn handoff_item(id: &str, ordinal: u64, status: &str) -> Value {
+        json!({
+            "id": id,
+            "threadId": "t",
+            "runId": "r2",
+            "type": "handoff",
+            "ordinal": ordinal,
+            "status": status,
+            "title": null,
+            "fromProviderInstanceIds": ["codex_personal"],
+            "toProviderInstanceId": "claudeAgent",
+            "strategy": "full_thread_summary",
+            "summary": "Full conversation context for provider handoff.",
+            "updatedAt": "2026-10-08T10:00:00.000Z",
+        })
+    }
+
+    /// A run on `instance` with `model`.
+    fn run_on(id: &str, ordinal: u64, status: &str, instance: &str, model: &str) -> Value {
+        json!({"id": id, "ordinal": ordinal, "status": status, "providerInstanceId": instance,
+            "modelSelection": {"instanceId": instance, "model": model}})
+    }
+
+    #[test]
+    fn a_handoff_marker_names_its_endpoints_and_follows_its_item() {
+        let theme = Theme::new(Depth::TrueColor);
+        let context = RenderContext {
+            theme: &theme,
+            text: Styles::new(&theme, theme.text()),
+            bubble: Styles::new(&theme, theme.text()),
+            reasoning: Styles::new(&theme, Style::new().fg(theme.muted)).dimmed(),
+        };
+        // A handoff the runs name, and one T3 stamped with made-up models: an Esc, CJK and a
+        // joined emoji.
+        let running = handoff_item("h1", 3, "running");
+        let mut stamped = handoff_item("h2", 4, "completed");
+        stamped["title"] = json!("Imported context");
+        stamped["fromModelSelections"] = json!([
+            {"instanceId": "codex_personal", "model": "gpt\u{1b}[2J-5.5"},
+            {"instanceId": "codex_personal", "model": "日本語"},
+        ]);
+        stamped["toModel"] = json!("👩\u{200d}💻 coder");
+        let runs = json!([
+            run_on("r1", 1, "completed", "codex_personal", "gpt-5.5"),
+            run_on("r2", 2, "running", "claudeAgent", "claude-fable-5"),
+        ]);
+        let mut open = OpenThread::new("t".into(), mpsc::unbounded_channel().1);
+        let snapshot = json!({"kind": "snapshot", "snapshotSequence": 1, "projection": {
+            "thread": {"id": "t"},
+            "runs": runs,
+            "turnItems": [running, stamped],
+        }});
+        assert_eq!(open.apply(&snapshot), Applied::Snapshot);
+        open.prepare();
+        let first = open.prepared.blocks.clone();
+        assert_eq!(first.len(), 2);
+        let marker = format!("{} Context handoff {}", "─".repeat(11), "─".repeat(12));
+        let rows = [
+            String::new(),
+            marker,
+            "  gpt-5.5 → claude-fable-5".to_string(),
+            String::new(),
+        ];
+        let lines = render_block(&first[0], 40, &context, &Extra::None);
+        assert_eq!(text(&lines), rows);
+        assert_eq!(lines[1].spans[1].style.fg, Some(theme.muted));
+        assert_eq!(lines[2].style.fg, Some(theme.muted));
+
+        // T3 sends the item again, failed. It stays one row, its label turns red and its
+        // endpoints stay grey.
+        let mut failed = running;
+        failed["status"] = json!("failed");
+        failed["updatedAt"] = json!("2026-10-08T10:00:05.000Z");
+        let update = json!({"kind": "event", "sequence": 2, "event": {
+            "type": "turn-item.updated",
+            "payload": failed,
+        }});
+        assert_eq!(
+            open.apply(&update),
+            Applied::Event("turn-item.updated".into())
+        );
+        open.prepare();
+        let blocks = &open.prepared.blocks;
+        assert_eq!(blocks.len(), 2);
+        assert_eq!(blocks[0].item_id, "h1");
+        assert_eq!(blocks[0].status, "failed");
+        let lines = render_block(&blocks[0], 40, &context, &Extra::None);
+        assert_eq!(text(&lines), rows);
+        assert_eq!(lines[1].spans[1].style.fg, Some(theme.error_fg));
+        assert_eq!(lines[2].style.fg, Some(theme.muted));
+        // A reconnect replays the event, which changes nothing.
+        let made = open.prepared.made;
+        assert_eq!(open.apply(&update), Applied::Duplicate);
+        open.prepare();
+        assert_eq!(open.prepared.blocks.len(), 2);
+        assert_eq!(open.prepared.made, made);
+
+        // The stamped handoff keeps its models in order, cleaned. At 10 columns, the narrowest
+        // the transcript is drawn, the label is cut and the endpoints wrap under it with the
+        // joined emoji whole.
+        let imported = &open.prepared.blocks[1];
+        assert_eq!(imported.body, "gpt[2J-5.5, 日本語 → 👩\u{200d}💻 coder");
+        let rows = text(&render_block(imported, 10, &context, &Extra::None));
+        assert_eq!(
+            rows,
+            [
+                "",
+                "── Con… ──",
+                "  gpt[2J",
+                "  -5.5,",
+                "  日本語",
+                "  → 👩\u{200d}💻",
+                "  coder",
+                "",
+            ]
+        );
+        for width in [10, 11, 13] {
+            for block in &open.prepared.blocks {
+                let rows = text(&render_block(block, width, &context, &Extra::None));
+                assert!(rows.iter().all(|row| row.width() <= width), "{rows:?}");
+            }
+        }
+
+        // Another notice's label stays grey when it fails, and so does a failed compaction's.
+        for kind in ["system_notice", "compaction"] {
+            let mut notice = block(BlockKind::Notice, kind, "Model changed", "");
+            notice.status = "failed".into();
+            let lines = render_block(&notice, 40, &context, &Extra::None);
+            assert_eq!(lines[1].spans[1].style.fg, Some(theme.muted), "{kind}");
+        }
+    }
+
+    #[test]
+    fn a_handoff_is_prepared_again_only_when_its_item_or_a_run_it_reads_changes() {
+        // Each block the next frame draws from: its item and the number it was made under.
+        fn frame(open: &mut OpenThread) -> Vec<(String, u64)> {
+            open.prepare();
+            let prepared = &open.prepared;
+            prepared
+                .blocks
+                .iter()
+                .map(|block| block.item_id.clone())
+                .zip(prepared.versions.iter().copied())
+                .collect()
+        }
+        fn body(open: &OpenThread, index: usize) -> &str {
+            &open.prepared.blocks[index].body
+        }
+        let snapshot = |sequence: u64, runs: Value, items: Value| {
+            json!({"kind": "snapshot", "snapshotSequence": sequence, "projection": {
+                "thread": {"id": "t"},
+                "runs": runs,
+                "turnItems": items,
+            }})
+        };
+        let event = |sequence: u64, kind: &str, payload: &Value| {
+            json!({"kind": "event", "sequence": sequence, "event": {
+                "type": kind,
+                "payload": payload,
+            }})
+        };
+
+        // A handoff the runs name, one T3 stamped and an answer, in a thread whose runs the
+        // snapshot doesn't have yet. The first handoff names both ends by their providers.
+        let legacy = handoff_item("h1", 3, "completed");
+        let mut stamped = handoff_item("h2", 4, "completed");
+        stamped["fromModelSelections"] = json!([
+            {"instanceId": "codex_personal", "model": "gpt-5.4"},
+        ]);
+        stamped["toModel"] = json!("claude-fable-5");
+        let answer = json!({"id": "a1", "type": "assistant_message", "ordinal": 5,
+            "text": "Done"});
+        let mut open = OpenThread::new("t".into(), mpsc::unbounded_channel().1);
+        let opened = snapshot(1, json!([]), json!([legacy, stamped, answer]));
+        assert_eq!(open.apply(&opened), Applied::Snapshot);
+        let first = frame(&mut open);
+        assert_eq!(open.prepared.made, 3);
+        assert_eq!(body(&open, 0), "codex_personal → claudeAgent");
+        assert_eq!(body(&open, 1), "gpt-5.4 → claude-fable-5");
+        assert_eq!(open.prepared.run_readers, HashSet::from(["h1".into()]));
+
+        // A frame drawn for a key, the clock or a resize follows no event and makes nothing.
+        for _ in 0..3 {
+            assert_eq!(frame(&mut open), first);
+        }
+        assert_eq!(open.prepared.made, 3);
+
+        // The runs arrive. The one before the handoff's run names the source, and the
+        // handoff's run names the target. Each makes the first handoff again, and only it.
+        let source = run_on("r1", 1, "completed", "codex_personal", "gpt-5.5");
+        open.apply(&event(2, "run.created", &source));
+        let second = frame(&mut open);
+        assert_eq!(open.prepared.made, 4);
+        assert_eq!((&second[1], &second[2]), (&first[1], &first[2]));
+        assert_eq!(body(&open, 0), "gpt-5.5 → claudeAgent");
+        let mut target = run_on("r2", 2, "running", "claudeAgent", "claude-fable-5");
+        open.apply(&event(3, "run.created", &target));
+        let third = frame(&mut open);
+        assert_eq!(open.prepared.made, 5);
+        assert_eq!((&third[1], &third[2]), (&first[1], &first[2]));
+        assert_eq!(body(&open, 0), "gpt-5.5 → claude-fable-5");
+
+        // The run finishes. Its status and times change, which no endpoint reads, so nothing is
+        // made again. Nor is anything when a reconnect replays the event or the replay ends.
+        target["status"] = json!("completed");
+        target["completedAt"] = json!("2026-10-08T10:01:00.000Z");
+        open.apply(&event(4, "run.updated", &target));
+        assert_eq!(
+            open.apply(&event(4, "run.updated", &target)),
+            Applied::Duplicate
+        );
+        assert_eq!(
+            open.apply(&json!({"kind": "synchronized"})),
+            Applied::Synchronized
+        );
+        assert_eq!(frame(&mut open), third);
+        assert_eq!(open.prepared.made, 5);
+
+        // A new model on the handoff's run makes the first handoff again.
+        target["modelSelection"]["model"] = json!("claude-fable-5-1");
+        open.apply(&event(5, "run.updated", &target));
+        let fourth = frame(&mut open);
+        assert_eq!(open.prepared.made, 6);
+        assert_eq!((&fourth[1], &fourth[2]), (&first[1], &first[2]));
+        assert_eq!(body(&open, 0), "gpt-5.5 → claude-fable-5-1");
+
+        // Updates to the handoff's item between two frames make its block once.
+        for sequence in [6, 7, 8] {
+            let mut next = legacy.clone();
+            next["status"] = json!("failed");
+            next["updatedAt"] = json!(format!("2026-10-08T10:02:0{sequence}.000Z"));
+            open.apply(&event(sequence, "turn-item.updated", &next));
+        }
+        let fifth = frame(&mut open);
+        assert_eq!(open.prepared.made, 7);
+        assert_eq!((&fifth[1], &fifth[2]), (&first[1], &first[2]));
+        assert_eq!(open.prepared.blocks[0].status, "failed");
+
+        // A reconnect's snapshot has the first handoff stamped. Every block is made again, as
+        // after any snapshot, and from then on a change to a run makes none.
+        let mut now_stamped = legacy;
+        now_stamped["fromModelSelections"] = json!([
+            {"instanceId": "codex_personal", "model": "gpt-5.5"},
+        ]);
+        now_stamped["toModel"] = json!("claude-fable-5-1");
+        let runs = json!([source, target]);
+        let items = json!([now_stamped, stamped, answer]);
+        assert_eq!(open.apply(&snapshot(9, runs, items)), Applied::Snapshot);
+        let sixth = frame(&mut open);
+        assert_eq!(open.prepared.made, 10);
+        assert!(open.prepared.run_readers.is_empty());
+        target["modelSelection"]["model"] = json!("claude-fable-6");
+        open.apply(&event(10, "run.updated", &target));
+        assert_eq!(frame(&mut open), sixth);
+        assert_eq!(open.prepared.made, 10);
+        assert_eq!(body(&open, 0), "gpt-5.5 → claude-fable-5-1");
+    }
 }
