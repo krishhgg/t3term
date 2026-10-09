@@ -34,7 +34,7 @@ The second truecolor run checked the held queue clearing and the empty `lastErro
 
 ## Dismissing
 
-- Alt+W on Err A hid its banner. The draft `draft stays here` stayed in the composer, and every cell outside the banner's rectangle stayed the same.
+- Alt+W on Err A hid its banner. The draft `draft stays here` stayed in the composer, and every transcript cell outside the banner's rectangle stayed the same.
 - Err B still showed the same text. Back on Err A, the banner stayed hidden, and an update with the same text kept it hidden. A new text on Err A showed.
 - In the 256-color run, back at 140x44 after the narrow sizes below, Alt+W dismissed the long error. Err A's error, dismissed before a restart, showed again after it, and a click on × then dismissed it. t3term restarted twice in that run.
 
