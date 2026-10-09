@@ -233,6 +233,10 @@ T3 sends the whole edit again each time it changes, such as when a running edit 
 
 There is no turn diff yet, and nothing opens an edit's full diff. Paths show as T3 sent them, not relative to the workspace, and the TUI doesn't show `oldStr` or `newStr`.
 
+![A running turn's open group: Move the session store in red with 3 files after it failed, two red error lines, then a move, an add and a delete in grey, and two more edits below](docs/screenshots/file-change-error.png)
+
+The thread is invented and comes from a fake T3 server that sends what the pinned nightly sends. The image renders t3term's captured terminal output. [File change verification](docs/file-change-verification.md) lists what was checked, with captures of the bounds, 256 colors, a narrow screen and a patch that only the fake server sends. A [screen tour](docs/screenshots/file-change-screen-tour.mp4) shows the live edit's captures in order. It is a slideshow of the captures, not a recording.
+
 ## It's a CLI too
 
 ```text
