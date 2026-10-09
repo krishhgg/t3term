@@ -74,14 +74,16 @@ pub struct TaskStep {
 /// The steps of a `todo_list` plan or the turn item that shows it. Both carry V2 plan steps,
 /// `{id, text, status: "pending" | "running" | "completed", durationMs?}`
 /// (`OrchestrationV2PlanStep` in the nightly's `packages/contracts/src/orchestrationV2.ts`).
-/// A status this build doesn't know reads as pending.
+/// A status this build doesn't know reads as pending. An agent writes each step's text, so the
+/// text comes without its control characters. The list itself, which `--json` prints, keeps
+/// them.
 pub fn task_steps(list: &Value) -> Vec<TaskStep> {
     list.get("steps")
         .and_then(Value::as_array)
         .into_iter()
         .flatten()
         .map(|step| TaskStep {
-            text: str_of(step, "text").to_string(),
+            text: without_controls(str_of(step, "text")),
             status: match str_of(step, "status") {
                 "completed" => StepStatus::Completed,
                 "running" => StepStatus::Running,
@@ -90,6 +92,29 @@ pub fn task_steps(list: &Value) -> Vec<TaskStep> {
             duration_ms: step.get("durationMs").and_then(Value::as_f64),
         })
         .collect()
+}
+
+/// `text` as it is safe to print. A terminal acts on a control character rather than show it:
+/// ESC and the C1 CSI and OSC start sequences that clear the screen, move the cursor or set
+/// the clipboard, and a carriage return lets the text after it overwrite the line. So a line
+/// break stays, `\r\n` and a lone `\r` each read as one, a tab or other control that spaces
+/// text reads as a space, and every other control, C0, DEL or C1, is dropped. What a sequence
+/// leaves behind, such as `[2J`, is plain text. Combining marks, joiners and variation
+/// selectors aren't controls, so they stay.
+fn without_controls(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(c) = chars.next() {
+        match c {
+            '\n' => out.push('\n'),
+            '\r' if chars.peek() == Some(&'\n') => {}
+            '\r' => out.push('\n'),
+            c if c.is_control() && c.is_whitespace() => out.push(' '),
+            c if c.is_control() => {}
+            c => out.push(c),
+        }
+    }
+    out
 }
 
 /// The one value a tool call is about, for a transcript row: the file, pattern or query it
@@ -511,6 +536,62 @@ mod tests {
         // A list with no steps has no rows.
         assert!(task_steps(&json!({"type": "todo_list"})).is_empty());
         assert!(task_steps(&json!({"steps": null})).is_empty());
+    }
+
+    #[test]
+    fn a_steps_control_characters_never_reach_the_terminal() {
+        // Made-up payloads: a CSI that clears the screen and homes the cursor, an OSC 52
+        // clipboard write ended by BEL and another ended by ST, the C1 forms of CSI, OSC and
+        // ST, a backspace and DEL, a carriage return that would write over the line, and the
+        // tab, VT, FF and NEL that space text.
+        let raw = [
+            "Clear\u{1b}[2J\u{1b}[Hthe screen",
+            "Copy\u{1b}]52;c;Zm9v\u{7} and\u{1b}]52;c;YmFy\u{1b}\\ text",
+            "C1\u{9b}31m csi and \u{9d}0;title\u{9c} osc",
+            "Fix\u{8}\u{7f}ed\rDone\r\nnext\tline\u{b}and\u{c}more\u{85}end",
+            // Text a terminal draws as it is: a joined emoji, an emoji with U+FE0F, a combining
+            // accent and a skin tone.
+            "Ship 👩\u{200d}💻 ⚠\u{fe0f} cafe\u{301} 👍\u{1f3fd}",
+        ];
+        let steps: Vec<Value> = raw
+            .iter()
+            .enumerate()
+            .map(|(n, text)| json!({"id": n, "text": text, "status": "pending"}))
+            .collect();
+        let item = json!({"id": "todo-1", "type": "todo_list", "ordinal": 1, "steps": steps});
+        let texts: Vec<String> = task_steps(&item).into_iter().map(|s| s.text).collect();
+        assert_eq!(
+            texts,
+            [
+                "Clear[2J[Hthe screen",
+                "Copy]52;c;Zm9v and]52;c;YmFy\\ text",
+                "C131m csi and 0;title osc",
+                "Fixed\nDone\nnext line and more end",
+                raw[4],
+            ]
+        );
+
+        // The transcript row and `t3term read` print the cleaned text, and the projection that
+        // `--json` prints keeps the text as T3 sent it.
+        let state = ThreadState::from_snapshot(&json!({
+            "snapshotSequence": 1,
+            "projection": {"thread": {"id": "t"}, "turnItems": [item]},
+        }))
+        .expect("a snapshot");
+        let block = describe(&state.items()[0]).expect("a checklist has a row");
+        let printed = plain_text(&state, None, false);
+        for text in [&block.body, &printed] {
+            let control = text.chars().find(|c| c.is_control() && *c != '\n');
+            assert_eq!(control, None, "{text:?}");
+        }
+        assert!(printed.contains("    [ ] Fixed\n    Done\n    next line"), "{printed:?}");
+        let kept: Vec<&str> = state.list("turnItems")[0]["steps"]
+            .as_array()
+            .expect("steps")
+            .iter()
+            .filter_map(|step| step["text"].as_str())
+            .collect();
+        assert_eq!(kept, raw);
     }
 
     #[test]
