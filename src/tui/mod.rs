@@ -60,9 +60,10 @@ const TOGGLE: &str = " ◧ ";
 /// The narrowest width the sidebar can be given, in columns. The desktop's is 13rem against a
 /// 16rem default. Twenty columns keep the wordmark and a card's first words.
 const NARROWEST_SIDEBAR: u16 = 20;
-/// The columns the sidebar always leaves the conversation, as the layout did before the
-/// sidebar could be resized. The desktop keeps 40rem, which would be most of an 80-column
-/// terminal.
+/// The columns the sidebar leaves the conversation on a screen at least this wide, as the
+/// layout did before the sidebar could be resized. A narrower screen gives the sidebar no
+/// columns and the conversation all of them. The desktop keeps 40rem, which would be most of
+/// an 80-column terminal.
 const NARROWEST_MAIN: u16 = 20;
 /// How far `[` and `]` move the sidebar's edge, in columns.
 const SIDEBAR_STEP: u16 = 2;
@@ -579,7 +580,8 @@ fn columns(area: Rect, sidebar_width: u16) -> (Rect, Rect) {
 }
 
 /// The widest the sidebar gets on a screen `width` columns wide: half of it, and less when that
-/// would leave the conversation fewer than `NARROWEST_MAIN` columns.
+/// would leave the conversation fewer than `NARROWEST_MAIN` columns. On a screen narrower than
+/// `NARROWEST_MAIN`, that is no columns.
 fn widest_sidebar(width: u16) -> u16 {
     (width / 2).min(width.saturating_sub(NARROWEST_MAIN))
 }
