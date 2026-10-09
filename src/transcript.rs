@@ -276,6 +276,27 @@ impl Endpoint<'_> {
     }
 }
 
+/// The ends of a handoff that its detail line names.
+struct Endpoints<'a> {
+    /// The first `MAX_HANDOFF_SOURCES` sources, in T3's order.
+    from: Vec<Endpoint<'a>>,
+    /// How many sources came after those. None of them is resolved.
+    more: usize,
+    to: Endpoint<'a>,
+}
+
+/// The first `MAX_HANDOFF_SOURCES` of a handoff's raw sources, each made an endpoint by
+/// `resolve`, and how many came after them. The cut comes before `resolve`, which never sees
+/// the rest, so a handoff with thousands of sources looks up at most twelve models. The count
+/// is the array's length less those, not a walk over the rest.
+fn shown_sources<'a>(
+    raw: &'a [Value],
+    resolve: impl FnMut(&'a Value) -> Endpoint<'a>,
+) -> (Vec<Endpoint<'a>>, usize) {
+    let shown = &raw[..raw.len().min(MAX_HANDOFF_SOURCES)];
+    (shown.iter().map(resolve).collect(), raw.len() - shown.len())
+}
+
 /// Where a `handoff` item took the context from and to, worked out as the nightly's
 /// `resolveHandoffEndpoints` (`packages/client-runtime/src/handoff.ts`) does for the desktop
 /// and mobile timelines. T3 stamps the source models on the item in `fromModelSelections`, in
@@ -283,8 +304,8 @@ impl Endpoint<'_> {
 /// `toModel`. An item from before it did has only provider ids. Then the target's model is the
 /// handoff run's, when that run is on the target's provider, and each source's is the model of
 /// the newest run on its provider that came before the handoff run. An endpoint with no model
-/// keeps its provider.
-fn endpoints<'a>(item: &'a Value, runs: &'a [Value]) -> (Vec<Endpoint<'a>>, Endpoint<'a>) {
+/// keeps its provider. Only the sources the line shows are resolved, through `shown_sources`.
+fn endpoints<'a>(item: &'a Value, runs: &'a [Value]) -> Endpoints<'a> {
     let handoff_run = item
         .get("runId")
         .and_then(Value::as_str)
@@ -300,37 +321,37 @@ fn endpoints<'a>(item: &'a Value, runs: &'a [Value]) -> (Vec<Endpoint<'a>>, Endp
         .get("fromModelSelections")
         .and_then(Value::as_array)
         .filter(|selections| !selections.is_empty());
-    let from = match stamped {
-        Some(selections) => selections
-            .iter()
-            .map(|selection| Endpoint {
-                instance_id: str_of(selection, "instanceId"),
-                model: selection.get("model").and_then(Value::as_str),
-            })
-            .collect(),
+    let (from, more) = match stamped {
+        Some(selections) => shown_sources(selections, |selection| Endpoint {
+            instance_id: str_of(selection, "instanceId"),
+            model: selection.get("model").and_then(Value::as_str),
+        }),
         None => {
             let before = handoff_run
                 .and_then(|run| run.get("ordinal"))
                 .and_then(Value::as_u64);
-            item.get("fromProviderInstanceIds")
+            let ids = item
+                .get("fromProviderInstanceIds")
                 .and_then(Value::as_array)
-                .into_iter()
-                .flatten()
-                .map(|id| {
-                    let instance_id = id.as_str().unwrap_or_default();
-                    Endpoint {
-                        instance_id,
-                        model: latest_model_before(runs, instance_id, before),
-                    }
-                })
-                .collect()
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            shown_sources(ids, |id| {
+                let instance_id = id.as_str().unwrap_or_default();
+                Endpoint {
+                    instance_id,
+                    model: latest_model_before(runs, instance_id, before),
+                }
+            })
         }
     };
-    let to = Endpoint {
-        instance_id: to_instance,
-        model: to_model,
-    };
-    (from, to)
+    Endpoints {
+        from,
+        more,
+        to: Endpoint {
+            instance_id: to_instance,
+            model: to_model,
+        },
+    }
 }
 
 fn run_model(run: &Value) -> Option<&str> {
@@ -394,14 +415,10 @@ pub fn reads_runs(item: &Value) -> bool {
 /// has no model, both from T3's provider list. `t3term read` doesn't fetch that list, so
 /// t3term names both ends by the ids T3 sent.
 fn handoff_detail(item: &Value, runs: &[Value]) -> String {
-    let (from, to) = endpoints(item, runs);
-    let mut sources: Vec<String> = from
-        .iter()
-        .take(MAX_HANDOFF_SOURCES)
-        .map(Endpoint::label)
-        .collect();
-    if from.len() > MAX_HANDOFF_SOURCES {
-        sources.push(format!("+{} more", from.len() - MAX_HANDOFF_SOURCES));
+    let Endpoints { from, more, to } = endpoints(item, runs);
+    let mut sources: Vec<String> = from.iter().map(Endpoint::label).collect();
+    if more > 0 {
+        sources.push(format!("+{more} more"));
     }
     if sources.is_empty() {
         return to.label();
@@ -1299,9 +1316,11 @@ mod tests {
 
     #[test]
     fn an_inherited_handoff_keeps_its_providers() {
-        // A fork inherits its parent's items but not its runs. This thread's runs would name
-        // both ends of the parent's handoff, so it keeps its providers, as the nightly's
-        // timeline does for an item from another thread.
+        // A fork inherits its parent's items but not its runs, so t3term gives an inherited
+        // handoff no runs and names both its ends by provider. The nightly differs: its
+        // timeline passes the fork's own runs, where a source can take the model of a fork run
+        // that came after the handoff. Here the fork's runs would name both ends of the
+        // parent's handoff, yet only the fork's own handoff reads them.
         let runs = [
             run("source", 1, "codex_personal", "source-model"),
             run("target", 2, "claudeAgent", "destination"),
@@ -1374,16 +1393,79 @@ mod tests {
             assert!(kept.width() <= MAX_ENDPOINT_WIDTH, "{kept}");
             assert_eq!(detail(&stamped(&raw, "x"), &[]), format!("{kept} → x"));
         }
+    }
 
-        // Past twelve sources, a count stands for the rest.
-        let selections: Vec<Value> = (1..=15)
-            .map(|n| json!({"instanceId": "codex_personal", "model": format!("m{n}")}))
-            .collect();
-        let item = handoff_item(json!({"fromModelSelections": selections, "toModel": "x"}));
-        assert_eq!(
-            detail(&item, &[]),
-            "m1, m2, m3, m4, m5, m6, m7, m8, m9, m10, m11, m12, +3 more → x"
-        );
+    #[test]
+    fn only_the_first_twelve_sources_reach_the_resolver() {
+        // `endpoints` turns both kinds of source list into endpoints through `shown_sources`,
+        // and the legacy kind calls `latest_model_before` only in the closure it passes. So a
+        // source that closure never receives never reaches a model lookup. The closure here
+        // records each raw source it receives.
+        let mut raw: Vec<Value> = (1..=1_000).map(|n| json!(format!("p{n}"))).collect();
+        raw[2] = json!("p1");
+        let cases = [
+            (0, 0, 0),
+            (11, 11, 0),
+            (12, 12, 0),
+            (13, 12, 1),
+            (1_000, 12, 988),
+        ];
+        for (count, resolved, more) in cases {
+            let mut seen = Vec::new();
+            let (from, rest) = shown_sources(&raw[..count], |source| {
+                seen.push(source.clone());
+                Endpoint {
+                    instance_id: source.as_str().unwrap_or_default(),
+                    model: None,
+                }
+            });
+            // The first sources come in T3's order, the repeat of p1 included.
+            assert_eq!(seen, raw[..resolved], "{count} sources");
+            assert_eq!(from.len(), resolved, "{count} sources");
+            assert_eq!(rest, more, "{count} sources");
+        }
+    }
+
+    #[test]
+    fn past_twelve_sources_both_kinds_of_handoff_count_the_rest() {
+        // Fifteen providers, each with an old run, a run before the handoff run and a run
+        // after it, so every source would name a model if it were resolved.
+        let providers: Vec<String> = (1..=15).map(|n| format!("p{n}")).collect();
+        let mut runs = vec![run("target", 100, "claudeAgent", "destination")];
+        for (n, provider) in (1..).zip(&providers) {
+            runs.push(run(&format!("{provider}-old"), n, provider, "old-model"));
+            runs.push(run(&format!("{provider}-new"), 50 + n, provider, &format!("m{n}")));
+            runs.push(run(&format!("{provider}-late"), 100 + n, provider, "too-late"));
+        }
+        let shown = (1..=12)
+            .map(|n| format!("m{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        for (count, more, expected) in [
+            (12, 0, format!("{shown} → destination")),
+            (13, 1, format!("{shown}, +1 more → destination")),
+            (15, 3, format!("{shown}, +3 more → destination")),
+        ] {
+            let ids = &providers[..count];
+            let legacy = handoff_item(json!({"fromProviderInstanceIds": ids}));
+            assert_eq!(detail(&legacy, &runs), expected, "{count} legacy");
+
+            let selections: Vec<Value> = (1..=count)
+                .map(|n| json!({"instanceId": format!("p{n}"), "model": format!("m{n}")}))
+                .collect();
+            let stamped = handoff_item(json!({
+                "fromModelSelections": selections,
+                "toModel": "destination",
+            }));
+            assert_eq!(detail(&stamped, &runs), expected, "{count} stamped");
+
+            // Either way the endpoints hold only the twelve shown, and the count of the rest
+            // comes from the array's length.
+            for item in [&legacy, &stamped] {
+                let ends = endpoints(item, &runs);
+                assert_eq!((ends.from.len(), ends.more), (12, more), "{item}");
+            }
+        }
     }
 
     #[test]
