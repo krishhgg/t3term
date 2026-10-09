@@ -37,7 +37,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::client::{Client, IfBusy, WatchEvent};
 use crate::models::Choice;
-use crate::projection::{Applied, ShellState, ThreadState, is_active_status, status};
+use crate::projection::{Applied, ShellState, ThreadState, apply_config, is_active_status, status};
 use crate::settings::Settings;
 use crate::transcript::{self, BlockKind, ChangeLine};
 use composer::Composer;
@@ -268,8 +268,12 @@ impl Prepared {
 enum ActionResult {
     Info(String),
     Error(String),
-    /// T3's provider and model list, from `server.getConfig`.
-    Config(Value),
+    /// T3's configuration from `server.getConfig`, with the count of changes from the config
+    /// subscription when the read was asked for.
+    Config {
+        config: Value,
+        revision: u64,
+    },
     /// What one tool printed, for the row that asked. `None` when T3 couldn't be reached.
     Output {
         item_id: String,
@@ -377,7 +381,15 @@ impl OpenThread {
 struct App {
     client: Arc<Client>,
     theme: Theme,
+    /// T3's configuration, with its providers and models. The config subscription keeps it
+    /// current, and it stays as it was while the subscription reconnects.
     config: Option<Value>,
+    /// False once T3 refuses the config subscription. Each menu then reads the configuration
+    /// with `server.getConfig`, as t3term did before it subscribed.
+    config_subscribed: bool,
+    /// How many changes the config subscription has made, so a `server.getConfig` answer asked
+    /// for before the latest of them can't put older providers back.
+    config_revision: u64,
     /// Model, effort and mode choices per thread, sent with the thread's next message.
     drafts: HashMap<String, Choice>,
     /// Messages that failed to send, until they go out or reach T3 late.
@@ -488,9 +500,10 @@ impl Drop for Screen {
 async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>) -> Result<()> {
     let (actions, mut action_results) = mpsc::unbounded_channel();
     let mut shell_events = client.watch_shell(None);
+    // Dropped when the loop ends, which ends the subscription.
+    let mut config_events = client.watch_config();
     let settings = Settings::load().await;
     let mut app = App::new(client, Theme::detect(), &settings, actions);
-    app.load_config();
     let mut input = EventStream::new();
     let mut dirty = true;
     let mut last_draw = Instant::now() - FRAME;
@@ -531,6 +544,10 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
             },
             Some(event) = shell_events.recv() => {
                 app.on_shell_event(event);
+                dirty = true;
+            }
+            Some(event) = config_events.recv() => {
+                app.on_config_event(event);
                 dirty = true;
             }
             Some(event) = thread_event => {
@@ -649,6 +666,8 @@ impl App {
             client,
             theme,
             config: None,
+            config_subscribed: true,
+            config_revision: 0,
             drafts: HashMap::new(),
             unsent: Unsent::default(),
             picker: None,
@@ -715,6 +734,25 @@ impl App {
             }
             WatchEvent::Reconnecting { .. } => self.shell_connection = "reconnecting".into(),
             WatchEvent::Failed(message) => self.message = Some((message, true)),
+        }
+    }
+
+    /// Applies an item from T3's config subscription. A reconnect keeps the configuration as it
+    /// was until the new subscription's snapshot replaces it.
+    fn on_config_event(&mut self, event: WatchEvent) {
+        match event {
+            WatchEvent::Item(item) => {
+                if self.update_config(|config| apply_config(config, &item) != Applied::Ignored) {
+                    self.config_revision += 1;
+                }
+            }
+            WatchEvent::Reconnecting { .. } => {}
+            // Such as a server without the subscription. Read the configuration once now, and
+            // again each time a menu opens.
+            WatchEvent::Failed(_) => {
+                self.config_subscribed = false;
+                self.load_config();
+            }
         }
     }
 
@@ -1409,16 +1447,15 @@ impl App {
         match result {
             ActionResult::Info(text) => self.message = Some((text, false)),
             ActionResult::Error(text) => self.message = Some((text, true)),
-            ActionResult::Config(config) => {
-                // A refresh can add or drop rows, so the highlight follows its entry, not
-                // its row number.
-                let previous = self.selected_pick();
-                self.config = Some(config);
-                if self.picker.is_some() {
-                    self.select_pick(previous);
+            ActionResult::Config { config, revision } => {
+                // A change from the subscription since the read was asked for is newer than
+                // the answer.
+                if revision == self.config_revision {
+                    self.update_config(|held| {
+                        *held = Some(config);
+                        true
+                    });
                 }
-                // Its capabilities decide whether the Snoozed and Settled shelves apply.
-                self.rebuild_rows();
             }
             ActionResult::Output {
                 item_id,
@@ -1535,15 +1572,35 @@ impl App {
 
     // ---- model, effort and mode menus ----
 
-    /// Fetches T3's provider list in the background. Menus use the last copy until it arrives.
+    /// Reads T3's configuration once in the background. Menus use the last copy until it
+    /// arrives.
     fn load_config(&self) {
         let (client, results) = (self.client.clone(), self.actions.clone());
+        let revision = self.config_revision;
         tokio::spawn(async move {
             let _ = results.send(match client.server_config().await {
-                Ok(config) => ActionResult::Config(config),
+                Ok(config) => ActionResult::Config { config, revision },
                 Err(e) => ActionResult::Error(format!("Couldn't read T3's model list: {e}")),
             });
         });
+    }
+
+    /// Changes the configuration with `change`, which says whether it changed anything, and
+    /// keeps what depends on it in step. A change can add or drop menu rows, so an open menu's
+    /// highlight follows its entry, not its row number. The sidebar is laid out again when the
+    /// change turns snooze or settlement on or off, which decide whether those shelves apply.
+    fn update_config(&mut self, change: impl FnOnce(&mut Option<Value>) -> bool) -> bool {
+        let (pick, capabilities) = (self.selected_pick(), self.capabilities());
+        if !change(&mut self.config) {
+            return false;
+        }
+        if self.picker.is_some() {
+            self.select_pick(pick);
+        }
+        if self.capabilities() != capabilities {
+            self.rebuild_rows();
+        }
+        true
     }
 
     /// The open thread's settings with its draft applied.
@@ -1579,8 +1636,10 @@ impl App {
             ));
             return;
         }
-        // Provider status changes while T3 runs, so each menu refreshes the list.
-        if self.picker.is_none() {
+        // Provider status changes while T3 runs. The config subscription brings each change,
+        // so a menu reads the configuration only while the TUI has none or after T3 refused
+        // the subscription.
+        if self.picker.is_none() && (self.config.is_none() || !self.config_subscribed) {
             self.load_config();
         }
         self.focus = Focus::Composer;
