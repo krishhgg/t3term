@@ -2293,4 +2293,68 @@ mod tests {
             vec![(Operation, format!("modify {}…", "a".repeat(1_024)))]
         );
     }
+
+    #[test]
+    fn the_cli_prints_an_edits_row_without_building_the_lines_under_it() {
+        // Edits whose lines take work to build: a failed one with 1,000 operations whose name
+        // and error hold controls, one with a patch, and a Codex or Claude edit with neither and
+        // no counts.
+        let changes: Vec<Value> = (0..1_000)
+            .map(|n| json!({"operation": "add", "path": format!("/repo/f{n}.rs")}))
+            .collect();
+        let items = [
+            edit_item(json!({
+                "id": "edit-failed",
+                "ordinal": 1,
+                "status": "failed",
+                "fileName": "src/\u{1b}[2Jmain.rs\r\nnext\u{7f}",
+                "diffStr": format!("\u{1b}]52;c;Zm9v\u{7}{}", "not found\n".repeat(30)),
+                "changes": changes,
+            })),
+            edit_item(json!({
+                "id": "edit-patch",
+                "ordinal": 2,
+                "fileName": "src/lib.rs",
+                "additions": 1,
+                "diffStr": "@@ -1 +1 @@\n-old\n+new",
+            })),
+            edit_item(json!({
+                "id": "edit-legacy",
+                "ordinal": 3,
+                "fileName": "README.md",
+                "additions": null,
+                "deletions": null,
+            })),
+        ];
+        // The TUI's block has the lines. The CLI's block is the same block without them.
+        for item in &items {
+            let full = describe(item, &[]).expect("an edit has a row");
+            let plain = describe_plain(item, &[]).expect("an edit has a row");
+            assert!(full.change.is_some(), "{item}");
+            assert!(plain.change.is_none(), "{item}");
+            let without = Block {
+                change: None,
+                ..full
+            };
+            assert_eq!(format!("{plain:?}"), format!("{without:?}"), "{item}");
+        }
+
+        // `t3term read` prints each row alone, with its name cleaned, from blocks that have no
+        // lines.
+        let state = ThreadState::from_snapshot(&json!({
+            "snapshotSequence": 1,
+            "projection": {"thread": {"id": "t"}, "turnItems": items},
+        }))
+        .expect("a snapshot");
+        assert!(blocks(&state).iter().all(|block| block.change.is_none()));
+        let rows = [
+            "  · edit src/[2Jmain.rs next  +3 -1",
+            "  · edit src/lib.rs  +1 -1",
+            "  · edit README.md",
+        ];
+        assert_eq!(
+            plain_text(&state, None, false),
+            format!("{}\n", rows.join("\n"))
+        );
+    }
 }
