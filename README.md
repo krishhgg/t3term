@@ -173,6 +173,12 @@ The shelf starts closed, with its heading counting the threads in it. The open t
 
 Ctrl+B hides the sidebar and gives its columns to the conversation. It works from any pane, with a menu open too, and never types into the composer. Ctrl+B again, or a click on ◧ at the top left of the conversation, brings it back. On the desktop, Mod+B and the panel button in the title bar do the same.
 
+| Shown | Hidden |
+|---|---|
+| ![t3term with the sidebar shown: shelves of threads on the left, and on the right ◧ before the breadcrumb, a running turn's plan, the tasks drawer and the draft hd in the composer](docs/screenshots/sidebar-shown.png) | ![The same thread after Ctrl+B: the conversation takes the full width, ◧ still leads the header, the draft reads hid after an i typed at the kept cursor, and the status line's key hints start with Ctrl+B sidebar](docs/screenshots/sidebar-hidden.png) |
+
+The threads are invented and come from a fake T3 server. The images render t3term's captured terminal output. A [screen tour](docs/screenshots/sidebar-screen-tour.mp4) shows these two and a hidden sidebar at 60x20 in 256 colors, for three seconds each. It is a slideshow of the captures, not a recording.
+
 While the sidebar is hidden, the key hints on the status line start with `Ctrl+B sidebar`, and Tab and Shift+Tab move between the composer and the transcript. Esc, ← or h in the transcript show the sidebar and focus it. Hiding it while it has focus moves focus to the transcript when a thread is open, or else to the composer. The open thread, the draft and its cursor, and how far you have scrolled stay as they were. The sidebar keeps up with T3 while hidden, so it comes back with any new or renamed threads and with your highlight where you left it.
 
 t3term saves the choice in `~/.config/t3term/settings.json` under `sidebarHidden`, so the next run starts the same way. A file without the key shows the sidebar. The desktop writes its choice to a cookie that it never reads back, so it opens with the sidebar shown every time, and this key is t3term's.
