@@ -137,7 +137,7 @@ The open list takes at most 15 rows, the desktop's height, and at most 40% of th
 
 In the transcript and in `t3term read`, a checklist shows as Plan rows marked `[x]` done, `[>]` running and `[ ]` to do.
 
-An agent writes each step's text, so the drawer, the transcript and `t3term read` drop its control characters, such as Esc and the C1 codes, and a step can't move the cursor, clear the screen or set the clipboard. What followed an Esc stays as plain text. A carriage return starts a new row, and a tab or another blank control shows as a space. `t3term --json read` prints the text as T3 sent it. JSON escapes Esc and the other codes below 0x20 there, but not DEL or the C1 codes, so send that output to a program rather than straight to a terminal.
+An agent writes each step's text, so the drawer, the transcript and `t3term read` drop its control characters, such as Esc and the C1 codes, and a step can't move the cursor, clear the screen or set the clipboard. What followed an Esc stays as plain text. A carriage return starts a new row, and a tab or another blank control shows as a space. `t3term --json read` keeps the text as T3 sent it and writes each control character as a JSON escape, such as `\u001b` for Esc or `\u009b` for the C1 CSI. A terminal shows the escape as text, and a JSON parser reads back the original step.
 
 ### The Working shelf
 
@@ -181,7 +181,7 @@ t3term settings <thread> [choices]  show a thread's model and modes, or change t
 t3term logout                       revoke the saved login and remove it from the Keychain
 ```
 
-`<thread>` takes a full id, the 8-character prefix `threads` prints, or an exact title. `send` reads stdin when you leave the prompt out. Add `--json` to any command for machine-readable output.
+`<thread>` takes a full id, the 8-character prefix `threads` prints, or an exact title. `send` reads stdin when you leave the prompt out. Add `--json` to any command for machine-readable output. Inside its strings, every control character, DEL and the C1 codes included, is a JSON escape such as `\n` or `\u009b`.
 
 Exit codes: 0 success, 1 failure or a turn that ended without completing, 2 usage, 3 not found, 4 rejected or unsupported protocol, 5 server unavailable, 6 timeout, 7 the turn is waiting for an approval or answer.
 
@@ -222,7 +222,7 @@ Set `T3TERM_NO_SAVED_LOGIN=1` to use a session that lasts one run instead. t3ter
 cargo test
 ```
 
-The unit tests cover the reducers, Markdown wrapping, the composer, the model menus, the transcript, the tasks drawer and auth command parsing. `tests/fake_server.rs` drives the real RPC client against a fake Effect RPC server, dropping the socket mid-stream to check the resume cursor, chunk acks, batched frames, duplicate suppression and error decoding. `tests/cli.rs` runs the built binary with a temporary home and checks the `--json` error and exit code when the server is gone, when it isn't on protocol 2 and when the TUI has no terminal. It also runs `t3term read` against a fake server and a fake `t3` that issues a made-up session, and checks that a checklist prints without its control characters. None of them reach a real T3 server or the Keychain, and CI runs them on macOS for every pull request.
+The unit tests cover the reducers, Markdown wrapping, the composer, the model menus, the transcript, the tasks drawer and auth command parsing. `tests/fake_server.rs` drives the real RPC client against a fake Effect RPC server, dropping the socket mid-stream to check the resume cursor, chunk acks, batched frames, duplicate suppression and error decoding. `tests/cli.rs` runs the built binary with a temporary home and checks the `--json` error and exit code when the server is gone, when it isn't on protocol 2 and when the TUI has no terminal. It also runs `t3term read` against a fake server and a fake `t3` that issues a made-up session. It checks that the plain output drops a checklist's control characters and that `--json` writes them as escapes that decode to the text T3 sent. None of them reach a real T3 server or the Keychain, and CI runs them on macOS for every pull request.
 
 `docs/screenshots/` also holds `before-tui.png`, `after-tui.png`, `approval.png`, `streaming.gif`, `picker-model.png` and `tool-calls-failed.png`.
 

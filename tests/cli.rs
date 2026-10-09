@@ -180,15 +180,18 @@ fn servers_not_on_protocol_2_are_refused_before_any_login() {
 }
 
 #[test]
-fn read_prints_a_checklist_without_its_control_characters() {
+fn read_prints_no_raw_control_characters_from_a_checklist() {
     // Made-up payloads an agent could write into a step: a CSI that clears the screen, an
-    // OSC 52 clipboard write, the C1 forms of CSI, OSC and ST, and a carriage return that
-    // would write over the line.
+    // OSC 52 clipboard write, the C1 forms of CSI, OSC and ST, a carriage return that would
+    // write over the line, then DEL, the C1 DCS and NEL, and last a step with no controls
+    // whose characters join or combine.
     let raw = [
         "Clear\u{1b}[2J\u{1b}[Hthe screen",
         "Copy\u{1b}]52;c;Zm9v\u{7}text",
         "Color\u{9b}31m and \u{9d}0;title\u{9c}done",
         "Fake\rReal",
+        "Delete\u{7f}\u{7f}d, \u{90}DCS\u{9c} and\u{85}NEL",
+        "Ship \u{2714}\u{fe0f} to \u{1f469}\u{200d}\u{1f4bb} cafe\u{301}",
     ];
     let id = "8a3c1f52-6d4e-4b7a-9c2d-1e5f7a9b3c4d";
     let steps: Vec<Value> = raw
@@ -223,15 +226,28 @@ fn read_prints_a_checklist_without_its_control_characters() {
     let printed = String::from_utf8(read.stdout).expect("UTF-8");
     let control = printed.chars().find(|c| c.is_control() && *c != '\n');
     assert_eq!(control, None, "{printed:?}");
-    let expected = format!(
-        "# Checklist  ({id})\n  · Plan\n    [ ] Clear[2J[Hthe screen\n    [ ] Copy]52;c;Zm9vtext\n    [ ] Color31m and 0;titledone\n    [ ] Fake\n    Real\n"
-    );
+    let rows = [
+        "  · Plan",
+        "    [ ] Clear[2J[Hthe screen",
+        "    [ ] Copy]52;c;Zm9vtext",
+        "    [ ] Color31m and 0;titledone",
+        "    [ ] Fake",
+        "    Real",
+        "    [ ] Deleted, DCS and NEL",
+        "    [ ] Ship \u{2714}\u{fe0f} to \u{1f469}\u{200d}\u{1f4bb} cafe\u{301}",
+    ];
+    let expected = format!("# Checklist  ({id})\n{}\n", rows.join("\n"));
     assert_eq!(printed, expected);
 
-    // `--json` prints the projection as T3 sent it, controls and all, escaped as JSON escapes
-    // them.
+    // `--json` prints the projection as T3 sent it, controls and all. Every control is a JSON
+    // escape, so stdout holds no raw control but the line breaks between fields, and the steps
+    // decode to the text T3 sent. Characters that aren't controls print as they are.
     let read = home.run_with(&["--json", "read", id], &t3);
     assert_eq!(read.status.code(), Some(0), "{read:?}");
+    let printed = std::str::from_utf8(&read.stdout).expect("UTF-8");
+    let control = printed.chars().find(|c| c.is_control() && *c != '\n');
+    assert_eq!(control, None, "{printed:?}");
+    assert!(printed.contains(raw[5]), "{printed}");
     let value = json_stdout(&read);
     let texts: Vec<&str> = value["projection"]["turnItems"][0]["steps"]
         .as_array()

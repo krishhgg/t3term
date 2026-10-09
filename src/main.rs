@@ -412,11 +412,8 @@ fn report(error: &anyhow::Error, json_mode: bool) -> i32 {
     // `println!` panics when the terminal is gone, and a panic here would skip the revoke in
     // `main`, so write without panicking.
     if json_mode {
-        let _ = writeln!(
-            std::io::stdout(),
-            "{}",
-            json!({"ok": false, "error": {"code": code, "message": error.to_string()}})
-        );
+        let body = json!({"ok": false, "error": {"code": code, "message": error.to_string()}});
+        let _ = writeln!(std::io::stdout(), "{}", json_text(&body, false));
     } else {
         let _ = writeln!(std::io::stderr(), "t3term: {error} [{code}]");
     }
@@ -424,10 +421,34 @@ fn report(error: &anyhow::Error, json_mode: bool) -> i32 {
 }
 
 fn print_json(value: &Value) {
-    println!(
-        "{}",
+    println!("{}", json_text(value, true));
+}
+
+/// `value` as JSON text that is safe to print. serde_json escapes the controls below 0x20 but
+/// writes DEL and the C1 controls, U+007F to U+009F, as they are, and some terminals act on
+/// them, such as U+009B, which starts a CSI sequence as Esc [ does. JSON holds those characters
+/// only inside strings, so this writes each one as a `\u` escape, and a parser reads back the
+/// same string.
+fn json_text(value: &Value, pretty: bool) -> String {
+    use std::fmt::Write as _;
+    let text = if pretty {
         serde_json::to_string_pretty(value).unwrap_or_default()
-    );
+    } else {
+        value.to_string()
+    };
+    let del_or_c1 = |c: char| ('\u{7f}'..='\u{9f}').contains(&c);
+    if !text.contains(del_or_c1) {
+        return text;
+    }
+    let mut escaped = String::with_capacity(text.len() + 16);
+    for c in text.chars() {
+        if del_or_c1(c) {
+            let _ = write!(escaped, "\\u{:04x}", u32::from(c));
+        } else {
+            escaped.push(c);
+        }
+    }
+    escaped
 }
 
 async fn connect(scopes: &[Scope], ttl: &str) -> Result<Arc<Client>> {
@@ -608,7 +629,7 @@ async fn run(cli: Cli) -> Result<i32> {
                     WatchEvent::Item(item) => {
                         let applied = state.apply(&item);
                         if json_mode {
-                            println!("{item}");
+                            println!("{}", json_text(&item, false));
                         } else {
                             match applied {
                                 Applied::Snapshot => {
@@ -1113,5 +1134,29 @@ mod tests {
         assert!(text.contains("reasoning low|high*"), "{text}");
         assert!(text.contains("fastMode on*|off"), "{text}");
         assert!(text.contains("thinking on|off"), "{text}");
+    }
+
+    #[test]
+    fn json_text_escapes_del_and_c1_and_reads_back_the_same_value() {
+        // DEL and C1 controls between `~` and a no-break space, which aren't controls, then an
+        // Esc and a line break, which serde_json escapes itself, then characters that join or
+        // combine, which stay as they are. The key holds a C1 code, and the value a backslash
+        // just before one.
+        let escaped = r"~\u007f\u0085\u009b31m\u009f";
+        let after = "\u{a0}\\u001b[2J\\n";
+        let joined = "\u{2714}\u{fe0f}\u{1f469}\u{200d}\u{1f4bb}e\u{301}";
+        let text = format!("~\u{7f}\u{85}\u{9b}31m\u{9f}\u{a0}\u{1b}[2J\n{joined}");
+        let value = json!({"text": text, "key\u{9d}": ["\\\u{80}"]});
+        for pretty in [true, false] {
+            let printed = json_text(&value, pretty);
+            let control = printed.chars().find(|c| c.is_control() && *c != '\n');
+            assert_eq!(control, None, "{printed}");
+            assert_eq!(serde_json::from_str::<Value>(&printed).unwrap(), value);
+            for part in [escaped, after, joined, r#""key\u009d""#, r#""\\\u0080""#] {
+                assert!(printed.contains(part), "{part:?} in {printed}");
+            }
+        }
+        // `watch --json` prints one item per line.
+        assert!(!json_text(&value, false).contains('\n'));
     }
 }
