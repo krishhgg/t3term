@@ -1,10 +1,10 @@
 //! Runs the built `t3term` binary and checks its `--json` errors and exit codes, and what it
 //! prints.
 //!
-//! Each run gets a cleared environment with HOME and T3CODE_HOME in a temporary directory, so it
-//! never reads the real ~/.t3, never uses the Keychain and never reaches a real T3 server. Any
-//! server it finds is a fake one that this file starts on 127.0.0.1, and any `t3` command it
-//! runs either fails or is a script this file writes.
+//! Each run starts in a temporary directory with a cleared environment and HOME and T3CODE_HOME
+//! inside it, so it never reads the real ~/.t3, never uses the Keychain and never reaches a real
+//! T3 server. Any server it finds is a fake one that this file starts on 127.0.0.1, and any `t3`
+//! command it runs either fails or is a script this file writes.
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::TcpListener;
@@ -18,8 +18,11 @@ use tempfile::TempDir;
 struct Home(TempDir);
 
 impl Home {
+    /// The directory's name has a space, so every test here also runs t3term from a path with
+    /// a space in it.
     fn new() -> Self {
-        Home(tempfile::tempdir().unwrap())
+        let dir = tempfile::Builder::new().prefix("t3term home ").tempdir();
+        Home(dir.unwrap())
     }
 
     /// Writes `server-runtime.json` the way T3 does
@@ -37,11 +40,13 @@ impl Home {
         self.run_with(args, "false")
     }
 
-    /// Runs t3term with `t3` as the command that issues and revokes its sessions.
+    /// Runs t3term in the home directory, with `t3` as the command that issues and revokes its
+    /// sessions.
     fn run_with(&self, args: &[&str], t3: &str) -> Output {
         let home: &Path = self.0.path();
         Command::new(env!("CARGO_BIN_EXE_t3term"))
             .args(args)
+            .current_dir(home)
             .env_clear()
             .env("PATH", std::env::var_os("PATH").unwrap_or_default())
             .env("HOME", home)
@@ -55,6 +60,9 @@ impl Home {
 
     /// Writes a `t3` that issues a made-up session and accepts its revoke, and returns the
     /// command that runs it. The session means something only to this file's fake servers.
+    ///
+    /// t3term splits `T3TERM_T3_COMMAND` on whitespace, and the home path has a space, so the
+    /// command names the script relative to the home directory that `run_with` runs t3term in.
     fn fake_t3(&self) -> String {
         let path = self.0.path().join("t3.sh");
         let script = r#"case "$3" in
@@ -62,7 +70,7 @@ impl Home {
 esac
 "#;
         std::fs::write(&path, script).unwrap();
-        format!("/bin/sh {}", path.display())
+        "/bin/sh ./t3.sh".to_string()
     }
 }
 
