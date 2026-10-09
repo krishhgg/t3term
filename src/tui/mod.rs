@@ -1,6 +1,7 @@
-//! The interactive client. It draws only after input or a server event, at most 30 times a second.
-//! Two timers can wake it besides: a one-second tick, armed while the open thread has a run
-//! going or a sidebar card on screen reads Working or Goal, so the elapsed-time labels and
+//! The interactive client. It draws only after input or a server event, at most 30 times a
+//! second. Hiding or showing the sidebar draws at once, so a click that follows lands on the new
+//! layout. Two timers can wake it besides: a one-second tick, armed while the open thread has a
+//! run going or a sidebar card on screen reads Working or Goal, so the elapsed-time labels and
 //! spinners advance, and a one-shot timer for the moment the soonest snooze ends, which no
 //! server event marks. An idle TUI uses no CPU.
 
@@ -54,8 +55,10 @@ const TICK: Duration = Duration::from_secs(1);
 const SPINNER: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 /// Text rows the composer grows to before it scrolls.
 const COMPOSER_MAX_ROWS: usize = 6;
+/// The button that hides and shows the sidebar, after the panel icon on the desktop's.
+const TOGGLE: &str = " ◧ ";
 
-#[derive(Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
     Sidebar,
     Transcript,
@@ -358,6 +361,12 @@ struct App {
     shell: Option<ShellState>,
     shell_connection: String,
     sidebar: Sidebar,
+    /// Whether the sidebar is hidden, which gives the main column its width. Saved between
+    /// runs. Focus never rests on a hidden sidebar.
+    sidebar_hidden: bool,
+    /// Set when the sidebar is hidden or shown, so the next frame draws at once instead of
+    /// waiting out the frame budget. Until it does, clicks would land on the old layout.
+    layout_changed: bool,
     open: Option<OpenThread>,
     focus: Focus,
     composer: Composer,
@@ -401,6 +410,8 @@ struct App {
     picker_area: Rect,
     /// The screen row of each menu item drawn, with its index.
     picker_rows: Vec<(u16, usize)>,
+    /// The button at the top left of the conversation that hides and shows the sidebar.
+    sidebar_toggle: Rect,
     quit: bool,
 }
 
@@ -440,47 +451,7 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
     let (actions, mut action_results) = mpsc::unbounded_channel();
     let mut shell_events = client.watch_shell(None);
     let settings = Settings::load().await;
-    let mut app = App {
-        client,
-        theme: Theme::detect(),
-        config: None,
-        drafts: HashMap::new(),
-        unsent: Unsent::default(),
-        picker: None,
-        shell: None,
-        shell_connection: "connecting".into(),
-        sidebar: Sidebar::with_working(
-            settings.sidebar_working_shelf_enabled,
-            settings.sidebar_working_shelf_expanded,
-        ),
-        open: None,
-        focus: Focus::Sidebar,
-        composer: Composer::default(),
-        scroll: Scroll::default(),
-        open_bundles: HashSet::new(),
-        bundle_rows: Vec::new(),
-        expanded_plans: HashSet::new(),
-        drawn_plans: Vec::new(),
-        tasks: tasks::Drawer::default(),
-        anchor: None,
-        drawn_scroll: 0,
-        verbose: settings.verbose,
-        plan_mode_enabled: settings.plan_mode_enabled,
-        outputs: Outputs::default(),
-        cache: HashMap::new(),
-        message: None,
-        actions,
-        now: now_ms(),
-        transcript_area: Rect::default(),
-        panel_area: Rect::default(),
-        panel_scroll: 0,
-        panel_key: String::new(),
-        composer_area: Rect::default(),
-        chips: Vec::new(),
-        picker_area: Rect::default(),
-        picker_rows: Vec::new(),
-        quit: false,
-    };
+    let mut app = App::new(client, Theme::detect(), &settings, actions);
     app.load_config();
     let mut input = EventStream::new();
     let mut dirty = true;
@@ -488,7 +459,7 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
     let mut tick_at = Instant::now() + TICK;
 
     while !app.quit {
-        if dirty && last_draw.elapsed() >= FRAME {
+        if dirty && (app.layout_changed || last_draw.elapsed() >= FRAME) {
             terminal.draw(|frame| app.draw(frame))?;
             last_draw = Instant::now();
             dirty = false;
@@ -551,7 +522,8 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
 
 /// Whether a clock or spinner needs the once-a-second tick: the open thread has a run going,
 /// or the last frame drew a sidebar card that reads Working or Goal. Work the sidebar doesn't
-/// show, because it is hidden, settled or scrolled away, doesn't wake the TUI.
+/// show, because it is behind a closed shelf, scrolled away or in a hidden sidebar, doesn't
+/// wake the TUI.
 fn needs_tick(open: Option<&OpenThread>, sidebar: &Sidebar) -> bool {
     // A closed watch never hears that its run finished, so its last state can't count.
     let open_run = open
@@ -559,6 +531,31 @@ fn needs_tick(open: Option<&OpenThread>, sidebar: &Sidebar) -> bool {
         .and_then(|o| o.state.as_ref())
         .is_some_and(|s| s.active_run().is_some());
     open_run || sidebar.drew_working()
+}
+
+/// The sidebar's column and the main column. A hidden sidebar's column has no width, and the
+/// main column takes the whole screen.
+fn columns(area: Rect, sidebar_hidden: bool) -> (Rect, Rect) {
+    if sidebar_hidden {
+        return (Rect { width: 0, ..area }, area);
+    }
+    let sidebar_width = (area.width / 4).clamp(26, 34).min(area.width / 2);
+    let widths = [Constraint::Length(sidebar_width), Constraint::Min(20)];
+    let [sidebar, main] = Layout::horizontal(widths).areas(area);
+    (sidebar, main)
+}
+
+/// The pane Tab moves focus to from `focus`, or BackTab when `forward` is false. A hidden
+/// sidebar is left out of the cycle.
+fn cycle(focus: Focus, forward: bool, sidebar_hidden: bool) -> Focus {
+    let panes: &[Focus] = if sidebar_hidden {
+        &[Focus::Composer, Focus::Transcript]
+    } else {
+        &[Focus::Sidebar, Focus::Composer, Focus::Transcript]
+    };
+    let at = panes.iter().position(|&pane| pane == focus).unwrap_or(0);
+    let step = if forward { 1 } else { panes.len() - 1 };
+    panes[(at + step) % panes.len()]
 }
 
 /// The spinner frame for a wall-clock time, so every spinner on screen turns together.
@@ -578,6 +575,64 @@ fn hash(value: impl std::hash::Hash) -> u64 {
 }
 
 impl App {
+    /// The TUI before anything has arrived from T3, laid out as the settings file says. Focus
+    /// starts on the sidebar, or on the composer when the sidebar starts hidden.
+    fn new(
+        client: Arc<Client>,
+        theme: Theme,
+        settings: &Settings,
+        actions: mpsc::UnboundedSender<ActionResult>,
+    ) -> App {
+        App {
+            client,
+            theme,
+            config: None,
+            drafts: HashMap::new(),
+            unsent: Unsent::default(),
+            picker: None,
+            shell: None,
+            shell_connection: "connecting".into(),
+            sidebar: Sidebar::with_working(
+                settings.sidebar_working_shelf_enabled,
+                settings.sidebar_working_shelf_expanded,
+            ),
+            sidebar_hidden: settings.sidebar_hidden,
+            layout_changed: false,
+            open: None,
+            focus: if settings.sidebar_hidden {
+                Focus::Composer
+            } else {
+                Focus::Sidebar
+            },
+            composer: Composer::default(),
+            scroll: Scroll::default(),
+            open_bundles: HashSet::new(),
+            bundle_rows: Vec::new(),
+            expanded_plans: HashSet::new(),
+            drawn_plans: Vec::new(),
+            tasks: tasks::Drawer::default(),
+            anchor: None,
+            drawn_scroll: 0,
+            verbose: settings.verbose,
+            plan_mode_enabled: settings.plan_mode_enabled,
+            outputs: Outputs::default(),
+            cache: HashMap::new(),
+            message: None,
+            actions,
+            now: now_ms(),
+            transcript_area: Rect::default(),
+            panel_area: Rect::default(),
+            panel_scroll: 0,
+            panel_key: String::new(),
+            composer_area: Rect::default(),
+            chips: Vec::new(),
+            picker_area: Rect::default(),
+            picker_rows: Vec::new(),
+            sidebar_toggle: Rect::default(),
+            quit: false,
+        }
+    }
+
     // ---- server events ----
 
     fn on_shell_event(&mut self, event: WatchEvent) {
@@ -658,6 +713,31 @@ impl App {
     fn toggle_settled(&mut self) {
         self.sidebar.show_settled = !self.sidebar.show_settled;
         self.rebuild_rows();
+    }
+
+    /// Hides or shows the sidebar and remembers it, as Ctrl+B and the desktop's Mod+B do. Focus
+    /// on a sidebar being hidden moves to the transcript when a thread is open, or else to the
+    /// composer. The rows, the highlight, the open thread and the composer stay as they are.
+    fn toggle_sidebar(&mut self) {
+        self.sidebar_hidden = !self.sidebar_hidden;
+        if self.sidebar_hidden && self.focus == Focus::Sidebar {
+            self.focus = if self.open.is_some() {
+                Focus::Transcript
+            } else {
+                Focus::Composer
+            };
+        }
+        self.layout_changed = true;
+        let hidden = self.sidebar_hidden;
+        Settings::update(move |settings| settings.sidebar_hidden = hidden);
+    }
+
+    /// Moves focus to the sidebar, showing it first if it is hidden.
+    fn focus_sidebar(&mut self) {
+        if self.sidebar_hidden {
+            self.toggle_sidebar();
+        }
+        self.focus = Focus::Sidebar;
     }
 
     /// Opens or closes the Working shelf and remembers it, as the GUI does. Nothing happens
@@ -774,6 +854,10 @@ impl App {
                     self.open_picker(kind);
                     return true;
                 }
+                if click && inside(self.sidebar_toggle) {
+                    self.toggle_sidebar();
+                    return true;
+                }
                 if let Some(redraw) = self.tasks.on_mouse(&mouse) {
                     return redraw;
                 }
@@ -855,6 +939,11 @@ impl App {
                 self.interrupt();
                 return;
             }
+            // From any pane, an open menu included, and never typed into the composer.
+            KeyCode::Char('b') if ctrl => {
+                self.toggle_sidebar();
+                return;
+            }
             // Answer approvals from any pane. Terminals report Esc followed quickly by a letter as Alt.
             KeyCode::Char(c @ ('a' | 's' | 'd')) if alt => {
                 self.respond(match c {
@@ -893,20 +982,9 @@ impl App {
                 self.swap_unsent();
                 return;
             }
-            KeyCode::Tab => {
-                self.focus = match self.focus {
-                    Focus::Sidebar => Focus::Composer,
-                    Focus::Composer => Focus::Transcript,
-                    Focus::Transcript => Focus::Sidebar,
-                };
-                return;
-            }
-            KeyCode::BackTab => {
-                self.focus = match self.focus {
-                    Focus::Sidebar => Focus::Transcript,
-                    Focus::Composer => Focus::Sidebar,
-                    Focus::Transcript => Focus::Composer,
-                };
+            KeyCode::Tab | KeyCode::BackTab => {
+                let forward = key.code == KeyCode::Tab;
+                self.focus = cycle(self.focus, forward, self.sidebar_hidden);
                 return;
             }
             KeyCode::PageUp => {
@@ -980,7 +1058,7 @@ impl App {
                 KeyCode::Char('s') => self.respond("acceptForSession"),
                 KeyCode::Char('d') => self.respond("decline"),
                 KeyCode::Char('i') | KeyCode::Enter => self.focus = Focus::Composer,
-                KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => self.focus = Focus::Sidebar,
+                KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => self.focus_sidebar(),
                 _ => {}
             },
         }
@@ -1605,25 +1683,28 @@ impl App {
         self.now = now_ms();
         let area = frame.area();
         frame.render_widget(Block::new().style(Style::new().bg(self.theme.bg)), area);
-        let sidebar_width = (area.width / 4).clamp(26, 34).min(area.width / 2);
-        let [sidebar, main] =
-            Layout::horizontal([Constraint::Length(sidebar_width), Constraint::Min(20)])
-                .areas(area);
+        self.layout_changed = false;
+        let (sidebar, main) = columns(area, self.sidebar_hidden);
         // The wake timer usually moves a woken thread first, but it runs on a clock that
-        // stops while the machine sleeps.
+        // stops while the machine sleeps. A hidden sidebar keeps its rows current too, so it
+        // comes back as T3 has it.
         if self.sidebar.next_wake.is_some_and(|wake| wake <= self.now) {
             self.rebuild_rows();
         }
-        let (_, dot) = self.connection_state();
-        let view = View {
-            theme: &self.theme,
-            shell: self.shell.as_ref(),
-            open_id: self.open.as_ref().map(|o| o.id.as_str()),
-            focused: self.focus == Focus::Sidebar,
-            now: self.now,
-            dot,
-        };
-        self.sidebar.draw(frame, sidebar, &view);
+        if self.sidebar_hidden {
+            self.sidebar.forget_drawn();
+        } else {
+            let (_, dot) = self.connection_state();
+            let view = View {
+                theme: &self.theme,
+                shell: self.shell.as_ref(),
+                open_id: self.open.as_ref().map(|o| o.id.as_str()),
+                focused: self.focus == Focus::Sidebar,
+                now: self.now,
+                dot,
+            };
+            self.sidebar.draw(frame, sidebar, &view);
+        }
 
         // The main column keeps one blank column on each side, like the GUI's padding.
         let main = Rect {
@@ -1668,9 +1749,25 @@ impl App {
         ])
         .areas(main);
 
+        // The toggle leads the header, where the desktop's sits in its title bar, so a hidden
+        // sidebar always has a way back. The breadcrumb follows it.
+        let toggle = Rect::new(header.x, header.y, TOGGLE.width() as u16, 1);
+        self.sidebar_toggle = toggle.intersection(header);
         frame.render_widget(
-            Paragraph::new(self.header_line(header.width as usize)),
-            header,
+            Paragraph::new(Line::styled(
+                TOGGLE,
+                Style::new().fg(self.theme.muted).bg(self.theme.chip_bg),
+            )),
+            self.sidebar_toggle,
+        );
+        let breadcrumb = Rect {
+            x: header.x + self.sidebar_toggle.width + 1,
+            width: header.width.saturating_sub(self.sidebar_toggle.width + 1),
+            ..header
+        };
+        frame.render_widget(
+            Paragraph::new(self.header_line(breadcrumb.width as usize)),
+            breadcrumb,
         );
         self.transcript_area = body;
         self.draw_transcript(frame, body);
@@ -1767,6 +1864,8 @@ impl App {
         else {
             let hint = if self.open.is_some() {
                 "Loading thread…"
+            } else if self.sidebar_hidden {
+                "Press Ctrl+B to show the sidebar and pick a thread."
             } else {
                 "Select a thread with ↑/↓ and press Enter."
             };
@@ -1957,7 +2056,8 @@ impl App {
         self.bundle_rows = rows;
         self.drawn_plans = plans;
         frame.render_widget(Paragraph::new(lines), area);
-        if scroll > 0 {
+        // A terminal too short for any transcript rows has nowhere to put the label.
+        if scroll > 0 && area.height > 0 {
             let label = format!(" ↓ {scroll} more ");
             let x = area.x + area.width.saturating_sub(label.width() as u16 + 1);
             frame.render_widget(
@@ -2489,9 +2589,11 @@ impl App {
             (_, Some(Kind::Model)) => "Type to search · ↑↓ choose · Enter select · Esc close",
             (_, Some(_)) => "↑↓ choose · Enter select · Esc close",
             (Focus::Sidebar, None) if self.sidebar.has_working() => {
-                "↑↓ select · Enter open · w working · e settled · Tab focus · q quit"
+                "↑↓ select · Enter open · w working · e settled · Ctrl+B hide · Tab focus · q quit"
             }
-            (Focus::Sidebar, None) => "↑↓ select · Enter open · e settled · Tab focus · q quit",
+            (Focus::Sidebar, None) => {
+                "↑↓ select · Enter open · e settled · Ctrl+B hide · Tab focus · q quit"
+            }
             (Focus::Composer, None) => {
                 "Enter send · Alt+Enter newline · Alt+M model · Alt+E effort · Alt+P mode · Ctrl+X interrupt"
             }
@@ -2503,6 +2605,12 @@ impl App {
                 hint = transcript_keys(self.verbose, plan);
                 hint.as_str()
             }
+        };
+        // Only Ctrl+B and the toggle bring a hidden sidebar back, so the keys lead with it.
+        let restore = if self.sidebar_hidden && self.picker.is_none() {
+            "Ctrl+B sidebar · "
+        } else {
+            ""
         };
         let head = fit(&format!("{connection}  ·  "), width.saturating_sub(2));
         let mut room = width.saturating_sub(2 + head.width());
@@ -2516,7 +2624,8 @@ impl App {
             spans.push(Span::styled(note, Style::new().fg(t.warning_fg)));
         }
         if room > 0 {
-            spans.push(Span::styled(fit(keys, room), Style::new().fg(t.muted)));
+            let keys = format!("{restore}{keys}");
+            spans.push(Span::styled(fit(&keys, room), Style::new().fg(t.muted)));
         }
         Line::from(spans)
     }
@@ -4236,5 +4345,435 @@ mod tests {
         assert_eq!(third[1], first[0]);
         assert_ne!(third[0], second[0]);
         assert_eq!(bodies(&open), ["gpt-5.5 → claude-fable-6", "Done"]);
+    }
+
+    // ---- hiding the sidebar ----
+
+    const CLICK: MouseEventKind = MouseEventKind::Down(MouseButton::Left);
+
+    /// The TUI as the event loop starts it, with a client that reaches no server. What it
+    /// saves goes to `saved_in_test`, never to a settings file.
+    fn tui(settings: &Settings) -> App {
+        App::new(
+            Arc::new(Client::offline()),
+            Theme::new(Depth::TrueColor),
+            settings,
+            mpsc::unbounded_channel().0,
+        )
+    }
+
+    /// Draws one frame of `app` on a screen `width` columns by `height` rows, as the event loop
+    /// does, and returns each row as text.
+    fn screen(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let frame = terminal.draw(|frame| app.draw(frame)).unwrap();
+        let buffer = frame.buffer;
+        (0..height)
+            .map(|y| (0..width).map(|x| buffer[(x, y)].symbol()).collect())
+            .collect()
+    }
+
+    /// The first screen row that shows `needle`.
+    fn row_showing(rows: &[String], needle: &str) -> u16 {
+        rows.iter()
+            .position(|row| row.contains(needle))
+            .unwrap_or_else(|| panic!("no row shows {needle:?} in {rows:#?}")) as u16
+    }
+
+    fn press(app: &mut App, code: KeyCode) {
+        app.on_terminal_event(Event::Key(KeyEvent::new(code, KeyModifiers::NONE)));
+    }
+
+    /// Presses each key in turn and notes where focus went after it.
+    fn focus_after(app: &mut App, codes: &[KeyCode]) -> Vec<Focus> {
+        let mut order = Vec::new();
+        for &code in codes {
+            press(app, code);
+            order.push(app.focus);
+        }
+        order
+    }
+
+    fn ctrl_b(app: &mut App) {
+        let key = KeyEvent::new(KeyCode::Char('b'), KeyModifiers::CONTROL);
+        app.on_terminal_event(Event::Key(key));
+    }
+
+    /// A mouse event at column `x` of row `y`, and whether the TUI took it.
+    fn mouse(app: &mut App, kind: MouseEventKind, x: u16, y: u16) -> bool {
+        app.on_terminal_event(Event::Mouse(crossterm::event::MouseEvent {
+            kind,
+            column: x,
+            row: y,
+            modifiers: KeyModifiers::NONE,
+        }))
+    }
+
+    /// A thread as the shell lists it, in project `p`.
+    fn listed(id: &str, title: &str, status: &str) -> Value {
+        json!({
+            "id": id,
+            "projectId": "p",
+            "title": title,
+            "status": status,
+            "latestRunId": "r",
+            "lineage": {},
+            "createdAt": "2026-10-01T00:00:00.000Z",
+        })
+    }
+
+    /// The shell's snapshot, listing `threads`.
+    fn shell_snapshot(threads: Vec<Value>) -> WatchEvent {
+        let projects = json!([{"id": "p", "title": "Demo"}]);
+        let snapshot = json!({"snapshotSequence": 1, "projects": projects, "threads": threads});
+        WatchEvent::Item(json!({"kind": "snapshot", "snapshot": snapshot}))
+    }
+
+    /// A shell event that lists `thread` as it is now.
+    fn thread_updated(sequence: u64, thread: Value) -> WatchEvent {
+        let item = json!({"kind": "thread.updated", "sequence": sequence, "thread": thread});
+        WatchEvent::Item(item)
+    }
+
+    /// Thread `t`, open with twenty answers long enough to wrap to a different height at each
+    /// width.
+    fn long_thread() -> OpenThread {
+        let answers: Vec<Value> = (0..20)
+            .map(|i| {
+                json!({
+                    "id": format!("a{i}"),
+                    "type": "assistant_message",
+                    "ordinal": i,
+                    "text": format!("Answer {i}: {}", "word ".repeat(60)),
+                })
+            })
+            .collect();
+        let snapshot = json!({"kind": "snapshot", "snapshotSequence": 1, "projection": {
+            "thread": {"id": "t"},
+            "turnItems": answers,
+        }});
+        let mut open = OpenThread::new("t".into(), mpsc::unbounded_channel().1);
+        assert_eq!(open.apply(&snapshot), Applied::Snapshot);
+        open.connection = "live".into();
+        open
+    }
+
+    #[test]
+    fn ctrl_b_hides_the_sidebar_and_leaves_the_draft_alone() {
+        let mut app = tui(&Settings::default());
+        assert!(!app.sidebar_hidden, "no settings file shows it");
+        assert_eq!(app.focus, Focus::Sidebar);
+        let rows = screen(&mut app, 80, 24);
+        assert!(rows[0].contains("T3 Code"), "{rows:#?}");
+        assert_ne!(app.sidebar.list, Rect::default());
+        assert!(app.composer_area.x > app.sidebar.list.right());
+
+        // A draft with the cursor between its two letters, then Ctrl+B.
+        app.focus = Focus::Composer;
+        press(&mut app, KeyCode::Char('h'));
+        press(&mut app, KeyCode::Char('d'));
+        press(&mut app, KeyCode::Left);
+        ctrl_b(&mut app);
+        assert!(app.sidebar_hidden);
+        assert!(crate::settings::saved_in_test().sidebar_hidden);
+        assert_eq!(app.focus, Focus::Composer);
+        assert!(app.layout_changed, "the next frame waits for nothing");
+        let rows = screen(&mut app, 80, 24);
+        assert!(!app.layout_changed);
+        assert!(!rows.iter().any(|row| row.contains("T3 Code")), "{rows:#?}");
+        // The conversation takes the whole width, less a column of padding on each side.
+        assert_eq!((app.composer_area.x, app.composer_area.width), (1, 78));
+        assert_eq!((app.transcript_area.x, app.transcript_area.width), (1, 78));
+        assert_eq!(app.sidebar_toggle, Rect::new(1, 0, 3, 1));
+        assert!(rows[0].starts_with("  ◧  Pick a thread"), "{:?}", rows[0]);
+        row_showing(&rows, "Press Ctrl+B to show the sidebar");
+        assert!(rows[23].contains("Ctrl+B sidebar · Enter send"));
+        // No `b` went in, and the cursor is still between the letters.
+        press(&mut app, KeyCode::Char('i'));
+        assert_eq!(app.composer.text(), "hid");
+
+        ctrl_b(&mut app);
+        assert!(!app.sidebar_hidden);
+        assert!(!crate::settings::saved_in_test().sidebar_hidden);
+        assert_eq!(app.focus, Focus::Composer, "showing it leaves focus alone");
+        let rows = screen(&mut app, 80, 24);
+        assert!(rows[0].contains("T3 Code"), "{rows:#?}");
+        assert!(!rows[23].contains("Ctrl+B sidebar"), "{:?}", rows[23]);
+        assert_eq!(app.composer.text(), "hid");
+    }
+
+    #[test]
+    fn focus_never_rests_on_a_hidden_sidebar() {
+        use super::Focus::{Composer, Sidebar, Transcript};
+        use crossterm::event::KeyCode::{BackTab, Tab};
+
+        // Saved hidden, it starts hidden, with focus on the composer. Tab and BackTab skip it.
+        let hidden = Settings {
+            sidebar_hidden: true,
+            ..Settings::default()
+        };
+        let mut app = tui(&hidden);
+        assert!(app.sidebar_hidden);
+        assert_eq!(app.focus, Composer);
+        let order = focus_after(&mut app, &[Tab, Tab, BackTab, BackTab]);
+        assert_eq!(order, [Transcript, Composer, Transcript, Composer]);
+
+        // Shown, it is back in the cycle.
+        ctrl_b(&mut app);
+        let order = focus_after(&mut app, &[Tab, Tab, Tab, BackTab]);
+        assert_eq!(order, [Transcript, Sidebar, Composer, Sidebar]);
+
+        // Hiding it while it has focus moves focus to the composer with no thread open, and to
+        // the transcript with one.
+        ctrl_b(&mut app);
+        assert_eq!(app.focus, Composer);
+        ctrl_b(&mut app);
+        app.open = Some(long_thread());
+        app.focus = Sidebar;
+        ctrl_b(&mut app);
+        assert_eq!(app.focus, Transcript);
+
+        // From the transcript, the keys that go to the sidebar show it first.
+        for code in [KeyCode::Esc, KeyCode::Left, KeyCode::Char('h')] {
+            press(&mut app, code);
+            assert!(!app.sidebar_hidden, "{code:?}");
+            assert!(!crate::settings::saved_in_test().sidebar_hidden);
+            assert_eq!(app.focus, Sidebar);
+            ctrl_b(&mut app);
+            assert_eq!(app.focus, Transcript);
+        }
+    }
+
+    #[test]
+    fn a_hidden_sidebar_leaves_its_clicks_and_wheel_to_the_conversation() {
+        let mut app = tui(&Settings::default());
+        let threads = vec![listed("a", "Alpha", "idle"), listed("b", "Bravo", "idle")];
+        app.on_shell_event(shell_snapshot(threads));
+        app.open = Some(long_thread());
+        assert!(app.sidebar.select("a"));
+        let rows = screen(&mut app, 80, 24);
+        // Shown, a click on Bravo's card would open it, and the wheel there moves the highlight.
+        let (x, y) = (5, row_showing(&rows, "Bravo"));
+        assert_eq!(app.sidebar.thread_at(y), Some("b"));
+        let footer = app.sidebar.footer;
+        assert_ne!(footer, Rect::default());
+
+        app.focus = Focus::Composer;
+        ctrl_b(&mut app);
+        screen(&mut app, 80, 24);
+        assert_eq!(app.sidebar.thread_at(y), None);
+        // Hidden, the wheel there scrolls the transcript and the highlight stays on Alpha.
+        assert!(mouse(&mut app, MouseEventKind::ScrollUp, x, y));
+        assert_eq!(app.scroll.rows(), 3);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a"));
+        // A click there focuses the transcript and opens nothing.
+        assert!(mouse(&mut app, CLICK, x, y));
+        assert_eq!(app.focus, Focus::Transcript);
+        assert_eq!(app.open.as_ref().map(|open| open.id.as_str()), Some("t"));
+        // A click on the old Settled footer lands on the status line.
+        assert!(mouse(&mut app, CLICK, footer.x, footer.y));
+        assert_eq!(app.focus, Focus::Composer);
+        assert!(!app.sidebar.show_settled);
+
+        // The toggle brings the sidebar back as it was, and its cards take clicks again.
+        let toggle = app.sidebar_toggle;
+        assert!(mouse(&mut app, CLICK, toggle.x, toggle.y));
+        assert!(!app.sidebar_hidden);
+        assert!(!crate::settings::saved_in_test().sidebar_hidden);
+        let rows = screen(&mut app, 80, 24);
+        let bravo = row_showing(&rows, "Bravo");
+        assert_eq!(app.sidebar.thread_at(bravo), Some("b"));
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a"));
+        // The toggle moved right of the sidebar, and a click on it there hides it again.
+        let toggle = app.sidebar_toggle;
+        assert!(toggle.x > app.sidebar.list.right());
+        assert!(mouse(&mut app, CLICK, toggle.x + 2, toggle.y));
+        assert!(app.sidebar_hidden);
+        assert!(crate::settings::saved_in_test().sidebar_hidden);
+    }
+
+    #[test]
+    fn chips_and_an_open_menu_follow_the_composer_when_the_sidebar_hides() {
+        let mut app = tui(&Settings::default());
+        app.open = Some(long_thread());
+        app.focus = Focus::Composer;
+        app.picker = Some(Picker {
+            kind: Kind::Mode,
+            filter: String::new(),
+            selected: 0,
+            offset: 0,
+        });
+        screen(&mut app, 80, 24);
+        let (chips, menu) = (app.chips.clone(), app.picker_area);
+        assert!(!chips.is_empty());
+        assert_ne!(menu, Rect::default());
+
+        // Ctrl+B leaves the menu open, and the next frame lays both out in the wider composer.
+        ctrl_b(&mut app);
+        assert!(app.picker.is_some());
+        screen(&mut app, 80, 24);
+        let composer = app.composer_area;
+        assert_eq!(app.chips.len(), chips.len());
+        for ((area, kind), (before, kind_before)) in app.chips.iter().zip(&chips) {
+            assert_eq!(kind, kind_before);
+            assert!(area.x < before.x, "{kind:?} stayed at {before:?}");
+            assert!(area.x > composer.x && area.right() < composer.right());
+        }
+        assert!(app.picker_area.x < menu.x);
+        assert!(app.picker_area.x >= composer.x);
+        assert!(app.picker_area.right() <= composer.right());
+    }
+
+    #[test]
+    fn hiding_the_sidebar_rewraps_the_transcript_and_keeps_the_reader_in_place() {
+        let mut app = tui(&Settings::default());
+        app.open = Some(long_thread());
+        app.composer.insert_str("draft");
+        app.focus = Focus::Transcript;
+        screen(&mut app, 80, 24);
+        for _ in 0..3 {
+            press(&mut app, KeyCode::PageUp);
+        }
+        screen(&mut app, 80, 24);
+        let narrow = app.transcript_area.width - 1;
+        let (top, _) = app.anchor.clone().expect("scrolled up");
+        let prepared = &app.open.as_ref().unwrap().prepared;
+        let (made, versions) = (prepared.made, prepared.versions.clone());
+
+        for hidden in [true, false] {
+            ctrl_b(&mut app);
+            assert_eq!(app.sidebar_hidden, hidden);
+            assert_eq!(app.focus, Focus::Transcript, "the transcript keeps focus");
+            screen(&mut app, 80, 24);
+            let width = app.transcript_area.width - 1;
+            assert_eq!(width > narrow, hidden);
+            // Every block is wrapped again at the new width, from the blocks already made.
+            assert!(app.cache.values().all(|cached| cached.key.1 == width));
+            let prepared = &app.open.as_ref().unwrap().prepared;
+            assert_eq!(prepared.made, made, "a block was made again");
+            assert_eq!(prepared.versions, versions);
+            // The same answer is at the top, and the transcript is still scrolled up.
+            assert_eq!(app.anchor.as_ref().map(|(id, _)| id), Some(&top));
+            assert!(app.scroll.rows() > 0);
+            assert_eq!(app.composer.text(), "draft");
+        }
+    }
+
+    #[test]
+    fn the_sidebar_comes_back_with_what_changed_while_it_was_hidden() {
+        let mut app = tui(&Settings::default());
+        let threads = vec![listed("a", "Alpha", "idle"), listed("b", "Bravo", "idle")];
+        app.on_shell_event(shell_snapshot(threads));
+        assert!(app.sidebar.select("b"));
+        ctrl_b(&mut app);
+        let rows = screen(&mut app, 80, 24);
+        assert!(!rows.iter().any(|row| row.contains("Bravo")), "{rows:#?}");
+
+        // T3 renames Bravo and lists a new thread while the sidebar is hidden.
+        app.on_shell_event(thread_updated(2, listed("b", "Bravo renamed", "idle")));
+        app.on_shell_event(thread_updated(3, listed("c", "Charlie", "idle")));
+        screen(&mut app, 80, 24);
+        ctrl_b(&mut app);
+        let rows = screen(&mut app, 80, 24);
+        let bravo = row_showing(&rows, "Bravo renamed");
+        let charlie = row_showing(&rows, "Charlie");
+        assert_eq!(app.sidebar.thread_at(bravo), Some("b"));
+        assert_eq!(app.sidebar.thread_at(charlie), Some("c"));
+        assert_eq!(app.sidebar.selected_thread_id(), Some("b"));
+    }
+
+    #[test]
+    fn hidden_working_cards_need_no_tick() {
+        let mut app = tui(&Settings::default());
+        app.on_shell_event(shell_snapshot(vec![listed("w", "Busy", "running")]));
+        screen(&mut app, 80, 24);
+        assert!(needs_tick(app.open.as_ref(), &app.sidebar));
+        ctrl_b(&mut app);
+        screen(&mut app, 80, 24);
+        assert!(!needs_tick(app.open.as_ref(), &app.sidebar));
+        ctrl_b(&mut app);
+        screen(&mut app, 80, 24);
+        assert!(needs_tick(app.open.as_ref(), &app.sidebar));
+    }
+
+    #[test]
+    fn a_hidden_sidebar_still_wakes_a_snoozed_thread() {
+        let mut client = Client::offline();
+        client.runtime.capabilities = json!({"threadSnooze": true});
+        let mut app = App::new(
+            Arc::new(client),
+            Theme::new(Depth::TrueColor),
+            &Settings::default(),
+            mpsc::unbounded_channel().0,
+        );
+        let mut zulu = listed("z", "Zulu", "idle");
+        zulu["snoozedUntil"] = json!("2026-01-01T00:00:00.000Z");
+        app.on_shell_event(shell_snapshot(vec![zulu]));
+        // Laid out the day before its snooze ended, as by a timer that slept with the machine.
+        let threads = app.shell.as_ref().unwrap().threads.clone();
+        let capabilities = app.capabilities();
+        let before = parse_iso_ms("2025-12-31T00:00:00.000Z").unwrap();
+        app.sidebar.rebuild(&threads, capabilities, None, before);
+        let wake = parse_iso_ms("2026-01-01T00:00:00.000Z");
+        assert_eq!(app.sidebar.next_wake, wake);
+
+        // A hidden frame still moves it back. A wake left in the past would fire at once and
+        // again on every pass of the event loop.
+        ctrl_b(&mut app);
+        screen(&mut app, 80, 24);
+        assert_eq!(app.sidebar.next_wake, None);
+        ctrl_b(&mut app);
+        let rows = screen(&mut app, 80, 24);
+        assert!(row_showing(&rows, "Active ─") < row_showing(&rows, "Zulu"));
+        assert!(!rows.iter().any(|row| row.contains("Snoozed")), "{rows:#?}");
+    }
+
+    #[test]
+    fn any_screen_size_draws_with_the_sidebar_shown_or_hidden() {
+        for start_hidden in [false, true] {
+            let settings = Settings {
+                sidebar_hidden: start_hidden,
+                ..Settings::default()
+            };
+            let mut app = tui(&settings);
+            let threads = vec![listed("a", "Ann", "running"), listed("b", "Bo", "idle")];
+            app.on_shell_event(shell_snapshot(threads));
+            app.open = Some(long_thread());
+            app.scroll.set(30);
+            app.composer.insert_str("a draft that wraps when narrow");
+            app.picker = Some(Picker {
+                kind: Kind::Mode,
+                filter: String::new(),
+                selected: 0,
+                offset: 0,
+            });
+            let small = [(0, 0), (1, 1), (2, 2), (10, 5), (19, 3), (26, 4)];
+            // Growing, then shrinking, so nothing from a larger frame is left behind.
+            for (width, height) in small.into_iter().chain([(80, 24), (200, 60), (26, 4)]) {
+                let whole = Rect::new(0, 0, width, height);
+                for _ in 0..2 {
+                    screen(&mut app, width, height);
+                    let drawn = [
+                        app.sidebar_toggle,
+                        app.transcript_area,
+                        app.composer_area,
+                        app.picker_area,
+                        app.sidebar.list,
+                        app.sidebar.footer,
+                    ];
+                    for area in drawn {
+                        assert_eq!(area.intersection(whole), area, "{width}x{height}");
+                    }
+                    if app.sidebar_hidden {
+                        assert_eq!(app.sidebar.list, Rect::default());
+                        assert!(!app.sidebar.drew_working());
+                    }
+                    ctrl_b(&mut app);
+                }
+            }
+        }
     }
 }

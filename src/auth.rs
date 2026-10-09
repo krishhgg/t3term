@@ -213,6 +213,18 @@ impl Session {
         &self.token
     }
 
+    /// A session no server issued, for tests that build a client they never connect. It has
+    /// no token, and dropping it revokes nothing, since no login was recorded for it.
+    #[cfg(test)]
+    pub(crate) fn offline() -> Session {
+        Session {
+            id: "offline".into(),
+            token: String::new(),
+            source: LoginSource::Temporary,
+            scopes: Vec::new(),
+        }
+    }
+
     /// Reuses the saved login for this environment, or issues and saves a new one.
     ///
     /// `scopes` and `ttl` apply only to a temporary session. A saved login always carries

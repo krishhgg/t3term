@@ -865,8 +865,8 @@ impl Sidebar {
 
     /// Whether the last frame drew a card that reads Working or Goal, whose spinner and clock
     /// need the event loop's tick. A card scrolled out of view, behind the closed Settled or
-    /// Working shelf or left out of the sidebar has nothing on screen to move, so it doesn't
-    /// count.
+    /// Working shelf, left out of the sidebar or in a hidden sidebar has nothing on screen to
+    /// move, so it doesn't count.
     pub fn drew_working(&self) -> bool {
         self.drew_working
     }
@@ -951,17 +951,25 @@ impl Sidebar {
         }
     }
 
+    /// Forgets what the last frame drew, so nothing left from it takes clicks, the wheel or the
+    /// tick. `draw` starts with it, and a frame that hides the sidebar calls it instead of
+    /// `draw`. The rows, the highlight and the scroll stay, so the sidebar comes back as it
+    /// was, brought up to date by any `rebuild` while it was hidden.
+    pub fn forget_drawn(&mut self) {
+        self.list = Rect::default();
+        self.footer = Rect::default();
+        self.cards.clear();
+        self.drew_working = false;
+        self.working_heading = None;
+    }
+
     /// Draws the wordmark, the shelves and the Settled footer, keeping the highlight in view.
     pub fn draw(&mut self, frame: &mut Frame, area: Rect, view: &View) {
         let t = view.theme;
         frame.render_widget(Block::new().style(Style::new().bg(t.sidebar_bg)), area);
-        self.cards.clear();
-        self.drew_working = false;
-        self.working_heading = None;
+        self.forget_drawn();
+        // Too small to draw, so nothing there takes clicks.
         if area.width < 6 || area.height < 4 {
-            // Nothing is drawn, so nothing there should take clicks.
-            self.list = Rect::default();
-            self.footer = Rect::default();
             return;
         }
         // A one-column strip stands in for the GUI's 1px border.
@@ -2950,6 +2958,49 @@ mod tests {
         // Four rows leave the list one line, which is the card's first line, word and all.
         let lines = text(&render(&mut sidebar, Some(&listed), None, (30, 4)));
         assert!(lines[2].contains("Working"), "{lines:#?}");
+        assert!(sidebar.drew_working());
+    }
+
+    #[test]
+    fn a_hidden_sidebar_forgets_its_frame_and_keeps_its_rows() {
+        let before = shell(vec![busy("w", json!({})), thread("a"), thread("b")]);
+        let mut sidebar = Sidebar::with_working(true, true);
+        sidebar.rebuild(&before.threads, ALL, None, now());
+        assert!(sidebar.select("b"));
+        let lines = text(&render(&mut sidebar, Some(&before), None, (30, 24)));
+        assert_eq!(sidebar.thread_at(row_of(&lines, "Thread b")), Some("b"));
+        assert!(sidebar.working_heading_at(row_of(&lines, "Working ─")));
+        assert_ne!(sidebar.list, Rect::default());
+        assert_ne!(sidebar.footer, Rect::default());
+        assert!(sidebar.drew_working());
+
+        // Hidden, the frame draws no sidebar, so nothing it drew before takes a click, the
+        // wheel or the tick.
+        sidebar.forget_drawn();
+        for y in 0..24 {
+            assert_eq!(sidebar.thread_at(y), None);
+            assert!(!sidebar.working_heading_at(y));
+        }
+        assert_eq!(sidebar.list, Rect::default());
+        assert_eq!(sidebar.footer, Rect::default());
+        assert!(!sidebar.drew_working());
+
+        // While it is hidden, `b` is renamed and `c` arrives. Shown again, it lists both, with
+        // the highlight still on `b`.
+        let after = shell(vec![
+            busy("w", json!({})),
+            thread("a"),
+            with(thread("b"), json!({"title": "Renamed b"})),
+            with(
+                thread("c"),
+                json!({"createdAt": "2026-10-02T00:00:00.000Z"}),
+            ),
+        ]);
+        sidebar.rebuild(&after.threads, ALL, None, now());
+        assert_eq!(sidebar.selected_thread_id(), Some("b"));
+        let lines = text(&render(&mut sidebar, Some(&after), None, (30, 24)));
+        assert_eq!(sidebar.thread_at(row_of(&lines, "Renamed b")), Some("b"));
+        assert_eq!(sidebar.thread_at(row_of(&lines, "Thread c")), Some("c"));
         assert!(sidebar.drew_working());
     }
 
