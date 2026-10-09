@@ -1445,7 +1445,8 @@ impl App {
                 }
                 // The thread's banner shows the error, as the desktop's does, and keeps it
                 // after the toast goes, until the next send to that thread.
-                self.banner.failed(&thread_id, error.clone(), message_id.clone());
+                self.banner
+                    .failed(&thread_id, error.clone(), message_id.clone());
                 let message = Failed {
                     thread_id: thread_id.clone(),
                     message_id: Some(message_id),
@@ -4085,6 +4086,7 @@ mod tests {
             answers: serde_json::Map::new(),
             run_changes: HashMap::new(),
             prepared: Prepared::default(),
+            error: banner::Derived::default(),
         };
 
         // A working card on screen ticks by itself, even past a closed watch.
@@ -6102,7 +6104,8 @@ mod tests {
         screen(&mut app, 120, 30);
         assert_eq!((app.banner.area, app.scroll.rows()), (banner, scrolled));
         // Beside the banner, the same row opens the calls.
-        assert!(mouse(&mut app, CLICK, app.transcript_area.x, y));
+        let x = app.transcript_area.x;
+        assert!(mouse(&mut app, CLICK, x, y));
         assert!(!app.open_bundles.is_empty());
     }
 
@@ -6151,7 +6154,8 @@ mod tests {
     #[test]
     fn a_failed_run_shows_its_error_until_a_new_run_starts() {
         let run = |id: &str, ordinal: u64, status: &str| {
-            json!({"id": id, "ordinal": ordinal, "status": status, "rootNodeId": format!("{id}-n")})
+            let root = format!("{id}-n");
+            json!({"id": id, "ordinal": ordinal, "status": status, "rootNodeId": root})
         };
         let error = |class: &str| {
             let failure = json!({"message": "You hit the usage limit", "class": class});

@@ -756,7 +756,13 @@ mod tests {
         // doesn't stand for the thread.
         let recovered = thread(
             vec![run("r1", 1, "completed")],
-            vec![error_item("e", "r1", "r1-root", "Retrying", "transport_error")],
+            vec![error_item(
+                "e",
+                "r1",
+                "r1-root",
+                "Retrying",
+                "transport_error",
+            )],
             vec![],
         );
         assert_eq!(derive(&recovered), None);
@@ -766,7 +772,13 @@ mod tests {
     fn the_latest_runs_root_failure_is_the_error() {
         let state = thread(
             vec![run("r1", 1, "failed")],
-            vec![error_item("e", "r1", "r1-root", "Provider crashed", "provider_error")],
+            vec![error_item(
+                "e",
+                "r1",
+                "r1-root",
+                "Provider crashed",
+                "provider_error",
+            )],
             vec![],
         );
         assert_eq!(
