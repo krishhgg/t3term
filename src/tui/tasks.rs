@@ -84,41 +84,43 @@ fn run_of(plan: &Value) -> Option<&str> {
     plan.get("runId").and_then(Value::as_str)
 }
 
-/// The checklist the drawer shows for the thread, or None. It is the newest `todo_list` the
-/// run that owns the thread's work wrote, while that run hasn't settled. A thread that has
-/// never run shows its newest list only when no run wrote it. Another run's list never stands
-/// in, and an empty list shows nothing.
-pub fn active(state: &ThreadState) -> Option<Tasks> {
+/// The `todo_list` the drawer shows for the thread, or None. It is the newest list the run
+/// that owns the thread's work wrote, while that run hasn't settled. A thread that has never
+/// run shows its newest list only when no run wrote it. Another run's list never stands in,
+/// and a list with no steps shows nothing.
+fn checklist(state: &ThreadState) -> Option<&Value> {
     let run = state.activity_run();
     if run.is_some_and(|run| !unsettled(projection::status(run))) {
         return None;
     }
     let run_id = run.and_then(|run| run.get("id")).and_then(Value::as_str);
-    let lists: Vec<&Value> = state
+    // Newest first, so the search stops at the list it wants.
+    let mut lists = state
         .list("plans")
         .iter()
-        .filter(|plan| plan.get("kind").and_then(Value::as_str) == Some("todo_list"))
-        .collect();
+        .rev()
+        .filter(|plan| plan.get("kind").and_then(Value::as_str) == Some("todo_list"));
     // `deriveActivePlanState` takes the run's newest list, else the thread's newest, and
     // `activeComposerTasksProgress` then drops a list that isn't the run's own. Together that
     // is the run's newest list, or with no run, the thread's newest if no run wrote it.
     let list = match run_id {
-        Some(_) => lists.iter().rev().find(|plan| run_of(plan) == run_id),
-        None => lists.last().filter(|plan| run_of(plan).is_none()),
+        Some(_) => lists.find(|plan| run_of(plan) == run_id),
+        None => lists.next().filter(|plan| run_of(plan).is_none()),
     }?;
-    Tasks::of(task_steps(list))
+    let steps = list.get("steps").and_then(Value::as_array);
+    steps.is_some_and(|steps| !steps.is_empty()).then_some(list)
 }
 
-/// The tasks for the drawer, when it may show. It needs a live watch, since the GUI hides the
+/// The list for the drawer, when it may show. It needs a live watch, since the GUI hides the
 /// tasks while a thread syncs (`ChatComposer.tsx:1808`) and a watch that is connecting,
 /// reconnecting or closed can be behind. A waiting request hides it too: its panel takes the
 /// place the GUI gives its approval and question drawer (`ChatComposer.tsx:5114-5120`).
-pub fn shown(state: Option<&ThreadState>, live: bool) -> Option<Tasks> {
+fn shown(state: Option<&ThreadState>, live: bool) -> Option<&Value> {
     let state = state.filter(|_| live)?;
     if !state.pending_requests().is_empty() {
         return None;
     }
-    active(state)
+    checklist(state)
 }
 
 /// A duration as the nightly's `formatDuration` writes it
@@ -164,24 +166,102 @@ fn step_time(step: &TaskStep) -> String {
     }
 }
 
-/// What the reader has done with the drawer. Only this window keeps it, as the GUI keeps it in
-/// React state: nothing goes to T3 or the settings file.
+/// The tasks the drawer shows and what the reader has done with it. Only this window keeps
+/// either, as the GUI keeps them in React state: nothing goes to T3 or the settings file.
 #[derive(Debug, Default)]
 pub struct Drawer {
     /// Whether the list is open under the summary row.
     pub open: bool,
     /// Rows the open list is scrolled down.
     scroll: usize,
-    /// Where the last frame drew the drawer, for the mouse. Empty when it drew none.
+    /// Where the last frame drew the drawer, for the mouse. Empty when it drew none, and once
+    /// the tasks have gone.
     pub area: Rect,
     /// Whether the last frame's list was too long for its rows, which is when it scrolls.
     overflows: bool,
+    /// The tasks on show, as of the last change to the thread or its watch.
+    shown: Option<Shown>,
+    /// How many times the drawer read a list's steps, and wrapped them into rows, so the tests
+    /// can tell a frame that redrew from what the drawer kept.
+    #[cfg(test)]
+    reads: usize,
+    #[cfg(test)]
+    wraps: usize,
+}
+
+/// The list the drawer shows and what it made of it, so a frame that nothing changed draws
+/// from these instead of reading the list and wrapping its steps again. It holds one list, and
+/// its rows at one width: another list replaces it, another width rewraps it, and it goes
+/// when the tasks go.
+#[derive(Debug)]
+struct Shown {
+    /// The list as T3 sent it, to tell a change to it from a change elsewhere in the thread.
+    source: Value,
+    tasks: Tasks,
+    /// The steps as rows, made when the list first opens at a width.
+    rows: Option<Rows>,
+}
+
+/// The open list's rows at one width, as text. A frame styles the rows it shows as it copies
+/// them, so the rows hold no colors and a theme needs no rewrap.
+#[derive(Debug)]
+struct Rows {
+    width: usize,
+    /// The time column with the space before it, or 0 when a row can't spare it.
+    column: usize,
+    rows: Vec<StepRow>,
+}
+
+/// A row of the open list: a piece of a step's text. A step's first row carries its mark and
+/// its time.
+#[derive(Debug)]
+struct StepRow {
+    step: usize,
+    first: bool,
+    text: String,
 }
 
 impl Drawer {
-    /// Closes the list and forgets its scroll, as the GUI does when the tasks go away, a
-    /// request opens or another thread opens.
-    pub fn close(&mut self) {
+    /// Brings the drawer up to date after a change to the thread or its watch, or another
+    /// thread opening. It reads the list again only when the list changed. Tasks that go away
+    /// close the list and forget its scroll, as the GUI's effects do when the tasks go, a
+    /// request opens or another thread opens (`ChatComposer.tsx:5615-5629`). That happens on
+    /// each change rather than at the next frame, so a request that opens and resolves between
+    /// two frames still closes the list.
+    pub fn follow(&mut self, state: Option<&ThreadState>, live: bool) {
+        let Some(list) = shown(state, live) else {
+            self.hide();
+            return;
+        };
+        let same = |kept: &Shown| kept.source == *list;
+        if self.shown.as_ref().is_some_and(same) {
+            return;
+        }
+        #[cfg(test)]
+        {
+            self.reads += 1;
+        }
+        let Some(tasks) = Tasks::of(task_steps(list)) else {
+            self.hide();
+            return;
+        };
+        self.shown = Some(Shown {
+            source: list.clone(),
+            tasks,
+            rows: None,
+        });
+    }
+
+    /// Closes the list and forgets the tasks and where the drawer was drawn, so a key or a
+    /// click before the next frame doesn't reach a drawer that has gone.
+    fn hide(&mut self) {
+        self.close();
+        self.shown = None;
+        self.area = Rect::default();
+    }
+
+    /// Closes the list and forgets its scroll.
+    fn close(&mut self) {
         self.open = false;
         self.scroll = 0;
         self.overflows = false;
@@ -238,49 +318,60 @@ impl Drawer {
 
     /// The drawer's rows within `width` columns and `room` rows: the summary row, then the
     /// steps while the list is open. `screen` is the terminal's height, 40% of which caps the
-    /// list. No tasks closes the drawer and draws nothing. So does a drawer with no room, which
-    /// keeps whether its list is open for when the room comes back.
+    /// list. With no tasks the drawer draws nothing. Neither does a drawer with no room, which
+    /// keeps whether its list is open for when the room comes back. The steps wrap once per
+    /// list and width, and a frame copies only the rows it shows.
     pub fn lay_out(
         &mut self,
-        tasks: Option<&Tasks>,
         width: usize,
         room: usize,
         screen: usize,
         theme: &Theme,
     ) -> Vec<Line<'static>> {
         self.overflows = false;
-        let Some(tasks) = tasks else {
-            self.close();
+        let Some(shown) = self.shown.as_mut() else {
             return Vec::new();
         };
         if room == 0 || width < MIN_WIDTH {
             return Vec::new();
         }
-        let mut lines = vec![summary(tasks, self.open, width, theme)];
+        let mut lines = vec![summary(&shown.tasks, self.open, width, theme)];
         if !self.open {
             return lines;
         }
-        let list = step_rows(tasks, width, theme);
-        let total = list.len();
-        let rows = (room - 1).min(MAX_LIST_ROWS).min(screen * 2 / 5);
-        if total <= rows {
+        if shown.rows.as_ref().is_none_or(|rows| rows.width != width) {
+            #[cfg(test)]
+            {
+                self.wraps += 1;
+            }
+            shown.rows = Some(Rows::of(&shown.tasks, width));
+        }
+        let Some(rows) = shown.rows.as_ref() else {
+            return lines;
+        };
+        let tasks = &shown.tasks;
+        let line = |part: &StepRow| rows.line(part, tasks, theme);
+        let total = rows.rows.len();
+        let list_rows = (room - 1).min(MAX_LIST_ROWS).min(screen * 2 / 5);
+        if total <= list_rows {
             self.scroll = 0;
-            lines.extend(list);
-        } else if rows > 0 {
+            lines.extend(rows.rows.iter().map(line));
+        } else if list_rows > 0 {
             // Too long: the list scrolls above a hint row, as a long request does.
-            let shown = rows - 1;
-            self.overflows = shown > 0;
-            self.scroll = self.scroll.min(total - shown);
-            let hint = if shown == 0 {
+            let visible = list_rows - 1;
+            self.overflows = visible > 0;
+            self.scroll = self.scroll.min(total - visible);
+            let hint = if visible == 0 {
                 "Make the window taller to see the tasks".to_string()
             } else {
                 format!(
                     "Lines {}-{} of {total} · Alt+↑/↓ scroll",
                     self.scroll + 1,
-                    self.scroll + shown
+                    self.scroll + visible
                 )
             };
-            lines.extend(list.into_iter().skip(self.scroll).take(shown));
+            let on_screen = &rows.rows[self.scroll..self.scroll + visible];
+            lines.extend(on_screen.iter().map(line));
             lines.push(Line::styled(
                 fit(&hint, width),
                 Style::new().fg(theme.muted),
@@ -350,43 +441,64 @@ fn summary(tasks: &Tasks, open: bool, width: usize, theme: &Theme) -> Line<'stat
     row(left, right, width)
 }
 
-/// Each step as rows: its mark, its text broken between words, or inside a word too long for a
-/// row as the GUI's `wrap-anywhere` breaks it, and its time on the right of its first row.
-fn step_rows(tasks: &Tasks, width: usize, theme: &Theme) -> Vec<Line<'static>> {
-    let muted = Style::new().fg(theme.muted);
-    let times: Vec<String> = tasks.steps.iter().map(step_time).collect();
-    let time_width = times.iter().map(|time| time.width()).max().unwrap_or(0);
-    // The time column, when the row keeps room for some text beside it.
-    let column = if time_width > 0 && width >= 2 + MIN_TEXT + 1 + time_width {
-        time_width + 1
-    } else {
-        0
-    };
-    let text_width = width.saturating_sub(2 + column).max(1);
-    let mut lines = Vec::new();
-    for (step, time) in tasks.steps.iter().zip(times) {
+impl Rows {
+    /// Each step as rows: its text broken between words, or inside a word too long for a row as
+    /// the GUI's `wrap-anywhere` breaks it, clear of the time column on the right of its first
+    /// row.
+    fn of(tasks: &Tasks, width: usize) -> Rows {
+        let times = tasks.steps.iter().map(step_time);
+        let time_width = times.map(|time| time.width()).max().unwrap_or(0);
+        // The time column, when the row keeps room for some text beside it.
+        let column = if time_width > 0 && width >= 2 + MIN_TEXT + 1 + time_width {
+            time_width + 1
+        } else {
+            0
+        };
+        let text_width = width.saturating_sub(2 + column).max(1);
+        let mut rows = Vec::new();
+        for (step, item) in tasks.steps.iter().enumerate() {
+            for (index, text) in wrap(&item.text, text_width).into_iter().enumerate() {
+                rows.push(StepRow {
+                    step,
+                    first: index == 0,
+                    text,
+                });
+            }
+        }
+        Rows {
+            width,
+            column,
+            rows,
+        }
+    }
+
+    /// A row as a frame draws it: a step's first row with its mark and, when the column has
+    /// room, its time, and the step's other rows under its text.
+    fn line(&self, part: &StepRow, tasks: &Tasks, theme: &Theme) -> Line<'static> {
+        let step = &tasks.steps[part.step];
         let (mark, text_color) = match step.status {
             StepStatus::Completed => ("✓ ", theme.muted),
             StepStatus::Running => ("◉ ", theme.fg),
             StepStatus::Pending => ("○ ", theme.muted),
         };
-        let mark_style = Style::new().fg(status_color(step.status, theme));
-        for (index, part) in wrap(&step.text, text_width).into_iter().enumerate() {
-            let lead = if index == 0 {
-                Span::styled(mark, mark_style)
-            } else {
-                Span::raw("  ")
-            };
-            let left = vec![lead, Span::styled(part, Style::new().fg(text_color))];
-            let right = if index == 0 && column > 0 && !time.is_empty() {
-                vec![Span::styled(time.clone(), muted)]
-            } else {
-                Vec::new()
-            };
-            lines.push(row(left, right, width));
-        }
+        let lead = if part.first {
+            Span::styled(mark, Style::new().fg(status_color(step.status, theme)))
+        } else {
+            Span::raw("  ")
+        };
+        let text = Span::styled(part.text.clone(), Style::new().fg(text_color));
+        let time = if part.first && self.column > 0 {
+            step_time(step)
+        } else {
+            String::new()
+        };
+        let right = if time.is_empty() {
+            Vec::new()
+        } else {
+            vec![Span::styled(time, Style::new().fg(theme.muted))]
+        };
+        row(vec![lead, text], right, self.width)
     }
-    lines
 }
 
 /// `text` in rows of at most `width` columns, broken at spaces, or inside a word too long for a
@@ -493,6 +605,32 @@ mod tests {
 
     fn tasks_of(plan: &Value) -> Tasks {
         Tasks::of(task_steps(plan)).expect("tasks")
+    }
+
+    /// The tasks the drawer would show for the thread, read as `follow` reads them.
+    fn active(state: &ThreadState) -> Option<Tasks> {
+        checklist(state).and_then(|list| Tasks::of(task_steps(list)))
+    }
+
+    /// A drawer showing `tasks`, as `follow` leaves it.
+    fn showing(tasks: Tasks, open: bool) -> Drawer {
+        let shown = Shown {
+            source: Value::Null,
+            tasks,
+            rows: None,
+        };
+        Drawer {
+            open,
+            shown: Some(shown),
+            ..Drawer::default()
+        }
+    }
+
+    /// Every row of the open list at `width`, as one frame tall enough for them all draws them.
+    fn step_rows(tasks: &Tasks, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+        let rows = Rows::of(tasks, width);
+        let line = |part: &StepRow| rows.line(part, tasks, theme);
+        rows.rows.iter().map(line).collect()
     }
 
     fn texts(tasks: Option<Tasks>) -> Vec<String> {
@@ -771,8 +909,8 @@ mod tests {
         assert_eq!(drawer.on_mouse(&mouse(click, 0, 0)), None);
     }
 
-    /// Thirty one-row steps: four done, the fifth running and the rest to do.
-    fn long_list() -> Tasks {
+    /// r1's list of thirty one-row steps: four done, the fifth running and the rest to do.
+    fn long_plan() -> Value {
         let steps: Vec<Value> = (1..=30)
             .map(|n| {
                 let status = match n {
@@ -783,22 +921,27 @@ mod tests {
                 json!({"id": n, "text": format!("Step {n}"), "status": status})
             })
             .collect();
-        tasks_of(&json!({ "steps": steps }))
+        let mut plan = list("p1", Some("r1"), &[]);
+        plan["steps"] = json!(steps);
+        plan
+    }
+
+    fn long_list() -> Tasks {
+        tasks_of(&long_plan())
     }
 
     #[test]
     fn a_long_list_scrolls_under_a_hint_and_keeps_to_its_rows() {
         let theme = Theme::new(Depth::TrueColor);
-        let tasks = long_list();
-        let mut drawer = Drawer::default();
+        let mut drawer = showing(long_list(), false);
         // Closed, the drawer is its summary row, whatever the room.
-        let rows = text(&drawer.lay_out(Some(&tasks), 50, 40, 60, &theme));
+        let rows = text(&drawer.lay_out(50, 40, 60, &theme));
         assert_eq!(rows.len(), 1);
         assert!(rows[0].starts_with("≡ Tasks Step 5"), "{}", rows[0]);
         assert!(rows[0].ends_with("4/30  Alt+T ▴"), "{}", rows[0]);
 
         drawer.open = true;
-        let rows = text(&drawer.lay_out(Some(&tasks), 50, 40, 60, &theme));
+        let rows = text(&drawer.lay_out(50, 40, 60, &theme));
         // The summary, 14 steps and the hint: the list keeps to the GUI's 15 rows.
         assert_eq!(rows.len(), 16);
         assert!(rows[0].ends_with("4/30  Alt+T ▾"), "{}", rows[0]);
@@ -819,38 +962,236 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
         assert_eq!(drawer.on_mouse(&wheel), Some(true));
-        let rows = text(&drawer.lay_out(Some(&tasks), 50, 40, 60, &theme));
+        let rows = text(&drawer.lay_out(50, 40, 60, &theme));
         assert!(rows[1].starts_with("✓ Step 3"), "{}", rows[1]);
         for _ in 0..40 {
             drawer.on_key(&alt_down);
         }
-        let rows = text(&drawer.lay_out(Some(&tasks), 50, 40, 60, &theme));
+        let rows = text(&drawer.lay_out(50, 40, 60, &theme));
         assert!(rows[1].starts_with("○ Step 17"), "{}", rows[1]);
         assert!(rows[14].starts_with("○ Step 30"), "{}", rows[14]);
         assert_eq!(rows[15], "Lines 17-30 of 30 · Alt+↑/↓ scroll");
 
         // A 20-row terminal gives the list 40% of its height: 8 rows, the hint among them. The
         // scroll stays where it was while it still fits.
-        let rows = text(&drawer.lay_out(Some(&tasks), 50, 40, 20, &theme));
+        let rows = text(&drawer.lay_out(50, 40, 20, &theme));
         assert_eq!(rows.len(), 9);
         assert!(rows[8].starts_with("Lines 17-23 of 30"), "{}", rows[8]);
         // Less room than that: the summary and as much of the list as fits.
-        let rows = text(&drawer.lay_out(Some(&tasks), 50, 4, 60, &theme));
+        let rows = text(&drawer.lay_out(50, 4, 60, &theme));
         assert_eq!(rows.len(), 4);
         assert!(rows[3].starts_with("Lines 17-18 of 30"), "{}", rows[3]);
-        let rows = text(&drawer.lay_out(Some(&tasks), 50, 1, 60, &theme));
+        let rows = text(&drawer.lay_out(50, 1, 60, &theme));
         assert_eq!(rows.len(), 1);
         assert!(!drawer.on_key(&alt_down));
         // No room at all draws nothing, and the list stays open for when the room comes back.
-        assert!(drawer.lay_out(Some(&tasks), 50, 0, 60, &theme).is_empty());
+        assert!(drawer.lay_out(50, 0, 60, &theme).is_empty());
         assert!(drawer.open);
 
-        // When the tasks go away the drawer closes, so new tasks start closed and at the top.
-        assert!(drawer.lay_out(None, 50, 40, 60, &theme).is_empty());
+        // When the tasks go away the drawer closes and draws nothing.
+        drawer.follow(None, true);
         assert!(!drawer.open);
-        drawer.toggle();
-        let rows = text(&drawer.lay_out(Some(&tasks), 50, 40, 60, &theme));
-        assert!(rows[1].starts_with("✓ Step 1"), "{}", rows[1]);
+        assert!(drawer.lay_out(50, 40, 60, &theme).is_empty());
+    }
+
+    #[test]
+    fn a_frame_nothing_changed_draws_from_what_the_drawer_kept() {
+        let theme = Theme::new(Depth::TrueColor);
+        let plan = long_plan();
+        let mut state = thread(vec![run("r1", 1, "running")], vec![plan.clone()]);
+        let mut drawer = Drawer::default();
+        drawer.follow(Some(&state), true);
+        assert_eq!((drawer.reads, drawer.wraps), (1, 0));
+        // Closed, the drawer draws its summary without wrapping a step.
+        assert_eq!(text(&drawer.lay_out(50, 40, 60, &theme)).len(), 1);
+        assert_eq!(drawer.wraps, 0);
+        drawer.area = Rect::new(0, 0, 50, 1);
+        assert!(drawer.on_key(&key(KeyCode::Char('t'), KeyModifiers::ALT)));
+        let opened = text(&drawer.lay_out(50, 40, 60, &theme));
+        assert_eq!((drawer.reads, drawer.wraps), (1, 1));
+
+        // Frames that typing or the clock cause, a reply streaming in and T3 sending the same
+        // list again all draw from what the drawer kept.
+        for _ in 0..5 {
+            assert_eq!(text(&drawer.lay_out(50, 40, 60, &theme)), opened);
+        }
+        let reply = json!({"id": "a1", "type": "assistant_message", "text": "On it"});
+        update(&mut state, "turn-item.updated", reply);
+        drawer.follow(Some(&state), true);
+        update(&mut state, "plan.updated", plan.clone());
+        drawer.follow(Some(&state), true);
+        assert_eq!(text(&drawer.lay_out(50, 40, 60, &theme)), opened);
+        assert_eq!((drawer.reads, drawer.wraps), (1, 1));
+
+        // Scrolling moves which kept rows the frame copies.
+        drawer.area = Rect::new(0, 0, 50, 16);
+        assert!(drawer.on_key(&key(KeyCode::Down, KeyModifiers::ALT)));
+        let scrolled = text(&drawer.lay_out(50, 40, 60, &theme));
+        assert!(scrolled[1].starts_with("✓ Step 2"), "{}", scrolled[1]);
+        assert_eq!(scrolled[15], "Lines 2-15 of 30 · Alt+↑/↓ scroll");
+        assert_eq!(drawer.wraps, 1);
+
+        // The kept rows hold no colors, so another theme restyles them without a rewrap.
+        let indexed = Theme::new(Depth::Indexed);
+        let restyled = drawer.lay_out(50, 40, 60, &indexed);
+        assert_eq!(text(&restyled), scrolled);
+        assert_eq!(restyled[1].spans[0].style.fg, Some(indexed.emerald));
+        assert_eq!(drawer.wraps, 1);
+
+        // Another width wraps the list again, and only the last width is kept.
+        drawer.lay_out(30, 40, 60, &theme);
+        assert_eq!(drawer.wraps, 2);
+        let shown = drawer.shown.as_ref().expect("tasks");
+        assert_eq!(shown.rows.as_ref().map(|rows| rows.width), Some(30));
+        assert_eq!(text(&drawer.lay_out(50, 40, 60, &theme)), scrolled);
+        assert_eq!(drawer.wraps, 3);
+
+        // A change to the list reads it again and wraps it at the next frame. The list stays
+        // open where it was scrolled, with the new count, mark and time: step 5 took 2.5s
+        // and step 6 runs.
+        let mut changed = plan;
+        changed["steps"][4]["status"] = json!("completed");
+        changed["steps"][4]["durationMs"] = json!(2500);
+        changed["steps"][5]["status"] = json!("running");
+        update(&mut state, "plan.updated", changed);
+        drawer.follow(Some(&state), true);
+        assert_eq!((drawer.reads, drawer.wraps), (2, 3));
+        assert!(drawer.open);
+        let rows = text(&drawer.lay_out(50, 40, 60, &theme));
+        assert_eq!(drawer.wraps, 4);
+        assert!(rows[0].starts_with("≡ Tasks Step 6"), "{}", rows[0]);
+        assert!(rows[0].ends_with("5/30  Alt+T ▾"), "{}", rows[0]);
+        assert!(rows[1].starts_with("✓ Step 2"), "{}", rows[1]);
+        assert!(rows[4].starts_with("✓ Step 5"), "{}", rows[4]);
+        assert!(rows[4].ends_with("2.5s"), "{}", rows[4]);
+        assert!(rows[5].starts_with("◉ Step 6"), "{}", rows[5]);
+        assert!(rows[5].ends_with("now"), "{}", rows[5]);
+        assert_eq!(rows[15], "Lines 2-15 of 30 · Alt+↑/↓ scroll");
+
+        // The tasks going away drops what the drawer kept.
+        update(&mut state, "run.updated", run("r1", 1, "completed"));
+        drawer.follow(Some(&state), true);
+        assert!(drawer.shown.is_none());
+    }
+
+    /// r1's long list, shown open and scrolled three rows down, as the last frame drew it.
+    fn scrolled() -> (ThreadState, Drawer) {
+        let theme = Theme::new(Depth::TrueColor);
+        let state = thread(vec![run("r1", 1, "running")], vec![long_plan()]);
+        let mut drawer = Drawer::default();
+        drawer.follow(Some(&state), true);
+        drawer.area = Rect::new(0, 0, 50, 1);
+        assert!(drawer.on_key(&key(KeyCode::Char('t'), KeyModifiers::ALT)));
+        drawer.lay_out(50, 40, 60, &theme);
+        for _ in 0..3 {
+            assert!(drawer.on_key(&key(KeyCode::Down, KeyModifiers::ALT)));
+        }
+        let rows = text(&drawer.lay_out(50, 40, 60, &theme));
+        assert!(rows[1].starts_with("✓ Step 4"), "{}", rows[1]);
+        drawer.area = Rect::new(0, 0, 50, 16);
+        (state, drawer)
+    }
+
+    /// Checks that the next frame draws the drawer closed, and that it opens at the top.
+    fn closed_at_top(drawer: &mut Drawer, case: &str) {
+        let theme = Theme::new(Depth::TrueColor);
+        let rows = text(&drawer.lay_out(50, 40, 60, &theme));
+        assert_eq!(rows.len(), 1, "{case}");
+        assert!(rows[0].ends_with("Alt+T ▴"), "{case}: {}", rows[0]);
+        drawer.area = Rect::new(0, 0, 50, 1);
+        assert!(drawer.on_key(&key(KeyCode::Char('t'), KeyModifiers::ALT)));
+        let rows = text(&drawer.lay_out(50, 40, 60, &theme));
+        assert!(rows[1].starts_with("✓ Step 1"), "{case}: {}", rows[1]);
+        assert!(rows[15].starts_with("Lines 1-14 of 30"), "{case}: {}", rows[15]);
+    }
+
+    #[test]
+    fn tasks_that_go_and_come_back_between_frames_still_close_the_list() {
+        // Each case applies its events with no frame between them, as when they arrive within
+        // one frame's 33ms. The tasks go with the first event and are back after the last.
+        let request = |status: &str| json!({"id": "q1", "kind": "command", "status": status});
+        let (mut state, mut drawer) = scrolled();
+        update(&mut state, "runtime-request.updated", request("pending"));
+        drawer.follow(Some(&state), true);
+        // Until the next frame, nothing is kept, and neither Alt+T nor a click is the drawer's.
+        assert!(drawer.shown.is_none());
+        assert!(!drawer.on_key(&key(KeyCode::Char('t'), KeyModifiers::ALT)));
+        assert!(!drawer.on_key(&key(KeyCode::Down, KeyModifiers::ALT)));
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 3,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        };
+        assert_eq!(drawer.on_mouse(&click), None);
+        update(&mut state, "runtime-request.updated", request("resolved"));
+        drawer.follow(Some(&state), true);
+        closed_at_top(&mut drawer, "a request");
+
+        let (mut state, mut drawer) = scrolled();
+        update(&mut state, "plan.updated", list("p1", Some("r1"), &[]));
+        drawer.follow(Some(&state), true);
+        update(&mut state, "plan.updated", long_plan());
+        drawer.follow(Some(&state), true);
+        closed_at_top(&mut drawer, "an emptied list");
+
+        // The run settles, and the next one starts and writes its own list.
+        let (mut state, mut drawer) = scrolled();
+        update(&mut state, "run.updated", run("r1", 1, "completed"));
+        drawer.follow(Some(&state), true);
+        update(&mut state, "run.created", run("r2", 2, "running"));
+        drawer.follow(Some(&state), true);
+        let mut next = long_plan();
+        next["id"] = json!("p2");
+        next["runId"] = json!("r2");
+        update(&mut state, "plan.updated", next);
+        drawer.follow(Some(&state), true);
+        closed_at_top(&mut drawer, "a new run");
+
+        // The watch drops, T3 sends a snapshot on the new socket, then the watch is live.
+        let (mut state, mut drawer) = scrolled();
+        drawer.follow(Some(&state), false);
+        let mut snapshot = json!({"kind": "snapshot", "snapshotSequence": 9});
+        snapshot["projection"] = Value::Object(state.projection.clone());
+        state.apply(&snapshot);
+        drawer.follow(Some(&state), false);
+        state.apply(&json!({"kind": "synchronized"}));
+        drawer.follow(Some(&state), true);
+        closed_at_top(&mut drawer, "a reconnect");
+
+        // Another thread opens, then this one again.
+        let (state, mut drawer) = scrolled();
+        drawer.follow(None, false);
+        drawer.follow(Some(&state), true);
+        closed_at_top(&mut drawer, "another thread");
+    }
+
+    #[test]
+    fn a_step_draws_without_its_control_characters() {
+        let theme = Theme::new(Depth::TrueColor);
+        let steps = [
+            ("Clear\u{1b}[2J the screen", "running"),
+            ("Copy\u{1b}]52;c;Zm9v\u{7} and \u{9b}31m color", "pending"),
+            ("Fake\rReal", "pending"),
+        ];
+        let plan = list("p1", Some("r1"), &steps);
+        let state = thread(vec![run("r1", 1, "running")], vec![plan]);
+        let mut drawer = Drawer {
+            open: true,
+            ..Drawer::default()
+        };
+        drawer.follow(Some(&state), true);
+        let rows = text(&drawer.lay_out(40, 40, 60, &theme));
+        assert_eq!(rows.len(), 5);
+        for row in &rows {
+            let control = row.chars().find(|c| c.is_control());
+            assert_eq!(control, None, "{row:?}");
+            assert!(row.width() <= 40, "{row:?}");
+        }
+        assert!(rows[0].starts_with("≡ Tasks Clear[2J the screen"), "{:?}", rows[0]);
+        assert_eq!(rows[2].trim_end(), "○ Copy]52;c;Zm9v and 31m color");
+        assert_eq!(rows[3].trim_end(), "○ Fake");
+        assert_eq!(rows[4].trim_end(), "  Real");
     }
 
     /// ⚠ and U+FE0F, which a terminal draws two columns wide, though ⚠ alone is one.
@@ -904,11 +1245,8 @@ mod tests {
             .collect();
         let gap = format!(" {count}");
         for width in 0..=90 {
-            let mut drawer = Drawer {
-                open: true,
-                ..Drawer::default()
-            };
-            let rows = text(&drawer.lay_out(Some(tasks), width, 40, 60, &theme));
+            let mut drawer = showing(tasks.clone(), true);
+            let rows = text(&drawer.lay_out(width, 40, 60, &theme));
             if width < MIN_WIDTH {
                 assert!(rows.is_empty(), "{width}");
                 continue;
@@ -958,23 +1296,21 @@ mod tests {
         check_every_width(&tasks, "1/3");
         check_every_width(&unicode_list(), "1/4");
 
-        let mut drawer = Drawer {
-            open: true,
-            ..Drawer::default()
-        };
-        let rows = text(&drawer.lay_out(Some(&tasks), 50, 40, 60, &theme));
+        let mut drawer = showing(tasks, true);
+        let rows = text(&drawer.lay_out(50, 40, 60, &theme));
         // A step's time sits on its first row, and its text wraps clear of the time column.
         assert!(rows[1].starts_with("✓ Read every log"), "{}", rows[1]);
         assert!(rows[1].ends_with("1h 1m 1s"), "{}", rows[1]);
         assert!(rows[2].starts_with("  "), "{}", rows[2]);
         assert!(!rows[2].contains("1h"), "{}", rows[2]);
         // At 8 columns the summary row keeps the icon, the count and the chevron.
-        let rows = text(&drawer.lay_out(Some(&tasks), 8, 40, 60, &theme));
+        let rows = text(&drawer.lay_out(8, 40, 60, &theme));
         assert_eq!(rows[0], "≡ 1/3 ▾");
 
         // At 30 columns the running CJK step is cut a column short of where `fit` would cut it,
         // so a space stays before the count.
-        let rows = text(&drawer.lay_out(Some(&unicode_list()), 30, 40, 60, &theme));
+        let mut drawer = showing(unicode_list(), true);
+        let rows = text(&drawer.lay_out(30, 40, 60, &theme));
         assert_eq!(rows[0], "≡ Tasks 修复解析器中的…  1/4 ▾");
         // Each ⚠️ takes two of the step's 19 columns, so nine fit on a row.
         assert_eq!(rows[1], "✓ Ship 🚀 then flag   1h 1m 1s");

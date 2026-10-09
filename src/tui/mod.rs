@@ -488,6 +488,18 @@ impl App {
                 self.message = Some((message, true));
             }
         }
+        self.follow_tasks();
+    }
+
+    /// Brings the tasks drawer up to date with the open thread and its watch. It runs after
+    /// each change to either, so tasks that go and come back before the next frame still close
+    /// the list.
+    fn follow_tasks(&mut self) {
+        let open = self.open.as_ref();
+        self.tasks.follow(
+            open.and_then(|open| open.state.as_ref()),
+            open.is_some_and(|open| open.connection == "live"),
+        );
     }
 
     /// Lays the sidebar's shelves out again from the shell, as of now.
@@ -557,7 +569,8 @@ impl App {
         self.bundle_rows.clear();
         self.expanded_plans.clear();
         self.drawn_plans.clear();
-        self.tasks.close();
+        // The thread has no state yet, so the drawer closes and drops the last thread's tasks.
+        self.follow_tasks();
         self.scroll.set(0);
         self.picker = None;
         self.focus = Focus::Composer;
@@ -1511,16 +1524,10 @@ impl App {
         };
         // The tasks drawer takes what room the panel leaves. A waiting request hides it, so the
         // two never show together.
-        let open = self.open.as_ref();
-        let checklist = tasks::shown(
-            open.and_then(|open| open.state.as_ref()),
-            open.is_some_and(|open| open.connection == "live"),
-        );
         let tasks_room = main
             .height
             .saturating_sub(2 + 3 + composer_height + 1 + panel_height);
         let tasks = self.tasks.lay_out(
-            checklist.as_ref(),
             main.width.saturating_sub(4) as usize,
             tasks_room as usize,
             area.height as usize,
