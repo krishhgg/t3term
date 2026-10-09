@@ -2942,15 +2942,29 @@ fn render_block(
             lines.push(Line::default());
         }
         BlockKind::Notice => {
+            let compaction = block.item_type == "compaction";
+            // A compaction still under way has its label in blue, where the desktop shimmers
+            // it, so the row changes only when the item does.
+            let label = match block.status.as_str() {
+                "pending" | "running" | "waiting" if compaction => Style::new().fg(t.info),
+                _ => muted,
+            };
             lines.push(Line::default());
             let title = fit(&block.header, width.saturating_sub(6));
             let side = width.saturating_sub(title.width() + 2) / 2;
             let rest = width.saturating_sub(side + title.width() + 2);
             lines.push(Line::from(vec![
                 Span::styled("─".repeat(side), hairline),
-                Span::styled(format!(" {title} "), muted),
+                Span::styled(format!(" {title} "), label),
                 Span::styled("─".repeat(rest), hairline),
             ]));
+            // Of the notices, only a compaction has detail: the counts its label leaves out
+            // and the summary, which `describe` has already bounded and cleaned.
+            if compaction && !block.body.is_empty() {
+                for text in tasks::wrap(&block.body, width.saturating_sub(4)) {
+                    lines.push(Line::styled(format!("  {text}"), muted));
+                }
+            }
             lines.push(Line::default());
         }
         BlockKind::Error => {
@@ -3473,5 +3487,120 @@ mod tests {
         assert_eq!(rows[3].trim_end(), "  [ ] Patch it");
         let all = rows.concat();
         assert!(!all.contains('╭') && !all.contains("Expand"));
+    }
+
+    #[test]
+    fn a_compaction_marker_shows_its_detail_and_follows_its_item() {
+        let theme = Theme::new(Depth::TrueColor);
+        let context = RenderContext {
+            theme: &theme,
+            text: Styles::new(&theme, theme.text()),
+            bubble: Styles::new(&theme, theme.text()),
+            reasoning: Styles::new(&theme, Style::new().fg(theme.muted)).dimmed(),
+        };
+        // A compaction starts with the count it compacts from and no title, then T3 sends the
+        // same item finished.
+        let running = json!({
+            "id": "compaction-1",
+            "type": "compaction",
+            "ordinal": 1,
+            "status": "running",
+            "title": null,
+            "driver": null,
+            "summary": "Kept the plan 日本語 👩\u{200d}💻",
+            "beforeTokenCount": 899_000,
+            "updatedAt": "2026-10-08T10:00:00.000Z",
+        });
+        let mut completed = running.clone();
+        completed["status"] = json!("completed");
+        completed["afterTokenCount"] = json!(19_000);
+        completed["updatedAt"] = json!("2026-10-08T10:00:05.000Z");
+        let mut state = ThreadState::from_snapshot(&json!({
+            "snapshotSequence": 1,
+            "projection": {"thread": {"id": "t"}, "turnItems": [running]},
+        }))
+        .expect("a snapshot");
+
+        let first = transcript::blocks(&state);
+        assert_eq!(first.len(), 1);
+        let lines = render_block(&first[0], 40, &context, &Extra::None);
+        assert_eq!(
+            text(&lines),
+            [
+                String::new(),
+                format!("{} Compacting context {}", "─".repeat(10), "─".repeat(10)),
+                "  899K → ? tokens".to_string(),
+                "  Kept the plan 日本語 👩\u{200d}💻".to_string(),
+                String::new(),
+            ]
+        );
+        assert_eq!(lines[1].spans[1].style.fg, Some(theme.info));
+
+        // The update replaces the row rather than adding one. Its header and status change,
+        // and both are in the key its cached lines are kept under.
+        let update = json!({"kind": "event", "sequence": 2, "event": {
+            "type": "turn-item.updated",
+            "payload": completed,
+        }});
+        assert_eq!(
+            state.apply(&update),
+            Applied::Event("turn-item.updated".into())
+        );
+        let next = transcript::blocks(&state);
+        assert_eq!(next.len(), 1);
+        assert_eq!(next[0].item_id, first[0].item_id);
+        assert_ne!(next[0].header, first[0].header);
+        assert_ne!(next[0].status, first[0].status);
+        let lines = render_block(&next[0], 60, &context, &Extra::None);
+        assert_eq!(
+            text(&lines),
+            [
+                String::new(),
+                format!(
+                    "{} Context compacted 899K → 19K tokens {}",
+                    "─".repeat(11),
+                    "─".repeat(12)
+                ),
+                "  Kept the plan 日本語 👩\u{200d}💻".to_string(),
+                String::new(),
+            ]
+        );
+        assert_eq!(lines[1].spans[1].style.fg, Some(theme.muted));
+        // A reconnect replays the event, which changes nothing.
+        assert_eq!(state.apply(&update), Applied::Duplicate);
+        assert_eq!(transcript::blocks(&state).len(), 1);
+
+        // The transcript is never drawn narrower than 10 columns. There the label is cut, the
+        // detail wraps under it and the joined emoji stays whole on its own row.
+        let rows = text(&render_block(&first[0], 10, &context, &Extra::None));
+        assert_eq!(
+            rows,
+            [
+                "",
+                "── Com… ──",
+                "  899K →",
+                "  ?",
+                "  tokens",
+                "  Kept",
+                "  the",
+                "  plan",
+                "  日本語",
+                "  👩\u{200d}💻",
+                "",
+            ]
+        );
+        for width in [10, 11, 13] {
+            for item in [&first[0], &next[0]] {
+                let rows = text(&render_block(item, width, &context, &Extra::None));
+                assert!(rows.iter().all(|row| row.width() <= width), "{rows:?}");
+            }
+        }
+
+        // Other notices keep their bare rule, even while running.
+        let mut notice = block(BlockKind::Notice, "system_notice", "Model changed", "");
+        notice.status = "running".into();
+        let lines = render_block(&notice, 40, &context, &Extra::None);
+        assert_eq!(lines.len(), 3);
+        assert_eq!(lines[1].spans[1].style.fg, Some(theme.muted));
     }
 }

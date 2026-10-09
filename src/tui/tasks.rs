@@ -504,8 +504,9 @@ impl Rows {
 /// `text` in rows of at most `width` columns, broken at spaces, or inside a word too long for a
 /// row as the GUI's `wrap-anywhere` breaks it. Each piece `clusters` finds is measured whole, as
 /// the terminal draws it, so ⚠ with U+FE0F counts two columns, though ⚠ alone counts one. A
-/// break drops its space, and a run of spaces inside a row reads as one.
-fn wrap(text: &str, width: usize) -> Vec<String> {
+/// break drops its space, and a run of spaces inside a row reads as one. A compaction's summary
+/// in the transcript wraps the same way.
+pub(super) fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut rows = Vec::new();
     for line in text.split('\n') {
         let mut row = String::new();

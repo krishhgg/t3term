@@ -139,6 +139,12 @@ In the transcript and in `t3term read`, a checklist shows as Plan rows marked `[
 
 An agent writes each step's text, so the drawer, the transcript and `t3term read` drop its control characters, such as Esc and the C1 codes, and a step can't move the cursor, clear the screen or set the clipboard. What followed an Esc stays as plain text. A carriage return starts a new row, and a tab or another blank control shows as a space. `t3term --json read` keeps the text as T3 sent it and writes each control character as a JSON escape, such as `\u001b` for Esc or `\u009b` for the C1 CSI. A terminal shows the escape as text, and a JSON parser reads back the original step.
 
+### Context compaction
+
+When an agent compacts its context, the transcript and `t3term read` show a marker for it, whether or not T3 gave the item a title. The marker names the state as the nightly desktop's lifecycle row does. It reads Compacting context while the compaction is pending, running or waiting, Context compaction failed, Context compaction stopped once it was cancelled or interrupted, and Context compacted otherwise. A compaction that finished with both token counts reads as the desktop's timeline row does, such as `Context compacted 899K → 19K tokens`. The desktop's row says Context compacted for a failed compaction too, so t3term takes the state from the lifecycle row instead. A count the marker leaves out goes on the line under it, with `?` for one T3 didn't send, such as `899K → ? tokens`.
+
+The summary the provider wrote follows, which the desktop's timeline row doesn't show. t3term shows up to twelve lines with text from its first 4,096 bytes, and a last line of `…` when there was more. It drops the summary's control characters as it does a checklist step's, and `t3term --json read` keeps the summary as T3 sent it. In the TUI the marker is a rule across the transcript with the label in the middle, blue while the compaction is under way, and the summary wraps under it in grey. When T3 updates the item, such as when a running compaction finishes, the same marker changes in place.
+
 ### The Working shelf
 
 The nightly desktop app has a "Working shelf" setting, off by default, that moves threads busy without you out of Active. To turn it on in t3term, add `"sidebarWorkingShelfEnabled": true` to `~/.config/t3term/settings.json` and restart t3term. The desktop's switch uses the same key, though each app keeps its own copy. With it off, the sidebar is as described above.
