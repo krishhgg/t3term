@@ -1434,8 +1434,18 @@ mod tests {
         let mut runs = vec![run("target", 100, "claudeAgent", "destination")];
         for (n, provider) in (1..).zip(&providers) {
             runs.push(run(&format!("{provider}-old"), n, provider, "old-model"));
-            runs.push(run(&format!("{provider}-new"), 50 + n, provider, &format!("m{n}")));
-            runs.push(run(&format!("{provider}-late"), 100 + n, provider, "too-late"));
+            runs.push(run(
+                &format!("{provider}-new"),
+                50 + n,
+                provider,
+                &format!("m{n}"),
+            ));
+            runs.push(run(
+                &format!("{provider}-late"),
+                100 + n,
+                provider,
+                "too-late",
+            ));
         }
         let shown = (1..=12)
             .map(|n| format!("m{n}"))
