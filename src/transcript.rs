@@ -304,23 +304,36 @@ fn shown_sources<'a>(
 /// `toModel`. An item from before it did has only provider ids. Then the target's model is the
 /// handoff run's, when that run is on the target's provider, and each source's is the model of
 /// the newest run on its provider that came before the handoff run. An endpoint with no model
-/// keeps its provider. Only the sources the line shows are resolved, through `shown_sources`.
+/// keeps its provider. Only the sources the line shows are resolved, through `shown_sources`,
+/// and a handoff stamped at both ends doesn't look for its run.
 fn endpoints<'a>(item: &'a Value, runs: &'a [Value]) -> Endpoints<'a> {
-    let handoff_run = item
-        .get("runId")
-        .and_then(Value::as_str)
-        .and_then(|id| runs.iter().find(|run| str_of(run, "id") == id));
+    endpoints_with(item, runs, || {
+        item.get("runId")
+            .and_then(Value::as_str)
+            .and_then(|id| runs.iter().find(|run| str_of(run, "id") == id))
+    })
+}
+
+/// `endpoints`, with `find_run` finding the handoff's run in `runs`. It is called once for a
+/// handoff that `reads_runs`, and never for one stamped at both ends, which reads nothing of
+/// the runs.
+fn endpoints_with<'a>(
+    item: &'a Value,
+    runs: &'a [Value],
+    find_run: impl FnOnce() -> Option<&'a Value>,
+) -> Endpoints<'a> {
+    let (stamped, to_stamp) = stamps(item);
+    let handoff_run = match (stamped, to_stamp) {
+        (Some(_), Some(_)) => None,
+        _ => find_run(),
+    };
     let to_instance = str_of(item, "toProviderInstanceId");
     // A `toModel` with no text still wins over the run's, as `??` lets it in the nightly.
-    let to_model = item.get("toModel").and_then(Value::as_str).or_else(|| {
+    let to_model = to_stamp.or_else(|| {
         handoff_run
             .filter(|run| str_of(run, "providerInstanceId") == to_instance)
             .and_then(run_model)
     });
-    let stamped = item
-        .get("fromModelSelections")
-        .and_then(Value::as_array)
-        .filter(|selections| !selections.is_empty());
     let (from, more) = match stamped {
         Some(selections) => shown_sources(selections, |selection| Endpoint {
             instance_id: str_of(selection, "instanceId"),
@@ -394,18 +407,21 @@ pub fn handoff_fields(run: &Value) -> (Option<u64>, Option<String>, Option<Strin
     )
 }
 
-/// Whether a turn item is a handoff whose endpoints read the thread's runs, because T3 stamped
-/// no source models or no target model on it.
-pub fn reads_runs(item: &Value) -> bool {
-    if str_of(item, "type") != "handoff" {
-        return false;
-    }
-    let stamped_from = item
+/// The models T3 stamped on a handoff: its sources' in `fromModelSelections`, when that lists
+/// any, and its target's in `toModel`, even one with no text.
+fn stamps(item: &Value) -> (Option<&[Value]>, Option<&str>) {
+    let from = item
         .get("fromModelSelections")
         .and_then(Value::as_array)
-        .is_some_and(|selections| !selections.is_empty());
-    let stamped_to = item.get("toModel").and_then(Value::as_str).is_some();
-    !(stamped_from && stamped_to)
+        .map(Vec::as_slice)
+        .filter(|selections| !selections.is_empty());
+    (from, item.get("toModel").and_then(Value::as_str))
+}
+
+/// Whether a turn item is a handoff whose endpoints read the thread's runs, because T3 stamped
+/// no source models or no target model on it. Only such a handoff looks for its run.
+pub fn reads_runs(item: &Value) -> bool {
+    str_of(item, "type") == "handoff" && !matches!(stamps(item), (Some(_), Some(_)))
 }
 
 /// A handoff's detail line: its sources, then `→` and its target, in the order of the
@@ -1397,10 +1413,10 @@ mod tests {
 
     #[test]
     fn only_the_first_twelve_sources_reach_the_resolver() {
-        // `endpoints` turns both kinds of source list into endpoints through `shown_sources`,
-        // and the legacy kind calls `latest_model_before` only in the closure it passes. So a
-        // source that closure never receives never reaches a model lookup. The closure here
-        // records each raw source it receives.
+        // `endpoints_with`, which `endpoints` runs, turns both kinds of source list into
+        // endpoints through `shown_sources`, and the legacy kind calls `latest_model_before`
+        // only in the closure it passes. So a source that closure never receives never reaches
+        // a model lookup. The closure here records each raw source it receives.
         let mut raw: Vec<Value> = (1..=1_000).map(|n| json!(format!("p{n}"))).collect();
         raw[2] = json!("p1");
         let cases = [
@@ -1475,6 +1491,73 @@ mod tests {
                 let ends = endpoints(item, &runs);
                 assert_eq!((ends.from.len(), ends.more), (12, more), "{item}");
             }
+        }
+    }
+
+    #[test]
+    fn a_handoff_looks_for_its_run_only_when_an_end_has_no_stamped_model() {
+        // The handoff's run is `target`. Before it codex_personal ran gpt-5.4, and the stamps
+        // name other models, so each line shows which ends came from the runs.
+        let runs = [
+            run("old", 1, "codex_personal", "gpt-5.4"),
+            run("target", 2, "claudeAgent", "claude-fable-5-1"),
+        ];
+        let stamped = json!([{"instanceId": "codex_personal", "model": "gpt-5.5"}]);
+        let cases = [
+            // Stamped at both ends, even with a target model of no text, it looks for no run.
+            (
+                json!({"fromModelSelections": stamped, "toModel": "claude-fable-5"}),
+                0,
+                "gpt-5.5 → claude-fable-5",
+            ),
+            (
+                json!({"fromModelSelections": stamped, "toModel": "  "}),
+                0,
+                "gpt-5.5 → claudeAgent",
+            ),
+            // With no target model, or one that isn't text, the target's is its run's.
+            (
+                json!({"fromModelSelections": stamped}),
+                1,
+                "gpt-5.5 → claude-fable-5-1",
+            ),
+            (
+                json!({"fromModelSelections": stamped, "toModel": 5}),
+                1,
+                "gpt-5.5 → claude-fable-5-1",
+            ),
+            // With no source models, an empty list of them or something else in their place,
+            // each source's is the model of the run before the handoff's.
+            (
+                json!({"toModel": "claude-fable-5"}),
+                1,
+                "gpt-5.4 → claude-fable-5",
+            ),
+            (
+                json!({"fromModelSelections": [], "toModel": "claude-fable-5"}),
+                1,
+                "gpt-5.4 → claude-fable-5",
+            ),
+            (
+                json!({"fromModelSelections": "gpt-5.5", "toModel": "claude-fable-5"}),
+                1,
+                "gpt-5.4 → claude-fable-5",
+            ),
+            (json!({}), 1, "gpt-5.4 → claude-fable-5-1"),
+        ];
+        for (fields, looked, line) in cases {
+            let item = handoff_item(fields);
+            let mut calls = 0;
+            let ends = endpoints_with(&item, &runs, || {
+                calls += 1;
+                runs.iter().find(|run| run["id"] == item["runId"])
+            });
+            let from: Vec<String> = ends.from.iter().map(Endpoint::label).collect();
+            let shown = format!("{} → {}", from.join(", "), ends.to.label());
+            assert_eq!((calls, shown.as_str()), (looked, line), "{item}");
+            // The TUI describes a handoff again after a run changes only when `reads_runs`.
+            assert_eq!(reads_runs(&item), looked == 1, "{item}");
+            assert_eq!(detail(&item, &runs), line, "{item}");
         }
     }
 
