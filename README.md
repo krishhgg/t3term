@@ -217,6 +217,22 @@ T3 leaves tool output out of a thread's projection so a large result can't stall
 
 Colors come from T3's dark theme. When `COLORTERM` reports truecolor the TUI uses the exact values. Otherwise, or when `T3TERM_COLOR=256` is set, it maps each one to the nearest entry in the 256-color palette.
 
+### File changes
+
+An edit's row reads `✎ Edit` with a chip holding the file and T3's line counts, such as `src/main.rs  +3 -1`. When T3 lists more than one operation in the edit, the chip counts the files instead, such as `2 files  +4 -2`, as the nightly desktop's `Changed 3 files` does. T3 counts lines for the whole edit and sends no count per file, so t3term never puts a count beside one path.
+
+Open the edit's group and each operation T3 listed gets a line under the row. A move shows the old path and an arrow, and a file or MIME type follows in brackets when T3 sends one, such as `move /workspace/old.ts → /workspace/new.ts (text)`. The row lists at most twelve operations, and a line such as `… 988 more files` counts the rest. An entry without a path is left out and counted with the rest. When T3 sends no list, an empty one or one with no entry t3term can read, the row shows the file name alone.
+
+When an edit fails, T3 sends the provider's error where a patch would be. The error comes first under the row, in red, and the operations follow, the order the desktop's item inspector uses.
+
+The pinned nightly sends no patch for an edit that didn't fail, because the desktop reads full diffs another way. When a server does send one, t3term shows its start under the operations: hunk headers in blue, added lines in green, removed lines in red, file headers in bold grey and other lines in grey. The counts in each hunk's header say where the hunk ends, so a removed line that starts with `--` stays a removed line, and a text that isn't a patch reads as plain grey text. t3term never builds a patch of its own from the item's other fields.
+
+An error or a patch shows at most twelve lines from its first 4,096 bytes, and a last line says what it left out, such as `… 18 more lines` or `… the text goes on past 4096 bytes`. t3term reads at most 1,024 bytes of a path, an operation or a file type, and ends one it cut with `…`. A line too long for the transcript ends in `…` at its edge, and a wide character or joined emoji that doesn't fit before it is left out whole. t3term drops the control characters of all of it as it does a checklist step's, and a tab shows as one space.
+
+T3 sends the whole edit again each time it changes, such as when a running edit fails. The TUI describes the edit once for each change and draws it again in place, so a reader scrolled up stays on the same text. `t3term read`, `t3term send --wait` and `t3term wait` print the row alone, such as `edit src/main.rs  +3 -1`, with the file name cleaned the same way. `t3term --json read` keeps the item as T3 sent it.
+
+There is no turn diff yet, and nothing opens an edit's full diff. Paths show as T3 sent them, not relative to the workspace, and the TUI doesn't show `oldStr` or `newStr`.
+
 ## It's a CLI too
 
 ```text
@@ -276,7 +292,7 @@ Set `T3TERM_NO_SAVED_LOGIN=1` to use a session that lasts one run instead. t3ter
 cargo test
 ```
 
-The unit tests cover the reducers, Markdown wrapping, the composer, the model menus, the transcript, the tasks drawer, hiding and resizing the sidebar and auth command parsing. The TUI tests draw frames on ratatui's test backend with a client that never connects, and a test build keeps saved settings in memory, so no test writes `~/.config/t3term/settings.json`. `tests/fake_server.rs` drives the real RPC client against a fake Effect RPC server, dropping the socket mid-stream to check the resume cursor, chunk acks, batched frames, duplicate suppression and error decoding. `tests/cli.rs` runs the built binary with a temporary home and checks the `--json` error and exit code when the server is gone, when it isn't on protocol 2 and when the TUI has no terminal. It also runs `t3term read` against a fake server and a fake `t3` that issues a made-up session. It checks that the plain output drops the control characters of a checklist and a compaction summary, and that `--json` writes them as escapes that decode to the text T3 sent. Another test runs `t3term send --wait` against a fake server that also plays T3's side of the WebSocket. It checks that each finished handoff in the turn prints its marker and endpoints on stderr once, even when T3 sends the item again, and that `--json` prints only the result. None of them reach a real T3 server or the Keychain, and CI runs them on macOS for every pull request.
+The unit tests cover the reducers, Markdown wrapping, the composer, the model menus, the transcript and the lines under a file change, the tasks drawer, hiding and resizing the sidebar and auth command parsing. The TUI tests draw frames on ratatui's test backend with a client that never connects, and a test build keeps saved settings in memory, so no test writes `~/.config/t3term/settings.json`. `tests/fake_server.rs` drives the real RPC client against a fake Effect RPC server, dropping the socket mid-stream to check the resume cursor, chunk acks, batched frames, duplicate suppression and error decoding. `tests/cli.rs` runs the built binary with a temporary home and checks the `--json` error and exit code when the server is gone, when it isn't on protocol 2 and when the TUI has no terminal. It also runs `t3term read` against a fake server and a fake `t3` that issues a made-up session. It checks that the plain output drops the control characters of a checklist and a compaction summary, and that `--json` writes them as escapes that decode to the text T3 sent. Another test runs `t3term send --wait` against a fake server that also plays T3's side of the WebSocket. It checks that each finished handoff in the turn prints its marker and endpoints on stderr once, even when T3 sends the item again, and that `--json` prints only the result. None of them reach a real T3 server or the Keychain, and CI runs them on macOS for every pull request.
 
 `docs/screenshots/` also holds `before-tui.png`, `after-tui.png`, `approval.png`, `streaming.gif`, `picker-model.png` and `tool-calls-failed.png`.
 
