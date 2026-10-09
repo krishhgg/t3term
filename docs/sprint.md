@@ -30,6 +30,7 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 | 8 | https://github.com/krishhgg/t3term/pull/15 | The running turn's tasks in a drawer above the composer, and checklist steps read in the nightly's shape | |
 | 9 | https://github.com/krishhgg/t3term/pull/16 | Context compaction markers with their state, token counts and summary, without handoff markers | |
 | 10 | https://github.com/krishhgg/t3term/pull/17 | Context handoff markers with their source and target models | |
+| 11 | https://github.com/krishhgg/t3term/pull/18 | Hide and show the main sidebar with Ctrl+B or its toggle, remembered between runs | |
 
 ## Maintenance review PRs
 
