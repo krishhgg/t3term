@@ -1102,7 +1102,11 @@ mod tests {
         assert!(drawer.on_key(&key(KeyCode::Char('t'), KeyModifiers::ALT)));
         let rows = text(&drawer.lay_out(50, 40, 60, &theme));
         assert!(rows[1].starts_with("✓ Step 1"), "{case}: {}", rows[1]);
-        assert!(rows[15].starts_with("Lines 1-14 of 30"), "{case}: {}", rows[15]);
+        assert!(
+            rows[15].starts_with("Lines 1-14 of 30"),
+            "{case}: {}",
+            rows[15]
+        );
     }
 
     #[test]
@@ -1188,7 +1192,11 @@ mod tests {
             assert_eq!(control, None, "{row:?}");
             assert!(row.width() <= 40, "{row:?}");
         }
-        assert!(rows[0].starts_with("≡ Tasks Clear[2J the screen"), "{:?}", rows[0]);
+        assert!(
+            rows[0].starts_with("≡ Tasks Clear[2J the screen"),
+            "{:?}",
+            rows[0]
+        );
         assert_eq!(rows[2].trim_end(), "○ Copy]52;c;Zm9v and 31m color");
         assert_eq!(rows[3].trim_end(), "○ Fake");
         assert_eq!(rows[4].trim_end(), "  Real");

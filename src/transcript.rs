@@ -578,13 +578,16 @@ mod tests {
             "projection": {"thread": {"id": "t"}, "turnItems": [item]},
         }))
         .expect("a snapshot");
-        let block = describe(&state.items()[0]).expect("a checklist has a row");
+        let block = describe(state.items()[0]).expect("a checklist has a row");
         let printed = plain_text(&state, None, false);
         for text in [&block.body, &printed] {
             let control = text.chars().find(|c| c.is_control() && *c != '\n');
             assert_eq!(control, None, "{text:?}");
         }
-        assert!(printed.contains("    [ ] Fixed\n    Done\n    next line"), "{printed:?}");
+        assert!(
+            printed.contains("    [ ] Fixed\n    Done\n    next line"),
+            "{printed:?}"
+        );
         let kept: Vec<&str> = state.list("turnItems")[0]["steps"]
             .as_array()
             .expect("steps")
