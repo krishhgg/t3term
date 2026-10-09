@@ -927,6 +927,13 @@ async fn wait_for_reply(
                             && announced.insert(item_id)
                         {
                             eprintln!("\n· {}", block.header);
+                            // A handoff says where the context went, as `t3term read` does.
+                            // `describe` has cleaned and bounded its endpoints.
+                            if block.item_type == "handoff" {
+                                for line in block.body.lines() {
+                                    eprintln!("  {line}");
+                                }
+                            }
                         }
                     }
                 }
