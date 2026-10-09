@@ -25,8 +25,9 @@ use super::{clip, row};
 use crate::projection::{Applied, ThreadState, status};
 use crate::transcript::without_controls;
 
-/// The most of an error the banner reads, in bytes. A provider failure's message is at most
-/// 4,096 characters on the wire, but a provider session's `lastError` has no limit.
+/// The most of an error the banner prints, in bytes. A provider failure's message is at most
+/// 4,096 characters on the wire, but a provider session's `lastError` has no limit. Dismissal
+/// still goes by the whole error.
 const MAX_BYTES: usize = 4096;
 /// The widest the banner gets, in columns. The desktop's is `min(48rem, 100% - 2rem)`, and
 /// 48rem is 768px, 96 columns of 8px.
@@ -237,6 +238,11 @@ impl Derived {
         }
     }
 
+    /// Whether an item noted since the last read can have changed the error.
+    pub fn stale(&self) -> bool {
+        !self.current
+    }
+
     /// The thread's error as of the last item noted.
     pub fn get(&mut self, state: Option<&ThreadState>) -> Option<&RuntimeError> {
         if !self.current {
@@ -259,15 +265,17 @@ struct Local {
     message_id: String,
 }
 
-/// The error on show and what the banner made of it.
+/// The error the banner last took up and what it made of it, whether it shows or not.
 #[derive(Debug)]
 struct Shown {
     thread_id: String,
-    /// The error as T3 or the send gave it, which keys its dismissal.
+    /// The whole error as T3 or the send gave it, which keys its dismissal.
     raw: String,
     /// A usage limit shows as a warning rather than an error.
     warning: bool,
     /// What the banner prints: `raw`, cut to `MAX_BYTES` and without its control characters.
+    /// Empty when it prints nothing, because the reader dismissed the error or nothing of it
+    /// is left to print.
     text: String,
     /// Whether the reader opened the whole error.
     expanded: bool,
@@ -275,6 +283,12 @@ struct Shown {
     scroll: usize,
     /// `text` wrapped at one width. Another width wraps it again.
     rows: Option<Rows>,
+}
+
+impl Shown {
+    fn prints(&self) -> bool {
+        !self.text.is_empty()
+    }
 }
 
 #[derive(Debug)]
@@ -295,6 +309,9 @@ pub(super) struct Banner {
     /// Errors dismissed this session, by thread, as their raw text.
     dismissed: HashMap<String, HashSet<String>>,
     shown: Option<Shown>,
+    /// Whether a send error came or went, or the reader dismissed an error, since the banner
+    /// last followed the thread.
+    stale: bool,
     /// Where the last frame drew the banner and its close button, for the mouse. Empty when
     /// it drew none.
     pub area: Rect,
@@ -304,10 +321,14 @@ pub(super) struct Banner {
     /// Whether the last frame's open error was too long for its rows, which is when it
     /// scrolls.
     overflows: bool,
-    /// How many times the banner cleaned an error's text and wrapped it, so the tests can
-    /// tell a frame that redrew from what the banner kept.
+    /// How many times the banner followed the thread, took up an error it didn't have, and
+    /// wrapped an error's text, so the tests can tell what a streamed answer or a frame did
+    /// from what the banner kept. Taking up an error looks it up among those dismissed and
+    /// cleans its text.
     #[cfg(test)]
-    prepares: usize,
+    pub follows: usize,
+    #[cfg(test)]
+    pub reads: usize,
     #[cfg(test)]
     wraps: usize,
 }
@@ -341,12 +362,15 @@ impl Banner {
     pub fn failed(&mut self, thread_id: &str, error: String, message_id: String) {
         self.local
             .insert(thread_id.to_string(), Local { error, message_id });
+        self.stale = true;
     }
 
     /// Drops the thread's last send error when a new send to it starts, as the desktop does
     /// (`ChatView.tsx:9700`).
     pub fn clear_local(&mut self, thread_id: &str) {
-        self.local.remove(thread_id);
+        if self.local.remove(thread_id).is_some() {
+            self.stale = true;
+        }
     }
 
     /// Drops the send error of a message the thread shows after all. A send that timed out can
@@ -358,15 +382,28 @@ impl Banner {
             .is_some_and(|local| in_thread(&local.message_id))
         {
             self.local.remove(thread_id);
+            self.stale = true;
         }
     }
 
-    /// Brings the banner up to date with the open thread and its error from T3. It runs after
-    /// each change to either. The same error on the same thread keeps the banner as it was,
-    /// open or scrolled. An empty error, a dismissed one, or one with nothing to print once
-    /// its control characters are gone, such as only spaces or a terminal sequence's ESC,
-    /// shows no banner.
+    /// Whether the banner has to follow the thread again, though T3's error for it is as it
+    /// was, because a send error came or went or the reader dismissed an error.
+    pub fn stale(&self) -> bool {
+        self.stale
+    }
+
+    /// Brings the banner up to date with the open thread and its error from T3. The same error
+    /// on the same thread keeps the banner as it was, open, scrolled or hidden, after one
+    /// comparison of the whole error. Only an error it hasn't taken up yet is looked up among
+    /// those dismissed and cleaned, and cleaning reads at most `MAX_BYTES` of it. An empty
+    /// error, a dismissed one, or one with nothing to print once its control characters are
+    /// gone, such as only spaces or a terminal sequence's ESC, shows no banner.
     pub fn follow(&mut self, thread_id: Option<&str>, runtime: Option<&RuntimeError>) {
+        self.stale = false;
+        #[cfg(test)]
+        {
+            self.follows += 1;
+        }
         let Some(thread_id) = thread_id else {
             self.shown = None;
             return;
@@ -382,11 +419,7 @@ impl Banner {
                 }
             },
         };
-        let dismissed = self
-            .dismissed
-            .get(thread_id)
-            .is_some_and(|errors| errors.contains(raw));
-        if raw.is_empty() || dismissed {
+        if raw.is_empty() {
             self.shown = None;
             return;
         }
@@ -401,12 +434,18 @@ impl Banner {
         }
         #[cfg(test)]
         {
-            self.prepares += 1;
+            self.reads += 1;
         }
-        let text = prepare(raw);
+        let dismissed = self
+            .dismissed
+            .get(thread_id)
+            .is_some_and(|errors| errors.contains(raw));
         // Zero-width characters alone, such as a joiner, would draw an empty banner.
-        let printable = text.split('\n').any(|line| line.width() > 0);
-        self.shown = printable.then(|| Shown {
+        let text = (!dismissed)
+            .then(|| prepare(raw))
+            .filter(|text| text.split('\n').any(|line| line.width() > 0))
+            .unwrap_or_default();
+        self.shown = Some(Shown {
             thread_id: thread_id.to_string(),
             raw: raw.to_string(),
             warning,
@@ -419,21 +458,25 @@ impl Banner {
 
     /// Whether the last frame drew the banner, which is when its keys and clicks apply.
     pub fn showing(&self) -> bool {
-        self.shown.is_some() && self.area.height > 0
+        self.shown.as_ref().is_some_and(Shown::prints) && self.area.height > 0
     }
 
     /// Hides the error on show for the rest of the session and forgets the thread's send
-    /// error, as the desktop's close button does. The caller follows the thread again, which
-    /// shows T3's own error if a send error was hiding it.
+    /// error, as the desktop's close button does. The banner keeps the error's raw text, so
+    /// following the same error again only compares it. The caller follows the thread again,
+    /// which shows T3's own error if a send error was hiding it.
     pub fn dismiss(&mut self) {
-        let Some(shown) = self.shown.take() else {
+        let Some(shown) = self.shown.as_mut().filter(|shown| shown.prints()) else {
             return;
         };
+        shown.text.clear();
+        shown.rows = None;
         self.local.remove(&shown.thread_id);
         self.dismissed
-            .entry(shown.thread_id)
+            .entry(shown.thread_id.clone())
             .or_default()
-            .insert(shown.raw);
+            .insert(shown.raw.clone());
+        self.stale = true;
         self.area = Rect::default();
         self.close = Rect::default();
         self.clipped = false;
@@ -512,7 +555,7 @@ impl Banner {
         self.close = Rect::default();
         self.clipped = false;
         self.overflows = false;
-        let Some(shown) = self.shown.as_mut() else {
+        let Some(shown) = self.shown.as_mut().filter(|shown| shown.prints()) else {
             return;
         };
         let width = area.width as usize;
@@ -1182,10 +1225,12 @@ mod tests {
 
     // ---- what the banner shows ----
 
+    /// The error the banner prints and whether it is a warning, or None when it prints none.
     fn shown(banner: &Banner) -> Option<(&str, bool)> {
         banner
             .shown
             .as_ref()
+            .filter(|shown| shown.prints())
             .map(|shown| (shown.text.as_str(), shown.warning))
     }
 
@@ -1319,15 +1364,85 @@ mod tests {
         for _ in 0..5 {
             banner.follow(Some("a"), Some(&boom));
         }
-        assert_eq!(banner.prepares, 1);
+        assert_eq!(banner.reads, 1);
         assert!(banner.shown.as_ref().unwrap().expanded);
         // The class can change without the text.
         banner.follow(Some("a"), Some(&runtime("Boom", Some("usage_limit"))));
         assert_eq!(shown(&banner), Some(("Boom", true)));
-        assert_eq!(banner.prepares, 1);
+        assert_eq!(banner.reads, 1);
         // Another thread, or a new text, starts closed.
         banner.follow(Some("b"), Some(&boom));
         assert!(!banner.shown.as_ref().unwrap().expanded);
+    }
+
+    #[test]
+    fn an_error_that_prints_nothing_is_read_once() {
+        let mut banner = Banner::default();
+        // Blanks and control characters, far past what the banner prints.
+        let blank = runtime(&" \t\u{1b}\u{7}\r\n".repeat(100_000), None);
+        for _ in 0..5 {
+            banner.follow(Some("a"), Some(&blank));
+        }
+        assert_eq!(shown(&banner), None);
+        assert_eq!((banner.follows, banner.reads), (5, 1));
+        // So is a dismissed error, however often the banner follows the thread again.
+        let boom = runtime("Boom", None);
+        banner.follow(Some("a"), Some(&boom));
+        banner.dismiss();
+        assert!(banner.stale());
+        for _ in 0..5 {
+            banner.follow(Some("a"), Some(&boom));
+        }
+        assert_eq!(shown(&banner), None);
+        assert!(!banner.stale());
+        assert_eq!(banner.reads, 2);
+    }
+
+    #[test]
+    fn dismissal_goes_by_the_whole_error_past_what_the_banner_prints() {
+        let head = "x".repeat(MAX_BYTES + 100);
+        let first = runtime(&format!("{head} first"), None);
+        let second = runtime(&format!("{head} second"), None);
+        let mut banner = Banner::default();
+        banner.follow(Some("a"), Some(&first));
+        let printed = shown(&banner).unwrap().0.to_string();
+        assert!(printed.ends_with("past 4096 bytes"), "{printed}");
+        banner.dismiss();
+        banner.follow(Some("a"), Some(&first));
+        assert_eq!(shown(&banner), None);
+        // The second prints the same, but it is another error, so it shows.
+        banner.follow(Some("a"), Some(&second));
+        assert_eq!(shown(&banner).unwrap().0, printed);
+        // The first stays dismissed.
+        banner.follow(Some("a"), Some(&first));
+        assert_eq!(shown(&banner), None);
+    }
+
+    #[test]
+    fn only_a_send_error_that_comes_or_goes_or_a_dismissal_makes_the_banner_stale() {
+        let mut banner = Banner::default();
+        let boom = runtime("Boom", None);
+        banner.follow(Some("a"), Some(&boom));
+        assert!(!banner.stale());
+        // A new send with no error to clear, and a landed message with none, change nothing.
+        banner.clear_local("a");
+        banner.landed("a", |_| true);
+        assert!(!banner.stale());
+        // Opening or scrolling the error leaves it as it was.
+        banner.toggle();
+        banner.scroll(true);
+        assert!(!banner.stale());
+
+        banner.failed("b", "Couldn't reach T3".into(), "m1".into());
+        assert!(banner.stale());
+        banner.follow(Some("a"), Some(&boom));
+        banner.landed("b", |id| id == "m1");
+        assert!(banner.stale());
+        banner.follow(Some("a"), Some(&boom));
+        banner.failed("a", "Couldn't reach T3".into(), "m2".into());
+        banner.follow(Some("a"), Some(&boom));
+        banner.clear_local("a");
+        assert!(banner.stale());
     }
 
     #[test]

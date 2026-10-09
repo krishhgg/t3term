@@ -758,14 +758,19 @@ impl App {
 
     /// Brings the error banner up to date with the open thread. It runs after each change to
     /// the thread or to its send errors, and after the reader dismisses one, which can show
-    /// T3's own error from under a send error. The thread's error is worked out again only
-    /// after an event that can change it.
+    /// T3's own error from under a send error. It reads the error only after something that
+    /// can change it: an event for a run, a provider session, the thread or an error item, a
+    /// snapshot, a send error that came or went, or a dismissal. A thread just opened counts
+    /// too, as its error hasn't been read. Each piece of a streamed answer, a frame, and a key
+    /// that only opens or scrolls the banner leave the error unread, however long a provider
+    /// session made it.
     fn follow_banner(&mut self) {
         match self.open.as_mut() {
-            Some(open) => {
+            Some(open) if open.error.stale() || self.banner.stale() => {
                 let runtime = open.error.get(open.state.as_ref());
                 self.banner.follow(Some(&open.id), runtime);
             }
+            Some(_) => {}
             None => self.banner.follow(None, None),
         }
     }
@@ -6380,5 +6385,133 @@ mod tests {
             assert!(opened);
             assert_eq!(app.composer.text(), "a draft that wraps when narrow");
         }
+    }
+
+    /// How many times the thread's error was worked out, the banner followed the thread, and
+    /// the banner took up an error it didn't have, which looks it up among those dismissed and
+    /// cleans its text.
+    fn banner_work(app: &App) -> (usize, usize, usize) {
+        let derives = app.open.as_ref().map_or(0, |open| open.error.derives);
+        (derives, app.banner.follows, app.banner.reads)
+    }
+
+    /// `pieces` updates of one answer in run r1, from `sequence` on, with a frame after each.
+    fn stream(app: &mut App, sequence: u64, pieces: u64) {
+        for piece in 0..pieces {
+            let text = format!("Answer: {}", "word ".repeat(piece as usize));
+            let answer = json!({"id": "streamed", "type": "assistant_message", "runId": "r1",
+                "ordinal": 30, "text": text});
+            app.on_thread_event(live(sequence + piece, "turn-item.updated", answer));
+            screen(app, 120, 30);
+        }
+    }
+
+    #[test]
+    fn a_streamed_answer_never_reads_the_threads_error_again() {
+        // A provider session's error has no limit. This one is over a megabyte, of which the
+        // banner prints 4,096 bytes.
+        let long = format!("Codex quit: {}", "the provider said more ".repeat(50_000));
+        let mut app = tui(&Settings::default());
+        app.open_thread(codex_thread("t", Some(&long), json!({})));
+        // The thread just opened, so its error is read once.
+        assert!(banner_shows(&mut app));
+        assert_eq!(banner_work(&app), (1, 1, 1));
+        // A run event works the thread's error out again, and the banner only compares it.
+        let run = json!({"id": "r1", "ordinal": 1, "status": "running", "rootNodeId": "r1-n"});
+        app.on_thread_event(live(2, "run.created", run.clone()));
+        assert_eq!(banner_work(&app), (2, 2, 1));
+
+        // An answer streams in a hundred pieces with a frame after each, a message lands, the
+        // watch reconnects, and the reader opens and scrolls the error. None of it reads it.
+        stream(&mut app, 3, 100);
+        let message = json!({"id": "m9", "role": "user", "text": "hello"});
+        app.on_thread_event(live(103, "message.updated", message));
+        app.on_thread_event(WatchEvent::Reconnecting {
+            reason: "socket closed".into(),
+            retry_in: Duration::from_secs(1),
+        });
+        alt(&mut app, 'i');
+        screen(&mut app, 120, 30);
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::ALT);
+        app.on_terminal_event(Event::Key(down));
+        let rows = screen(&mut app, 120, 30);
+        assert!(rows.iter().any(|row| row.contains("Lines 2-")), "{rows:#?}");
+        assert_eq!(banner_work(&app), (2, 2, 1));
+
+        // A blank error, or one of control characters only, shows nothing. The banner takes it
+        // up once, and neither the answer going on nor another run event takes it up again.
+        let blank = " \t\u{1b}\u{7}\r\n".repeat(100_000);
+        app.on_thread_event(session_error(104, json!(blank)));
+        assert!(!banner_shows(&mut app));
+        assert_eq!(banner_work(&app), (3, 3, 2));
+        stream(&mut app, 105, 100);
+        assert_eq!(banner_work(&app), (3, 3, 2));
+        app.on_thread_event(live(205, "run.updated", run));
+        assert!(!banner_shows(&mut app));
+        assert_eq!(banner_work(&app), (4, 4, 2));
+
+        // The long error again, which the reader dismisses. It stays dismissed when T3 sends it
+        // again, and an error that differs from it only past what the banner prints shows.
+        app.on_thread_event(session_error(206, json!(long)));
+        assert!(banner_shows(&mut app));
+        assert_eq!(banner_work(&app), (5, 5, 3));
+        alt(&mut app, 'w');
+        assert!(!banner_shows(&mut app));
+        // The dismissal follows the thread again, which only compares the error.
+        assert_eq!(banner_work(&app), (5, 6, 3));
+        stream(&mut app, 207, 20);
+        app.on_thread_event(session_error(227, json!(long)));
+        assert!(!banner_shows(&mut app));
+        assert_eq!(banner_work(&app), (6, 7, 3));
+        let tail = format!("{long} and one more line");
+        app.on_thread_event(session_error(228, json!(tail)));
+        assert!(banner_shows(&mut app));
+        assert_eq!(banner_work(&app), (7, 8, 4));
+
+        // A reconnect's snapshot reads the thread again and keeps the banner as it was.
+        let snapshot = codex_snapshot("t", Some(&tail), json!({}));
+        app.on_thread_event(WatchEvent::Item(snapshot));
+        assert!(banner_shows(&mut app));
+        assert_eq!(banner_work(&app), (8, 9, 4));
+    }
+
+    #[test]
+    fn a_new_send_drops_the_last_ones_error() {
+        // Enter spawns the send on this runtime, which never runs it, so nothing connects.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let mut app = tui(&Settings::default());
+        app.open_thread(codex_thread("t", Some("Codex quit"), json!({})));
+        app.on_action_result(send_failed("t", "m1", "hello"));
+        let buffer = cells(&mut app, 120, 30);
+        let text = text_in(&buffer, app.banner.area);
+        assert!(text.contains("T3 refused the message"), "{text}");
+        assert_eq!(app.composer.text(), "hello");
+
+        // Sending it again drops its error, and the thread's own shows until this send fails
+        // too.
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.composer.text(), "");
+        let buffer = cells(&mut app, 120, 30);
+        let text = text_in(&buffer, app.banner.area);
+        assert!(text.contains("Codex quit"), "{text}");
+        app.on_action_result(send_failed("t", "m2", "hello"));
+        let buffer = cells(&mut app, 120, 30);
+        let text = text_in(&buffer, app.banner.area);
+        assert!(text.contains("T3 refused the message"), "{text}");
+        assert_eq!(app.composer.text(), "hello");
+
+        // Once the send's error is dismissed, the next send has none to drop, so the banner
+        // keeps the thread's own without reading it again.
+        alt(&mut app, 'w');
+        let buffer = cells(&mut app, 120, 30);
+        assert!(text_in(&buffer, app.banner.area).contains("Codex quit"));
+        let before = banner_work(&app);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.composer.text(), "");
+        assert!(banner_shows(&mut app));
+        assert_eq!(banner_work(&app), before);
     }
 }
