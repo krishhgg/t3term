@@ -147,6 +147,8 @@ A compaction that finished with both token counts shows them in the marker, such
 
 The provider's summary comes next, which the desktop's timeline leaves out. t3term shows up to twelve lines with text from its first 4,096 bytes, and a last line of `…` when there was more. It drops the summary's control characters as it does a checklist step's, and `t3term --json read` keeps the summary as T3 sent it. In the TUI the marker is a rule across the transcript with the label in the middle, blue while the compaction is under way, and the summary wraps under it in grey. When T3 updates the item, such as when a running compaction finishes, the same marker changes in place. The TUI cleans the summary and writes the counts once each time T3 changes the item, not on every redraw.
 
+![Three compaction markers in one thread: Context compacted 899K → 19K tokens over a two-line summary, Context compaction failed over 1.23M → ? tokens and its summary, and Context compaction stopped over 999 → ? tokens](docs/screenshots/compaction-states.png)
+
 ### The Working shelf
 
 The nightly desktop app has a "Working shelf" setting, off by default, that moves threads busy without you out of Active. To turn it on in t3term, add `"sidebarWorkingShelfEnabled": true` to `~/.config/t3term/settings.json` and restart t3term. The desktop's switch uses the same key, though each app keeps its own copy. With it off, the sidebar is as described above.
