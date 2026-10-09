@@ -78,7 +78,8 @@ pub(super) fn derive(state: &ThreadState) -> Option<RuntimeError> {
         .and_then(Value::as_str);
     let presented =
         usage_limit_presented(runs, &errors, session_error).or_else(|| latest_unheld(runs));
-    if presented.is_none() && thread.get("activeProviderThreadId").is_none_or(Value::is_null) {
+    let provider_thread = thread.get("activeProviderThreadId");
+    if presented.is_none() && provider_thread.is_none_or(Value::is_null) {
         return None;
     }
     let failure = presented.and_then(|run| root_failure(run, &errors));
@@ -184,7 +185,8 @@ fn usage_limit_presented<'a>(
         return None;
     }
     let limited = ordinal(executed);
-    runs.iter().any(|run| ordinal(run) > limited).then_some(executed)
+    let newer = runs.iter().any(|run| ordinal(run) > limited);
+    newer.then_some(executed)
 }
 
 /// The newest run not waiting in a held queue, as `latestUnheldRun`
@@ -296,7 +298,7 @@ pub(super) struct Banner {
     /// Where the last frame drew the banner and its close button, for the mouse. Empty when
     /// it drew none.
     pub area: Rect,
-    close: Rect,
+    pub close: Rect,
     /// Whether the last frame cut the closed error short.
     clipped: bool,
     /// Whether the last frame's open error was too long for its rows, which is when it
@@ -536,7 +538,7 @@ impl Banner {
         // space on its left. Without the border, the icon and × with one space each.
         let frame_width = if bordered { 8 } else { 4 };
         let text_width = room - frame_width;
-        if shown.rows.as_ref().is_none_or(|rows| rows.width != text_width) {
+        if shown.rows.as_ref().map(|rows| rows.width) != Some(text_width) {
             #[cfg(test)]
             {
                 self.wraps += 1;
@@ -788,7 +790,8 @@ mod tests {
         // A different type on the root node.
         let mut message = error_item("e5", "r2", "r2-root", "Not an error", "unknown");
         message["type"] = json!("assistant_message");
-        let state = thread(runs.clone(), vec![tool, child, old, running, message], vec![]);
+        let items = vec![tool, child, old, running, message];
+        let state = thread(runs.clone(), items, vec![]);
         assert_eq!(derive(&state), None);
 
         // A fork's parent failed with the same run and node ids, but its item comes only in
@@ -843,8 +846,9 @@ mod tests {
         let state = thread(runs.clone(), vec![high, low], vec![]);
         assert_eq!(derive(&state).unwrap().message, "High");
 
-        let first = at(error_item("a", "r1", "r1-root", "First", "unknown"), same, 1);
-        let second = at(error_item("b", "r1", "r1-root", "Second", "unknown"), same, 1);
+        let first = error_item("a", "r1", "r1-root", "First", "unknown");
+        let second = error_item("b", "r1", "r1-root", "Second", "unknown");
+        let (first, second) = (at(first, same, 1), at(second, same, 1));
         let state = thread(runs, vec![second, first], vec![]);
         assert_eq!(derive(&state).unwrap().message, "Second");
     }
@@ -989,10 +993,12 @@ mod tests {
         // A failure without a message, or with no failure at all, has nothing to show.
         let mut no_message = items[0].clone();
         no_message["failure"] = json!({"class": "unknown"});
-        assert_eq!(derive(&thread(runs.clone(), vec![no_message], vec![])), None);
+        let state = thread(runs.clone(), vec![no_message], vec![]);
+        assert_eq!(derive(&state), None);
         let mut no_failure = items[0].clone();
         no_failure["failure"] = Value::Null;
-        assert_eq!(derive(&thread(runs.clone(), vec![no_failure], vec![])), None);
+        let state = thread(runs.clone(), vec![no_failure], vec![]);
+        assert_eq!(derive(&state), None);
         // A failure without a class has a message and no class.
         let mut no_class = items[0].clone();
         no_class["failure"] = json!({"message": "Classless"});
@@ -1135,7 +1141,11 @@ mod tests {
         apply(
             &mut state,
             &mut derived,
-            event(18, "provider-session.attached", session("s2", "codex", json!("Codex down"))),
+            event(
+                18,
+                "provider-session.attached",
+                session("s2", "codex", json!("Codex down")),
+            ),
         );
         assert_eq!(derived.get(Some(&state)).unwrap().message, "Codex down");
         apply(
@@ -1388,7 +1398,7 @@ mod tests {
         assert!(text_row.contains(" ! Boom"), "{rows:#?}");
         assert!(text_row.contains(" × "));
         assert!(rows[2].contains("Alt+W dismiss"), "{rows:#?}");
-        assert!(!rows[2].contains("Alt+I"), "nothing is cut, so there is nothing more");
+        assert!(!rows[2].contains("Alt+I"), "nothing is cut");
         // The rows below it are left alone.
         assert!(rows[3..].iter().all(|row| row.trim().is_empty()));
         // × is on the text row, inside the banner.
@@ -1409,7 +1419,8 @@ mod tests {
         let mut banner = showing(&raw);
         let rows = draw(&mut banner, 60, 30);
         assert_eq!(banner.area.height, 5, "three rows of text and the borders");
-        assert!(rows[1].contains("line 1") && rows[3].contains("line 3…"), "{rows:#?}");
+        assert!(rows[1].contains("line 1"), "{rows:#?}");
+        assert!(rows[3].contains("line 3…"), "{rows:#?}");
         assert!(rows[4].contains("Alt+I more · Alt+W dismiss"), "{rows:#?}");
         assert!(banner.clipped);
 
@@ -1428,13 +1439,15 @@ mod tests {
         assert!(rows[7].contains("Lines 1-6 of 12"), "{rows:#?}");
         assert!(banner.on_key(&key(KeyCode::Down, alt)));
         let rows = draw(&mut banner, 60, 8);
-        assert!(rows[1].contains("line 2") && rows[7].contains("Lines 2-7 of 12"));
+        assert!(rows[1].contains("line 2"), "{rows:#?}");
+        assert!(rows[7].contains("Lines 2-7 of 12"), "{rows:#?}");
         // The scroll stops at the end.
         for _ in 0..20 {
             banner.on_key(&key(KeyCode::Down, alt));
         }
         let rows = draw(&mut banner, 60, 8);
-        assert!(rows[6].contains("line 12") && rows[7].contains("Lines 7-12 of 12"));
+        assert!(rows[6].contains("line 12"), "{rows:#?}");
+        assert!(rows[7].contains("Lines 7-12 of 12"), "{rows:#?}");
         // The wheel scrolls it too.
         let x = banner.area.x + 2;
         assert_eq!(
@@ -1445,7 +1458,8 @@ mod tests {
         assert!(rows[7].contains("Lines 6-11 of 12"), "{rows:#?}");
 
         // Alt+I closes it again, back at the top.
-        assert!(banner.on_key(&key(KeyCode::Char('I'), alt | KeyModifiers::SHIFT)));
+        let shift_i = key(KeyCode::Char('I'), alt | KeyModifiers::SHIFT);
+        assert!(banner.on_key(&shift_i));
         let rows = draw(&mut banner, 60, 30);
         assert!(rows[1].contains("line 1"));
         let x = banner.area.x + 2;
@@ -1464,7 +1478,8 @@ mod tests {
         draw(&mut banner, 60, 20);
         let area = banner.area;
         // A click outside isn't the banner's.
-        assert_eq!(banner.on_mouse(&mouse(CLICK, 0, area.y + area.height)), None);
+        let below = mouse(CLICK, 0, area.y + area.height);
+        assert_eq!(banner.on_mouse(&below), None);
         // A click on the cut text opens it, and a second closes it.
         assert_eq!(banner.on_mouse(&mouse(CLICK, area.x + 3, 2)), Some(true));
         assert!(banner.shown.as_ref().unwrap().expanded);
@@ -1499,7 +1514,8 @@ mod tests {
         draw(&mut banner, 60, 20);
         // Plain letters, Ctrl+Alt and other Alt keys go on.
         assert!(!banner.on_key(&key(KeyCode::Char('w'), KeyModifiers::NONE)));
-        assert!(!banner.on_key(&key(KeyCode::Char('w'), alt | KeyModifiers::CONTROL)));
+        let ctrl_alt_w = key(KeyCode::Char('w'), alt | KeyModifiers::CONTROL);
+        assert!(!banner.on_key(&ctrl_alt_w));
         assert!(!banner.on_key(&key(KeyCode::Char('t'), alt)));
         assert!(!banner.on_key(&key(KeyCode::Up, alt)), "nothing to scroll");
         assert!(banner.on_key(&key(KeyCode::Char('w'), alt)));
