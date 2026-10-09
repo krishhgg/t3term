@@ -5,6 +5,7 @@
 //! labels and spinners advance, and a one-shot timer for the moment the soonest snooze ends,
 //! which no server event marks. An idle TUI uses no CPU.
 
+mod banner;
 mod composer;
 mod markdown;
 mod picker;
@@ -311,6 +312,8 @@ struct OpenThread {
     run_changes: HashMap<String, u64>,
     /// The transcript's blocks, which go with the thread when another one opens.
     prepared: Prepared,
+    /// The thread's error from T3, for the banner.
+    error: banner::Derived,
 }
 
 impl OpenThread {
@@ -323,6 +326,7 @@ impl OpenThread {
             answers: Default::default(),
             run_changes: HashMap::new(),
             prepared: Prepared::default(),
+            error: banner::Derived::default(),
         }
     }
 
@@ -344,6 +348,7 @@ impl OpenThread {
             .and_then(|run_id| state.run(run_id))
             .map(transcript::handoff_fields);
         let applied = state.apply(item);
+        self.error.note(&applied, item);
         match &applied {
             Applied::Synchronized => self.connection = "live".into(),
             Applied::Snapshot => self.prepared.mark(None),
@@ -409,6 +414,9 @@ struct App {
     drawn_plans: Vec<plan::Drawn>,
     /// The tasks drawer above the composer. Only this window keeps whether it is open.
     tasks: tasks::Drawer,
+    /// The thread error banner over the top of the conversation, with the errors dismissed
+    /// this session and the sends that failed.
+    banner: banner::Banner,
     /// The item at the top of the last frame and the row of it that was showing, so a block
     /// that grows under the reader doesn't move the text.
     anchor: Option<(String, usize)>,
@@ -667,6 +675,7 @@ impl App {
             expanded_plans: HashSet::new(),
             drawn_plans: Vec::new(),
             tasks: tasks::Drawer::default(),
+            banner: banner::Banner::default(),
             anchor: None,
             drawn_scroll: 0,
             verbose: settings.verbose,
@@ -733,6 +742,7 @@ impl App {
             }
         }
         self.follow_tasks();
+        self.follow_banner();
     }
 
     /// Brings the tasks drawer up to date with the open thread and its watch. It runs after
@@ -744,6 +754,20 @@ impl App {
             open.and_then(|open| open.state.as_ref()),
             open.is_some_and(|open| open.connection == "live"),
         );
+    }
+
+    /// Brings the error banner up to date with the open thread. It runs after each change to
+    /// the thread or to its send errors, and after the reader dismisses one, which can show
+    /// T3's own error from under a send error. The thread's error is worked out again only
+    /// after an event that can change it.
+    fn follow_banner(&mut self) {
+        match self.open.as_mut() {
+            Some(open) => {
+                let runtime = open.error.get(open.state.as_ref());
+                self.banner.follow(Some(&open.id), runtime);
+            }
+            None => self.banner.follow(None, None),
+        }
     }
 
     /// Lays the sidebar's shelves out again from the shell, as of now.
@@ -919,7 +943,12 @@ impl App {
             return;
         }
         let events = self.client.watch_thread(&id, None);
-        self.open = Some(OpenThread::new(id, events));
+        self.open_thread(OpenThread::new(id, events));
+    }
+
+    /// Shows `open` in place of the thread that was open, as when one is picked in the sidebar.
+    fn open_thread(&mut self, open: OpenThread) {
+        self.open = Some(open);
         self.cache.clear();
         self.outputs.clear();
         self.open_bundles.clear();
@@ -928,6 +957,9 @@ impl App {
         self.drawn_plans.clear();
         // The thread has no state yet, so the drawer closes and drops the last thread's tasks.
         self.follow_tasks();
+        // The banner shows a send to this thread that failed, until the thread's own error
+        // comes with it.
+        self.follow_banner();
         self.scroll.set(0);
         self.picker = None;
         self.focus = Focus::Composer;
@@ -1040,6 +1072,13 @@ impl App {
                     self.toggle_sidebar();
                     return true;
                 }
+                // The banner lies over the transcript, so it takes what lands on it: a click on
+                // × dismisses it, a click elsewhere on it opens or closes its details, and the
+                // wheel scrolls them. Nothing reaches the rows under it.
+                if let Some(redraw) = self.banner.on_mouse(&mouse) {
+                    self.follow_banner();
+                    return redraw;
+                }
                 if let Some(redraw) = self.tasks.on_mouse(&mouse) {
                     return redraw;
                 }
@@ -1146,6 +1185,13 @@ impl App {
                     's' => "acceptForSession",
                     _ => "decline",
                 });
+                return;
+            }
+            // While an error banner shows, from any pane and over a menu: Alt+W dismisses it,
+            // Alt+I opens or closes its details, and Alt+↑/↓ scroll details too long to show.
+            // None of them reach the composer.
+            _ if self.banner.on_key(&key) => {
+                self.follow_banner();
                 return;
             }
             // Scroll a request panel too long to show at once.
@@ -1397,6 +1443,9 @@ impl App {
                         }
                     }
                 }
+                // The thread's banner shows the error, as the desktop's does, and keeps it
+                // after the toast goes, until the next send to that thread.
+                self.banner.failed(&thread_id, error.clone(), message_id.clone());
                 let message = Failed {
                     thread_id: thread_id.clone(),
                     message_id: Some(message_id),
@@ -1405,6 +1454,7 @@ impl App {
                 self.give_back(&thread_id, message, error);
                 // The thread may have shown the message before this result arrived.
                 self.drop_landed();
+                self.follow_banner();
             }
         }
     }
@@ -1424,6 +1474,8 @@ impl App {
         {
             self.message = Some(note);
         }
+        // A send that failed but reached T3 anyway is no error to show.
+        self.banner.landed(&open.id, |id| state.has_message(id));
     }
 
     /// Puts a failed message back in the composer. If the composer holds other text, or the
@@ -1768,6 +1820,10 @@ impl App {
         }
         self.composer.clear();
         self.unsent.forget_composer();
+        // A new send clears the last one's error, as the desktop's does. If this one fails
+        // too, its error takes the place.
+        self.banner.clear_local(&thread_id);
+        self.follow_banner();
         self.scroll.set(0);
         // As in the desktop app, ultrathink applies to one message. This send takes it out of
         // the draft now, so a second message sent before this one lands doesn't reuse it.
@@ -1970,6 +2026,8 @@ impl App {
         );
         self.transcript_area = body;
         self.draw_transcript(frame, body);
+        // Over the transcript's top rows, which keep their place under it.
+        self.banner.draw(frame, body, &self.theme);
         self.panel_area = panel_area;
         if !panel.is_empty() {
             self.draw_request_panel(frame, panel_area, panel);
