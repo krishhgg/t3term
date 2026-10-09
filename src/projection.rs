@@ -188,6 +188,17 @@ impl ThreadState {
         items
     }
 
+    /// The runs of the thread a turn item belongs to, as far as this projection holds them:
+    /// every run for the thread's own items, and none for an item inherited from the thread
+    /// it was forked from, whose runs stay with that thread. An item that names no thread
+    /// counts as the thread's own.
+    pub fn runs_for(&self, item: &Value) -> &[Value] {
+        match item.get("threadId").and_then(Value::as_str) {
+            Some(owner) if owner != self.thread_id() => &[],
+            _ => self.list("runs"),
+        }
+    }
+
     pub fn run(&self, run_id: &str) -> Option<&Value> {
         self.list("runs")
             .iter()

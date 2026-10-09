@@ -157,7 +157,9 @@ impl Outputs {
 /// The open thread's transcript blocks, kept from one frame to the next. An event marks the
 /// turn item it changed, and the next frame describes only the marked items again, so a frame
 /// drawn for a key, the clock or a resize describes none. A compaction's summary is cleaned and
-/// its counts written once each time its item changes.
+/// its counts written once each time its item changes. A handoff that reads its models from
+/// the runs is described again when its item changes, and when a run it could read is added or
+/// changes its ordinal, provider or model. A run's status and times don't count.
 #[derive(Default)]
 struct Prepared {
     /// In transcript order.
@@ -172,6 +174,8 @@ struct Prepared {
     /// Whether the blocks are those of every item outside `changed`. False until the first
     /// frame, and after a snapshot, which can change or drop any item.
     current: bool,
+    /// Handoffs whose endpoints read the thread's runs, because T3 stamped no models on them.
+    run_readers: HashSet<String>,
 }
 
 impl Prepared {
@@ -185,6 +189,11 @@ impl Prepared {
         }
     }
 
+    /// Marks the handoffs that read the runs, after an event changed what they read of one.
+    fn mark_run_readers(&mut self) {
+        self.changed.extend(self.run_readers.iter().cloned());
+    }
+
     /// Brings the blocks up to date with `state`. The block of an item nothing has marked moves
     /// over as it was, and the blocks of items that have left the thread are dropped. An item
     /// with no row is described again, which stops at its type, its title or its blank text.
@@ -193,6 +202,9 @@ impl Prepared {
             return;
         }
         let current = self.current;
+        if !current {
+            self.run_readers.clear();
+        }
         let mut kept: HashMap<String, (transcript::Block, u64)> = self
             .blocks
             .drain(..)
@@ -205,13 +217,20 @@ impl Prepared {
             let unchanged = kept.remove(id).filter(|_| !self.changed.contains(id));
             let (block, version) = match unchanged {
                 Some(old) => old,
-                None => match transcript::describe(item) {
-                    Some(block) => {
-                        self.made += 1;
-                        (block, self.made)
+                None => {
+                    if transcript::reads_runs(item) {
+                        self.run_readers.insert(id.to_string());
+                    } else {
+                        self.run_readers.remove(id);
                     }
-                    None => continue,
-                },
+                    match transcript::describe(item, state.runs_for(item)) {
+                        Some(block) => {
+                            self.made += 1;
+                            (block, self.made)
+                        }
+                        None => continue,
+                    }
+                }
             };
             self.blocks.push(block);
             self.versions.push(version);
@@ -286,14 +305,25 @@ impl OpenThread {
     /// Applies one item from the thread's watch, and notes what it changed for the next frame.
     fn apply(&mut self, item: &Value) -> Applied {
         let state = self.state.get_or_insert_with(ThreadState::default);
-        let applied = state.apply(item);
         let id = item.pointer("/event/payload/id").and_then(Value::as_str);
+        // What a handoff reads of the run a run event changes, from before the event.
+        let before = item
+            .pointer("/event/type")
+            .and_then(Value::as_str)
+            .filter(|kind| kind.starts_with("run."))
+            .and(id)
+            .and_then(|run_id| state.run(run_id))
+            .map(transcript::handoff_fields);
+        let applied = state.apply(item);
         match &applied {
             Applied::Synchronized => self.connection = "live".into(),
             Applied::Snapshot => self.prepared.mark(None),
             Applied::Event(kind) if kind.starts_with("run.") => {
                 if let Some(run_id) = id {
                     self.run_changes.insert(run_id.to_string(), state.sequence);
+                    if state.run(run_id).map(transcript::handoff_fields) != before {
+                        self.prepared.mark_run_readers();
+                    }
                 }
             }
             Applied::Event(kind) if kind.starts_with("turn-item.") => self.prepared.mark(id),
@@ -3030,10 +3060,13 @@ fn render_block(
         }
         BlockKind::Notice => {
             let compaction = block.item_type == "compaction";
+            let handoff = block.item_type == "handoff";
             // A compaction still under way has its label in blue, where the desktop shimmers
-            // it, so the row changes only when the item does.
+            // it, so the row changes only when the item does. A failed handoff has its label in
+            // red, the desktop's danger tone, and its endpoints stay grey, as on mobile.
             let label = match block.status.as_str() {
                 "pending" | "running" | "waiting" if compaction => Style::new().fg(t.info),
+                "failed" if handoff => Style::new().fg(t.error_fg),
                 _ => muted,
             };
             lines.push(Line::default());
@@ -3045,9 +3078,10 @@ fn render_block(
                 Span::styled(format!(" {title} "), label),
                 Span::styled("─".repeat(rest), hairline),
             ]));
-            // Of the notices, only a compaction has detail: the counts its label leaves out
-            // and the summary, which `describe` has already bounded and cleaned.
-            if compaction && !block.body.is_empty() {
+            // Of the notices, only a compaction and a handoff have detail: the counts a
+            // compaction's label leaves out and its summary, and where a handoff went.
+            // `describe` has already bounded and cleaned both.
+            if (compaction || handoff) && !block.body.is_empty() {
                 for text in tasks::wrap(&block.body, width.saturating_sub(4)) {
                     lines.push(Line::styled(format!("  {text}"), muted));
                 }

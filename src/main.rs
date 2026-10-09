@@ -916,7 +916,7 @@ async fn wait_for_reply(
                             *done = body.len();
                             announced.insert("assistant".into());
                         }
-                    } else if let Some(block) = transcript::describe(item) {
+                    } else if let Some(block) = transcript::describe(item, state.runs_for(item)) {
                         let settled =
                             !matches!(block.status.as_str(), "running" | "pending" | "idle");
                         if settled

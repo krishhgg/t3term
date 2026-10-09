@@ -1,6 +1,7 @@
 //! Turns projection items into display blocks. The CLI prints them; the TUI styles them.
 
 use serde_json::Value;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::projection::ThreadState;
 
@@ -9,6 +10,14 @@ use crate::projection::ThreadState;
 const MAX_OUTPUT_LINES: usize = 12;
 /// What one row's output can weigh, since a single line has no length of its own to bound.
 const MAX_OUTPUT_BYTES: usize = 4096;
+/// Sources a handoff names before it counts the rest. T3 lists one for each provider and model
+/// the handed-off runs used, so a real handoff has far fewer.
+const MAX_HANDOFF_SOURCES: usize = 12;
+/// Columns one end of a handoff can take. Model and provider ids are far shorter.
+const MAX_ENDPOINT_WIDTH: usize = 64;
+/// Bytes of a model or provider id that are read at all, enough for `MAX_ENDPOINT_WIDTH`
+/// columns in any script.
+const MAX_ENDPOINT_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockKind {
@@ -115,6 +124,26 @@ fn without_controls(text: &str) -> String {
         }
     }
     out
+}
+
+/// `text` cut where a terminal starts a new character: before each character with a width,
+/// except a skin tone and the character after a zero-width joiner. So an accent stays on its
+/// letter, U+FE0F on its emoji, and a joined emoji such as 👩‍💻 stays whole.
+pub(crate) fn clusters(text: &str) -> Vec<&str> {
+    let mut clusters = Vec::new();
+    let mut start = 0;
+    let mut joined = false;
+    for (index, c) in text.char_indices() {
+        let width = UnicodeWidthChar::width(c).unwrap_or(0);
+        let skin_tone = matches!(c, '\u{1F3FB}'..='\u{1F3FF}');
+        if index > 0 && width > 0 && !joined && !skin_tone {
+            clusters.push(&text[start..index]);
+            start = index;
+        }
+        joined = c == '\u{200D}';
+    }
+    clusters.push(&text[start..]);
+    clusters
 }
 
 /// The marker and detail of a context compaction, the `compaction` turn item
@@ -226,6 +255,191 @@ fn summary_text(summary: &str) -> String {
         shown.push("…");
     }
     shown.join("\n")
+}
+
+/// One end of a context handoff: a provider instance and, when the item or the thread's runs
+/// name it, the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Endpoint<'a> {
+    instance_id: &'a str,
+    model: Option<&'a str>,
+}
+
+impl Endpoint<'_> {
+    /// The endpoint as the transcript names it: its model, or its provider id when no model is
+    /// known or the model has no text, or `?` when neither has any.
+    fn label(&self) -> String {
+        self.model
+            .and_then(endpoint_text)
+            .or_else(|| endpoint_text(self.instance_id))
+            .unwrap_or_else(|| "?".into())
+    }
+}
+
+/// Where a `handoff` item took the context from and to, worked out as the nightly's
+/// `resolveHandoffEndpoints` (`packages/client-runtime/src/handoff.ts`) does for the desktop
+/// and mobile timelines. T3 stamps the source models on the item in `fromModelSelections`, in
+/// order and several for one provider when its runs used several, and the target's in
+/// `toModel`. An item from before it did has only provider ids. Then the target's model is the
+/// handoff run's, when that run is on the target's provider, and each source's is the model of
+/// the newest run on its provider that came before the handoff run. An endpoint with no model
+/// keeps its provider.
+fn endpoints<'a>(item: &'a Value, runs: &'a [Value]) -> (Vec<Endpoint<'a>>, Endpoint<'a>) {
+    let handoff_run = item
+        .get("runId")
+        .and_then(Value::as_str)
+        .and_then(|id| runs.iter().find(|run| str_of(run, "id") == id));
+    let to_instance = str_of(item, "toProviderInstanceId");
+    // A `toModel` with no text still wins over the run's, as `??` lets it in the nightly.
+    let to_model = item.get("toModel").and_then(Value::as_str).or_else(|| {
+        handoff_run
+            .filter(|run| str_of(run, "providerInstanceId") == to_instance)
+            .and_then(run_model)
+    });
+    let stamped = item
+        .get("fromModelSelections")
+        .and_then(Value::as_array)
+        .filter(|selections| !selections.is_empty());
+    let from = match stamped {
+        Some(selections) => selections
+            .iter()
+            .map(|selection| Endpoint {
+                instance_id: str_of(selection, "instanceId"),
+                model: selection.get("model").and_then(Value::as_str),
+            })
+            .collect(),
+        None => {
+            let before = handoff_run
+                .and_then(|run| run.get("ordinal"))
+                .and_then(Value::as_u64);
+            item.get("fromProviderInstanceIds")
+                .and_then(Value::as_array)
+                .into_iter()
+                .flatten()
+                .map(|id| {
+                    let instance_id = id.as_str().unwrap_or_default();
+                    Endpoint {
+                        instance_id,
+                        model: latest_model_before(runs, instance_id, before),
+                    }
+                })
+                .collect()
+        }
+    };
+    let to = Endpoint {
+        instance_id: to_instance,
+        model: to_model,
+    };
+    (from, to)
+}
+
+fn run_model(run: &Value) -> Option<&str> {
+    run.pointer("/modelSelection/model").and_then(Value::as_str)
+}
+
+/// The model of the newest run on `instance_id` with an ordinal below `before`, or of the
+/// newest run on it when the handoff's own run isn't known. Of two runs with one ordinal the
+/// first wins, as in the nightly's `latestRunModelBefore`.
+fn latest_model_before<'a>(
+    runs: &'a [Value],
+    instance_id: &str,
+    before: Option<u64>,
+) -> Option<&'a str> {
+    let mut latest: Option<(u64, &Value)> = None;
+    for run in runs {
+        if str_of(run, "providerInstanceId") != instance_id {
+            continue;
+        }
+        let ordinal = run.get("ordinal").and_then(Value::as_u64).unwrap_or(0);
+        if before.is_some_and(|before| ordinal >= before) {
+            continue;
+        }
+        if latest.is_none_or(|(newest, _)| ordinal > newest) {
+            latest = Some((ordinal, run));
+        }
+    }
+    latest.and_then(|(_, run)| run_model(run))
+}
+
+/// The fields of a run that a handoff's endpoints read: its ordinal, its provider and its
+/// model. A run's status and times change far more often, and they move no endpoint.
+pub fn handoff_fields(run: &Value) -> (Option<u64>, Option<String>, Option<String>) {
+    (
+        run.get("ordinal").and_then(Value::as_u64),
+        run.get("providerInstanceId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        run_model(run).map(str::to_string),
+    )
+}
+
+/// Whether a turn item is a handoff whose endpoints read the thread's runs, because T3 stamped
+/// no source models or no target model on it.
+pub fn reads_runs(item: &Value) -> bool {
+    if str_of(item, "type") != "handoff" {
+        return false;
+    }
+    let stamped_from = item
+        .get("fromModelSelections")
+        .and_then(Value::as_array)
+        .is_some_and(|selections| !selections.is_empty());
+    let stamped_to = item.get("toModel").and_then(Value::as_str).is_some();
+    !(stamped_from && stamped_to)
+}
+
+/// A handoff's detail line: its sources, then `→` and its target, in the order of the
+/// nightly's `V2LifecycleRow.tsx`, which also drops the arrow when there is no source. Past
+/// `MAX_HANDOFF_SOURCES` sources a count such as `+3 more` stands for the rest. The desktop
+/// names an endpoint by its model's catalog name, and by its provider's display name when it
+/// has no model, both from T3's provider list. `t3term read` doesn't fetch that list, so
+/// t3term names both ends by the ids T3 sent.
+fn handoff_detail(item: &Value, runs: &[Value]) -> String {
+    let (from, to) = endpoints(item, runs);
+    let mut sources: Vec<String> = from
+        .iter()
+        .take(MAX_HANDOFF_SOURCES)
+        .map(Endpoint::label)
+        .collect();
+    if from.len() > MAX_HANDOFF_SOURCES {
+        sources.push(format!("+{} more", from.len() - MAX_HANDOFF_SOURCES));
+    }
+    if sources.is_empty() {
+        return to.label();
+    }
+    format!("{} → {}", sources.join(", "), to.label())
+}
+
+/// A model or provider id as one line can show it: without control characters, each run of
+/// blanks and line breaks read as one space, and cut with `…` past `MAX_ENDPOINT_WIDTH`
+/// columns, at a place `clusters` finds. `None` when no text is left.
+fn endpoint_text(raw: &str) -> Option<String> {
+    // Only the start of a long id can show, so only that much is read.
+    let mut end = raw.len().min(MAX_ENDPOINT_BYTES);
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    let text = without_controls(&raw[..end])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.is_empty() {
+        return None;
+    }
+    let width: usize = clusters(&text).iter().map(|piece| piece.width()).sum();
+    if end == raw.len() && width <= MAX_ENDPOINT_WIDTH {
+        return Some(text);
+    }
+    // The … takes the last column.
+    let mut cut = String::new();
+    let mut used = 0;
+    for piece in clusters(&text) {
+        used += piece.width();
+        if used >= MAX_ENDPOINT_WIDTH {
+            break;
+        }
+        cut.push_str(piece);
+    }
+    Some(format!("{}…", cut.trim_end()))
 }
 
 /// The one value a tool call is about, for a transcript row: the file, pattern or query it
@@ -341,7 +555,10 @@ fn truncate_lines(text: &str, max_lines: usize) -> String {
     )
 }
 
-pub fn describe(item: &Value) -> Option<Block> {
+/// The block for one turn item. `runs` are the runs of the item's thread, which
+/// `ThreadState::runs_for` gives. A handoff that T3 stamped no models on reads its models from
+/// them.
+pub fn describe(item: &Value, runs: &[Value]) -> Option<Block> {
     let item_type = str_of(item, "type");
     let title = str_of(item, "title");
     let block = |kind, header: String, body: String| Block {
@@ -514,7 +731,14 @@ pub fn describe(item: &Value) -> Option<Block> {
             let (header, body) = compaction(item);
             block(BlockKind::Notice, header, body)
         }
-        "system_notice" | "handoff" | "fork" | "thread_created" | "notification" => {
+        // The nightly's `V2LifecycleRow.tsx` labels every handoff this way, whatever its title,
+        // and shows where it went rather than its summary.
+        "handoff" => block(
+            BlockKind::Notice,
+            "Context handoff".into(),
+            handoff_detail(item, runs),
+        ),
+        "system_notice" | "fork" | "thread_created" | "notification" => {
             if title.is_empty() {
                 return None;
             }
@@ -532,7 +756,11 @@ pub fn describe(item: &Value) -> Option<Block> {
 }
 
 pub fn blocks(state: &ThreadState) -> Vec<Block> {
-    state.items().into_iter().filter_map(describe).collect()
+    state
+        .items()
+        .into_iter()
+        .filter_map(|item| describe(item, state.runs_for(item)))
+        .collect()
 }
 
 /// Plain text for `threads read`.
@@ -625,7 +853,7 @@ mod tests {
         // A running step has only the anchor its clock started from.
         assert_eq!(steps[1].duration_ms, None);
 
-        let block = describe(&item).expect("a checklist has a row");
+        let block = describe(&item, &[]).expect("a checklist has a row");
         assert_eq!(block.kind, BlockKind::Plan);
         assert_eq!(
             block.body,
@@ -693,7 +921,7 @@ mod tests {
             "projection": {"thread": {"id": "t"}, "turnItems": [item]},
         }))
         .expect("a snapshot");
-        let block = describe(state.items()[0]).expect("a checklist has a row");
+        let block = describe(state.items()[0], &[]).expect("a checklist has a row");
         let printed = plain_text(&state, None, false);
         for text in [&block.body, &printed] {
             let control = text.chars().find(|c| c.is_control() && *c != '\n');
@@ -820,7 +1048,7 @@ mod tests {
         ];
         for (status, before, after, header, body) in cases {
             let item = compaction_item(status, before, after);
-            let block = describe(&item).expect("a compaction has a row");
+            let block = describe(&item, &[]).expect("a compaction has a row");
             assert_eq!(block.kind, BlockKind::Notice, "{item}");
             assert_eq!(
                 (block.header.as_str(), block.body.as_str()),
@@ -833,7 +1061,7 @@ mod tests {
         let mut titled = compaction_item("running", None, None);
         titled["title"] = json!("Auto-compact");
         assert_eq!(
-            describe(&titled).expect("a row").header,
+            describe(&titled, &[]).expect("a row").header,
             "Compacting context"
         );
     }
@@ -850,7 +1078,7 @@ mod tests {
             "projection": {"thread": {"id": "t"}, "turnItems": [item]},
         }))
         .expect("a snapshot");
-        let block = describe(state.items()[0]).expect("a compaction has a row");
+        let block = describe(state.items()[0], &[]).expect("a compaction has a row");
         assert_eq!(block.header, "Context compacted 899K → 19K tokens");
         assert_eq!(
             block.body,
@@ -868,7 +1096,7 @@ mod tests {
         let mut item = compaction_item("failed", Some(json!(899_000)), None);
         item["summary"] = json!("Ran out of room");
         assert_eq!(
-            describe(&item).expect("a row").body,
+            describe(&item, &[]).expect("a row").body,
             "899K → ? tokens\nRan out of room"
         );
 
@@ -879,14 +1107,14 @@ mod tests {
             .join("\n");
         let mut item = compaction_item("completed", None, None);
         item["summary"] = json!(lines);
-        let body = describe(&item).expect("a row").body;
+        let body = describe(&item, &[]).expect("a row").body;
         assert!(body.starts_with("line 1\nline 2\n"), "{body}");
         assert!(body.ends_with("\nline 12\n…"), "{body}");
 
         // One line longer than a row's byte budget is cut on a character boundary. 界 takes
         // three bytes, so 1,365 of them fit in 4,096.
         item["summary"] = json!("界".repeat(5_000));
-        let body = describe(&item).expect("a row").body;
+        let body = describe(&item, &[]).expect("a row").body;
         assert_eq!(body, format!("{}\n…", "界".repeat(1_365)));
     }
 

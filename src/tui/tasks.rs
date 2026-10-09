@@ -9,12 +9,12 @@ use ratatui::layout::Rect;
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
-use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
+use unicode_width::UnicodeWidthStr;
 
 use super::theme::Theme;
 use super::{fit, row};
 use crate::projection::{self, ThreadState};
-use crate::transcript::{StepStatus, TaskStep, task_steps};
+use crate::transcript::{StepStatus, TaskStep, clusters, task_steps};
 
 /// The most rows the open list takes. The GUI caps it at `min(24rem, 40dvh)`
 /// (`ComposerBanner.tsx`, `Scroll`). 24rem is 384px and a step row is 25px, a 16px line with
@@ -505,7 +505,7 @@ impl Rows {
 /// row as the GUI's `wrap-anywhere` breaks it. Each piece `clusters` finds is measured whole, as
 /// the terminal draws it, so ⚠ with U+FE0F counts two columns, though ⚠ alone counts one. A
 /// break drops its space, and a run of spaces inside a row reads as one. A compaction's summary
-/// in the transcript wraps the same way.
+/// and a handoff's endpoints in the transcript wrap the same way.
 pub(super) fn wrap(text: &str, width: usize) -> Vec<String> {
     let mut rows = Vec::new();
     for line in text.split('\n') {
@@ -537,26 +537,6 @@ pub(super) fn wrap(text: &str, width: usize) -> Vec<String> {
         rows.push(row);
     }
     rows
-}
-
-/// `text` cut where a terminal starts a new character: before each character with a width,
-/// except a skin tone and the character after a zero-width joiner. So an accent stays on its
-/// letter, U+FE0F on its emoji, and a joined emoji such as 👩‍💻 stays whole.
-fn clusters(text: &str) -> Vec<&str> {
-    let mut clusters = Vec::new();
-    let mut start = 0;
-    let mut joined = false;
-    for (index, c) in text.char_indices() {
-        let width = UnicodeWidthChar::width(c).unwrap_or(0);
-        let skin_tone = matches!(c, '\u{1F3FB}'..='\u{1F3FF}');
-        if index > 0 && width > 0 && !joined && !skin_tone {
-            clusters.push(&text[start..index]);
-            start = index;
-        }
-        joined = c == '\u{200D}';
-    }
-    clusters.push(&text[start..]);
-    clusters
 }
 
 #[cfg(test)]
