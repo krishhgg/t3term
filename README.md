@@ -149,6 +149,14 @@ The provider's summary comes next, which the desktop's timeline leaves out. t3te
 
 ![Three compaction markers in one thread: Context compacted 899K → 19K tokens over a two-line summary, Context compaction failed over 1.23M → ? tokens and its summary, and Context compaction stopped over 999 → ? tokens](docs/screenshots/compaction-states.png)
 
+### Context handoff
+
+When T3 hands a thread's context from one provider to another, the transcript and `t3term read` show a Context handoff marker, with or without a title from T3. The line under it lists the source models, then an arrow and the target model, such as `gpt-5.5, gpt-5.4 → claude-fable-5`. Sources keep T3's order, and past twelve a count such as `+3 more` stands for the rest.
+
+Newer T3 servers stamp the models on the handoff. For an older handoff, t3term reads them from the thread's runs as the nightly desktop does. The target's model is that of the handoff's run, and each source's is that of the latest earlier run on its provider. An end with no known model shows its provider id, such as `codex_personal`. So does each end of a handoff that a fork inherited, because the fork doesn't have its parent's runs. The desktop shows names from T3's model and provider list, which `t3term read` doesn't fetch, so t3term shows the ids T3 sent.
+
+Each end shows at most 64 columns and ends with `…` when cut. t3term drops its control characters as it does a checklist step's, and `t3term --json read` keeps the item as T3 sent it. In the TUI the marker is a rule like a compaction's, with the endpoints wrapped under it in grey and the label in red when the handoff failed. `t3term read` prints no colors, so a failed handoff reads the same there. The TUI works out the endpoints again when T3 changes the item and, for an older handoff, when a run is added or its model, provider or order changes, not on every redraw.
+
 ### The Working shelf
 
 The nightly desktop app has a "Working shelf" setting, off by default, that moves threads busy without you out of Active. To turn it on in t3term, add `"sidebarWorkingShelfEnabled": true` to `~/.config/t3term/settings.json` and restart t3term. The desktop's switch uses the same key, though each app keeps its own copy. With it off, the sidebar is as described above.
