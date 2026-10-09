@@ -157,6 +157,10 @@ Newer T3 servers stamp the models on the handoff. For an older handoff, t3term r
 
 Each end shows at most 64 columns and ends with `…` when cut. t3term drops its control characters as it does a checklist step's, and `t3term --json read` keeps the item as T3 sent it. In the TUI the marker is a rule like a compaction's, with the endpoints wrapped under it in grey and the label in red when the handoff failed. `t3term read` prints no colors, so a failed handoff reads the same there. The TUI works out the endpoints again when T3 changes the item and, for an older handoff, when a run is added or its model, provider or order changes, not on every redraw.
 
+![Two Context handoff markers in one thread: a grey one over gpt-5.5, gpt-5.4 → claude-fable-5, and a failed one with a red label over composer-2, gpt-5.5, opencode, composer-2 → claudeAgent](docs/screenshots/handoff-stamped.png)
+
+The thread is invented and comes from a fake T3 server. The image renders t3term's captured terminal output.
+
 ### The Working shelf
 
 The nightly desktop app has a "Working shelf" setting, off by default, that moves threads busy without you out of Active. To turn it on in t3term, add `"sidebarWorkingShelfEnabled": true` to `~/.config/t3term/settings.json` and restart t3term. The desktop's switch uses the same key, though each app keeps its own copy. With it off, the sidebar is as described above.
