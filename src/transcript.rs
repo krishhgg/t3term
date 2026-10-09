@@ -61,8 +61,8 @@ pub struct Block {
     pub tool_name: String,
     /// For request items: the runtime request they show.
     pub request_id: String,
-    /// For `file_change` items: what the TUI shows under the row. `t3term read` prints only
-    /// the header.
+    /// For `file_change` items: what the TUI shows under the row. The CLI prints only the
+    /// header, so `describe_plain` leaves this `None`.
     pub change: Option<FileChange>,
 }
 
@@ -842,10 +842,22 @@ fn hunk_counts(line: &str) -> Option<(u64, u64)> {
     Some((count(old)?, count(new)?))
 }
 
-/// The block for one turn item. `runs` are the runs of the item's thread, which
-/// `ThreadState::runs_for` gives. A handoff that T3 stamped no models on reads its models from
-/// them.
+/// The block for one turn item, as the TUI draws it. `runs` are the runs of the item's thread,
+/// which `ThreadState::runs_for` gives. A handoff that T3 stamped no models on reads its models
+/// from them.
 pub fn describe(item: &Value, runs: &[Value]) -> Option<Block> {
+    describe_as(item, runs, true)
+}
+
+/// The block for one turn item, as the CLI prints it. The CLI prints a file change's header
+/// and none of the lines the TUI draws under it, so its `change` stays `None` and those lines
+/// are never built. Everything else is as `describe` gives it.
+pub fn describe_plain(item: &Value, runs: &[Value]) -> Option<Block> {
+    describe_as(item, runs, false)
+}
+
+/// `describe`, which builds a file change's `change` only when `with_change` is set.
+fn describe_as(item: &Value, runs: &[Value], with_change: bool) -> Option<Block> {
     let item_type = str_of(item, "type");
     let title = str_of(item, "title");
     let block = |kind, header: String, body: String| Block {
@@ -944,7 +956,7 @@ pub fn describe(item: &Value, runs: &[Value]) -> Option<Block> {
             }
             Block {
                 detail: name,
-                change: Some(file_change(item, counts)),
+                change: with_change.then(|| file_change(item, counts)),
                 ..block(BlockKind::Tool, header, String::new())
             }
         }
@@ -1045,11 +1057,12 @@ pub fn describe(item: &Value, runs: &[Value]) -> Option<Block> {
     })
 }
 
+/// The blocks `t3term read` prints, which `describe_plain` gives.
 pub fn blocks(state: &ThreadState) -> Vec<Block> {
     state
         .items()
         .into_iter()
-        .filter_map(|item| describe(item, state.runs_for(item)))
+        .filter_map(|item| describe_plain(item, state.runs_for(item)))
         .collect()
 }
 

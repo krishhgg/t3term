@@ -904,6 +904,9 @@ async fn wait_for_reply(
                         continue;
                     }
                     let item_id = item["id"].as_str().unwrap_or_default().to_string();
+                    // A reply streams as it grows. Any other item gets one row when it settles.
+                    // Every event comes back through here, so an item is described only once it
+                    // has settled, and not again after its row is printed.
                     if item["type"] == "assistant_message" {
                         let body = item["text"].as_str().unwrap_or_default();
                         let done = printed.entry(item_id).or_insert(0);
@@ -916,23 +919,21 @@ async fn wait_for_reply(
                             *done = body.len();
                             announced.insert("assistant".into());
                         }
-                    } else if let Some(block) = transcript::describe(item, state.runs_for(item)) {
-                        let settled =
-                            !matches!(block.status.as_str(), "running" | "pending" | "idle");
-                        if settled
-                            && !matches!(
-                                block.kind,
-                                transcript::BlockKind::Reasoning | transcript::BlockKind::User
-                            )
-                            && announced.insert(item_id)
-                        {
-                            eprintln!("\n· {}", block.header);
-                            // A handoff says where the context went, as `t3term read` does.
-                            // `describe` has cleaned and bounded its endpoints.
-                            if block.item_type == "handoff" {
-                                for line in block.body.lines() {
-                                    eprintln!("  {line}");
-                                }
+                    } else if !announced.contains(&item_id)
+                        && !matches!(status(item), "running" | "pending" | "idle")
+                        && let Some(block) = transcript::describe_plain(item, state.runs_for(item))
+                        && !matches!(
+                            block.kind,
+                            transcript::BlockKind::Reasoning | transcript::BlockKind::User
+                        )
+                    {
+                        announced.insert(item_id);
+                        eprintln!("\n· {}", block.header);
+                        // A handoff says where the context went, as `t3term read` does.
+                        // `describe_plain` has cleaned and bounded its endpoints.
+                        if block.item_type == "handoff" {
+                            for line in block.body.lines() {
+                                eprintln!("  {line}");
                             }
                         }
                     }
