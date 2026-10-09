@@ -28,6 +28,7 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 | 6 | https://github.com/krishhgg/t3term/pull/13 | An opt-in Working shelf for threads busy without the user | `25477c1d01ca5e49fdba4568c80f7790c6be7a4c` |
 | 7 | https://github.com/krishhgg/t3term/pull/14 | Proposed plans as cards that collapse when long | `65e3d4351a0f70826c943cc160b7da6d898cd511` |
 | 8 | https://github.com/krishhgg/t3term/pull/15 | The running turn's tasks in a drawer above the composer, and checklist steps read in the nightly's shape | |
+| 9 | https://github.com/krishhgg/t3term/pull/16 | Context compaction markers with their state, token counts and summary, without handoff markers | |
 
 ## Maintenance review PRs
 
