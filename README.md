@@ -131,11 +131,13 @@ While a turn runs, the checklist its agent keeps shows in a drawer on the compos
 
 Alt+T is the drawer's only while the drawer shows. With no drawer, the key goes where it went before. Terminals send Esc then a quick `t` as Alt+T, so in the transcript that sequence still opens or closes every row of tool calls. While a drawer shows, the same Esc and `t` open its list instead, and a plain `t` still works.
 
-The drawer shows the newest list written by the run that owns the thread's work, while that run hasn't ended. A new turn that hasn't written a list yet shows nothing, rather than the last turn's list. A queued message doesn't take the drawer from the run still working, and a list with no steps shows nothing. The drawer goes away when the run ends, while a request waits for an answer, and while the thread's watch connects or reconnects. When it comes back, its list starts closed, as it does when you open another thread. Whether the list is open stays in this window, and t3term sends nothing to T3 or the settings file.
+The drawer shows the newest list written by the run that owns the thread's work, while that run hasn't ended. A new turn that hasn't written a list yet shows nothing, rather than the last turn's list. A queued message doesn't take the drawer from the run still working, and a list with no steps shows nothing. The drawer goes away when the run ends, while a request waits for an answer, and while the thread's watch connects or reconnects. When it comes back, its list starts closed, however briefly it was gone, as it does when you open another thread. Whether the list is open stays in this window, and t3term sends nothing to T3 or the settings file.
 
 The open list takes at most 15 rows, the desktop's height, and at most 40% of the terminal. A longer list ends with a row such as `Lines 1-14 of 30 · Alt+↑/↓ scroll`, and Alt+↑/↓ or the wheel scroll it. With less room the list shrinks, and with none the drawer isn't drawn. The Alt+T label leaves a drawer under 40 columns, and a very narrow one shows only the count and the arrow. A long step breaks onto more rows, mid-word if it has to. CJK characters and emoji count two columns each, and an accented letter or an emoji such as 👩‍💻 or ⚠️ stays on one row.
 
 In the transcript and in `t3term read`, a checklist shows as Plan rows marked `[x]` done, `[>]` running and `[ ]` to do.
+
+An agent writes each step's text, so the drawer, the transcript and `t3term read` drop its control characters, such as Esc and the C1 codes, and a step can't move the cursor, clear the screen or set the clipboard. What followed an Esc stays as plain text. A carriage return starts a new row, and a tab or another blank control shows as a space. `t3term --json read` prints the text as T3 sent it. JSON escapes Esc and the other codes below 0x20 there, but not DEL or the C1 codes, so send that output to a program rather than straight to a terminal.
 
 ### The Working shelf
 
@@ -220,7 +222,7 @@ Set `T3TERM_NO_SAVED_LOGIN=1` to use a session that lasts one run instead. t3ter
 cargo test
 ```
 
-The unit tests cover the reducers, Markdown wrapping, the composer, the model menus, the transcript, the tasks drawer and auth command parsing. `tests/fake_server.rs` drives the real RPC client against a fake Effect RPC server, dropping the socket mid-stream to check the resume cursor, chunk acks, batched frames, duplicate suppression and error decoding. `tests/cli.rs` runs the built binary with a temporary home and checks the `--json` error and exit code when the server is gone, when it isn't on protocol 2 and when the TUI has no terminal. None of them reach a real T3 server or the Keychain, and CI runs them on macOS for every pull request.
+The unit tests cover the reducers, Markdown wrapping, the composer, the model menus, the transcript, the tasks drawer and auth command parsing. `tests/fake_server.rs` drives the real RPC client against a fake Effect RPC server, dropping the socket mid-stream to check the resume cursor, chunk acks, batched frames, duplicate suppression and error decoding. `tests/cli.rs` runs the built binary with a temporary home and checks the `--json` error and exit code when the server is gone, when it isn't on protocol 2 and when the TUI has no terminal. It also runs `t3term read` against a fake server and a fake `t3` that issues a made-up session, and checks that a checklist prints without its control characters. None of them reach a real T3 server or the Keychain, and CI runs them on macOS for every pull request.
 
 `docs/screenshots/` also holds `before-tui.png`, `after-tui.png`, `approval.png`, `streaming.gif`, `picker-model.png` and `tool-calls-failed.png`.
 
