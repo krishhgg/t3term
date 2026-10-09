@@ -33,6 +33,7 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 | 11 | https://github.com/krishhgg/t3term/pull/18 | Hide and show the main sidebar with Ctrl+B or its toggle, remembered between runs | |
 | 12 | https://github.com/krishhgg/t3term/pull/19 | Resize the main sidebar by dragging its edge or with [ and ], remembered between runs | |
 | 13 | https://github.com/krishhgg/t3term/pull/20 | File changes in tool output: each edit's operations and a failed edit's error, with a bounded patch preview when a server sends one | |
+| 14 | https://github.com/krishhgg/t3term/pull/21 | A dismissible banner over the conversation for the thread's error, from a failed send or from T3 | |
 
 ## Maintenance review PRs
 
