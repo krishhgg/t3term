@@ -572,7 +572,9 @@ fn send_wait_says_once_where_each_handoff_in_the_turn_went() {
             return;
         };
         kept.lock().unwrap().push(subscribe.clone());
-        let message_id = dispatch["payload"]["messageId"].as_str().unwrap_or_default();
+        let message_id = dispatch["payload"]["messageId"]
+            .as_str()
+            .unwrap_or_default();
         reply(
             &mut socket,
             json!({"_tag": "Chunk", "requestId": subscribe["id"], "values": turn(message_id)}),
