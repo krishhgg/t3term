@@ -193,6 +193,14 @@ The edge follows the pointer while the button is down, and t3term saves the widt
 
 t3term saves the width in columns in `~/.config/t3term/settings.json` under `sidebarWidth`. A file without the key gives the width t3term picks. A screen too narrow for the saved width draws the sidebar narrower and keeps the saved width for when the screen grows again. The desktop keeps its width in pixels in the browser's storage, so this key is t3term's.
 
+| Width t3term picks, 140x44 | Dragged to 51 columns, 140x44 |
+|---|---|
+| ![t3term with no width saved: a 34-column sidebar of shelves, the thread Tasks: live run open with its plan and tasks drawer, and the draft hd in the composer](docs/screenshots/sidebar-width-default.png) | ![The same thread with the sidebar dragged to 51 columns: a card title cut short before now fits, the transcript wraps in the narrower conversation and the draft still reads hd](docs/screenshots/sidebar-width-chosen.png) |
+| **Saved 59, drawn at 40 on 80x24** | **Saved 48, 140x44 in 256 colors** |
+| ![On an 80x24 screen the saved 59 columns draw as 40, half the screen, beside the same thread's plan and tasks drawer, and the draft reads hid](docs/screenshots/sidebar-width-clamped.png) | ![A 48-column sidebar in 256 colors with Parser cleanup (fork) open and keep []0 draft unsent typed in the composer](docs/screenshots/sidebar-width-256.png) |
+
+The threads are invented and come from a fake T3 server. The images render t3term's captured terminal output, the first three in truecolor. A [screen tour](docs/screenshots/sidebar-width-screen-tour.mp4) shows the four in this order for three seconds each. It is a slideshow of the captures, not a recording, so it shows neither the pointer nor the edge moving.
+
 ### Tool calls and reasoning
 
 Reasoning is always there to read, laid out as prose in grey so the model's own answers stay the brightest text on screen. Tool calls are not: a run of them folds into one row saying how many there were and which tools ran, which keeps a turn short without hiding what it did.
