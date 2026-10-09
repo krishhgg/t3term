@@ -184,7 +184,10 @@ fn token_count(count: u64) -> String {
     let (whole, fraction) = (rounded / scale, rounded % scale);
     match fraction {
         0 => format!("{whole}{suffix}"),
-        _ => format!("{whole}.{fraction:0width$}{suffix}", width = digits as usize),
+        _ => format!(
+            "{whole}.{fraction:0width$}{suffix}",
+            width = digits as usize
+        ),
     }
 }
 

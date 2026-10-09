@@ -281,8 +281,7 @@ fn read_shows_compactions_without_a_title_and_json_keeps_them_as_sent() {
     // counts and a summary, one running with the count it started from, and one that failed
     // with nothing more. The summary holds made-up controls, a CSI that clears the screen, a
     // C1 CSI, a carriage return and DEL, then text that joins or combines.
-    let summary =
-        "Kept the plan\u{1b}[2J and\u{9b}31m the tests\r\nDropped\u{7f} the logs 日本語 👩\u{200d}💻 cafe\u{301}";
+    let summary = "Kept the plan\u{1b}[2J and\u{9b}31m the tests\r\nDropped\u{7f} the logs 日本語 👩\u{200d}💻 cafe\u{301}";
     let id = "5d2e8b17-3c4a-4f9e-8a61-0b7c9d4e2f13";
     let items = json!([
         {"id": "c1", "type": "compaction", "ordinal": 1, "status": "completed", "title": null,
