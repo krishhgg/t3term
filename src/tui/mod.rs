@@ -154,6 +154,73 @@ impl Outputs {
     }
 }
 
+/// The open thread's transcript blocks, kept from one frame to the next. An event marks the
+/// turn item it changed, and the next frame describes only the marked items again, so a frame
+/// drawn for a key, the clock or a resize describes none. A compaction's summary is cleaned and
+/// its counts written once each time its item changes.
+#[derive(Default)]
+struct Prepared {
+    /// In transcript order.
+    blocks: Vec<transcript::Block>,
+    /// The number each block was made under. It keys the block's wrapped lines in place of its
+    /// text, so a frame doesn't hash a long body to find them.
+    versions: Vec<u64>,
+    /// How many blocks have been made, which numbers the next one.
+    made: u64,
+    /// Items an event changed since the blocks were made.
+    changed: HashSet<String>,
+    /// Whether the blocks are those of every item outside `changed`. False until the first
+    /// frame, and after a snapshot, which can change or drop any item.
+    current: bool,
+}
+
+impl Prepared {
+    /// Marks the item an event changed. With no id to tell it by, every item counts as changed.
+    fn mark(&mut self, item_id: Option<&str>) {
+        match item_id {
+            Some(id) => {
+                self.changed.insert(id.to_string());
+            }
+            None => self.current = false,
+        }
+    }
+
+    /// Brings the blocks up to date with `state`. The block of an item nothing has marked moves
+    /// over as it was, and the blocks of items that have left the thread are dropped. An item
+    /// with no row is described again, which stops at its type, its title or its blank text.
+    fn refresh(&mut self, state: &ThreadState) {
+        if self.current && self.changed.is_empty() {
+            return;
+        }
+        let current = self.current;
+        let mut kept: HashMap<String, (transcript::Block, u64)> = self
+            .blocks
+            .drain(..)
+            .zip(self.versions.drain(..))
+            .filter(|_| current)
+            .map(|(block, version)| (block.item_id.clone(), (block, version)))
+            .collect();
+        for item in state.items() {
+            let id = str_of(item, "id");
+            let unchanged = kept.remove(id).filter(|_| !self.changed.contains(id));
+            let (block, version) = match unchanged {
+                Some(old) => old,
+                None => match transcript::describe(item) {
+                    Some(block) => {
+                        self.made += 1;
+                        (block, self.made)
+                    }
+                    None => continue,
+                },
+            };
+            self.blocks.push(block);
+            self.versions.push(version);
+        }
+        self.changed.clear();
+        self.current = true;
+    }
+}
+
 enum ActionResult {
     Info(String),
     Error(String),
@@ -199,6 +266,48 @@ struct OpenThread {
     answers: serde_json::Map<String, Value>,
     /// The event sequence of each run's last change, which keys the clock row under its prompt.
     run_changes: HashMap<String, u64>,
+    /// The transcript's blocks, which go with the thread when another one opens.
+    prepared: Prepared,
+}
+
+impl OpenThread {
+    fn new(id: String, events: mpsc::UnboundedReceiver<WatchEvent>) -> OpenThread {
+        OpenThread {
+            id,
+            state: None,
+            events,
+            connection: "connecting".into(),
+            answers: Default::default(),
+            run_changes: HashMap::new(),
+            prepared: Prepared::default(),
+        }
+    }
+
+    /// Applies one item from the thread's watch, and notes what it changed for the next frame.
+    fn apply(&mut self, item: &Value) -> Applied {
+        let state = self.state.get_or_insert_with(ThreadState::default);
+        let applied = state.apply(item);
+        let id = item.pointer("/event/payload/id").and_then(Value::as_str);
+        match &applied {
+            Applied::Synchronized => self.connection = "live".into(),
+            Applied::Snapshot => self.prepared.mark(None),
+            Applied::Event(kind) if kind.starts_with("run.") => {
+                if let Some(run_id) = id {
+                    self.run_changes.insert(run_id.to_string(), state.sequence);
+                }
+            }
+            Applied::Event(kind) if kind.starts_with("turn-item.") => self.prepared.mark(id),
+            _ => {}
+        }
+        applied
+    }
+
+    /// Brings the transcript's blocks up to date with the items applied since the last frame.
+    fn prepare(&mut self) {
+        if let Some(state) = &self.state {
+            self.prepared.refresh(state);
+        }
+    }
 }
 
 struct App {
@@ -425,11 +534,10 @@ fn str_of<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or_default()
 }
 
-fn hash(parts: &[&str], stamp: u64) -> u64 {
-    use std::hash::{Hash, Hasher};
+fn hash(value: impl std::hash::Hash) -> u64 {
+    use std::hash::Hasher;
     let mut hasher = std::collections::hash_map::DefaultHasher::new();
-    parts.hash(&mut hasher);
-    stamp.hash(&mut hasher);
+    value.hash(&mut hasher);
     hasher.finish()
 }
 
@@ -459,23 +567,11 @@ impl App {
         };
         match event {
             WatchEvent::Item(item) => {
-                let state = open.state.get_or_insert_with(ThreadState::default);
-                match state.apply(&item) {
-                    Applied::Synchronized => open.connection = "live".into(),
-                    Applied::Snapshot => {
-                        // A fresh snapshot means the watch reconnected, so output T3 couldn't
-                        // send before is worth asking for again.
-                        self.cache.clear();
-                        self.outputs.retry_failed();
-                    }
-                    Applied::Event(kind) if kind.starts_with("run.") => {
-                        if let Some(run_id) =
-                            item.pointer("/event/payload/id").and_then(Value::as_str)
-                        {
-                            open.run_changes.insert(run_id.to_string(), state.sequence);
-                        }
-                    }
-                    _ => {}
+                // A fresh snapshot means the watch reconnected, so output T3 couldn't send
+                // before is worth asking for again.
+                if open.apply(&item) == Applied::Snapshot {
+                    self.cache.clear();
+                    self.outputs.retry_failed();
                 }
                 self.settle_draft();
                 self.drop_landed();
@@ -555,14 +651,7 @@ impl App {
             return;
         }
         let events = self.client.watch_thread(&id, None);
-        self.open = Some(OpenThread {
-            id,
-            state: None,
-            events,
-            connection: "connecting".into(),
-            answers: Default::default(),
-            run_changes: HashMap::new(),
-        });
+        self.open = Some(OpenThread::new(id, events));
         self.cache.clear();
         self.outputs.clear();
         self.open_bundles.clear();
@@ -1632,10 +1721,13 @@ impl App {
         let muted = Style::new().fg(t.muted);
         // Clicks and `p` act on the plans this frame draws, so the last frame's go first.
         self.drawn_plans.clear();
-        let Some((state, run_changes)) = self
+        if let Some(open) = self.open.as_mut() {
+            open.prepare();
+        }
+        let Some((state, run_changes, prepared)) = self
             .open
             .as_ref()
-            .and_then(|o| Some((o.state.as_ref()?, &o.run_changes)))
+            .and_then(|o| Some((o.state.as_ref()?, &o.run_changes, &o.prepared)))
         else {
             let hint = if self.open.is_some() {
                 "Loading thread…"
@@ -1646,15 +1738,9 @@ impl App {
             return;
         };
         let width = area.width.saturating_sub(1).max(10);
-        let mut blocks = transcript::blocks(state);
-        // Tool output T3 withheld, for the rows that have already been given it.
-        for block in &mut blocks {
-            if let Some(text) = self.outputs.get(&block.item_id, &block.updated_at) {
-                block.body = text.to_string();
-            }
-        }
+        let blocks = &prepared.blocks;
         // A plan that has left the thread forgets that it was expanded.
-        plan::keep_present(&mut self.expanded_plans, &blocks);
+        plan::keep_present(&mut self.expanded_plans, blocks);
         let active_run = state.active_run().map(|r| str_of(r, "id").to_string());
         let context = RenderContext {
             theme: &t,
@@ -1664,9 +1750,9 @@ impl App {
         };
         // Tool calls are shown in runs: one row for the lot, opened by clicking it or by
         // verbose mode. Everything else, reasoning included, is always there.
-        let bundles = bundle_tools(&blocks);
-        // Each block keeps its wrapped lines until its content or the width changes. Only a
-        // streaming block, or the clock row under a running prompt, is rewrapped per frame.
+        let bundles = bundle_tools(blocks);
+        // Each block keeps its wrapped lines until it is made again or the width changes. Only
+        // a streaming block, or the clock row under a running prompt, is rewrapped per frame.
         let mut heights = Vec::with_capacity(blocks.len());
         for (index, block) in blocks.iter().enumerate() {
             let bundle = bundles[index].as_ref().map(|head| {
@@ -1694,12 +1780,8 @@ impl App {
                 BlockKind::Request => decision_for(state, &block.request_id),
                 _ => String::new(),
             };
-            // Everything a row is drawn from, so a tool that keeps its header but changes its
-            // description, its argument or how it ended still redraws.
-            let exit = block
-                .exit_code
-                .map(|code| code.to_string())
-                .unwrap_or_default();
+            // Tool output T3 withheld, for the rows that have already been given it.
+            let output = self.outputs.get(&block.item_id, &block.updated_at);
             // The row this block stands for when it heads a run of calls, which changes as
             // calls are added to it and when it is opened.
             let head = match &bundle {
@@ -1711,23 +1793,19 @@ impl App {
             // A proposed plan draws its preview or all of it, so which one joins the key.
             let expanded =
                 block.item_type == "proposed_plan" && self.expanded_plans.contains(&block.item_id);
+            // Everything a row is drawn from. The block's number stands for all it took from its
+            // item, so a tool that keeps its header but changes its description, its argument
+            // or how it ended still redraws.
             let key = (
-                hash(
-                    &[
-                        &block.header,
-                        &block.body,
-                        &block.status,
-                        &block.title,
-                        &block.detail,
-                        &block.tool_name,
-                        &exit,
-                        &head,
-                        clock,
-                        &decision,
-                        if expanded { "expanded" } else { "" },
-                    ],
+                hash((
+                    prepared.versions[index],
+                    output,
+                    &head,
+                    clock,
+                    &decision,
+                    expanded,
                     stamp,
-                ),
+                )),
                 width,
             );
             let fresh = self.cache.get(&block.item_id).is_none_or(|c| c.key != key);
@@ -1754,7 +1832,16 @@ impl App {
                     }
                     _ => Extra::None,
                 };
-                let lines = render_block(block, width as usize, &context, &extra);
+                let lines = match output {
+                    Some(text) => {
+                        let block = transcript::Block {
+                            body: text.to_string(),
+                            ..block.clone()
+                        };
+                        render_block(&block, width as usize, &context, &extra)
+                    }
+                    None => render_block(block, width as usize, &context, &extra),
+                };
                 let cached = Cached {
                     key,
                     lines,
@@ -1771,7 +1858,7 @@ impl App {
         // that moved the transcript after the toggle has already cancelled this.
         let pinned = self.scroll.take_pin().and_then(|(id, row)| {
             let header = self.cache.get(&id)?.toggle?.0;
-            scroll_to(&blocks, &heights, &id, header, row, height)
+            scroll_to(blocks, &heights, &id, header, row, height)
         });
         // Scrolled up, the view stays on the row it was reading: output that arrives for a
         // block on screen makes it taller, and without this the text would slide away. The
@@ -1779,7 +1866,7 @@ impl App {
         // still win, and following the bottom is untouched.
         let anchored = if self.scroll.rows() > 0 && self.scroll.rows() == self.drawn_scroll {
             self.anchor.as_ref().and_then(|(item_id, within)| {
-                scroll_to(&blocks, &heights, item_id, *within, 0, height)
+                scroll_to(blocks, &heights, item_id, *within, 0, height)
             })
         } else {
             None
@@ -3370,6 +3457,7 @@ mod tests {
             connection: connection.into(),
             answers: serde_json::Map::new(),
             run_changes: HashMap::new(),
+            prepared: Prepared::default(),
         };
 
         // A working card on screen ticks by itself, even past a closed watch.
@@ -3536,8 +3624,7 @@ mod tests {
         );
         assert_eq!(lines[1].spans[1].style.fg, Some(theme.info));
 
-        // The update replaces the row rather than adding one. Its header and status change,
-        // and both are in the key its cached lines are kept under.
+        // The update replaces the row rather than adding one, with a new header and status.
         let update = json!({"kind": "event", "sequence": 2, "event": {
             "type": "turn-item.updated",
             "payload": completed,
@@ -3602,5 +3689,156 @@ mod tests {
         let lines = render_block(&notice, 40, &context, &Extra::None);
         assert_eq!(lines.len(), 3);
         assert_eq!(lines[1].spans[1].style.fg, Some(theme.muted));
+    }
+
+    #[test]
+    fn a_compaction_is_prepared_once_for_each_change_to_its_item() {
+        fn context(theme: &Theme) -> RenderContext<'_> {
+            RenderContext {
+                theme,
+                text: Styles::new(theme, theme.text()),
+                bubble: Styles::new(theme, Style::new().fg(theme.fg).bg(theme.bubble)),
+                reasoning: Styles::new(theme, Style::new().fg(theme.muted)).dimmed(),
+            }
+        }
+        // Each block the next frame draws from: its item, the number it was made under and
+        // where its text is kept, which moves only when the block is made again.
+        fn frame(open: &mut OpenThread) -> Vec<(String, u64, *const u8)> {
+            open.prepare();
+            let prepared = &open.prepared;
+            prepared
+                .blocks
+                .iter()
+                .zip(&prepared.versions)
+                .map(|(block, version)| (block.item_id.clone(), *version, block.body.as_ptr()))
+                .collect()
+        }
+        fn ids(blocks: Vec<(String, u64, *const u8)>) -> Vec<String> {
+            blocks.into_iter().map(|(id, ..)| id).collect()
+        }
+        let compaction = |id: &str, ordinal: u64, status: &str| {
+            json!({
+                "id": id,
+                "type": "compaction",
+                "ordinal": ordinal,
+                "status": status,
+                "title": null,
+                "driver": null,
+                "summary": format!("Kept\u{1b}[2J the plan for {id} 日本語"),
+                "beforeTokenCount": 899_000,
+                "updatedAt": "2026-10-08T10:00:00.000Z",
+            })
+        };
+        let snapshot = |sequence: u64, items: Value| {
+            json!({"kind": "snapshot", "snapshotSequence": sequence, "projection": {
+                "thread": {"id": "t"},
+                "turnItems": items,
+            }})
+        };
+        let event = |sequence: u64, kind: &str, payload: &Value| {
+            json!({"kind": "event", "sequence": sequence, "event": {
+                "type": kind,
+                "payload": payload,
+            }})
+        };
+
+        // A finished compaction, a running one and an answer, as the watch of a thread just
+        // opened delivers them. The first frame makes a block for each.
+        let mut done = compaction("c1", 1, "completed");
+        done["afterTokenCount"] = json!(19_000);
+        let running = compaction("c2", 2, "running");
+        let answer = json!({"id": "a1", "type": "assistant_message", "ordinal": 3,
+            "text": "Done"});
+        let mut open = OpenThread::new("t".into(), mpsc::unbounded_channel().1);
+        let items = json!([done, running, answer]);
+        assert_eq!(open.apply(&snapshot(1, items)), Applied::Snapshot);
+        let first = frame(&mut open);
+        assert_eq!(open.prepared.made, 3);
+        let (c1, c2) = (&open.prepared.blocks[0], &open.prepared.blocks[1]);
+        assert_eq!(c1.header, "Context compacted 899K → 19K tokens");
+        assert_eq!(c1.body, "Kept[2J the plan for c1 日本語");
+        assert_eq!(c2.header, "Compacting context");
+        assert_eq!(c2.body, "899K → ? tokens\nKept[2J the plan for c2 日本語");
+
+        // A frame drawn for a key, the clock or a resize follows no event. At any width and in
+        // either palette it draws from the same blocks, so no summary is cleaned and no count
+        // written again.
+        for theme in [Theme::new(Depth::TrueColor), Theme::new(Depth::Indexed)] {
+            for width in [10, 40, 120] {
+                for block in &open.prepared.blocks {
+                    let rows = text(&render_block(block, width, &context(&theme), &Extra::None));
+                    assert!(rows.iter().all(|row| row.width() <= width), "{rows:?}");
+                }
+                assert_eq!(frame(&mut open), first);
+            }
+        }
+
+        // A replayed event, a run's update and the end of the replay change no item.
+        assert_eq!(
+            open.apply(&event(1, "turn-item.updated", &done)),
+            Applied::Duplicate
+        );
+        let run = json!({"id": "r1", "status": "running", "ordinal": 1});
+        assert_eq!(
+            open.apply(&event(2, "run.updated", &run)),
+            Applied::Event("run.updated".into())
+        );
+        assert_eq!(
+            open.apply(&json!({"kind": "synchronized"})),
+            Applied::Synchronized
+        );
+        assert_eq!(frame(&mut open), first);
+        assert_eq!(open.prepared.made, 3);
+
+        // The running compaction finishes. T3 sends the item whole, here under the same
+        // `updatedAt`, and the next frame makes its block again and keeps the others.
+        let mut finished = running;
+        finished["status"] = json!("completed");
+        finished["afterTokenCount"] = json!(1_500);
+        open.apply(&event(3, "turn-item.updated", &finished));
+        let second = frame(&mut open);
+        assert_eq!(open.prepared.made, 4);
+        assert_eq!((&second[0], &second[2]), (&first[0], &first[2]));
+        assert_ne!(second[1].1, first[1].1);
+        let c2 = &open.prepared.blocks[1];
+        assert_eq!(c2.header, "Context compacted 899K → 1.50K tokens");
+        assert_eq!(c2.body, "Kept[2J the plan for c2 日本語");
+
+        // A new summary alone makes the block again too.
+        let mut summarized = finished;
+        summarized["summary"] = json!("Kept only the plan");
+        open.apply(&event(4, "turn-item.updated", &summarized));
+        let third = frame(&mut open);
+        assert_eq!(open.prepared.made, 5);
+        assert_eq!((&third[0], &third[2]), (&first[0], &first[2]));
+        assert_ne!(third[1].1, second[1].1);
+        assert_eq!(open.prepared.blocks[1].body, "Kept only the plan");
+
+        // Updates that arrive between two frames make the block once, at the next frame.
+        for (sequence, count) in [(5, 1_600), (6, 1_700), (7, 1_800)] {
+            let mut next = summarized.clone();
+            next["afterTokenCount"] = json!(count);
+            open.apply(&event(sequence, "turn-item.updated", &next));
+        }
+        open.prepare();
+        assert_eq!(open.prepared.made, 6);
+        let c2 = &open.prepared.blocks[1];
+        assert_eq!(c2.header, "Context compacted 899K → 1.80K tokens");
+        assert!(open.prepared.changed.is_empty());
+
+        // A reconnect's snapshot no longer has the first compaction. Its block is dropped, and
+        // the others are made again, since a snapshot can change any item.
+        let items = json!([summarized, answer]);
+        assert_eq!(open.apply(&snapshot(9, items)), Applied::Snapshot);
+        assert_eq!(ids(frame(&mut open)), ["c2", "a1"]);
+        assert_eq!(open.prepared.made, 8);
+
+        // Opening another thread replaces the open one, as `open_selected` does, and the blocks
+        // go with it. The new thread starts with none and makes only its own.
+        open = OpenThread::new("u".into(), mpsc::unbounded_channel().1);
+        assert!(frame(&mut open).is_empty());
+        open.apply(&snapshot(1, json!([compaction("c9", 1, "failed")])));
+        assert_eq!(ids(frame(&mut open)), ["c9"]);
+        assert_eq!(open.prepared.made, 1);
     }
 }
