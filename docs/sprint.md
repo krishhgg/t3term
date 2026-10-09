@@ -31,6 +31,7 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 | 9 | https://github.com/krishhgg/t3term/pull/16 | Context compaction markers with their state, token counts and summary, without handoff markers | |
 | 10 | https://github.com/krishhgg/t3term/pull/17 | Context handoff markers with their source and target models | |
 | 11 | https://github.com/krishhgg/t3term/pull/18 | Hide and show the main sidebar with Ctrl+B or its toggle, remembered between runs | |
+| 12 | https://github.com/krishhgg/t3term/pull/19 | Resize the main sidebar by dragging its edge or with [ and ], remembered between runs | |
 
 ## Maintenance review PRs
 
