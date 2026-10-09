@@ -174,7 +174,8 @@ struct Prepared {
     /// Whether the blocks are those of every item outside `changed`. False until the first
     /// frame, and after a snapshot, which can change or drop any item.
     current: bool,
-    /// Handoffs whose endpoints read the thread's runs, because T3 stamped no models on them.
+    /// Handoffs whose endpoints read the thread's runs, because T3 didn't stamp models on both
+    /// ends. While it's empty, `OpenThread::apply` doesn't look at what a run event changed.
     run_readers: HashSet<String>,
 }
 
@@ -306,11 +307,16 @@ impl OpenThread {
     fn apply(&mut self, item: &Value) -> Applied {
         let state = self.state.get_or_insert_with(ThreadState::default);
         let id = item.pointer("/event/payload/id").and_then(Value::as_str);
+        // Whether a block holds a handoff that reads the runs. With none, a run event has no
+        // block to mark, so the run isn't looked up on either side of it. A handoff whose item
+        // arrives or changes after a frame is described by the next one anyway, from the runs
+        // as they are then.
+        let readers = !self.prepared.run_readers.is_empty();
         // What a handoff reads of the run a run event changes, from before the event.
         let before = item
             .pointer("/event/type")
             .and_then(Value::as_str)
-            .filter(|kind| kind.starts_with("run."))
+            .filter(|kind| readers && kind.starts_with("run."))
             .and(id)
             .and_then(|run_id| state.run(run_id))
             .map(transcript::handoff_fields);
@@ -321,7 +327,7 @@ impl OpenThread {
             Applied::Event(kind) if kind.starts_with("run.") => {
                 if let Some(run_id) = id {
                     self.run_changes.insert(run_id.to_string(), state.sequence);
-                    if state.run(run_id).map(transcript::handoff_fields) != before {
+                    if readers && state.run(run_id).map(transcript::handoff_fields) != before {
                         self.prepared.mark_run_readers();
                     }
                 }
@@ -4134,5 +4140,101 @@ mod tests {
         assert_eq!(frame(&mut open), sixth);
         assert_eq!(open.prepared.made, 10);
         assert_eq!(body(&open, 0), "gpt-5.5 → claude-fable-5-1");
+    }
+
+    #[test]
+    fn a_run_event_makes_nothing_again_while_no_block_reads_the_runs() {
+        // Each block the next frame draws from: its item and the number it was made under.
+        fn frame(open: &mut OpenThread) -> Vec<(String, u64)> {
+            open.prepare();
+            let prepared = &open.prepared;
+            prepared
+                .blocks
+                .iter()
+                .map(|block| block.item_id.clone())
+                .zip(prepared.versions.iter().copied())
+                .collect()
+        }
+        fn bodies(open: &OpenThread) -> Vec<&str> {
+            let blocks = &open.prepared.blocks;
+            blocks.iter().map(|block| block.body.as_str()).collect()
+        }
+        // The thread's first run, before any handoff's, ran gpt-5.5 on codex_personal.
+        let source = run_on("r1", 1, "completed", "codex_personal", "gpt-5.5");
+        let snapshot = |items: Value| {
+            json!({"kind": "snapshot", "snapshotSequence": 1, "projection": {
+                "thread": {"id": "t"},
+                "runs": [source],
+                "turnItems": items,
+            }})
+        };
+        let event = |sequence: u64, kind: &str, payload: &Value| {
+            json!({"kind": "event", "sequence": sequence, "event": {
+                "type": kind,
+                "payload": payload,
+            }})
+        };
+        let answer = json!({"id": "a1", "type": "assistant_message", "ordinal": 5,
+            "text": "Done"});
+        let mut stamped = handoff_item("h2", 4, "completed");
+        stamped["fromModelSelections"] = json!([
+            {"instanceId": "codex_personal", "model": "gpt-5.4"},
+        ]);
+        stamped["toModel"] = json!("claude-fable-5");
+
+        // In a thread with no handoff, and in one whose only handoff T3 stamped at both ends,
+        // no block reads the runs. The handoff's run arriving and taking a new model makes
+        // nothing again, and the clock row under the prompt still follows each run event.
+        let cases = [
+            (json!([answer]), vec!["Done"]),
+            (
+                json!([stamped, answer]),
+                vec!["gpt-5.4 → claude-fable-5", "Done"],
+            ),
+        ];
+        for (items, shown) in cases {
+            let mut open = OpenThread::new("t".into(), mpsc::unbounded_channel().1);
+            assert_eq!(open.apply(&snapshot(items)), Applied::Snapshot);
+            let first = frame(&mut open);
+            assert_eq!(bodies(&open), shown);
+            assert!(open.prepared.run_readers.is_empty());
+            let mut target = run_on("r2", 2, "running", "claudeAgent", "claude-fable-5-1");
+            open.apply(&event(2, "run.created", &target));
+            target["modelSelection"]["model"] = json!("claude-fable-6");
+            let update = event(3, "run.updated", &target);
+            open.apply(&update);
+            assert_eq!(open.apply(&update), Applied::Duplicate);
+            assert!(open.prepared.changed.is_empty());
+            assert_eq!(open.run_changes["r2"], 3);
+            assert_eq!(frame(&mut open), first);
+            assert_eq!(bodies(&open), shown);
+        }
+
+        // A handoff that reads the runs arrives after a frame, and its run arrives and takes a
+        // new model before the next one. No block read the runs then, so neither run event
+        // marks anything, but the next frame describes the new handoff from the runs as they
+        // are by then. From that frame on it reads them, so a new model makes it again.
+        let mut open = OpenThread::new("t".into(), mpsc::unbounded_channel().1);
+        open.apply(&snapshot(json!([answer])));
+        let first = frame(&mut open);
+        let legacy = handoff_item("h1", 3, "completed");
+        open.apply(&event(2, "turn-item.updated", &legacy));
+        let mut target = run_on("r2", 2, "running", "claudeAgent", "claude-fable-5");
+        open.apply(&event(3, "run.created", &target));
+        target["modelSelection"]["model"] = json!("claude-fable-5-1");
+        open.apply(&event(4, "run.updated", &target));
+        assert_eq!(open.prepared.changed, HashSet::from(["h1".into()]));
+        assert!(open.prepared.run_readers.is_empty());
+        assert_eq!(open.run_changes["r2"], 4);
+        let second = frame(&mut open);
+        assert_eq!(second[1], first[0]);
+        assert_eq!(bodies(&open), ["gpt-5.5 → claude-fable-5-1", "Done"]);
+        assert_eq!(open.prepared.run_readers, HashSet::from(["h1".into()]));
+        target["modelSelection"]["model"] = json!("claude-fable-6");
+        open.apply(&event(5, "run.updated", &target));
+        let third = frame(&mut open);
+        assert_eq!(third[1], first[0]);
+        assert_ne!(third[0], second[0]);
+        assert_eq!(bodies(&open), ["gpt-5.5 → claude-fable-6", "Done"]);
     }
 }
