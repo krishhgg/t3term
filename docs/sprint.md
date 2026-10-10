@@ -34,6 +34,7 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 | 12 | https://github.com/krishhgg/t3term/pull/19 | Resize the main sidebar by dragging its edge or with [ and ], remembered between runs | |
 | 13 | https://github.com/krishhgg/t3term/pull/20 | File changes in tool output: each edit's operations and a failed edit's error, with a bounded patch preview when a server sends one | |
 | 14 | https://github.com/krishhgg/t3term/pull/21 | A dismissible banner over the conversation for the thread's error, from a failed send or from T3 | |
+| 15 | https://github.com/krishhgg/t3term/pull/22 | Live server config in the TUI, so provider and model changes reach the chips and menus without a reread | |
 
 ## Maintenance review PRs
 
