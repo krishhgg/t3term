@@ -189,11 +189,17 @@ fn serve_thread(id: &str, title: &str, turn_items: Value) -> String {
 
 /// Serves thread `id` as `serve_thread` does, with `projection` in its snapshot.
 fn serve_projection(id: &str, projection: Value) -> String {
+    serve_listed(json!({"projects": [], "threads": []}), id, projection)
+}
+
+/// Serves thread `id` as `serve_projection` does, with `shell` as `GET /api/orchestration/shell`
+/// returns it.
+fn serve_listed(shell: Value, id: &str, projection: Value) -> String {
     let snapshot = json!({"snapshotSequence": 3, "projection": projection});
     let thread_path = format!("/api/orchestration/threads/{id}");
     let (origin, _) = serve(move |path| match path {
         "/.well-known/t3/environment" => Some(protocol_2_descriptor()),
-        "/api/orchestration/shell" => Some(json!({"projects": [], "threads": []})),
+        "/api/orchestration/shell" => Some(shell.clone()),
         _ if path == thread_path => Some(snapshot.clone()),
         _ => None,
     });
@@ -1022,6 +1028,584 @@ fn send_wait_that_runs_out_of_time_exits_6_and_names_the_message() {
     assert_error(&sent, 6, "THREAD_WAIT_TIMEOUT");
     assert_eq!(json_stdout(&sent)["error"]["message"], gave_up());
     assert_eq!(std::str::from_utf8(&sent.stderr), Ok(""));
+}
+
+/// Fails when `printed` holds a control character other than a line feed, which a terminal
+/// would act on rather than show.
+#[track_caller]
+fn assert_printable(printed: &str) {
+    let control = printed.chars().find(|c| c.is_control() && *c != '\n');
+    assert_eq!(control, None, "{printed:?}");
+}
+
+/// What a run printed on stdout and on stderr.
+fn printed(output: &Output) -> (&str, &str) {
+    (
+        std::str::from_utf8(&output.stdout).expect("UTF-8"),
+        std::str::from_utf8(&output.stderr).expect("UTF-8"),
+    )
+}
+
+/// A thread whose made-up title holds control characters.
+const LISTED: &str = "0d7f3a52-8e1c-4b96-a4d2-5c9e1b7f3a08";
+const LISTED_TITLE: &str = "Night\u{1b}]0;pwned\u{7} shift\u{9b}2J";
+/// A made-up project name that holds control characters and runs past the 20 columns that
+/// `threads` gives a project.
+const PLATFORM: &str = "Platform\u{9b}31m\u{1b}[1m operations";
+
+/// A shell with two projects and two threads, `LISTED` and an older one. The first project's
+/// id, name and path, the older thread's id and title and `LISTED`'s status hold made-up
+/// control characters. The other project's name and path have characters that join, combine
+/// or don't break, which a terminal draws as they are.
+fn listed_shell() -> Value {
+    let cafe = "4e2b9d71-3c5a-4f80-9b16-7d3e0a5c2f94";
+    json!({
+        "projects": [
+            {"id": "p1\u{1b}[2J", "title": PLATFORM,
+                "workspaceRoot": "/repo/\u{1b}]52;c;Zm9v\u{7}ops"},
+            {"id": cafe, "title": "Caf\u{e9} \u{1f469}\u{200d}\u{1f4bb}",
+                "workspaceRoot": "/repo/caf\u{e9}\u{a0}two"},
+        ],
+        "threads": [
+            {"id": "t2\u{1b}[2J", "projectId": cafe, "title": "Fake\rReal",
+                "status": "completed", "updatedAt": "2026-10-09T10:00:01.000Z"},
+            {"id": LISTED, "projectId": "p1\u{1b}[2J", "title": LISTED_TITLE,
+                "status": "idle\u{9b}2J", "updatedAt": "2026-10-09T10:00:02.000Z"},
+        ],
+    })
+}
+
+#[test]
+fn read_prints_a_threads_text_without_control_characters() {
+    // Made-up text in each place `read` prints from T3: the title, a message from each side,
+    // reasoning, a proposed plan, the headers of a command, a tool, a web search, an approval
+    // and a notice, an approval's prompt and an error. They hold Esc and C1 sequences, BEL,
+    // DEL, carriage returns and controls that space text, and the reply also has characters
+    // that join, combine or don't break. `read` never prints a command's output or a tool's
+    // input.
+    let reply = concat!(
+        "Done\u{9b}31m: \u{1b}[1mbold\u{1b}[0m\rgone\ttab\u{7f}\r\u{1b}\n",
+        "Caf\u{e9} \u{1f469}\u{200d}\u{1f4bb} cafe\u{301}\u{a0}ok\r\n",
+    );
+    let items = json!([
+        {"id": "u1", "type": "user_message", "ordinal": 1,
+            "text": "Tidy\u{1b}[2J the\u{9b}31m logs\r\nplease\u{85}now"},
+        {"id": "r1", "type": "reasoning", "ordinal": 2,
+            "text": "Look\u{1b}[8m hidden\u{1b}[0m\u{7}\r"},
+        {"id": "c1", "type": "command_execution", "ordinal": 3, "status": "completed",
+            "input": "rg\u{1b}[2J -n\u{9b}31m todo\nrm -rf /", "output": "out\u{1b}[31mred",
+            "exitCode": 0},
+        {"id": "d1", "type": "dynamic_tool", "ordinal": 4, "status": "completed",
+            "title": "Read\u{90}q\u{9c} file\u{7f}", "toolName": "Read",
+            "input": {"file_path": "/repo/a\u{1b}[2J.rs"}},
+        {"id": "w1", "type": "web_search", "ordinal": 5, "status": "completed",
+            "patterns": ["rust\u{1b}[2J", "tty\u{9b}"]},
+        {"id": "p1", "type": "proposed_plan", "ordinal": 6,
+            "markdown": "# Ship\u{9d}0;t\u{9c} it\n- step\u{1b}[A one\r\n- two\u{b}three"},
+        {"id": "q1", "type": "approval_request", "ordinal": 7, "status": "pending",
+            "requestKind": "command\u{1b}[1m", "requestId": "request-1",
+            "prompt": "Run\u{7} make\r\nnow?"},
+        {"id": "a1", "type": "assistant_message", "ordinal": 8, "text": reply},
+        {"id": "e1", "type": "error", "ordinal": 9, "status": "failed",
+            "failure": {"message": "Boom\u{1b}]52;c;Zm9v\u{7}\u{9c} here"}},
+        {"id": "n1", "type": "system_notice", "ordinal": 10,
+            "title": "Notice\u{90}dcs\u{9c}\u{85}end"},
+    ]);
+    let projection = json!({
+        "thread": {"id": LISTED, "title": LISTED_TITLE},
+        "runs": [],
+        "runtimeRequests": [],
+        "turnItems": items,
+    });
+    let origin = serve_listed(listed_shell(), LISTED, projection.clone());
+    let home = Home::new();
+    home.record_server(&origin);
+    let t3 = home.fake_t3();
+
+    // Each control is dropped, a carriage return or `\r\n` starts one line, and a tab, VT or
+    // NEL reads as a space, so the reply's `\r`, Esc and `\n` start two. What a sequence leaves
+    // behind is plain text. The thread's exact title, controls and all, still finds it.
+    let title = format!("# Night]0;pwned shift2J  ({LISTED})");
+    let rows = [
+        title.as_str(),
+        "",
+        "## You",
+        "",
+        "Tidy[2J the31m logs",
+        "please now",
+        "  · Thinking",
+        "    Look[8m hidden[0m",
+        "  · $ rg[2J -n31m todo  (exit 0)",
+        "  · Readq file",
+        "  · web search rust[2J, tty",
+        "  · Proposed plan",
+        "    # Ship0;t it",
+        "    - step[A one",
+        "    - two three",
+        "  · Approval requested: command[1m",
+        "    Run make",
+        "    now?",
+        "",
+        "## Assistant",
+        "",
+        "Done31m: [1mbold[0m",
+        "gone tab",
+        "",
+        "Caf\u{e9} \u{1f469}\u{200d}\u{1f4bb} cafe\u{301}\u{a0}ok",
+        "  · Error",
+        "    Boom]52;c;Zm9v here",
+        "  · Noticedcs end",
+    ];
+    let expected = format!("{}\n", rows.join("\n"));
+    for query in [LISTED, LISTED_TITLE] {
+        let read = home.run_with(&["read", query, "--reasoning"], &t3);
+        assert_eq!(read.status.code(), Some(0), "{read:?}");
+        assert_printable(printed(&read).0);
+        assert_eq!(printed(&read), (expected.as_str(), ""));
+    }
+
+    // `--json` prints the projection as T3 sent it, with each control as a JSON escape.
+    let read = home.run_with(&["--json", "read", LISTED, "--reasoning"], &t3);
+    assert_eq!(read.status.code(), Some(0), "{read:?}");
+    assert_printable(printed(&read).0);
+    assert_eq!(json_stdout(&read)["projection"], projection);
+
+    // An error that quotes what was asked for prints it without its controls, and `--json`
+    // keeps them.
+    let query = "Night\u{1b}]0;pwned";
+    let missing = home.run_with(&["read", query], &t3);
+    assert_eq!(missing.status.code(), Some(3), "{missing:?}");
+    let error = "t3term: No active thread matches Night]0;pwned. [THREAD_NOT_FOUND]\n";
+    assert_eq!(printed(&missing), ("", error));
+    let missing = home.run_with(&["--json", "read", query], &t3);
+    assert_error(&missing, 3, "THREAD_NOT_FOUND");
+    assert_printable(printed(&missing).0);
+    assert_eq!(
+        json_stdout(&missing)["error"]["message"],
+        format!("No active thread matches {query}.")
+    );
+}
+
+#[test]
+fn projects_and_threads_print_names_without_control_characters() {
+    let origin = serve_listed(listed_shell(), LISTED, json!({"thread": {"id": LISTED}}));
+    let home = Home::new();
+    home.record_server(&origin);
+    let t3 = home.fake_t3();
+
+    // An id that isn't a UUID prints whole, so it loses its controls as a name does. The other
+    // project's characters print as they are.
+    let projects = home.run_with(&["projects"], &t3);
+    assert_eq!(projects.status.code(), Some(0), "{projects:?}");
+    assert_printable(printed(&projects).0);
+    let rows = [
+        "p1[2J  Platform31m[1m operations  /repo/]52;c;Zm9vops",
+        "4e2b9d71  Caf\u{e9} \u{1f469}\u{200d}\u{1f4bb}  /repo/caf\u{e9}\u{a0}two",
+    ];
+    let expected = format!("{}\n", rows.join("\n"));
+    assert_eq!(printed(&projects), (expected.as_str(), ""));
+
+    // The newer thread comes first. Its status fills its column and its project's name is cut
+    // to 20 characters once the controls are gone. The carriage return in the older thread's
+    // title starts a line. `--project` matches the project's name as T3 sent it.
+    let first = "0d7f3a52  idle2J     Platform31m[1m opera Night]0;pwned shift2J";
+    let cafe = "Caf\u{e9} \u{1f469}\u{200d}\u{1f4bb}";
+    let second = format!("t2[2J  completed  {cafe}{}Fake\nReal", " ".repeat(13));
+    let all = format!("{first}\n{second}\n");
+    let platform = format!("{first}\n");
+    for (args, expected) in [
+        (&["threads"][..], all),
+        (&["threads", "--project", PLATFORM][..], platform),
+    ] {
+        let threads = home.run_with(args, &t3);
+        assert_eq!(threads.status.code(), Some(0), "{threads:?}");
+        assert_printable(printed(&threads).0);
+        assert_eq!(printed(&threads), (expected.as_str(), ""));
+    }
+
+    // `--json` prints both lists as T3 sent them, with each control as a JSON escape.
+    let shell = listed_shell();
+    let projects = home.run_with(&["--json", "projects"], &t3);
+    assert_eq!(projects.status.code(), Some(0), "{projects:?}");
+    assert_printable(printed(&projects).0);
+    assert_eq!(json_stdout(&projects)["projects"], shell["projects"]);
+    for (args, expected) in [
+        (
+            &["--json", "threads"][..],
+            json!([shell["threads"][1], shell["threads"][0]]),
+        ),
+        (
+            &["--json", "threads", "--project", PLATFORM][..],
+            json!([shell["threads"][1]]),
+        ),
+    ] {
+        let threads = home.run_with(args, &t3);
+        assert_eq!(threads.status.code(), Some(0), "{threads:?}");
+        assert_printable(printed(&threads).0);
+        assert_eq!(json_stdout(&threads)["threads"], expected);
+    }
+}
+
+/// The first reply of `reply_with_controls` as T3 sends it last, and its second reply.
+const GROWN: &str = "Hel\u{1b}[2Jlo\r\nwor\u{9b}31mld\u{85}\u{e9}\u{1f469}\u{200d}\u{1f4bb}\r";
+const NEXT: &str = "\nNext\u{7f}\u{9c}\tline";
+
+/// What T3 streams once run r1 starts on message `message_id`: the run, a finished command, a
+/// reply that grows over six updates, a second reply and the end of the run, all with made-up
+/// control characters. One update of the reply adds only an Esc, and one repeats the update
+/// before it. One starts with the `\n` of a `\r\n` whose `\r` ended the update before it. The
+/// C1 CSI and NEL take two bytes each. The second reply starts with a `\n` of its own.
+fn reply_with_controls(message_id: &str) -> Vec<Value> {
+    let run = |status: &str| json!({"id": "r1", "ordinal": 1, "status": status, "userMessageId": message_id});
+    let reply = |item_id: &str, ordinal: u64, text: &str| {
+        json!({"id": item_id, "runId": "r1", "type": "assistant_message", "ordinal": ordinal,
+            "text": text, "streaming": true})
+    };
+    let command = json!({"id": "c1", "runId": "r1", "type": "command_execution", "ordinal": 1,
+        "status": "completed", "input": "make\u{1b}[2J\u{9b}31m test", "output": "ok",
+        "exitCode": 0});
+    let item = "turn-item.updated";
+    let mut events = vec![
+        stream_event(4, "run.created", run("running")),
+        stream_event(5, item, command),
+    ];
+    let growing = [
+        "Hel",
+        "Hel\u{1b}",
+        "Hel\u{1b}[2Jlo\r",
+        "Hel\u{1b}[2Jlo\r",
+        "Hel\u{1b}[2Jlo\r\nwor\u{9b}31m",
+        GROWN,
+    ];
+    for (sequence, text) in (6..).zip(growing) {
+        events.push(stream_event(sequence, item, reply("a1", 2, text)));
+    }
+    events.push(stream_event(12, item, reply("a2", 3, NEXT)));
+    events.push(stream_event(13, "run.updated", run("completed")));
+    events
+}
+
+#[test]
+fn wait_and_send_wait_stream_a_reply_without_control_characters() {
+    // `wait` joins run r1 while it works on message m1, and `send --wait` starts it.
+    let id = "8b5e2d19-6a3f-4c71-9e08-2d4f7b1a6c35";
+    let working = serve_working_thread(id, reply_with_controls("m1"));
+    let snapshot = json!({"snapshotSequence": 3, "projection": {
+        "thread": {"id": id, "title": "Idle"},
+        "runs": [],
+        "runtimeRequests": [],
+        "turnItems": [],
+    }});
+    let (idle, _) = serve_turn(id, snapshot, |message_id| {
+        let mut turn = vec![json!({"kind": "synchronized"})];
+        turn.extend(reply_with_controls(message_id));
+        Value::Array(turn)
+    });
+
+    // Each reply prints as it grows what the whole of it prints once cleaned. The update of
+    // only an Esc and the repeat add nothing, the split `\r\n` is one line break, no text after
+    // a C1 control is lost or printed twice, and the second reply keeps its own `\n`. The
+    // command's row on stderr is cleaned too.
+    let stdout = "\nHel[2Jlo\nwor31mld \u{e9}\u{1f469}\u{200d}\u{1f4bb}\n\n\nNext line\n";
+    let stderr = "\n· $ make[2J31m test  (exit 0)\n";
+    let wait = ["wait", id, "--timeout", "30"];
+    let send = ["send", id, "Summarize", "--wait", "--timeout", "30"];
+    for (origin, args) in [(&working, &wait[..]), (&idle, &send[..])] {
+        let home = Home::new();
+        home.record_server(origin);
+        let t3 = home.fake_t3();
+        let waited = home.run_with(args, &t3);
+        assert_eq!(waited.status.code(), Some(0), "{waited:?}");
+        let (out, err) = printed(&waited);
+        assert_printable(out);
+        assert_printable(err);
+        assert_eq!((out, err), (stdout, stderr));
+
+        // `--json` keeps both replies as T3 sent them.
+        let mut json_args = vec!["--json"];
+        json_args.extend(args);
+        let waited = home.run_with(&json_args, &t3);
+        assert_eq!(waited.status.code(), Some(0), "{waited:?}");
+        assert_printable(printed(&waited).0);
+        let result = json_stdout(&waited);
+        assert_eq!(result["outcome"], "completed", "{result}");
+        assert_eq!(result["reply"], format!("{GROWN}\n\n{NEXT}"), "{result}");
+        assert_eq!(printed(&waited).1, "");
+    }
+}
+
+#[test]
+fn watch_prints_event_types_and_its_failure_without_control_characters() {
+    // T3 answers the subscription with a snapshot, an event of a made-up type that holds
+    // control characters and the synchronized marker. Then it fails the subscription with a
+    // made-up message that holds some too.
+    let id = "5a1c8e47-2b9d-4f36-8e70-1d4a6c3b9f82";
+    let snapshot = json!({"kind": "snapshot", "snapshotSequence": 3, "projection": {
+        "thread": {"id": id, "title": "Watched"},
+        "runs": [],
+        "runtimeRequests": [],
+        "turnItems": [],
+    }});
+    let event = stream_event(4, "run\u{9b}2J.updated\u{1b}]0;x\u{7}", json!({}));
+    let synchronized = json!({"kind": "synchronized"});
+    let message = "Lost\u{1b}[2J the\u{9b}31m thread\r\nsorry";
+    let values = json!([snapshot, event, synchronized]);
+    let on_socket = move |mut socket: Socket| {
+        while let Some(request) = next_request(&mut socket) {
+            if request["tag"] != "orchestration.subscribeThread" {
+                continue;
+            }
+            reply(
+                &mut socket,
+                json!({"_tag": "Chunk", "requestId": request["id"], "values": values}),
+            );
+            let failure = json!({"_tag": "Fail",
+                "error": {"_tag": "SubscriptionError", "message": message}});
+            reply(
+                &mut socket,
+                json!({"_tag": "Exit", "requestId": request["id"],
+                    "exit": {"_tag": "Failure", "cause": [failure]}}),
+            );
+        }
+    };
+    let (origin, _) = serve_sockets(
+        |path| match path {
+            "/.well-known/t3/environment" => Some(protocol_2_descriptor()),
+            "/api/orchestration/shell" => Some(json!({"projects": [], "threads": []})),
+            "/api/auth/websocket-ticket" => Some(json!({"ticket": "ticket-test"})),
+            _ => None,
+        },
+        on_socket,
+    );
+    let home = Home::new();
+    home.record_server(&origin);
+    let t3 = home.fake_t3();
+
+    // The event's sequence and type go to stdout, and the rest to stderr, all without the
+    // controls. The failure ends the watch with exit 1.
+    let watched = home.run_with(&["watch", id], &t3);
+    assert_eq!(watched.status.code(), Some(1), "{watched:?}");
+    let (out, err) = printed(&watched);
+    assert_printable(out);
+    assert_printable(err);
+    assert_eq!(out, "4 run2J.updated]0;x\n");
+    let lines = [
+        "snapshot at sequence 3",
+        "live",
+        "t3term: Lost[2J the31m thread",
+        "sorry [WATCH_FAILED]",
+    ];
+    assert_eq!(err, format!("{}\n", lines.join("\n")));
+
+    // `--json` prints each item, then the error, on a line of its own and as T3 sent them.
+    let watched = home.run_with(&["--json", "watch", id], &t3);
+    assert_eq!(watched.status.code(), Some(1), "{watched:?}");
+    let (out, err) = printed(&watched);
+    assert_printable(out);
+    assert_eq!(err, "");
+    let items: Vec<Value> = out
+        .lines()
+        .map(|line| serde_json::from_str::<Value>(line).expect("one JSON value"))
+        .collect();
+    let failed = json!({"ok": false, "error": {"code": "WATCH_FAILED", "message": message}});
+    assert_eq!(items, [snapshot, event, synchronized, failed]);
+}
+
+#[test]
+fn requests_models_and_settings_print_values_without_control_characters() {
+    // A thread whose running run, pending approval, model and mode have made-up ids, names and
+    // text with control characters, and a config whose provider and model have the same.
+    let id = "9e3b7a15-4c2d-4f68-b1a9-6e0d2c8f4a73";
+    let request_id = "q\u{9b}31m1";
+    let run_id = "r\u{1b}[2J1";
+    let prompt = "Run\u{7} make\r\nnow?";
+    let snapshot = json!({"snapshotSequence": 3, "projection": {
+        "thread": {"id": id, "title": "Settings", "runtimeMode": "custom\u{9b}2J-mode",
+            "interactionMode": "default",
+            "modelSelection": {"instanceId": "cursor\u{1b}[2J", "model": "grok\u{9b}31m",
+                "options": [{"id": "fast\u{7}Mode", "value": "on\u{1b}[1m"}]}},
+        "runs": [{"id": run_id, "ordinal": 1, "status": "running", "userMessageId": "m1"}],
+        "runtimeRequests": [{"id": request_id, "kind": "command\u{1b}[1m", "status": "pending"}],
+        "turnItems": [{"id": "i1", "runId": run_id, "type": "approval_request", "ordinal": 1,
+            "status": "pending", "requestKind": "command", "requestId": request_id,
+            "prompt": prompt}],
+    }});
+    let provider = json!({"instanceId": "cursor\u{1b}[2J", "displayName": "Cur\u{7f}sor",
+    "status": "warn\u{9b}2Jing", "enabled": true,
+    "models": [{"slug": "grok\u{9b}31m", "name": "Grok\u{1b}[1m 4.7", "isDefault": true,
+        "capabilities": {"optionDescriptors": [
+            {"id": "fast\u{7}Mode", "type": "boolean"},
+            {"id": "reasoning\u{9b}", "type": "select",
+                "options": [{"id": "low"}, {"id": "hi\u{1b}[2Jgh", "isDefault": true}]},
+        ]}}]});
+    let config = json!({"providers": [provider]});
+
+    // T3's side of the WebSocket answers `server.getConfig` with the config and each command
+    // with sequence 4, and keeps the commands.
+    let commands = Arc::new(Mutex::new(Vec::new()));
+    let kept = commands.clone();
+    let on_socket = move |mut socket: Socket| {
+        while let Some(request) = next_request(&mut socket) {
+            let value = match request["tag"].as_str() {
+                Some("server.getConfig") => config.clone(),
+                Some("orchestration.dispatchCommand") => {
+                    kept.lock().unwrap().push(request["payload"].clone());
+                    json!({"sequence": 4})
+                }
+                _ => continue,
+            };
+            reply(
+                &mut socket,
+                json!({"_tag": "Exit", "requestId": request["id"],
+                    "exit": {"_tag": "Success", "value": value}}),
+            );
+        }
+    };
+    let thread_path = format!("/api/orchestration/threads/{id}/bounded");
+    let (origin, _) = serve_sockets(
+        move |path| match path {
+            "/.well-known/t3/environment" => Some(protocol_2_descriptor()),
+            "/api/orchestration/shell" => Some(json!({"projects": [], "threads": []})),
+            "/api/auth/websocket-ticket" => Some(json!({"ticket": "ticket-test"})),
+            _ if path == thread_path => Some(snapshot.clone()),
+            _ => None,
+        },
+        on_socket,
+    );
+    let home = Home::new();
+    home.record_server(&origin);
+    let t3 = home.fake_t3();
+
+    // Each command prints each value without its controls, and measures columns and the width
+    // of the model's slug once they are gone. With `--json`, it prints the values as T3 sent
+    // them.
+    let model = format!(
+        "  grok31m* Grok[1m 4.7{}fastMode on|off  reasoning low|hi[2Jgh*",
+        " ".repeat(12)
+    );
+    let settings = [
+        "model     cursor[2J/grok31m  (Cursor, Grok[1m 4.7)",
+        "fastMode  on[1m",
+        "reasoning hi[2Jgh",
+        "mode      custom2J-mode",
+        "plan      off",
+    ];
+    let request = json!({"id": request_id, "kind": "command\u{1b}[1m", "prompt": prompt,
+        "questions": null, "options": null});
+    let thread_settings = json!({"instanceId": "cursor\u{1b}[2J", "provider": "Cur\u{7f}sor",
+        "model": "grok\u{9b}31m", "modelName": "Grok\u{1b}[1m 4.7",
+        "options": {"fast\u{7}Mode": "on\u{1b}[1m", "reasoning\u{9b}": "hi\u{1b}[2Jgh"},
+        "runtimeMode": "custom\u{9b}2J-mode", "runtimeModeLabel": "custom\u{9b}2J-mode",
+        "interactionMode": "default"});
+    let cases = [
+        (
+            vec!["requests", id],
+            "q31m1  command[1m  Run make\nnow?\n".to_string(),
+            "requests",
+            json!([request]),
+        ),
+        (
+            vec!["approve", id],
+            "accept q31m1\n".to_string(),
+            "requestId",
+            json!(request_id),
+        ),
+        (
+            vec!["interrupt", id],
+            "interrupted r[2J1\n".to_string(),
+            "runId",
+            json!(run_id),
+        ),
+        (
+            vec!["models"],
+            format!("cursor[2J  Cursor  (warn2Jing)\n{model}\n"),
+            "providers",
+            json!([provider]),
+        ),
+        (
+            vec!["settings", id],
+            format!("{}\n", settings.join("\n")),
+            "settings",
+            thread_settings,
+        ),
+    ];
+    for (args, expected, key, value) in cases {
+        let run = home.run_with(&args, &t3);
+        assert_eq!(run.status.code(), Some(0), "{args:?}: {run:?}");
+        assert_printable(printed(&run).0);
+        assert_eq!(printed(&run), (expected.as_str(), ""), "{args:?}");
+
+        let mut json_args = vec!["--json"];
+        json_args.extend(&args);
+        let run = home.run_with(&json_args, &t3);
+        assert_eq!(run.status.code(), Some(0), "{args:?}: {run:?}");
+        assert_printable(printed(&run).0);
+        assert_eq!(json_stdout(&run)[key], value, "{args:?}");
+    }
+
+    // Each answer and interrupt carried the id as T3 sent it.
+    let sent = commands.lock().unwrap().clone();
+    let ids: Vec<(&str, &str)> = sent
+        .iter()
+        .map(|command| {
+            let key = match command["type"].as_str() {
+                Some("run.interrupt") => "runId",
+                _ => "requestId",
+            };
+            (
+                command["type"].as_str().unwrap_or_default(),
+                command[key].as_str().unwrap_or_default(),
+            )
+        })
+        .collect();
+    let answer = ("runtime-request.respond", request_id);
+    let interrupt = ("run.interrupt", run_id);
+    assert_eq!(ids, [answer, answer, interrupt, interrupt]);
+}
+
+#[test]
+fn doctor_and_errors_print_server_text_without_control_characters() {
+    // A server on protocol 1 whose made-up version holds DEL, a C1 CSI and an Esc sequence.
+    let version = "0.0.0\u{9b}2J\u{7f}-test\u{1b}[1m";
+    let mut descriptor = protocol_2_descriptor();
+    descriptor["serverVersion"] = json!(version);
+    descriptor["orchestrationProtocolVersion"] = json!(1);
+    let (origin, _) = fake_server(descriptor);
+    let home = Home::new();
+    home.record_server(&origin);
+
+    // `doctor` prints each check's details as JSON with every control as an escape, as
+    // `--json` does.
+    let doctor = home.run(&["doctor"]);
+    assert_eq!(doctor.status.code(), Some(5), "{doctor:?}");
+    let (out, err) = printed(&doctor);
+    assert_printable(out);
+    let escaped = r#""version":"0.0.0\u009b2J\u007f-test\u001b[1m""#;
+    assert!(out.contains(escaped), "{out}");
+    assert_eq!(err, "");
+    let doctor = home.run(&["--json", "doctor"]);
+    assert_eq!(doctor.status.code(), Some(5), "{doctor:?}");
+    let server = &json_stdout(&doctor)["checks"]["server"];
+    assert_eq!(server["version"], version);
+
+    // An error that quotes the version prints it without its controls, and `--json` keeps
+    // them.
+    let threads = home.run(&["threads"]);
+    assert_eq!(threads.status.code(), Some(4), "{threads:?}");
+    let (out, err) = printed(&threads);
+    assert_eq!(out, "");
+    assert_printable(err);
+    let start = "t3term: T3 0.0.02J-test[1m runs orchestrator V1.";
+    assert!(err.starts_with(start), "{err}");
+    assert!(err.ends_with(" [T3_PROTOCOL_UNSUPPORTED]\n"), "{err}");
+    let threads = home.run(&["--json", "threads"]);
+    assert_error(&threads, 4, "T3_PROTOCOL_UNSUPPORTED");
+    let message = json_stdout(&threads)["error"]["message"].clone();
+    let raw = format!("T3 {version} runs orchestrator V1.");
+    assert!(
+        message.as_str().is_some_and(|m| m.starts_with(&raw)),
+        "{message}"
+    );
 }
 
 #[test]

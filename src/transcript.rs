@@ -1,5 +1,7 @@
 //! Turns projection items into display blocks. The CLI prints them; the TUI styles them.
 
+use std::borrow::Cow;
+
 use serde_json::Value;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
@@ -156,17 +158,44 @@ pub fn task_steps(list: &Value) -> Vec<TaskStep> {
 /// selectors aren't controls, so they stay.
 pub(crate) fn without_controls(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut chars = text.chars().peekable();
-    while let Some(c) = chars.next() {
+    push_without_controls(&mut out, text, false);
+    out
+}
+
+/// Appends `text` to `out` as `without_controls` writes it. A `\r` reads as a line break at
+/// once, and a `\n` just after one adds nothing. `after_cr` says whether the text before `text`
+/// ended with a `\r`, so a `\r\n` split between the two is still one line break.
+fn push_without_controls(out: &mut String, text: &str, mut after_cr: bool) {
+    for c in text.chars() {
         match c {
-            '\n' => out.push('\n'),
-            '\r' if chars.peek() == Some(&'\n') => {}
-            '\r' => out.push('\n'),
+            '\n' if after_cr => {}
+            '\n' | '\r' => out.push('\n'),
             c if c.is_control() && c.is_whitespace() => out.push(' '),
             c if c.is_control() => {}
             c => out.push(c),
         }
+        after_cr = c == '\r';
     }
+}
+
+/// `text` as the CLI prints it, which `without_controls` gives. Text with no control other
+/// than a line feed comes back as it is, without a copy.
+pub fn plain(text: &str) -> Cow<'_, str> {
+    if text.contains(|c: char| c.is_control() && c != '\n') {
+        Cow::Owned(without_controls(text))
+    } else {
+        Cow::Borrowed(text)
+    }
+}
+
+/// What the part of `text` from byte `start` adds to what `plain` gives for the part before
+/// it. `start` counts the bytes of `text` as T3 sent it and must fall between characters. Only
+/// the character before `start` is read, so a reply printed this way as it grows, from where
+/// the last update ended, prints in all what `plain` gives for the whole reply.
+pub fn plain_from(text: &str, start: usize) -> String {
+    let rest = &text[start..];
+    let mut out = String::with_capacity(rest.len());
+    push_without_controls(&mut out, rest, text[..start].ends_with('\r'));
     out
 }
 
@@ -1066,7 +1095,8 @@ pub fn blocks(state: &ThreadState) -> Vec<Block> {
         .collect()
 }
 
-/// Plain text for `threads read`.
+/// Plain text for `t3term read`. Each header and body prints as `plain` gives it, and a body
+/// is cleaned before it is split into lines, so a `\r` in it starts an indented line too.
 pub fn plain_text(state: &ThreadState, last: Option<usize>, include_reasoning: bool) -> String {
     let all: Vec<Block> = blocks(state)
         .into_iter()
@@ -1081,14 +1111,17 @@ pub fn plain_text(state: &ThreadState, last: Option<usize>, include_reasoning: b
             _ => "",
         };
         if marker.is_empty() {
-            out.push_str(&format!("  · {}\n", block.header));
+            out.push_str(&format!("  · {}\n", plain(&block.header)));
             if !block.body.is_empty() && block.kind != BlockKind::Tool {
-                for line in block.body.lines() {
+                for line in plain(&block.body).lines() {
                     out.push_str(&format!("    {line}\n"));
                 }
             }
         } else {
-            out.push_str(&format!("\n{marker}\n\n{}\n", block.body.trim_end()));
+            out.push_str(&format!(
+                "\n{marker}\n\n{}\n",
+                plain(&block.body).trim_end()
+            ));
         }
     }
     out
@@ -1241,6 +1274,54 @@ mod tests {
             .filter_map(|step| step["text"].as_str())
             .collect();
         assert_eq!(kept, raw);
+    }
+
+    #[test]
+    fn a_carriage_return_reads_as_one_line_break_and_cleaning_twice_changes_nothing() {
+        // A `\r\n`, a lone `\r`, a `\r` and a `\n` with an Esc between them, which stay two line
+        // breaks, and a `\r` before a `\r\n`.
+        let text = "a\r\nb\rc\r\u{1b}\nd\r\r\ne";
+        let cleaned = without_controls(text);
+        assert_eq!(cleaned, "a\nb\nc\n\nd\n\ne");
+        assert_eq!(without_controls(&cleaned), cleaned);
+        assert_eq!(plain(text), cleaned);
+    }
+
+    #[test]
+    fn plain_keeps_text_without_controls_as_it_is() {
+        // An accent, a joined emoji, a combining accent and a no-break space aren't controls.
+        let text = "Caf\u{e9} \u{1f469}\u{200d}\u{1f4bb} cafe\u{301}\u{a0}ok\nnext";
+        assert!(matches!(plain(text), Cow::Borrowed(kept) if kept == text));
+        assert_eq!(plain("a\tb\u{1b}[2J\u{9b}c"), "a b[2Jc");
+    }
+
+    #[test]
+    fn a_reply_printed_as_it_grows_prints_what_plain_gives_for_the_whole_reply() {
+        // Replies with Esc, BEL, DEL and two-byte C1 controls, each kind of line break and
+        // characters of up to four bytes. Each is cut at every two places between characters,
+        // as if T3 sent it in three updates. Where both cuts are at one place, an update
+        // repeats the one before it.
+        let replies = [
+            "Hel\u{1b}[2Jlo\r\nwor\u{9b}31mld\u{85}\u{e9}\u{1f469}\u{200d}\u{1f4bb}\r",
+            "a\r\r\n\u{7}\r\u{1b}\n\tb\u{7f}\u{9c}",
+            "\r\n\r\n\n\r",
+            "\u{1b}",
+        ];
+        for reply in replies {
+            let whole = plain(reply);
+            assert_eq!(without_controls(&whole), whole, "{reply:?}");
+            let cuts: Vec<usize> = (0..=reply.len())
+                .filter(|&cut| reply.is_char_boundary(cut))
+                .collect();
+            for (n, &first) in cuts.iter().enumerate() {
+                for &second in &cuts[n..] {
+                    let printed = plain_from(&reply[..first], 0)
+                        + &plain_from(&reply[..second], first)
+                        + &plain_from(reply, second);
+                    assert_eq!(printed, whole, "{reply:?} cut at {first} and {second}");
+                }
+            }
+        }
     }
 
     /// A `compaction` item as the nightly sends it (`OrchestrationV2TurnItem` in
