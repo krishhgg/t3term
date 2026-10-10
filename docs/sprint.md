@@ -37,8 +37,28 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 
 ## Maintenance review PRs
 
-None yet.
+| Pull request | Audit | What it does | Merge commit |
+|---|---|---|---|
+| https://github.com/krishhgg/t3term/pull/23 | 1 | A CI concurrency group for each push to master, Greptile rule scopes and context brought up to date, and CLI tests for exit codes 7, 1 and 6 | |
 
 ## Audits
 
-None yet. The first is due when sprint PR 10 merges.
+### Audit 1: sprint PRs 1 to 10
+
+Sprint PR 10, #17, merged at `19f5db9942bfa594d86dda463a0f50c60da76e39`. The audit covered #8 to #17, from `54a5850` to that commit. Astra and Claude Fable 5.1 each finished an audit on their own, and both recommended maintenance. Sol reconciled them. Sprint PRs 11 to 14, #18 to #21, were already prepared and merged on the user's explicit go-ahead. Sol checked master at `7ad958f` after them. CI passed, its tree matches the tested head of #21, `e15c522`, and all 277 tests, a release install and the no-server smoke test passed.
+
+| Finding | Found by | Outcome |
+|---|---|---|
+| `wait` and `send --wait` formatted a handoff they had already printed, and scanned its runs again, on every event | Astra | Fixed by #20, which describes an item only once it has settled and only if it hasn't printed. No change here |
+| The master ruleset required only the Greptile Review check | Astra and Fable | Sol changed [ruleset 24698953](https://github.com/krishhgg/t3term/rules/24698953) to require Greptile Review and macOS, and checked the result. Linux stays optional, a branch need not be up to date with master, and the ruleset's other rules, conditions, bypass actors and enforcement are unchanged |
+| GitHub cancelled pending master CI runs when a newer merge joined the same concurrency group | Fable | Fixed by #23. 10 of the 14 merge pushes from #8 to #21 were cancelled before any job started, the audit's checkpoint `19f5db9` among them. Sol found no untested merge. Each merged tree matched a PR head that CI had passed, and master at `7ad958f` passed |
+| Greptile's protocol-fidelity rule left out main.rs, transcript.rs and src/tui/, which read the nightly's fields. Its idle-cost rule left out main.rs and transcript.rs, where the CLI formats items on each event | Astra and Fable | Fixed by #23 |
+| `.greptile/files.json` called research/next-steps.md the agreed plan. It is the earlier proposal, and its CLI syntax never shipped | Astra and Fable | Fixed by #23. The context now gives README.md as the current commands, docs/parity.md as the pinned plan whose statuses are the baseline, docs/parity-inventory.md for the desktop's source, and this file for the process and what merged |
+| No CLI test reached exit 7 or 6 through a real wait, or exit 1 through a failed run | Fable | Fixed by #23 |
+| Plain CLI output still prints thread titles, messages and tool text from the server with their control characters, in `read`, `projects`, `threads` and the `wait` stream, through `transcript::plain_text` and `describe_plain`. Checklist steps, compaction summaries, handoff endpoints and edit file names are cleaned, and `--json` escapes everything. The gap predates the sprint, and #15 and #16 noted it | Fable | Open. It needs its own CLI cleanup maintenance PR after #23 |
+
+An older concern that the TUI's App couldn't be tested offline no longer holds, because #21 made offline App tests possible.
+
+The rest needed no change. The tests reach only fake servers on 127.0.0.1 and temporary homes. The workflow pins each action to a commit SHA, reads the repository with `contents: read` and needs no secrets. Rust stays pinned to 1.95.0. The release smoke test checks that `doctor --json` exits 5 with no server and prints exactly one JSON object. macOS stays the only supported platform, with Linux as an optional build. The existing regression tests for the sidebar, settings, scrolling, the tasks drawer and caches were enough. The audit added no benchmarks, test frameworks, media migration or nightly automation.
+
+14 sprint PRs have merged. The next audit is due when sprint PR 20 merges.
