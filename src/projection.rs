@@ -115,6 +115,8 @@ impl ThreadState {
                 };
                 if event_type.starts_with("thread.") {
                     self.projection.insert("thread".into(), payload);
+                } else if event_type == "provider-session.detached" {
+                    self.detach_session(&payload);
                 } else if let Some(key) = collection_for(&event_type) {
                     // Creating the list here would hide every item the snapshot sent only in turnItems.
                     if key == "turnItems" && self.projection.contains_key("visibleTurnItems") {
@@ -125,6 +127,23 @@ impl ThreadState {
                 Applied::Event(event_type)
             }
             _ => Applied::Ignored,
+        }
+    }
+
+    /// Drops the provider session a `provider-session.detached` event names, as the nightly's
+    /// reducer does (`packages/client-runtime/src/state/orchestrationV2Projection.ts:220`), so
+    /// its `lastError` no longer stands for the thread. A payload that names no session drops
+    /// none.
+    fn detach_session(&mut self, payload: &Value) {
+        let Some(id) = payload.get("providerSessionId") else {
+            return;
+        };
+        if let Some(sessions) = self
+            .projection
+            .get_mut("providerSessions")
+            .and_then(Value::as_array_mut)
+        {
+            sessions.retain(|session| session.get("id") != Some(id));
         }
     }
 
@@ -656,6 +675,44 @@ mod tests {
             .map(|t| t["id"].as_str().unwrap())
             .collect();
         assert_eq!(ids, vec!["t2"]);
+    }
+
+    #[test]
+    fn a_detached_provider_session_leaves_the_thread() {
+        let mut state = ThreadState::default();
+        state.apply(&snapshot());
+        let attach = |sequence, id: &str| {
+            let session = json!({"id": id, "providerInstanceId": "codex", "lastError": "boom"});
+            event(sequence, "provider-session.attached", session)
+        };
+        let detach = |sequence, payload| event(sequence, "provider-session.detached", payload);
+        let ids = |state: &ThreadState| {
+            state.projection["providerSessions"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|session| session["id"].as_str().unwrap_or_default().to_string())
+                .collect::<Vec<_>>()
+        };
+        state.apply(&attach(11, "s1"));
+        state.apply(&attach(12, "s2"));
+
+        assert_eq!(
+            state.apply(&detach(13, json!({"providerSessionId": "s1"}))),
+            Applied::Event("provider-session.detached".into())
+        );
+        assert_eq!(ids(&state), ["s2"]);
+        // The detach names the session rather than being one, so it never lands in the list.
+        state.apply(&detach(14, json!({"providerSessionId": "s9"})));
+        state.apply(&detach(15, json!({"threadId": "t1"})));
+        assert_eq!(ids(&state), ["s2"]);
+        assert_eq!(
+            state.apply(&detach(13, json!({"providerSessionId": "s2"}))),
+            Applied::Duplicate
+        );
+        assert_eq!(ids(&state), ["s2"]);
+        state.apply(&detach(16, json!({"providerSessionId": "s2"})));
+        assert!(ids(&state).is_empty());
     }
 
     #[test]

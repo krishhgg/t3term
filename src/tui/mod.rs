@@ -5,6 +5,7 @@
 //! labels and spinners advance, and a one-shot timer for the moment the soonest snooze ends,
 //! which no server event marks. An idle TUI uses no CPU.
 
+mod banner;
 mod composer;
 mod markdown;
 mod picker;
@@ -311,6 +312,8 @@ struct OpenThread {
     run_changes: HashMap<String, u64>,
     /// The transcript's blocks, which go with the thread when another one opens.
     prepared: Prepared,
+    /// The thread's error from T3, for the banner.
+    error: banner::Derived,
 }
 
 impl OpenThread {
@@ -323,6 +326,7 @@ impl OpenThread {
             answers: Default::default(),
             run_changes: HashMap::new(),
             prepared: Prepared::default(),
+            error: banner::Derived::default(),
         }
     }
 
@@ -344,6 +348,7 @@ impl OpenThread {
             .and_then(|run_id| state.run(run_id))
             .map(transcript::handoff_fields);
         let applied = state.apply(item);
+        self.error.note(&applied, item);
         match &applied {
             Applied::Synchronized => self.connection = "live".into(),
             Applied::Snapshot => self.prepared.mark(None),
@@ -409,6 +414,9 @@ struct App {
     drawn_plans: Vec<plan::Drawn>,
     /// The tasks drawer above the composer. Only this window keeps whether it is open.
     tasks: tasks::Drawer,
+    /// The thread error banner over the top of the conversation, with the errors dismissed
+    /// this session and the sends that failed.
+    banner: banner::Banner,
     /// The item at the top of the last frame and the row of it that was showing, so a block
     /// that grows under the reader doesn't move the text.
     anchor: Option<(String, usize)>,
@@ -667,6 +675,7 @@ impl App {
             expanded_plans: HashSet::new(),
             drawn_plans: Vec::new(),
             tasks: tasks::Drawer::default(),
+            banner: banner::Banner::default(),
             anchor: None,
             drawn_scroll: 0,
             verbose: settings.verbose,
@@ -733,6 +742,7 @@ impl App {
             }
         }
         self.follow_tasks();
+        self.follow_banner();
     }
 
     /// Brings the tasks drawer up to date with the open thread and its watch. It runs after
@@ -744,6 +754,25 @@ impl App {
             open.and_then(|open| open.state.as_ref()),
             open.is_some_and(|open| open.connection == "live"),
         );
+    }
+
+    /// Brings the error banner up to date with the open thread. It runs after each change to
+    /// the thread or to its send errors, and after the reader dismisses one, which can show
+    /// T3's own error from under a send error. It reads the error only after something that
+    /// can change it: an event for a run, a provider session, the thread or an error item, a
+    /// snapshot, a send error that came or went, or a dismissal. A thread just opened counts
+    /// too, as its error hasn't been read. Each piece of a streamed answer, a frame, and a key
+    /// that only opens or scrolls the banner leave the error unread, however long a provider
+    /// session made it.
+    fn follow_banner(&mut self) {
+        match self.open.as_mut() {
+            Some(open) if open.error.stale() || self.banner.stale() => {
+                let runtime = open.error.get(open.state.as_ref());
+                self.banner.follow(Some(&open.id), runtime);
+            }
+            Some(_) => {}
+            None => self.banner.follow(None, None),
+        }
     }
 
     /// Lays the sidebar's shelves out again from the shell, as of now.
@@ -919,7 +948,12 @@ impl App {
             return;
         }
         let events = self.client.watch_thread(&id, None);
-        self.open = Some(OpenThread::new(id, events));
+        self.open_thread(OpenThread::new(id, events));
+    }
+
+    /// Shows `open` in place of the thread that was open, as when one is picked in the sidebar.
+    fn open_thread(&mut self, open: OpenThread) {
+        self.open = Some(open);
         self.cache.clear();
         self.outputs.clear();
         self.open_bundles.clear();
@@ -928,6 +962,9 @@ impl App {
         self.drawn_plans.clear();
         // The thread has no state yet, so the drawer closes and drops the last thread's tasks.
         self.follow_tasks();
+        // The banner shows a send to this thread that failed, until the thread's own error
+        // comes with it.
+        self.follow_banner();
         self.scroll.set(0);
         self.picker = None;
         self.focus = Focus::Composer;
@@ -1040,6 +1077,13 @@ impl App {
                     self.toggle_sidebar();
                     return true;
                 }
+                // The banner lies over the transcript, so it takes what lands on it: a click on
+                // × dismisses it, a click elsewhere on it opens or closes its details, and the
+                // wheel scrolls them. Nothing reaches the rows under it.
+                if let Some(redraw) = self.banner.on_mouse(&mouse) {
+                    self.follow_banner();
+                    return redraw;
+                }
                 if let Some(redraw) = self.tasks.on_mouse(&mouse) {
                     return redraw;
                 }
@@ -1146,6 +1190,13 @@ impl App {
                     's' => "acceptForSession",
                     _ => "decline",
                 });
+                return;
+            }
+            // While an error banner shows, from any pane and over a menu: Alt+W dismisses it,
+            // Alt+I opens or closes its details, and Alt+↑/↓ scroll details too long to show.
+            // None of them reach the composer.
+            _ if self.banner.on_key(&key) => {
+                self.follow_banner();
                 return;
             }
             // Scroll a request panel too long to show at once.
@@ -1397,6 +1448,10 @@ impl App {
                         }
                     }
                 }
+                // The thread's banner shows the error, as the desktop's does, and keeps it
+                // after the toast goes, until the next send to that thread.
+                self.banner
+                    .failed(&thread_id, error.clone(), message_id.clone());
                 let message = Failed {
                     thread_id: thread_id.clone(),
                     message_id: Some(message_id),
@@ -1405,6 +1460,7 @@ impl App {
                 self.give_back(&thread_id, message, error);
                 // The thread may have shown the message before this result arrived.
                 self.drop_landed();
+                self.follow_banner();
             }
         }
     }
@@ -1424,6 +1480,8 @@ impl App {
         {
             self.message = Some(note);
         }
+        // A send that failed but reached T3 anyway is no error to show.
+        self.banner.landed(&open.id, |id| state.has_message(id));
     }
 
     /// Puts a failed message back in the composer. If the composer holds other text, or the
@@ -1768,6 +1826,10 @@ impl App {
         }
         self.composer.clear();
         self.unsent.forget_composer();
+        // A new send clears the last one's error, as the desktop's does. If this one fails
+        // too, its error takes the place.
+        self.banner.clear_local(&thread_id);
+        self.follow_banner();
         self.scroll.set(0);
         // As in the desktop app, ultrathink applies to one message. This send takes it out of
         // the draft now, so a second message sent before this one lands doesn't reuse it.
@@ -1970,6 +2032,8 @@ impl App {
         );
         self.transcript_area = body;
         self.draw_transcript(frame, body);
+        // Over the transcript's top rows, which keep their place under it.
+        self.banner.draw(frame, body, &self.theme);
         self.panel_area = panel_area;
         if !panel.is_empty() {
             self.draw_request_panel(frame, panel_area, panel);
@@ -4027,6 +4091,7 @@ mod tests {
             answers: serde_json::Map::new(),
             run_changes: HashMap::new(),
             prepared: Prepared::default(),
+            error: banner::Derived::default(),
         };
 
         // A working card on screen ticks by itself, even past a closed watch.
@@ -5799,5 +5864,654 @@ mod tests {
         app.verbose = true;
         let rows = screen(&mut app, 120, 30);
         assert_eq!(count(&rows, "String to replace not found"), 1);
+    }
+
+    // ---- the thread error banner ----
+
+    /// Twenty answers long enough to wrap to a different height at each width.
+    fn answers() -> Vec<Value> {
+        (0..20)
+            .map(|i| {
+                json!({
+                    "id": format!("a{i}"),
+                    "type": "assistant_message",
+                    "ordinal": i,
+                    "text": format!("Answer {i}: {}", "word ".repeat(60)),
+                })
+            })
+            .collect()
+    }
+
+    /// The Codex provider session, with `last_error`.
+    fn codex_session(last_error: Value) -> Value {
+        json!({"id": "s1", "providerInstanceId": "codex", "lastError": last_error})
+    }
+
+    /// A snapshot of thread `id` on Codex with a provider thread, so the Codex session's
+    /// `lastError`, when it has one, is the thread's error. Twenty answers fill the transcript,
+    /// and `more` adds to the projection or replaces its lists.
+    fn codex_snapshot(id: &str, last_error: Option<&str>, more: Value) -> Value {
+        let sessions: Vec<Value> = last_error
+            .map(|error| codex_session(json!(error)))
+            .into_iter()
+            .collect();
+        let mut projection = json!({
+            "thread": {"id": id, "providerInstanceId": "codex", "activeProviderThreadId": "pt"},
+            "turnItems": answers(),
+            "providerSessions": sessions,
+        });
+        if let (Some(projection), Value::Object(more)) = (projection.as_object_mut(), more) {
+            projection.extend(more);
+        }
+        json!({"kind": "snapshot", "snapshotSequence": 1, "projection": projection})
+    }
+
+    /// Thread `id`, open and live as `codex_snapshot` has it.
+    fn codex_thread(id: &str, last_error: Option<&str>, more: Value) -> OpenThread {
+        let snapshot = codex_snapshot(id, last_error, more);
+        let mut open = OpenThread::new(id.into(), mpsc::unbounded_channel().1);
+        assert_eq!(open.apply(&snapshot), Applied::Snapshot);
+        open.connection = "live".into();
+        open
+    }
+
+    /// A live event on the open thread, as its watch delivers it.
+    fn live(sequence: u64, kind: &str, payload: Value) -> WatchEvent {
+        let event = json!({"type": kind, "payload": payload});
+        let item = json!({"kind": "event", "sequence": sequence, "event": event});
+        WatchEvent::Item(item)
+    }
+
+    /// The Codex session's `lastError` changing to `error`.
+    fn session_error(sequence: u64, error: Value) -> WatchEvent {
+        live(sequence, "provider-session.updated", codex_session(error))
+    }
+
+    /// A send to `thread` that failed, as the send's task reports it.
+    fn send_failed(thread: &str, message_id: &str, text: &str) -> ActionResult {
+        ActionResult::SendFailed {
+            thread_id: thread.into(),
+            message_id: message_id.into(),
+            text: text.into(),
+            error: "T3 refused the message".into(),
+            reserved: Vec::new(),
+        }
+    }
+
+    /// Alt and a letter, as terminals also report Esc and a quick letter.
+    fn alt(app: &mut App, c: char) {
+        let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::ALT);
+        app.on_terminal_event(Event::Key(key));
+    }
+
+    /// Draws one frame as `screen` does and returns its cells.
+    fn cells(app: &mut App, width: u16, height: u16) -> ratatui::buffer::Buffer {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        let frame = terminal.draw(|frame| app.draw(frame)).unwrap();
+        frame.buffer.clone()
+    }
+
+    /// The text `buffer` holds in `area`, a line for each row.
+    fn text_in(buffer: &ratatui::buffer::Buffer, area: Rect) -> String {
+        (area.y..area.bottom())
+            .map(|y| {
+                (area.x..area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>()
+            })
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    /// Draws a frame and says whether it has a banner.
+    fn banner_shows(app: &mut App) -> bool {
+        screen(app, 120, 30);
+        app.banner.showing()
+    }
+
+    #[test]
+    fn an_error_comes_over_the_transcript_and_moves_none_of_it() {
+        let mut app = tui(&Settings::default());
+        app.open_thread(codex_thread("t", None, json!({})));
+        app.focus = Focus::Transcript;
+        app.scroll.set(12);
+        let before = cells(&mut app, 120, 30);
+        assert_eq!(app.banner.area, Rect::default(), "no error, no banner");
+        let (anchor, body) = (app.anchor.clone(), app.transcript_area);
+
+        app.on_thread_event(session_error(2, json!("Codex quit")));
+        let after = cells(&mut app, 120, 30);
+        let banner = app.banner.area;
+        assert_eq!(banner.intersection(body), banner);
+        assert_eq!(banner.y, body.y, "it covers the transcript's top rows");
+        let text = text_in(&after, banner);
+        assert!(text.contains("! Codex quit"), "{text}");
+        assert!(text.contains('×'), "{text}");
+        assert!(text.contains("Alt+W dismiss"), "{text}");
+        // The rest of the transcript is as it was, and the reader is where they were.
+        for y in body.y..body.bottom() {
+            for x in body.x..body.right() {
+                if !banner.contains(ratatui::layout::Position::new(x, y)) {
+                    assert_eq!(after[(x, y)], before[(x, y)], "({x}, {y})");
+                }
+            }
+        }
+        assert_eq!(app.anchor, anchor);
+        assert_eq!(app.scroll.rows(), 12);
+        assert_eq!(app.focus, Focus::Transcript);
+    }
+
+    #[test]
+    fn alt_w_or_a_click_on_the_close_button_dismisses_the_error_and_keeps_the_draft() {
+        let mut app = tui(&Settings::default());
+        app.open_thread(codex_thread("t", Some("Codex quit"), json!({})));
+        app.composer.insert_str("draft");
+        assert!(banner_shows(&mut app));
+
+        alt(&mut app, 'w');
+        let rows = screen(&mut app, 120, 30);
+        assert_eq!(app.banner.area, Rect::default());
+        assert!(rows.iter().all(|row| !row.contains("Alt+W dismiss")));
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(app.composer.text(), "draft", "the key typed nothing");
+        // Nothing went to T3. The thread's session still has the error.
+        let state = app.open.as_ref().unwrap().state.as_ref().unwrap();
+        assert_eq!(state.list("providerSessions")[0]["lastError"], "Codex quit");
+        // With no banner, Alt+W types nothing either.
+        alt(&mut app, 'w');
+        assert_eq!(app.composer.text(), "draft");
+
+        // A new error shows. A w without Alt is the composer's.
+        app.on_thread_event(session_error(2, json!("Codex quit again")));
+        press(&mut app, KeyCode::Char('w'));
+        assert!(banner_shows(&mut app));
+        assert_eq!(app.composer.text(), "draftw");
+
+        // A click on × dismisses it. Focus stays in the composer, where a click on the
+        // transcript would have moved it.
+        let close = app.banner.close;
+        assert!(mouse(&mut app, CLICK, close.x + 1, close.y));
+        assert!(!banner_shows(&mut app));
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(app.composer.text(), "draftw");
+    }
+
+    #[test]
+    fn a_click_on_a_long_error_opens_it_and_alt_i_closes_it() {
+        let mut app = tui(&Settings::default());
+        let long = "the provider sent more than fits ".repeat(30);
+        let long = format!("Codex quit: {long}");
+        app.open_thread(codex_thread("t", Some(&long), json!({})));
+        let buffer = cells(&mut app, 120, 30);
+        let closed = app.banner.area;
+        assert_eq!(closed.height, 5, "three rows and the border");
+        let text = text_in(&buffer, closed);
+        assert!(text.contains('…'), "{text}");
+        assert!(text.contains("Alt+I more · Alt+W dismiss"), "{text}");
+        // The wheel over a closed error scrolls the transcript under it.
+        let (x, y) = (closed.x + 2, closed.y + 2);
+        assert!(mouse(&mut app, MouseEventKind::ScrollUp, x, y));
+        assert_eq!(app.scroll.rows(), 3);
+
+        // A click on its text opens it, and focus stays in the composer.
+        assert!(mouse(&mut app, CLICK, x, y));
+        let buffer = cells(&mut app, 120, 30);
+        let open = app.banner.area;
+        assert!(open.height > closed.height, "{open:?}");
+        assert_eq!(open.intersection(app.transcript_area), open);
+        assert!(text_in(&buffer, open).contains("Alt+I less"));
+        assert_eq!(app.focus, Focus::Composer);
+        // Alt+I closes it, and types nothing.
+        alt(&mut app, 'i');
+        screen(&mut app, 120, 30);
+        assert_eq!(app.banner.area, closed);
+        assert_eq!(app.composer.text(), "");
+        assert_eq!(app.scroll.rows(), 3);
+    }
+
+    #[test]
+    fn a_click_on_the_banner_never_reaches_the_row_under_it() {
+        let call = |id: &str, ordinal: u64| {
+            json!({"id": id, "runId": "r1", "type": "command_execution", "ordinal": ordinal,
+                "status": "completed", "title": null, "input": "cargo check", "exitCode": 0})
+        };
+        let mut items = answers();
+        items[10] = call("c1", 10);
+        items[11] = call("c2", 11);
+        let mut app = tui(&Settings::default());
+        let open = codex_thread("t", Some("Codex quit"), json!({"turnItems": items}));
+        app.open_thread(open);
+        // Scroll until the calls' row is under the banner.
+        let mut under = None;
+        for rows in 0..400 {
+            app.scroll.set(rows);
+            screen(&mut app, 120, 30);
+            let banner = app.banner.area;
+            under = app
+                .bundle_rows
+                .iter()
+                .find(|(y, _)| (banner.y..banner.bottom()).contains(y))
+                .map(|(y, _)| *y);
+            if under.is_some() {
+                break;
+            }
+        }
+        let y = under.expect("a scroll puts the calls' row under the banner");
+        let (banner, scrolled) = (app.banner.area, app.scroll.rows());
+
+        // A short error has nothing to open, so the click does nothing at all.
+        assert!(!mouse(&mut app, CLICK, banner.x + 1, y));
+        assert!(app.open_bundles.is_empty());
+        assert_eq!(app.focus, Focus::Composer);
+        screen(&mut app, 120, 30);
+        assert_eq!((app.banner.area, app.scroll.rows()), (banner, scrolled));
+        // Beside the banner, the same row opens the calls.
+        let x = app.transcript_area.x;
+        assert!(mouse(&mut app, CLICK, x, y));
+        assert!(!app.open_bundles.is_empty());
+    }
+
+    #[test]
+    fn a_dismissed_error_stays_hidden_on_its_thread_and_shows_on_another() {
+        let mut app = tui(&Settings::default());
+        app.open_thread(codex_thread("a", Some("Codex quit"), json!({})));
+        assert!(banner_shows(&mut app));
+        alt(&mut app, 'w');
+        assert!(!banner_shows(&mut app));
+        // Another thread with the same error shows it.
+        app.open_thread(codex_thread("b", Some("Codex quit"), json!({})));
+        assert!(banner_shows(&mut app));
+        // Back on the first, the error stays dismissed, as it does through a reconnect's
+        // snapshot and a replayed event.
+        app.open_thread(codex_thread("a", Some("Codex quit"), json!({})));
+        assert!(!banner_shows(&mut app));
+        let snapshot = codex_snapshot("a", Some("Codex quit"), json!({}));
+        app.on_thread_event(WatchEvent::Item(snapshot));
+        app.on_thread_event(session_error(2, json!("Codex quit")));
+        app.on_thread_event(session_error(2, json!("Codex quit")));
+        assert!(!banner_shows(&mut app));
+
+        // A different error shows.
+        app.on_thread_event(session_error(3, json!("Codex lost its connection")));
+        assert!(banner_shows(&mut app));
+        // An error that clears, or isn't text, hides it.
+        let errors = [
+            (4, Value::Null),
+            (5, json!(7)),
+            (6, json!("")),
+            (7, json!(" ")),
+        ];
+        for (sequence, error) in errors {
+            app.on_thread_event(session_error(sequence, error));
+            assert!(!banner_shows(&mut app), "{sequence}");
+        }
+        // A detached session's error no longer stands for the thread.
+        app.on_thread_event(session_error(8, json!("Codex lost its connection")));
+        assert!(banner_shows(&mut app));
+        let detach = json!({"providerSessionId": "s1"});
+        app.on_thread_event(live(9, "provider-session.detached", detach));
+        assert!(!banner_shows(&mut app));
+    }
+
+    #[test]
+    fn a_failed_run_shows_its_error_until_a_new_run_starts() {
+        let run = |id: &str, ordinal: u64, status: &str| {
+            let root = format!("{id}-n");
+            json!({"id": id, "ordinal": ordinal, "status": status, "rootNodeId": root})
+        };
+        let error = |class: &str| {
+            let failure = json!({"message": "You hit the usage limit", "class": class});
+            json!({"id": "e1", "type": "error", "status": "failed", "ordinal": 20, "runId": "r1",
+                "nodeId": "r1-n", "failure": failure})
+        };
+        let mut app = tui(&Settings::default());
+        app.open_thread(codex_thread("t", None, json!({})));
+        app.on_thread_event(live(2, "run.created", run("r1", 1, "running")));
+        app.on_thread_event(live(3, "turn-item.updated", error("provider_error")));
+        assert!(!banner_shows(&mut app), "the run hasn't failed yet");
+
+        app.on_thread_event(live(4, "run.updated", run("r1", 1, "failed")));
+        let buffer = cells(&mut app, 120, 30);
+        let banner = app.banner.area;
+        assert!(text_in(&buffer, banner).contains("You hit the usage limit"));
+        assert_eq!(buffer[(banner.x, banner.y)].fg, app.theme.error);
+
+        // A usage limit is a warning, and stays the thread's outcome while a new run waits.
+        app.on_thread_event(live(5, "turn-item.updated", error("usage_limit")));
+        app.on_thread_event(live(6, "run.created", run("r2", 2, "queued")));
+        let buffer = cells(&mut app, 120, 30);
+        let banner = app.banner.area;
+        assert!(text_in(&buffer, banner).contains("You hit the usage limit"));
+        assert_eq!(buffer[(banner.x, banner.y)].fg, app.theme.warning);
+        // Once the new run starts, the error is behind it.
+        app.on_thread_event(live(7, "run.updated", run("r2", 2, "running")));
+        assert!(!banner_shows(&mut app));
+    }
+
+    #[test]
+    fn a_failed_send_shows_on_its_thread_and_the_message_comes_back() {
+        let mut app = tui(&Settings::default());
+        app.open_thread(codex_thread("a", None, json!({})));
+        app.on_action_result(send_failed("a", "m1", "hello"));
+        let buffer = cells(&mut app, 120, 30);
+        let text = text_in(&buffer, app.banner.area);
+        assert!(text.contains("T3 refused the message"), "{text}");
+        // The message comes back to the composer, and the toast says why, as before.
+        assert_eq!(app.composer.text(), "hello");
+        let toast = app.message.clone().map(|(text, _)| text);
+        assert_eq!(toast.as_deref(), Some("T3 refused the message"));
+        // The toast goes with the next key. The banner stays until it is dismissed.
+        press(&mut app, KeyCode::End);
+        assert!(banner_shows(&mut app));
+        assert!(app.message.is_none());
+        alt(&mut app, 'w');
+        assert!(!banner_shows(&mut app));
+        assert_eq!(app.composer.text(), "hello", "kept for a retry");
+    }
+
+    #[test]
+    fn a_send_that_fails_after_the_reader_moves_on_waits_for_its_thread() {
+        let mut app = tui(&Settings::default());
+        app.open_thread(codex_thread("b", None, json!({})));
+        app.composer.insert_str("draft for b");
+        app.on_action_result(send_failed("a", "m1", "hello a"));
+        assert!(!banner_shows(&mut app), "the error is a's");
+        assert_eq!(app.composer.text(), "draft for b");
+        assert!(app.unsent.has_saved("a"));
+        let toast = app.message.clone().unwrap_or_default().0;
+        assert!(toast.contains("Ctrl+R in its thread"), "{toast}");
+
+        // On its thread the banner shows it, and Ctrl+R swaps the message with the draft.
+        app.open_thread(codex_thread("a", None, json!({})));
+        let buffer = cells(&mut app, 120, 30);
+        let text = text_in(&buffer, app.banner.area);
+        assert!(text.contains("T3 refused the message"), "{text}");
+        assert_eq!(app.composer.text(), "draft for b");
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        app.on_terminal_event(Event::Key(ctrl_r));
+        assert_eq!(app.composer.text(), "hello a");
+        assert!(app.unsent.has_saved("a"), "the draft waits in its place");
+        // Away and back, it is still there.
+        app.open_thread(codex_thread("b", None, json!({})));
+        assert!(!banner_shows(&mut app));
+        app.open_thread(codex_thread("a", None, json!({})));
+        assert!(banner_shows(&mut app));
+
+        // The message reached T3 after all, so its error goes.
+        let message = json!({"id": "m1", "role": "user", "text": "hello a"});
+        app.on_thread_event(live(2, "message.updated", message));
+        assert!(!banner_shows(&mut app));
+    }
+
+    #[test]
+    fn a_send_error_stands_before_the_threads_own_until_it_is_dismissed() {
+        let mut app = tui(&Settings::default());
+        app.open_thread(codex_thread("t", Some("Codex quit"), json!({})));
+        app.on_action_result(send_failed("t", "m1", "hello"));
+        let buffer = cells(&mut app, 120, 30);
+        let text = text_in(&buffer, app.banner.area);
+        assert!(text.contains("T3 refused the message"), "{text}");
+        assert!(!text.contains("Codex quit"), "{text}");
+        // Dismissing the send's error shows the thread's own.
+        alt(&mut app, 'w');
+        let buffer = cells(&mut app, 120, 30);
+        assert!(text_in(&buffer, app.banner.area).contains("Codex quit"));
+        alt(&mut app, 'w');
+        assert!(!banner_shows(&mut app));
+    }
+
+    #[test]
+    fn an_open_menu_takes_the_first_click_and_the_banners_keys_still_work() {
+        let mut app = tui(&Settings::default());
+        app.open_thread(codex_thread("t", Some("Codex quit"), json!({})));
+        app.picker = Some(mode_menu());
+        screen(&mut app, 120, 30);
+        let close = app.banner.close;
+        let on_close = ratatui::layout::Position::new(close.x + 1, close.y);
+        assert!(!app.picker_area.contains(on_close), "the menu covers ×");
+        assert!(mouse(&mut app, CLICK, on_close.x, on_close.y));
+        assert!(app.picker.is_none());
+        assert!(banner_shows(&mut app), "the click only closed the menu");
+
+        app.picker = Some(mode_menu());
+        alt(&mut app, 'w');
+        assert!(app.picker.is_some(), "the menu stays open");
+        assert!(!banner_shows(&mut app));
+    }
+
+    #[test]
+    fn the_banner_keeps_to_the_transcript_beside_a_request_the_tasks_and_the_sidebar() {
+        let request = json!({"id": "q1", "kind": "command", "status": "pending"});
+        let request = json!({"runtimeRequests": [request]});
+        let steps = json!([
+            {"id": "s1", "text": "Read the code", "status": "completed"},
+            {"id": "s2", "text": "Fix the bug", "status": "running"},
+        ]);
+        let list = json!({"id": "l1", "threadId": "t", "runId": null, "nodeId": "n",
+            "kind": "todo_list", "status": "active", "steps": steps});
+        let tasks = json!({"plans": [list]});
+        for (more, panel) in [(request, true), (tasks, false)] {
+            let mut app = tui(&Settings::default());
+            app.open_thread(codex_thread("t", Some("Codex quit"), more));
+            for (width, height) in [(120, 30), (60, 16), (40, 12)] {
+                screen(&mut app, width, height);
+                let banner = app.banner.area;
+                let other = if panel {
+                    app.panel_area
+                } else {
+                    app.tasks.area
+                };
+                if width == 120 {
+                    assert!(banner.height > 0 && other.height > 0, "{other:?}");
+                }
+                if banner.is_empty() {
+                    continue;
+                }
+                assert_eq!(banner.intersection(app.transcript_area), banner);
+                let drawn = [
+                    other,
+                    app.composer_area,
+                    app.sidebar.list,
+                    app.sidebar_toggle,
+                ];
+                for area in drawn {
+                    assert!(!banner.intersects(area), "{width}x{height}: {area:?}");
+                }
+            }
+            screen(&mut app, 120, 30);
+            if panel {
+                // A closed banner leaves Alt+↓ to the request panel.
+                let down = KeyEvent::new(KeyCode::Down, KeyModifiers::ALT);
+                app.on_terminal_event(Event::Key(down));
+                assert_eq!(app.panel_scroll, 1);
+            } else {
+                // Alt+T is still the drawer's.
+                alt(&mut app, 't');
+                assert!(app.tasks.open);
+            }
+            assert!(banner_shows(&mut app));
+            assert_eq!(app.composer.text(), "");
+        }
+    }
+
+    #[test]
+    fn any_screen_size_draws_the_banner_inside_the_transcript() {
+        let error = format!(
+            "{}\n\u{1b}[31m{}\u{1b}[0m\t👩‍💻 e\u{301}\r\n{}",
+            "界".repeat(200),
+            "a line that goes on ".repeat(30),
+            "x".repeat(5000)
+        );
+        let small = [(0, 0), (1, 1), (10, 5), (19, 3), (26, 4), (40, 8)];
+        // Growing, then shrinking, so nothing from a larger frame is left behind.
+        let large = [(80, 24), (200, 60), (26, 4), (80, 24)];
+        let sizes = small.into_iter().chain(large);
+        for hidden in [false, true] {
+            let settings = Settings {
+                sidebar_hidden: hidden,
+                ..Settings::default()
+            };
+            let mut app = tui(&settings);
+            app.open_thread(codex_thread("t", Some(&error), json!({})));
+            app.composer.insert_str("a draft that wraps when narrow");
+            let mut opened = false;
+            for (width, height) in sizes.clone() {
+                for _ in 0..2 {
+                    let buffer = cells(&mut app, width, height);
+                    let (banner, close) = (app.banner.area, app.banner.close);
+                    if banner.is_empty() {
+                        assert_eq!(close, Rect::default(), "{width}x{height}");
+                        continue;
+                    }
+                    let body = app.transcript_area;
+                    assert_eq!(banner.intersection(body), banner, "{width}x{height}");
+                    assert_eq!(close.intersection(banner), close, "{width}x{height}");
+                    assert!(text_in(&buffer, close).contains('×'), "{width}x{height}");
+                    // Closed, it takes at most half the transcript. Open, it may take all of it.
+                    let half = (body.height / 2).max(1);
+                    assert!(opened || banner.height <= half, "{width}x{height}");
+                    let printable = |c: char| c == '\n' || !c.is_control();
+                    let text = text_in(&buffer, banner);
+                    assert!(text.chars().all(printable), "{text:?}");
+                    if !opened && width >= 80 {
+                        alt(&mut app, 'i');
+                        opened = true;
+                    }
+                }
+            }
+            assert!(opened);
+            assert_eq!(app.composer.text(), "a draft that wraps when narrow");
+        }
+    }
+
+    /// How many times the thread's error was worked out, the banner followed the thread, and
+    /// the banner took up an error it didn't have, which looks it up among those dismissed and
+    /// cleans its text.
+    fn banner_work(app: &App) -> (usize, usize, usize) {
+        let derives = app.open.as_ref().map_or(0, |open| open.error.derives);
+        (derives, app.banner.follows, app.banner.reads)
+    }
+
+    /// `pieces` updates of one answer in run r1, from `sequence` on, with a frame after each.
+    fn stream(app: &mut App, sequence: u64, pieces: u64) {
+        for piece in 0..pieces {
+            let text = format!("Answer: {}", "word ".repeat(piece as usize));
+            let answer = json!({"id": "streamed", "type": "assistant_message", "runId": "r1",
+                "ordinal": 30, "text": text});
+            app.on_thread_event(live(sequence + piece, "turn-item.updated", answer));
+            screen(app, 120, 30);
+        }
+    }
+
+    #[test]
+    fn a_streamed_answer_never_reads_the_threads_error_again() {
+        // A provider session's error has no limit. This one is over a megabyte, of which the
+        // banner prints 4,096 bytes.
+        let long = format!("Codex quit: {}", "the provider said more ".repeat(50_000));
+        let mut app = tui(&Settings::default());
+        app.open_thread(codex_thread("t", Some(&long), json!({})));
+        // The thread just opened, so its error is read once.
+        assert!(banner_shows(&mut app));
+        assert_eq!(banner_work(&app), (1, 1, 1));
+        // A run event works the thread's error out again, and the banner only compares it.
+        let run = json!({"id": "r1", "ordinal": 1, "status": "running", "rootNodeId": "r1-n"});
+        app.on_thread_event(live(2, "run.created", run.clone()));
+        assert_eq!(banner_work(&app), (2, 2, 1));
+
+        // An answer streams in a hundred pieces with a frame after each, a message lands, the
+        // watch reconnects, and the reader opens and scrolls the error. None of it reads it.
+        stream(&mut app, 3, 100);
+        let message = json!({"id": "m9", "role": "user", "text": "hello"});
+        app.on_thread_event(live(103, "message.updated", message));
+        app.on_thread_event(WatchEvent::Reconnecting {
+            reason: "socket closed".into(),
+            retry_in: Duration::from_secs(1),
+        });
+        alt(&mut app, 'i');
+        screen(&mut app, 120, 30);
+        let down = KeyEvent::new(KeyCode::Down, KeyModifiers::ALT);
+        app.on_terminal_event(Event::Key(down));
+        let rows = screen(&mut app, 120, 30);
+        assert!(rows.iter().any(|row| row.contains("Lines 2-")), "{rows:#?}");
+        assert_eq!(banner_work(&app), (2, 2, 1));
+
+        // A blank error, or one of control characters only, shows nothing. The banner takes it
+        // up once, and neither the answer going on nor another run event takes it up again.
+        let blank = " \t\u{1b}\u{7}\r\n".repeat(100_000);
+        app.on_thread_event(session_error(104, json!(blank)));
+        assert!(!banner_shows(&mut app));
+        assert_eq!(banner_work(&app), (3, 3, 2));
+        stream(&mut app, 105, 100);
+        assert_eq!(banner_work(&app), (3, 3, 2));
+        app.on_thread_event(live(205, "run.updated", run));
+        assert!(!banner_shows(&mut app));
+        assert_eq!(banner_work(&app), (4, 4, 2));
+
+        // The long error again, which the reader dismisses. It stays dismissed when T3 sends it
+        // again, and an error that differs from it only past what the banner prints shows.
+        app.on_thread_event(session_error(206, json!(long)));
+        assert!(banner_shows(&mut app));
+        assert_eq!(banner_work(&app), (5, 5, 3));
+        alt(&mut app, 'w');
+        assert!(!banner_shows(&mut app));
+        // The dismissal follows the thread again, which only compares the error.
+        assert_eq!(banner_work(&app), (5, 6, 3));
+        stream(&mut app, 207, 20);
+        app.on_thread_event(session_error(227, json!(long)));
+        assert!(!banner_shows(&mut app));
+        assert_eq!(banner_work(&app), (6, 7, 3));
+        let tail = format!("{long} and one more line");
+        app.on_thread_event(session_error(228, json!(tail)));
+        assert!(banner_shows(&mut app));
+        assert_eq!(banner_work(&app), (7, 8, 4));
+
+        // A reconnect's snapshot reads the thread again and keeps the banner as it was.
+        let snapshot = codex_snapshot("t", Some(&tail), json!({}));
+        app.on_thread_event(WatchEvent::Item(snapshot));
+        assert!(banner_shows(&mut app));
+        assert_eq!(banner_work(&app), (8, 9, 4));
+    }
+
+    #[test]
+    fn a_new_send_drops_the_last_ones_error() {
+        // Enter spawns the send on this runtime, which never runs it, so nothing connects.
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        let _entered = runtime.enter();
+        let mut app = tui(&Settings::default());
+        app.open_thread(codex_thread("t", Some("Codex quit"), json!({})));
+        app.on_action_result(send_failed("t", "m1", "hello"));
+        let buffer = cells(&mut app, 120, 30);
+        let text = text_in(&buffer, app.banner.area);
+        assert!(text.contains("T3 refused the message"), "{text}");
+        assert_eq!(app.composer.text(), "hello");
+
+        // Sending it again drops its error, and the thread's own shows until this send fails
+        // too.
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.composer.text(), "");
+        let buffer = cells(&mut app, 120, 30);
+        let text = text_in(&buffer, app.banner.area);
+        assert!(text.contains("Codex quit"), "{text}");
+        app.on_action_result(send_failed("t", "m2", "hello"));
+        let buffer = cells(&mut app, 120, 30);
+        let text = text_in(&buffer, app.banner.area);
+        assert!(text.contains("T3 refused the message"), "{text}");
+        assert_eq!(app.composer.text(), "hello");
+
+        // Once the send's error is dismissed, the next send has none to drop, so the banner
+        // keeps the thread's own without reading it again.
+        alt(&mut app, 'w');
+        let buffer = cells(&mut app, 120, 30);
+        assert!(text_in(&buffer, app.banner.area).contains("Codex quit"));
+        let before = banner_work(&app);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.composer.text(), "");
+        assert!(banner_shows(&mut app));
+        assert_eq!(banner_work(&app), before);
     }
 }

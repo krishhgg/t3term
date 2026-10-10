@@ -154,7 +154,7 @@ pub fn task_steps(list: &Value) -> Vec<TaskStep> {
 /// text reads as a space, and every other control, C0, DEL or C1, is dropped. What a sequence
 /// leaves behind, such as `[2J`, is plain text. Combining marks, joiners and variation
 /// selectors aren't controls, so they stay.
-fn without_controls(text: &str) -> String {
+pub(crate) fn without_controls(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut chars = text.chars().peekable();
     while let Some(c) = chars.next() {
