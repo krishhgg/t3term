@@ -41,6 +41,11 @@ pub struct Settings {
     /// on the heading save it. The desktop keeps its own in the browser's storage, so this key
     /// is t3term's.
     pub sidebar_working_shelf_expanded: bool,
+    /// Whether the main sidebar is hidden. Ctrl+B and the toggle at the top left of the
+    /// conversation save it. The desktop writes its choice to a cookie that it never reads back,
+    /// so it opens with the sidebar shown each time, and this key is t3term's. A file without it
+    /// shows the sidebar.
+    pub sidebar_hidden: bool,
 }
 
 fn path() -> PathBuf {
@@ -189,7 +194,21 @@ impl Queue {
     }
 }
 
+#[cfg(not(test))]
 static QUEUE: Queue = Queue::new();
+
+#[cfg(test)]
+thread_local! {
+    /// What `update` has saved on this thread in a test build, starting from the defaults.
+    static SAVED_IN_TEST: std::cell::RefCell<Settings> =
+        std::cell::RefCell::new(Settings::default());
+}
+
+/// The settings `update` has saved on this thread in a test build.
+#[cfg(test)]
+pub(crate) fn saved_in_test() -> Settings {
+    SAVED_IN_TEST.with_borrow(Settings::clone)
+}
 
 impl Settings {
     /// The saved settings, or the defaults when there is no readable file.
@@ -201,9 +220,18 @@ impl Settings {
 
     /// Changes the saved settings on a blocking thread, ignoring a filesystem that won't take
     /// them. The caller does not wait: a preference is not worth a pause.
+    ///
+    /// A test build applies the change to `saved_in_test` instead, so a test that presses a key
+    /// the TUI saves never writes the user's file. The tests below save through `update_at`
+    /// and `Queue`, which take a path.
     pub fn update(change: impl FnOnce(&mut Settings) + Send + 'static) {
-        QUEUE.push(Box::new(change));
-        tokio::task::spawn_blocking(|| QUEUE.save(&path()));
+        #[cfg(test)]
+        SAVED_IN_TEST.with_borrow_mut(change);
+        #[cfg(not(test))]
+        {
+            QUEUE.push(Box::new(change));
+            tokio::task::spawn_blocking(|| QUEUE.save(&path()));
+        }
     }
 }
 
@@ -252,6 +280,7 @@ mod tests {
                 "planModeEnabled": true,
                 "sidebarWorkingShelfEnabled": false,
                 "sidebarWorkingShelfExpanded": false,
+                "sidebarHidden": false,
             })
         );
     }
@@ -299,6 +328,7 @@ mod tests {
                 plan_mode_enabled: true,
                 sidebar_working_shelf_enabled: true,
                 sidebar_working_shelf_expanded: true,
+                sidebar_hidden: false,
             }
         );
 
@@ -312,6 +342,74 @@ mod tests {
         assert_eq!(saved["sidebarWorkingShelfEnabled"], true);
         assert_eq!(saved["sidebarWorkingShelfExpanded"], false);
         assert_eq!(saved["planModeEnabled"], true);
+    }
+
+    #[test]
+    fn the_sidebar_starts_shown_and_its_key_is_t3terms() {
+        // A file from before the key, an empty one and one from a later version show it.
+        for raw in [
+            r#"{"verbose": true, "planModeEnabled": true}"#,
+            "{}",
+            r#"{"future": 3}"#,
+        ] {
+            let settings: Settings = serde_json::from_str(raw).unwrap();
+            assert!(!settings.sidebar_hidden, "{raw}");
+        }
+        assert!(!Settings::default().sidebar_hidden);
+        let hidden: Settings = serde_json::from_str(r#"{"sidebarHidden": true}"#).unwrap();
+        assert_eq!(
+            hidden,
+            Settings {
+                sidebar_hidden: true,
+                ..Settings::default()
+            }
+        );
+        let saved = serde_json::to_value(&hidden).unwrap();
+        assert_eq!(saved["sidebarHidden"], true);
+    }
+
+    #[test]
+    fn hiding_the_sidebar_keeps_the_other_settings() {
+        // Every other setting turned on by hand, then Ctrl+B pressed in the TUI.
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("settings.json");
+        let others = Settings {
+            verbose: true,
+            plan_mode_enabled: true,
+            sidebar_working_shelf_enabled: true,
+            sidebar_working_shelf_expanded: true,
+            sidebar_hidden: false,
+        };
+        std::fs::write(&path, serde_json::to_string(&others).unwrap()).unwrap();
+        update_at(&path, |settings| settings.sidebar_hidden = true).unwrap();
+        let hidden = Settings {
+            sidebar_hidden: true,
+            ..others
+        };
+        assert_eq!(read(&path), hidden);
+
+        // Ctrl+B twice more, showing it and hiding it, with the second press's thread started
+        // first. The first save takes both, in the order they were pressed.
+        let show: Change = Box::new(|settings: &mut Settings| settings.sidebar_hidden = false);
+        let hide: Change = Box::new(|settings: &mut Settings| settings.sidebar_hidden = true);
+        let queue = Queue::new();
+        queue.push(show);
+        queue.push(hide);
+        queue.save(&path);
+        queue.save(&path);
+        assert_eq!(read(&path), hidden, "the presses were saved out of order");
+
+        // Showing it again leaves the rest alone.
+        update_at(&path, |settings| settings.sidebar_hidden = false).unwrap();
+        assert_eq!(read(&path), others);
+    }
+
+    #[test]
+    fn an_update_in_a_test_build_stays_on_its_thread() {
+        Settings::update(|settings| settings.sidebar_hidden = true);
+        assert!(saved_in_test().sidebar_hidden);
+        let elsewhere = thread::spawn(saved_in_test).join().unwrap();
+        assert!(!elsewhere.sidebar_hidden, "another thread saw the change");
     }
 
     #[test]

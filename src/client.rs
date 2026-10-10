@@ -57,6 +57,29 @@ impl Client {
         })
     }
 
+    /// A client for tests of the TUI that never reach a server. It names a closed port on
+    /// 127.0.0.1 and holds no token, so a request that slips through fails at once.
+    #[cfg(test)]
+    pub(crate) fn offline() -> Client {
+        let runtime = Runtime {
+            origin: "http://127.0.0.1:9".into(),
+            t3_home: std::path::PathBuf::new(),
+            state_dir: None,
+            pid: None,
+            environment_id: "offline".into(),
+            label: None,
+            server_version: "0.0.0".into(),
+            protocol_version: Some(discovery::PROTOCOL_VERSION),
+            capabilities: json!({}),
+        };
+        Client {
+            api: Api::new(&runtime, ""),
+            runtime,
+            session: Session::offline(),
+            rpc: Mutex::new(None),
+        }
+    }
+
     pub fn login_source(&self) -> LoginSource {
         self.session.source
     }
