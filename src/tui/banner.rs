@@ -7,6 +7,9 @@
 //!
 //! The banner lies over the transcript's top rows, as the desktop's overlays the timeline, so
 //! an error that comes or goes doesn't move the text under it.
+//!
+//! `Card` draws it, and the provider status banner above it too, and `key_answer` and
+//! `mouse_answer` read what the reader asks of either.
 
 use std::collections::{HashMap, HashSet};
 
@@ -27,8 +30,9 @@ use crate::transcript::without_controls;
 
 /// The most of an error the banner prints, in bytes. A provider failure's message is at most
 /// 4,096 characters on the wire, but a provider session's `lastError` has no limit. Dismissal
-/// still goes by the whole error.
-const MAX_BYTES: usize = 4096;
+/// still goes by the whole error. The provider banner prints at most this much of its title
+/// and of its message.
+pub(super) const MAX_BYTES: usize = 4096;
 /// The widest the banner gets, in columns. The desktop's is `min(48rem, 100% - 2rem)`, and
 /// 48rem is 768px, 96 columns of 8px.
 const MAX_WIDTH: usize = 96;
@@ -277,12 +281,8 @@ struct Shown {
     /// Empty when it prints nothing, because the reader dismissed the error or nothing of it
     /// is left to print.
     text: String,
-    /// Whether the reader opened the whole error.
-    expanded: bool,
-    /// Rows the open error is scrolled down.
-    scroll: usize,
-    /// `text` wrapped at one width. Another width wraps it again.
-    rows: Option<Rows>,
+    /// Whether the reader opened the whole error, how far it is scrolled, and its rows.
+    card: Card,
 }
 
 impl Shown {
@@ -296,7 +296,324 @@ struct Rows {
     width: usize,
     /// The widest row, which the banner fits to.
     widest: usize,
+    /// How many of the rows, from the first, are the title's.
+    head: usize,
     rows: Vec<String>,
+}
+
+/// The letters that, with Alt, open a banner's text and dismiss the banner.
+#[derive(Debug, Clone, Copy)]
+pub(super) struct Keys {
+    pub more: char,
+    pub dismiss: char,
+}
+
+/// The thread error banner's keys: Alt+I opens the error and Alt+W dismisses it.
+const ERROR_KEYS: Keys = Keys {
+    more: 'I',
+    dismiss: 'W',
+};
+
+/// What a banner prints and how it looks, for one frame.
+pub(super) struct Look<'a> {
+    /// A bold title over the text, or empty for none.
+    pub title: &'a str,
+    /// The text, cleaned. Empty when the banner says nothing past its title.
+    pub text: &'a str,
+    /// Drawn in the warning color rather than the error color.
+    pub warning: bool,
+    /// The icon on the first row.
+    pub icon: char,
+    pub keys: Keys,
+}
+
+/// Where a frame drew a banner and its close button, for the mouse, and what it left out.
+/// Empty when it drew none.
+#[derive(Debug, Default, Clone, Copy)]
+pub(super) struct Drawn {
+    pub area: Rect,
+    pub close: Rect,
+    /// Whether the closed banner cut its text short.
+    pub clipped: bool,
+    /// Whether the open banner's text was too long for its rows, which is when it scrolls.
+    pub overflows: bool,
+}
+
+/// What the reader asked of a banner with a key or the mouse.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Answer {
+    Dismiss,
+    /// Open the whole text, or close it back to its first rows.
+    Toggle,
+    Scroll {
+        down: bool,
+    },
+    /// A click the banner takes so nothing under it gets it, and does nothing with.
+    Nothing,
+}
+
+/// A banner's answer to a key. Alt with `keys.dismiss` dismisses it, Alt with `keys.more`
+/// opens or closes its text, either case, and Alt+↑/↓ scroll open text too long for its rows.
+/// Plain keys and Ctrl+Alt aren't a banner's.
+pub(super) fn key_answer(key: &KeyEvent, keys: Keys, overflows: bool) -> Option<Answer> {
+    let modifiers = key.modifiers;
+    if !modifiers.contains(KeyModifiers::ALT) || modifiers.contains(KeyModifiers::CONTROL) {
+        return None;
+    }
+    match key.code {
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&keys.dismiss) => Some(Answer::Dismiss),
+        KeyCode::Char(c) if c.eq_ignore_ascii_case(&keys.more) => Some(Answer::Toggle),
+        KeyCode::Up if overflows => Some(Answer::Scroll { down: false }),
+        KeyCode::Down if overflows => Some(Answer::Scroll { down: true }),
+        _ => None,
+    }
+}
+
+/// A banner's answer to the mouse, where the last frame drew it as `drawn`. A click on ×
+/// dismisses it, and a click elsewhere on it opens or closes text that doesn't fit. The wheel
+/// scrolls open text too long for its rows, and otherwise the transcript under it. The banner
+/// takes its other clicks, so a row of calls or a plan under it doesn't open, and focus stays
+/// where it was. None for events outside the banner and wheel events it leaves to the
+/// transcript.
+pub(super) fn mouse_answer(mouse: &MouseEvent, drawn: Drawn, expanded: bool) -> Option<Answer> {
+    if !inside(drawn.area, mouse) {
+        return None;
+    }
+    Some(match mouse.kind {
+        MouseEventKind::Down(MouseButton::Left) if inside(drawn.close, mouse) => Answer::Dismiss,
+        MouseEventKind::Down(MouseButton::Left) if drawn.clipped || expanded => Answer::Toggle,
+        MouseEventKind::ScrollUp if drawn.overflows => Answer::Scroll { down: false },
+        MouseEventKind::ScrollDown if drawn.overflows => Answer::Scroll { down: true },
+        MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => return None,
+        _ => Answer::Nothing,
+    })
+}
+
+/// A banner's text as the reader left it: open or closed, how far open text is scrolled, and
+/// its rows wrapped for the last width drawn. The banner makes a new one for new text.
+#[derive(Debug, Default)]
+pub(super) struct Card {
+    /// Whether the reader opened the whole text.
+    pub expanded: bool,
+    /// Rows the open text is scrolled down.
+    scroll: usize,
+    /// The title and text wrapped at one width. Another width wraps them again.
+    rows: Option<Rows>,
+    /// How many times the text was wrapped, so the tests can tell what a frame did.
+    #[cfg(test)]
+    pub wraps: usize,
+}
+
+impl Card {
+    /// Opens the whole text, or closes it back to its first rows.
+    pub fn toggle(&mut self) {
+        self.expanded = !self.expanded;
+        self.scroll = 0;
+    }
+
+    /// Scrolls open text a row down or up. The next frame stops it at the end.
+    pub fn scroll(&mut self, down: bool) {
+        self.scroll = if down {
+            self.scroll + 1
+        } else {
+            self.scroll.saturating_sub(1)
+        };
+    }
+
+    /// Draws the banner over the top rows of `area`, in at most `limit` of them, centered and
+    /// as wide as its text up to `MAX_WIDTH`. A closed banner shows its title and at most three
+    /// rows of its text. An open one shows all it can and scrolls the rest. With three rows and
+    /// twelve columns to spare it has a border, which names its keys. With less, its rows go
+    /// straight on the transcript. The text wraps once for each width. With fewer than five
+    /// columns or no rows it draws nothing and returns an empty `Drawn`.
+    pub fn draw(
+        &mut self,
+        frame: &mut Frame,
+        area: Rect,
+        limit: usize,
+        theme: &Theme,
+        look: &Look,
+    ) -> Drawn {
+        let width = area.width as usize;
+        let limit = limit.min(area.height as usize);
+        // A column of the conversation shows on each side when there is room, as the
+        // desktop's `100% - 2rem` leaves.
+        let room = if width >= BORDER_MIN_WIDTH + 2 {
+            width - 2
+        } else {
+            width
+        }
+        .min(MAX_WIDTH);
+        if room < MIN_WIDTH || limit == 0 {
+            return Drawn::default();
+        }
+        let bordered = limit >= 3 && room >= BORDER_MIN_WIDTH;
+        // The border, a space inside it on each side, the icon and its space, and × with a
+        // space on its left. Without the border, the icon and × with one space each.
+        let frame_width = if bordered { 8 } else { 4 };
+        let text_width = room - frame_width;
+        if self.rows.as_ref().map(|rows| rows.width) != Some(text_width) {
+            #[cfg(test)]
+            {
+                self.wraps += 1;
+            }
+            let mut rows = if look.title.is_empty() {
+                Vec::new()
+            } else {
+                wrap(look.title, text_width)
+            };
+            let head = rows.len();
+            if !look.text.is_empty() {
+                rows.extend(wrap(look.text, text_width));
+            }
+            let widest = rows.iter().map(|row| row.width()).max().unwrap_or(0);
+            self.rows = Some(Rows {
+                width: text_width,
+                widest,
+                head,
+                rows,
+            });
+        }
+        let Some(rows) = self.rows.as_ref().filter(|rows| !rows.rows.is_empty()) else {
+            return Drawn::default();
+        };
+        let total = rows.rows.len();
+        let text_rows = if bordered { limit - 2 } else { limit };
+        let text_rows = if self.expanded {
+            text_rows
+        } else {
+            text_rows.min(rows.head + CLAMP)
+        };
+        // Never 0: there is a row of text, and room for one.
+        let visible = total.min(text_rows);
+        let overflows = total > visible;
+        self.scroll = if self.expanded {
+            self.scroll.min(total - visible)
+        } else {
+            0
+        };
+        let clipped = !self.expanded && overflows;
+
+        let (more, dismiss) = (look.keys.more, look.keys.dismiss);
+        let lines_label = format!(
+            "Lines {}-{} of {total}",
+            self.scroll + 1,
+            self.scroll + visible
+        );
+        let hints = match (self.expanded, overflows) {
+            (false, true) => vec![
+                format!("Alt+{more} more · Alt+{dismiss} dismiss"),
+                format!("Alt+{dismiss} dismiss"),
+                format!("Alt+{dismiss}"),
+            ],
+            (false, false) => vec![format!("Alt+{dismiss} dismiss"), format!("Alt+{dismiss}")],
+            (true, true) => vec![
+                format!("{lines_label} · Alt+↑/↓ · Alt+{more} less · Alt+{dismiss} dismiss"),
+                format!("{lines_label} · Alt+{more} less"),
+                lines_label,
+                format!("Alt+{dismiss}"),
+            ],
+            (true, false) => vec![
+                format!("Alt+{more} less · Alt+{dismiss} dismiss"),
+                format!("Alt+{dismiss} dismiss"),
+                format!("Alt+{dismiss}"),
+            ],
+        };
+        // The hint sits in the bottom border with a space on each side, between the corners.
+        let hint = hints
+            .into_iter()
+            .filter(|_| bordered)
+            .find(|hint| hint.width() + 4 <= room);
+        let banner_width = (rows.widest.min(text_width) + frame_width)
+            .max(hint.as_ref().map_or(0, |hint| hint.width() + 4))
+            .min(room);
+        let banner_height = visible + if bordered { 2 } else { 0 };
+        let rect = Rect::new(
+            area.x + ((width - banner_width) / 2) as u16,
+            area.y,
+            banner_width as u16,
+            banner_height as u16,
+        )
+        .intersection(area);
+
+        let (accent, icon_color) = if look.warning {
+            (theme.warning, theme.warning_fg)
+        } else {
+            (theme.error, theme.error_fg)
+        };
+        let muted = Style::new().fg(theme.muted);
+        let (inner, lead, close) = if bordered {
+            let inner = Rect {
+                x: rect.x + 1,
+                y: rect.y + 1,
+                width: rect.width.saturating_sub(2),
+                height: rect.height.saturating_sub(2),
+            };
+            (inner, format!(" {} ", look.icon), " × ")
+        } else {
+            (rect, format!("{} ", look.icon), " ×")
+        };
+        let inner_width = inner.width as usize;
+        let text_room = inner_width.saturating_sub(lead.width() + close.width());
+        let mut lines = Vec::with_capacity(visible);
+        for (index, text) in rows.rows[self.scroll..self.scroll + visible]
+            .iter()
+            .enumerate()
+        {
+            // The last row of closed text that goes on ends with …, as `line-clamp` does.
+            let text = if clipped && index + 1 == visible {
+                clip(&format!("{text}…"), text_room)
+            } else {
+                clip(text, text_room)
+            };
+            let text = if self.scroll + index < rows.head {
+                Span::styled(text, Style::new().add_modifier(Modifier::BOLD))
+            } else {
+                Span::raw(text)
+            };
+            let (left, right) = if index == 0 {
+                let icon = Span::styled(
+                    lead.clone(),
+                    Style::new().fg(icon_color).add_modifier(Modifier::BOLD),
+                );
+                let close = Span::styled(close.to_string(), muted);
+                (vec![icon, text], vec![close])
+            } else {
+                (vec![Span::raw(" ".repeat(lead.width())), text], Vec::new())
+            };
+            lines.push(row(left, right, inner_width));
+        }
+
+        frame.render_widget(Clear, rect);
+        let style = Style::new().fg(theme.fg).bg(theme.popover);
+        if bordered {
+            let mut block = Block::new()
+                .borders(Borders::ALL)
+                .border_type(BorderType::Rounded)
+                .border_style(Style::new().fg(accent))
+                .style(style);
+            if let Some(hint) = hint {
+                let hint = Line::styled(format!(" {hint} "), muted).right_aligned();
+                block = block.title_bottom(hint);
+            }
+            frame.render_widget(block, rect);
+        }
+        frame.render_widget(Paragraph::new(lines).style(style), inner);
+        let close_width = close.width() as u16;
+        let close = Rect::new(
+            (inner.x + inner.width).saturating_sub(close_width),
+            inner.y,
+            close_width,
+            1,
+        )
+        .intersection(inner);
+        Drawn {
+            area: rect,
+            close,
+            clipped,
+            overflows: self.expanded && overflows,
+        }
+    }
 }
 
 /// The banner's state for the session. Only this window keeps it: nothing goes to T3 or the
@@ -321,31 +638,45 @@ pub(super) struct Banner {
     /// Whether the last frame's open error was too long for its rows, which is when it
     /// scrolls.
     overflows: bool,
-    /// How many times the banner followed the thread, took up an error it didn't have, and
-    /// wrapped an error's text, so the tests can tell what a streamed answer or a frame did
-    /// from what the banner kept. Taking up an error looks it up among those dismissed and
-    /// cleans its text.
+    /// How many times the banner followed the thread and took up an error it didn't have, so
+    /// the tests can tell what a streamed answer or a frame did from what the banner kept.
+    /// Taking up an error looks it up among those dismissed and cleans its text.
     #[cfg(test)]
     pub follows: usize,
     #[cfg(test)]
     pub reads: usize,
-    #[cfg(test)]
-    wraps: usize,
 }
 
-/// The error as the banner prints it: at most `MAX_BYTES` of it, cut where a character starts,
-/// without its control characters and the blank space at either end. An error that was cut
-/// ends with a line that says so.
-fn prepare(raw: &str) -> String {
-    let mut end = raw.len().min(MAX_BYTES);
-    while !raw.is_char_boundary(end) {
+/// At most `max` bytes of `text`, cut where a character starts.
+pub(super) fn head(text: &str, max: usize) -> &str {
+    let mut end = text.len().min(max);
+    while !text.is_char_boundary(end) {
         end -= 1;
     }
-    let text = without_controls(&raw[..end]).trim().to_string();
-    if end < raw.len() && !text.is_empty() {
-        return format!("{text}\n… the error goes on past {MAX_BYTES} bytes");
+    &text[..end]
+}
+
+/// `raw` as a banner prints it: at most `MAX_BYTES` of it, cut where a character starts,
+/// without its control characters and the blank space at either end. Text that was cut ends
+/// with a line that says so, naming it `what`.
+pub(super) fn printable(raw: &str, what: &str) -> String {
+    let kept = head(raw, MAX_BYTES);
+    let text = without_controls(kept).trim().to_string();
+    if kept.len() < raw.len() && !text.is_empty() {
+        return format!("{text}\n… the {what} goes on past {MAX_BYTES} bytes");
     }
     text
+}
+
+/// Whether `text` would print anything. Zero-width characters alone, such as a joiner, would
+/// draw an empty row.
+pub(super) fn prints(text: &str) -> bool {
+    text.split('\n').any(|line| line.width() > 0)
+}
+
+/// The error as the banner prints it.
+fn prepare(raw: &str) -> String {
+    printable(raw, "error")
 }
 
 fn inside(area: Rect, mouse: &MouseEvent) -> bool {
@@ -440,25 +771,43 @@ impl Banner {
             .dismissed
             .get(thread_id)
             .is_some_and(|errors| errors.contains(raw));
-        // Zero-width characters alone, such as a joiner, would draw an empty banner.
         let text = (!dismissed)
             .then(|| prepare(raw))
-            .filter(|text| text.split('\n').any(|line| line.width() > 0))
+            .filter(|text| prints(text))
             .unwrap_or_default();
         self.shown = Some(Shown {
             thread_id: thread_id.to_string(),
             raw: raw.to_string(),
             warning,
             text,
-            expanded: false,
-            scroll: 0,
-            rows: None,
+            card: Card::default(),
         });
+    }
+
+    /// Whether the banner has an error to print, drawn or not.
+    pub fn prints(&self) -> bool {
+        self.shown.as_ref().is_some_and(Shown::prints)
     }
 
     /// Whether the last frame drew the banner, which is when its keys and clicks apply.
     pub fn showing(&self) -> bool {
-        self.shown.as_ref().is_some_and(Shown::prints) && self.area.height > 0
+        self.prints() && self.area.height > 0
+    }
+
+    /// Whether the reader opened the whole error.
+    pub fn expanded(&self) -> bool {
+        self.shown
+            .as_ref()
+            .is_some_and(|shown| shown.prints() && shown.card.expanded)
+    }
+
+    /// Closes the error back to its first rows, as when the reader opens the provider banner.
+    /// It no longer scrolls, so Alt+↑/↓ go on before the next frame.
+    pub fn collapse(&mut self) {
+        if self.expanded() {
+            self.toggle();
+        }
+        self.overflows = false;
     }
 
     /// Hides the error on show for the rest of the session and forgets the thread's send
@@ -470,7 +819,7 @@ impl Banner {
             return;
         };
         shown.text.clear();
-        shown.rows = None;
+        shown.card = Card::default();
         self.local.remove(&shown.thread_id);
         self.dismissed
             .entry(shown.thread_id.clone())
@@ -486,19 +835,24 @@ impl Banner {
     /// Opens the whole error, or closes it back to its first rows.
     fn toggle(&mut self) {
         if let Some(shown) = self.shown.as_mut() {
-            shown.expanded = !shown.expanded;
-            shown.scroll = 0;
+            shown.card.toggle();
         }
     }
 
-    fn scroll(&mut self, down: bool) {
-        if let Some(shown) = self.shown.as_mut() {
-            shown.scroll = if down {
-                shown.scroll + 1
-            } else {
-                shown.scroll.saturating_sub(1)
-            };
+    /// Does what the reader asked with a key or the mouse, and says whether it changed the
+    /// banner.
+    fn answer(&mut self, answer: Answer) -> bool {
+        match answer {
+            Answer::Dismiss => self.dismiss(),
+            Answer::Toggle => self.toggle(),
+            Answer::Scroll { down } => {
+                if let Some(shown) = self.shown.as_mut() {
+                    shown.card.scroll(down);
+                }
+            }
+            Answer::Nothing => return false,
         }
+        true
     }
 
     /// Alt+W dismisses the banner and Alt+I opens or closes the whole error, while the banner
@@ -506,226 +860,67 @@ impl Banner {
     /// the banner's. With no banner on screen the keys go where they went before there was
     /// one, as Alt+T does for the tasks drawer.
     pub fn on_key(&mut self, key: &KeyEvent) -> bool {
-        let modifiers = key.modifiers;
-        if !self.showing()
-            || !modifiers.contains(KeyModifiers::ALT)
-            || modifiers.contains(KeyModifiers::CONTROL)
-        {
+        if !self.showing() {
             return false;
         }
-        match key.code {
-            KeyCode::Char('w' | 'W') => self.dismiss(),
-            KeyCode::Char('i' | 'I') => self.toggle(),
-            KeyCode::Up if self.overflows => self.scroll(false),
-            KeyCode::Down if self.overflows => self.scroll(true),
-            _ => return false,
-        }
+        let Some(answer) = key_answer(key, ERROR_KEYS, self.overflows) else {
+            return false;
+        };
+        self.answer(answer);
         true
     }
 
-    /// A click on × dismisses the banner, and a click elsewhere on it opens or closes an error
-    /// that doesn't fit. The wheel scrolls an open error too long for its rows, and otherwise
-    /// the transcript under it. The banner takes its other clicks, so a row of calls or a
-    /// plan under it doesn't open, and focus stays where it was. Returns None for events
-    /// outside the banner and wheel events it leaves to the transcript, else whether the banner
-    /// changed.
+    /// The mouse on the banner, as `mouse_answer` has it. Returns None for events outside the
+    /// banner and wheel events it leaves to the transcript, else whether the banner changed.
     pub fn on_mouse(&mut self, mouse: &MouseEvent) -> Option<bool> {
-        if !self.showing() || !inside(self.area, mouse) {
+        if !self.showing() {
             return None;
         }
-        let expanded = self.shown.as_ref().is_some_and(|shown| shown.expanded);
-        match mouse.kind {
-            MouseEventKind::Down(MouseButton::Left) if inside(self.close, mouse) => self.dismiss(),
-            MouseEventKind::Down(MouseButton::Left) if self.clipped || expanded => self.toggle(),
-            MouseEventKind::ScrollUp if self.overflows => self.scroll(false),
-            MouseEventKind::ScrollDown if self.overflows => self.scroll(true),
-            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => return None,
-            _ => return Some(false),
-        }
-        Some(true)
+        let drawn = Drawn {
+            area: self.area,
+            close: self.close,
+            clipped: self.clipped,
+            overflows: self.overflows,
+        };
+        let answer = mouse_answer(mouse, drawn, self.expanded())?;
+        Some(self.answer(answer))
     }
 
-    /// Draws the banner over the top rows of `area`, the transcript's, centered and as wide as
-    /// its text up to `MAX_WIDTH`. A closed banner shows at most three rows of the error, and
-    /// at most half of `area`. An open one takes up to all of `area` and scrolls. With three
-    /// rows and twelve columns to spare it has a border, which names its keys. With less, its
-    /// rows go straight on the transcript. The error wraps once for each width.
+    /// Draws the banner over the top rows of `area`, the transcript's, as `Card::draw` does. A
+    /// closed banner takes at most half of `area`, and an open one all of it.
+    #[cfg(test)]
     pub fn draw(&mut self, frame: &mut Frame, area: Rect, theme: &Theme) {
-        self.area = Rect::default();
-        self.close = Rect::default();
-        self.clipped = false;
-        self.overflows = false;
-        let Some(shown) = self.shown.as_mut().filter(|shown| shown.prints()) else {
-            return;
-        };
-        let width = area.width as usize;
         let height = area.height as usize;
-        // A column of the conversation shows on each side when there is room, as the
-        // desktop's `100% - 2rem` leaves.
-        let room = if width >= BORDER_MIN_WIDTH + 2 {
-            width - 2
-        } else {
-            width
-        }
-        .min(MAX_WIDTH);
-        if room < MIN_WIDTH || height == 0 {
-            return;
-        }
-        let limit = if shown.expanded {
+        let limit = if self.expanded() {
             height
         } else {
             (height / 2).max(1)
         };
-        let bordered = limit >= 3 && room >= BORDER_MIN_WIDTH;
-        // The border, a space inside it on each side, the icon and its space, and × with a
-        // space on its left. Without the border, the icon and × with one space each.
-        let frame_width = if bordered { 8 } else { 4 };
-        let text_width = room - frame_width;
-        if shown.rows.as_ref().map(|rows| rows.width) != Some(text_width) {
-            #[cfg(test)]
-            {
-                self.wraps += 1;
-            }
-            let rows = wrap(&shown.text, text_width);
-            let widest = rows.iter().map(|row| row.width()).max().unwrap_or(0);
-            shown.rows = Some(Rows {
-                width: text_width,
-                widest,
-                rows,
-            });
-        }
-        let Some(rows) = shown.rows.as_ref() else {
+        self.draw_limited(frame, area, limit, theme);
+    }
+
+    /// Draws the banner over the top rows of `area` in at most `limit` of them.
+    pub fn draw_limited(&mut self, frame: &mut Frame, area: Rect, limit: usize, theme: &Theme) {
+        let Some(shown) = self.shown.as_mut().filter(|shown| shown.prints()) else {
+            self.drawn(Drawn::default());
             return;
         };
-        let total = rows.rows.len();
-        let text_rows = if bordered { limit - 2 } else { limit };
-        let text_rows = if shown.expanded {
-            text_rows
-        } else {
-            text_rows.min(CLAMP)
+        let look = Look {
+            title: "",
+            text: &shown.text,
+            warning: shown.warning,
+            icon: '!',
+            keys: ERROR_KEYS,
         };
-        // Never 0: the text isn't empty, so it has a row, and there is room for one.
-        let visible = total.min(text_rows);
-        let overflows = total > visible;
-        shown.scroll = if shown.expanded {
-            shown.scroll.min(total - visible)
-        } else {
-            0
-        };
-        self.clipped = !shown.expanded && overflows;
-        self.overflows = shown.expanded && overflows;
+        let drawn = shown.card.draw(frame, area, limit, theme, &look);
+        self.drawn(drawn);
+    }
 
-        let lines_label = format!(
-            "Lines {}-{} of {total}",
-            shown.scroll + 1,
-            shown.scroll + visible
-        );
-        let hints = match (shown.expanded, overflows) {
-            (false, true) => vec![
-                "Alt+I more · Alt+W dismiss".to_string(),
-                "Alt+W dismiss".into(),
-                "Alt+W".into(),
-            ],
-            (false, false) => vec!["Alt+W dismiss".to_string(), "Alt+W".into()],
-            (true, true) => vec![
-                format!("{lines_label} · Alt+↑/↓ · Alt+I less · Alt+W dismiss"),
-                format!("{lines_label} · Alt+I less"),
-                lines_label,
-                "Alt+W".into(),
-            ],
-            (true, false) => vec![
-                "Alt+I less · Alt+W dismiss".to_string(),
-                "Alt+W dismiss".into(),
-                "Alt+W".into(),
-            ],
-        };
-        // The hint sits in the bottom border with a space on each side, between the corners.
-        let hint = hints
-            .into_iter()
-            .filter(|_| bordered)
-            .find(|hint| hint.width() + 4 <= room);
-        let banner_width = (rows.widest.min(text_width) + frame_width)
-            .max(hint.as_ref().map_or(0, |hint| hint.width() + 4))
-            .min(room);
-        let banner_height = visible + if bordered { 2 } else { 0 };
-        let rect = Rect::new(
-            area.x + ((width - banner_width) / 2) as u16,
-            area.y,
-            banner_width as u16,
-            banner_height as u16,
-        )
-        .intersection(area);
-
-        let (accent, icon_color) = if shown.warning {
-            (theme.warning, theme.warning_fg)
-        } else {
-            (theme.error, theme.error_fg)
-        };
-        let muted = Style::new().fg(theme.muted);
-        let (inner, lead, close) = if bordered {
-            let inner = Rect {
-                x: rect.x + 1,
-                y: rect.y + 1,
-                width: rect.width.saturating_sub(2),
-                height: rect.height.saturating_sub(2),
-            };
-            (inner, " ! ", " × ")
-        } else {
-            (rect, "! ", " ×")
-        };
-        let inner_width = inner.width as usize;
-        let text_room = inner_width.saturating_sub(lead.width() + close.width());
-        let mut lines = Vec::with_capacity(visible);
-        for (index, text) in rows.rows[shown.scroll..shown.scroll + visible]
-            .iter()
-            .enumerate()
-        {
-            // The last row of a closed error that goes on ends with …, as `line-clamp` does.
-            let text = if self.clipped && index + 1 == visible {
-                clip(&format!("{text}…"), text_room)
-            } else {
-                clip(text, text_room)
-            };
-            let (left, right) = if index == 0 {
-                let icon = Span::styled(
-                    lead.to_string(),
-                    Style::new().fg(icon_color).add_modifier(Modifier::BOLD),
-                );
-                let close = Span::styled(close.to_string(), muted);
-                (vec![icon, Span::raw(text)], vec![close])
-            } else {
-                (
-                    vec![Span::raw(" ".repeat(lead.width())), Span::raw(text)],
-                    Vec::new(),
-                )
-            };
-            lines.push(row(left, right, inner_width));
-        }
-
-        frame.render_widget(Clear, rect);
-        let style = Style::new().fg(theme.fg).bg(theme.popover);
-        if bordered {
-            let mut block = Block::new()
-                .borders(Borders::ALL)
-                .border_type(BorderType::Rounded)
-                .border_style(Style::new().fg(accent))
-                .style(style);
-            if let Some(hint) = hint {
-                let hint = Line::styled(format!(" {hint} "), muted).right_aligned();
-                block = block.title_bottom(hint);
-            }
-            frame.render_widget(block, rect);
-        }
-        frame.render_widget(Paragraph::new(lines).style(style), inner);
-        self.area = rect;
-        let close_width = close.width() as u16;
-        self.close = Rect::new(
-            (inner.x + inner.width).saturating_sub(close_width),
-            inner.y,
-            close_width,
-            1,
-        )
-        .intersection(inner);
+    fn drawn(&mut self, drawn: Drawn) {
+        self.area = drawn.area;
+        self.close = drawn.close;
+        self.clipped = drawn.clipped;
+        self.overflows = drawn.overflows;
     }
 }
 
@@ -1365,14 +1560,14 @@ mod tests {
             banner.follow(Some("a"), Some(&boom));
         }
         assert_eq!(banner.reads, 1);
-        assert!(banner.shown.as_ref().unwrap().expanded);
+        assert!(banner.expanded());
         // The class can change without the text.
         banner.follow(Some("a"), Some(&runtime("Boom", Some("usage_limit"))));
         assert_eq!(shown(&banner), Some(("Boom", true)));
         assert_eq!(banner.reads, 1);
         // Another thread, or a new text, starts closed.
         banner.follow(Some("b"), Some(&boom));
-        assert!(!banner.shown.as_ref().unwrap().expanded);
+        assert!(!banner.expanded());
     }
 
     #[test]
@@ -1430,7 +1625,7 @@ mod tests {
         assert!(!banner.stale());
         // Opening or scrolling the error leaves it as it was.
         banner.toggle();
-        banner.scroll(true);
+        banner.answer(Answer::Scroll { down: true });
         assert!(!banner.stale());
 
         banner.failed("b", "Couldn't reach T3".into(), "m1".into());
@@ -1609,10 +1804,10 @@ mod tests {
         assert_eq!(banner.on_mouse(&below), None);
         // A click on the cut text opens it, and a second closes it.
         assert_eq!(banner.on_mouse(&mouse(CLICK, area.x + 3, 2)), Some(true));
-        assert!(banner.shown.as_ref().unwrap().expanded);
+        assert!(banner.expanded());
         draw(&mut banner, 60, 20);
         assert_eq!(banner.on_mouse(&mouse(CLICK, area.x + 3, 2)), Some(true));
-        assert!(!banner.shown.as_ref().unwrap().expanded);
+        assert!(!banner.expanded());
         // Other buttons and a release are taken and do nothing.
         draw(&mut banner, 60, 20);
         let right = MouseEventKind::Down(MouseButton::Right);
@@ -1629,7 +1824,7 @@ mod tests {
         draw(&mut banner, 60, 20);
         let area = banner.area;
         assert_eq!(banner.on_mouse(&mouse(CLICK, area.x + 3, 1)), Some(false));
-        assert!(!banner.shown.as_ref().unwrap().expanded);
+        assert!(!banner.expanded());
     }
 
     #[test]
@@ -1654,16 +1849,21 @@ mod tests {
     #[test]
     fn a_frame_rewraps_only_for_a_new_width() {
         let mut banner = showing(&"word ".repeat(400));
+        let wraps = |banner: &Banner| banner.shown.as_ref().unwrap().card.wraps;
         for _ in 0..3 {
             draw(&mut banner, 80, 24);
         }
-        assert_eq!(banner.wraps, 1);
+        assert_eq!(wraps(&banner), 1);
         banner.toggle();
         draw(&mut banner, 80, 24);
         draw(&mut banner, 80, 10);
-        assert_eq!(banner.wraps, 1, "height and opening don't change the width");
+        assert_eq!(
+            wraps(&banner),
+            1,
+            "height and opening don't change the width"
+        );
         draw(&mut banner, 70, 24);
-        assert_eq!(banner.wraps, 2);
+        assert_eq!(wraps(&banner), 2);
     }
 
     #[test]

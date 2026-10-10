@@ -10,6 +10,7 @@ mod composer;
 mod markdown;
 mod picker;
 mod plan;
+mod provider;
 mod scroll;
 mod sidebar;
 mod tasks;
@@ -426,8 +427,11 @@ struct App {
     drawn_plans: Vec<plan::Drawn>,
     /// The tasks drawer above the composer. Only this window keeps whether it is open.
     tasks: tasks::Drawer,
-    /// The thread error banner over the top of the conversation, with the errors dismissed
-    /// this session and the sends that failed.
+    /// The provider status banner over the top of the conversation, for the provider instance
+    /// the composer would send with, and the notice dismissed in this window.
+    provider_banner: provider::Banner,
+    /// The thread error banner under it, with the errors dismissed this session and the sends
+    /// that failed.
     banner: banner::Banner,
     /// The item at the top of the last frame and the row of it that was showing, so a block
     /// that grows under the reader doesn't move the text.
@@ -694,6 +698,7 @@ impl App {
             expanded_plans: HashSet::new(),
             drawn_plans: Vec::new(),
             tasks: tasks::Drawer::default(),
+            provider_banner: provider::Banner::default(),
             banner: banner::Banner::default(),
             anchor: None,
             drawn_scroll: 0,
@@ -731,6 +736,8 @@ impl App {
                 }
                 self.rebuild_rows();
                 self.settle_draft();
+                // The shell's copy of the open thread names its model and provider instance.
+                self.follow_provider(false);
             }
             WatchEvent::Reconnecting { .. } => self.shell_connection = "reconnecting".into(),
             WatchEvent::Failed(message) => self.message = Some((message, true)),
@@ -762,13 +769,24 @@ impl App {
         };
         match event {
             WatchEvent::Item(item) => {
+                let applied = open.apply(&item);
                 // A fresh snapshot means the watch reconnected, so output T3 couldn't send
                 // before is worth asking for again.
-                if open.apply(&item) == Applied::Snapshot {
+                if applied == Applied::Snapshot {
                     self.cache.clear();
                     self.outputs.retry_failed();
                 }
-                self.settle_draft();
+                // The projection's thread names its model and provider instance too, which the
+                // composer goes by when the shell doesn't list the thread. Other events, such
+                // as each piece of a streamed answer, leave the provider banner alone.
+                let thread_changed = match &applied {
+                    Applied::Snapshot => true,
+                    Applied::Event(kind) => kind.starts_with("thread."),
+                    _ => false,
+                };
+                if self.settle_draft() || thread_changed {
+                    self.follow_provider(false);
+                }
                 self.drop_landed();
             }
             WatchEvent::Reconnecting { reason, .. } => {
@@ -811,6 +829,39 @@ impl App {
             Some(_) => {}
             None => self.banner.follow(None, None),
         }
+    }
+
+    /// Brings the provider banner up to date with the provider instance the composer would
+    /// send the next message with, the one the model chip shows: the open thread's selection
+    /// with its unsent choice applied. It works the selection out again only when T3's config
+    /// changed, as `config_changed` says, or when the open thread, its model selection, its
+    /// provider instance or its unsent choice did. Callers run it after the events that can
+    /// change one of those, so neither a frame nor a streamed answer looks.
+    fn follow_provider(&mut self, config_changed: bool) {
+        let inputs = {
+            let open = self.open.as_ref().and_then(|open| {
+                let thread = self.open_thread_json()?;
+                Some((open.id.as_str(), thread, self.drafts.get(&open.id)))
+            });
+            if !config_changed && !self.provider_banner.stale(open) {
+                return;
+            }
+            open.map(|(id, thread, draft)| provider::Inputs::new(id, thread, draft))
+        };
+        // The provider goes by its instance id alone. One with no models left still has its
+        // status shown, and no other provider stands in for one T3 no longer lists.
+        let selection = self.settings_view().map(|view| view.selection);
+        let instance = selection
+            .as_ref()
+            .and_then(|selection| selection["instanceId"].as_str());
+        let provider = instance
+            .zip(self.config.as_ref())
+            .and_then(|(instance, config)| {
+                crate::models::providers(config)
+                    .iter()
+                    .find(|provider| provider["instanceId"] == instance)
+            });
+        self.provider_banner.follow(inputs, provider);
     }
 
     /// Lays the sidebar's shelves out again from the shell, as of now.
@@ -1003,6 +1054,7 @@ impl App {
         // The banner shows a send to this thread that failed, until the thread's own error
         // comes with it.
         self.follow_banner();
+        self.follow_provider(false);
         self.scroll.set(0);
         self.picker = None;
         self.focus = Focus::Composer;
@@ -1115,10 +1167,20 @@ impl App {
                     self.toggle_sidebar();
                     return true;
                 }
-                // The banner lies over the transcript, so it takes what lands on it: a click on
-                // × dismisses it, a click elsewhere on it opens or closes its details, and the
-                // wheel scrolls them. Nothing reaches the rows under it.
+                // The banners lie over the transcript, so each takes what lands on it: a click
+                // on × dismisses it, a click elsewhere on it opens or closes its details, and
+                // the wheel scrolls them. Nothing reaches the rows under them. Opening one
+                // closes the other, so only one is ever open.
+                if let Some(redraw) = self.provider_banner.on_mouse(&mouse) {
+                    if self.provider_banner.expanded() {
+                        self.banner.collapse();
+                    }
+                    return redraw;
+                }
                 if let Some(redraw) = self.banner.on_mouse(&mouse) {
+                    if self.banner.expanded() {
+                        self.provider_banner.collapse();
+                    }
                     self.follow_banner();
                     return redraw;
                 }
@@ -1230,10 +1292,21 @@ impl App {
                 });
                 return;
             }
-            // While an error banner shows, from any pane and over a menu: Alt+W dismisses it,
-            // Alt+I opens or closes its details, and Alt+↑/↓ scroll details too long to show.
-            // None of them reach the composer.
+            // While a banner shows, from any pane and over a menu. Alt+N dismisses the provider
+            // banner and Alt+O opens or closes its message. Alt+W dismisses the error banner
+            // and Alt+I opens or closes its details. Opening one closes the other, so Alt+↑/↓
+            // scroll whichever is open and too long to show, ahead of the request panel and
+            // the tasks drawer. None of them reach the composer.
+            _ if self.provider_banner.on_key(&key) => {
+                if self.provider_banner.expanded() {
+                    self.banner.collapse();
+                }
+                return;
+            }
             _ if self.banner.on_key(&key) => {
+                if self.banner.expanded() {
+                    self.provider_banner.collapse();
+                }
                 self.follow_banner();
                 return;
             }
@@ -1465,7 +1538,9 @@ impl App {
                 self.outputs.store(item_id, revision, text);
             }
             ActionResult::Sent { note } => {
-                self.settle_draft();
+                if self.settle_draft() {
+                    self.follow_provider(false);
+                }
                 self.message = Some((note, false));
             }
             ActionResult::SendFailed {
@@ -1498,6 +1573,7 @@ impl App {
                 // The thread may have shown the message before this result arrived.
                 self.drop_landed();
                 self.follow_banner();
+                self.follow_provider(false);
             }
         }
     }
@@ -1552,14 +1628,14 @@ impl App {
     }
 
     /// Drops the open thread's draft once the thread has every choice in it, so the next
-    /// message doesn't undo a change made in another client.
-    fn settle_draft(&mut self) {
+    /// message doesn't undo a change made in another client. Returns whether it dropped it.
+    fn settle_draft(&mut self) -> bool {
         let (Some(open), Some(config)) = (self.open.as_ref(), self.config.as_ref()) else {
-            return;
+            return false;
         };
         let (Some(draft), Some(thread)) = (self.drafts.get(&open.id), self.open_thread_json())
         else {
-            return;
+            return false;
         };
         if matches!(
             picker::spent(config, thread, draft, self.plan_mode_enabled),
@@ -1567,7 +1643,9 @@ impl App {
         ) {
             let id = open.id.clone();
             self.drafts.remove(&id);
+            return true;
         }
+        false
     }
 
     // ---- model, effort and mode menus ----
@@ -1589,6 +1667,7 @@ impl App {
     /// keeps what depends on it in step. A change can add or drop menu rows, so an open menu's
     /// highlight follows its entry, not its row number. The sidebar is laid out again when the
     /// change turns snooze or settlement on or off, which decide whether those shelves apply.
+    /// The provider banner follows the selected provider's new status.
     fn update_config(&mut self, change: impl FnOnce(&mut Option<Value>) -> bool) -> bool {
         let (pick, capabilities) = (self.selected_pick(), self.capabilities());
         if !change(&mut self.config) {
@@ -1600,6 +1679,7 @@ impl App {
         if self.capabilities() != capabilities {
             self.rebuild_rows();
         }
+        self.follow_provider(true);
         true
     }
 
@@ -1782,6 +1862,7 @@ impl App {
                 self.drafts.insert(id, draft);
             }
         }
+        self.follow_provider(false);
     }
 
     fn submit(&mut self) {
@@ -1905,6 +1986,7 @@ impl App {
                 self.drafts.remove(&thread_id);
             }
         }
+        self.follow_provider(false);
         let (client, results) = (self.client.clone(), self.actions.clone());
         let message_id = uuid::Uuid::new_v4().to_string();
         tokio::spawn(async move {
@@ -2091,8 +2173,8 @@ impl App {
         );
         self.transcript_area = body;
         self.draw_transcript(frame, body);
-        // Over the transcript's top rows, which keep their place under it.
-        self.banner.draw(frame, body, &self.theme);
+        // Over the transcript's top rows, which keep their place under them.
+        self.draw_banners(frame, body);
         self.panel_area = panel_area;
         if !panel.is_empty() {
             self.draw_request_panel(frame, panel_area, panel);
@@ -2169,6 +2251,44 @@ impl App {
             right,
             width,
         )
+    }
+
+    /// Draws the provider banner over the top rows of `body`, the transcript's, and the thread
+    /// error banner under it, as the desktop stacks the two. Closed, they take at most half of
+    /// the rows between them. With an error to show, the provider banner leaves the error banner
+    /// half of those rows, and at least three, so on a transcript of fewer than eight rows only
+    /// the error shows. An open banner can take every row the other leaves, and the error
+    /// banner keeps what it would have when closed.
+    fn draw_banners(&mut self, frame: &mut Frame, body: Rect) {
+        let height = body.height as usize;
+        let half = (height / 2).max(1);
+        let kept = if self.banner.prints() {
+            half.min(3).max(half / 2)
+        } else {
+            0
+        };
+        let limit = if self.provider_banner.expanded() {
+            height
+        } else {
+            half
+        };
+        self.provider_banner
+            .draw(frame, body, limit.saturating_sub(kept), &self.theme);
+        let taken = self.provider_banner.area.height;
+        let below = Rect {
+            y: body.y + taken,
+            height: body.height - taken,
+            ..body
+        };
+        let room = below.height as usize;
+        let limit = if self.banner.expanded() {
+            room
+        } else if self.provider_banner.expanded() {
+            half.min(room)
+        } else {
+            half.saturating_sub(taken as usize).min(room)
+        };
+        self.banner.draw_limited(frame, below, limit, &self.theme);
     }
 
     fn draw_transcript(&mut self, frame: &mut Frame, area: Rect) {
