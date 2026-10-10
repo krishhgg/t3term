@@ -2,11 +2,21 @@
   "files": [
     {
       "path": "README.md",
-      "description": "What t3term does, the CLI commands and exit codes, TUI keys, how discovery, auth, RPC, state and rendering work, and what is not done yet"
+      "description": "What t3term does today: the CLI commands, flags, exit codes and --json output, TUI keys, how discovery, auth, RPC, state and rendering work, and what is not done yet. It is the current command contract"
     },
     {
-      "path": "research/next-steps.md",
-      "description": "The agreed plan: milestones from the shared V2 connection and read-only CLI to desktop-independent operation, T3 workflows and measured resource savings"
+      "path": "docs/parity.md",
+      "description": "The parity plan, pinned to T3 Code nightly v0.0.46-nightly.20261007.2787: the desktop's features and the order the sprint builds them in. Its yes, partial and no statuses are the baseline at that pin, not current progress. docs/sprint.md records what has merged since"
+    },
+    {
+      "path": "docs/parity-inventory.md",
+      "description": "The source inventory behind parity.md at the same pin: the desktop's commands, features, keys and layout, each cited to a file and line in T3 Code's source. Its statuses describe t3term at commit a244ccd",
+      "scope": ["src/tui/**", "src/transcript.rs"]
+    },
+    {
+      "path": "docs/sprint.md",
+      "description": "How the parity sprint runs: the audit after every ten merged sprint PRs, the merged sprint PRs with their merge commits, the maintenance PRs and each audit's outcome",
+      "scope": ["docs/**", ".github/**", ".greptile/**"]
     },
     {
       "path": "research/agent-opus.md",
