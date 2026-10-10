@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Write};
 use std::sync::Arc;
@@ -13,7 +14,7 @@ use t3term::discovery;
 use t3term::error::{T3Error, err, err_exit, exit};
 use t3term::models::{self, Choice, Plan};
 use t3term::projection::{Applied, ThreadState, is_active_status, is_terminal_status, status};
-use t3term::transcript;
+use t3term::transcript::{self, plain};
 
 #[derive(Parser)]
 #[command(
@@ -255,8 +256,8 @@ fn option_text(value: &Value) -> String {
     match value {
         Value::Bool(true) => "on".into(),
         Value::Bool(false) => "off".into(),
-        Value::String(s) => s.clone(),
-        other => other.to_string(),
+        Value::String(s) => plain(s).into_owned(),
+        other => json_text(other, false),
     }
 }
 
@@ -266,18 +267,18 @@ fn models_text(providers: &[&Value]) -> String {
     for provider in providers {
         let state = match provider["status"].as_str() {
             _ if !models::enabled(provider) => "  (off)".to_string(),
-            Some(status) if status != "ready" => format!("  ({status})"),
+            Some(status) if status != "ready" => format!("  ({})", plain(status)),
             _ => String::new(),
         };
         out += &format!(
             "{}  {}{state}\n",
-            text(&provider["instanceId"]),
-            text(&provider["displayName"])
+            shown(&provider["instanceId"]),
+            shown(&provider["displayName"])
         );
         let models = models::models(provider);
         let width = models
             .iter()
-            .map(|m| text(&m["slug"]).chars().count() + 1)
+            .map(|m| shown(&m["slug"]).chars().count() + 1)
             .max()
             .unwrap_or(0);
         for model in models {
@@ -298,7 +299,7 @@ fn models_text(providers: &[&Value]) -> String {
                                         } else {
                                             ""
                                         };
-                                        format!("{}{star}", text(&c["id"]))
+                                        format!("{}{star}", shown(&c["id"]))
                                     })
                                     .collect::<Vec<_>>()
                                     .join("|")
@@ -317,13 +318,13 @@ fn models_text(providers: &[&Value]) -> String {
                             .collect::<Vec<_>>()
                             .join("|"),
                     };
-                    format!("{} {values}", text(&d["id"]))
+                    format!("{} {values}", shown(&d["id"]))
                 })
                 .collect();
             out += &format!(
                 "  {:<width$} {:<22} {}\n",
-                format!("{}{marker}", text(&model["slug"])),
-                text(&model["name"]),
+                format!("{}{marker}", shown(&model["slug"])),
+                shown(&model["name"]),
                 options.join("  ")
             );
         }
@@ -334,19 +335,19 @@ fn models_text(providers: &[&Value]) -> String {
 fn settings_text(settings: &Value) -> String {
     let mut out = format!(
         "model     {}/{}",
-        text(&settings["instanceId"]),
-        text(&settings["model"])
+        shown(&settings["instanceId"]),
+        shown(&settings["model"])
     );
     if let Some(name) = settings["modelName"].as_str() {
-        out += &format!("  ({}, {name})", text(&settings["provider"]));
+        out += &format!("  ({}, {})", shown(&settings["provider"]), plain(name));
     }
     out += "\n";
     if let Some(options) = settings["options"].as_object() {
         for (id, value) in options {
-            out += &format!("{id:<9} {}\n", option_text(value));
+            out += &format!("{:<9} {}\n", plain(id), option_text(value));
         }
     }
-    out += &format!("mode      {}\n", text(&settings["runtimeModeLabel"]));
+    out += &format!("mode      {}\n", shown(&settings["runtimeModeLabel"]));
     out += &format!(
         "plan      {}\n",
         if settings["interactionMode"] == "plan" {
@@ -365,12 +366,12 @@ fn changes_text(plan: &Plan) -> String {
             .as_array()
             .map_or(&[][..], Vec::as_slice)
             .iter()
-            .map(|o| format!("{}={}", text(&o["id"]), option_text(&o["value"])))
+            .map(|o| format!("{}={}", shown(&o["id"]), option_text(&o["value"])))
             .collect();
         out += &format!(
             "model set to {}/{} {}\n",
-            text(&selection["instanceId"]),
-            text(&selection["model"]),
+            shown(&selection["instanceId"]),
+            shown(&selection["model"]),
             options.join(" ")
         );
     }
@@ -411,11 +412,12 @@ fn report(error: &anyhow::Error, json_mode: bool) -> i32 {
     };
     // `println!` panics when the terminal is gone, and a panic here would skip the revoke in
     // `main`, so write without panicking.
+    let message = error.to_string();
     if json_mode {
-        let body = json!({"ok": false, "error": {"code": code, "message": error.to_string()}});
+        let body = json!({"ok": false, "error": {"code": code, "message": message}});
         let _ = writeln!(std::io::stdout(), "{}", json_text(&body, false));
     } else {
-        let _ = writeln!(std::io::stderr(), "t3term: {error} [{code}]");
+        let _ = writeln!(std::io::stderr(), "t3term: {} [{code}]", plain(&message));
     }
     exit_code
 }
@@ -532,8 +534,8 @@ async fn run(cli: Cli) -> Result<i32> {
                     println!(
                         "{}  {}  {}",
                         short(&project["id"]),
-                        text(&project["title"]),
-                        text(&project["workspaceRoot"])
+                        shown(&project["title"]),
+                        shown(&project["workspaceRoot"])
                     );
                 }
             }
@@ -593,9 +595,9 @@ async fn run(cli: Cli) -> Result<i32> {
                     println!(
                         "{}  {:<10} {:<20.20} {}",
                         short(&thread["id"]),
-                        text(&thread["status"]),
-                        project,
-                        text(&thread["title"])
+                        shown(&thread["status"]),
+                        plain(project),
+                        shown(&thread["title"])
                     );
                 }
             }
@@ -614,7 +616,8 @@ async fn run(cli: Cli) -> Result<i32> {
                     &json!({"ok": true, "snapshotSequence": state.sequence, "projection": state.projection}),
                 );
             } else {
-                println!("# {}  ({})", text(&state.thread()["title"]), id);
+                let title = shown(&state.thread()["title"]);
+                println!("# {title}  ({})", plain(&id));
                 print!("{}", transcript::plain_text(&state, last, reasoning));
             }
             Ok(0)
@@ -636,14 +639,17 @@ async fn run(cli: Cli) -> Result<i32> {
                                     eprintln!("snapshot at sequence {}", state.sequence)
                                 }
                                 Applied::Synchronized => eprintln!("live"),
-                                Applied::Event(kind) => println!("{} {kind}", state.sequence),
+                                Applied::Event(kind) => {
+                                    println!("{} {}", state.sequence, plain(&kind))
+                                }
                                 Applied::Duplicate | Applied::Ignored => {}
                             }
                         }
                     }
                     WatchEvent::Reconnecting { reason, retry_in } => {
                         eprintln!(
-                            "connection lost ({reason}); retrying in {}ms",
+                            "connection lost ({}); retrying in {}ms",
+                            plain(&reason),
                             retry_in.as_millis()
                         )
                     }
@@ -752,9 +758,9 @@ async fn run(cli: Cli) -> Result<i32> {
                 for request in &requests {
                     println!(
                         "{}  {}  {}",
-                        text(&request["id"]),
-                        text(&request["kind"]),
-                        text(&request["prompt"])
+                        shown(&request["id"]),
+                        shown(&request["kind"]),
+                        shown(&request["prompt"])
                     );
                 }
             }
@@ -799,7 +805,7 @@ async fn run(cli: Cli) -> Result<i32> {
                     &json!({"ok": true, "requestId": request_id, "decision": decision.wire(), "sequence": sequence}),
                 );
             } else {
-                println!("{} {request_id}", decision.wire());
+                println!("{} {}", decision.wire(), plain(&request_id));
             }
             Ok(0)
         }
@@ -819,21 +825,32 @@ async fn run(cli: Cli) -> Result<i32> {
             if json_mode {
                 print_json(&json!({"ok": true, "runId": run_id}));
             } else {
-                println!("interrupted {run_id}");
+                println!("interrupted {}", plain(&run_id));
             }
             Ok(0)
         }
     }
 }
 
+/// A string value as T3 sent it, for matching and sorting, or "" for any other value.
 fn text(value: &Value) -> &str {
     value.as_str().unwrap_or("")
 }
 
-/// UUID ids print as their first 8 characters, which `resolve_thread` accepts. Other ids print whole.
-fn short(value: &Value) -> &str {
+/// A string value as the CLI prints it, without control characters, or "" for any other value.
+fn shown(value: &Value) -> Cow<'_, str> {
+    plain(text(value))
+}
+
+/// UUID ids print as their first 8 characters, which `resolve_thread` accepts. Other ids print
+/// whole, without control characters.
+fn short(value: &Value) -> Cow<'_, str> {
     let id = text(value);
-    if is_uuid(id) { &id[..8] } else { id }
+    if is_uuid(id) {
+        Cow::Borrowed(&id[..8])
+    } else {
+        plain(id)
+    }
 }
 
 fn is_uuid(id: &str) -> bool {
@@ -914,7 +931,10 @@ async fn wait_for_reply(
                             if *done == 0 && !announced.is_empty() {
                                 println!();
                             }
-                            print!("{}", &body[*done..]);
+                            // `done` counts the bytes of the reply as T3 sent it, and
+                            // `plain_from` cleans from there to print what cleaning the whole
+                            // reply would add.
+                            print!("{}", transcript::plain_from(body, *done));
                             stdout.flush().ok();
                             *done = body.len();
                             announced.insert("assistant".into());
@@ -928,7 +948,7 @@ async fn wait_for_reply(
                         )
                     {
                         announced.insert(item_id);
-                        eprintln!("\n· {}", block.header);
+                        eprintln!("\n· {}", plain(&block.header));
                         // A handoff says where the context went, as `t3term read` does.
                         // `describe_plain` has cleaned and bounded its endpoints.
                         if block.item_type == "handoff" {
@@ -970,7 +990,8 @@ async fn wait_for_reply(
                     println!();
                     if needs_person {
                         eprintln!(
-                            "The turn is waiting for approval. Run `t3term requests {thread_id}`."
+                            "The turn is waiting for approval. Run `t3term requests {}`.",
+                            plain(thread_id)
                         );
                     } else if outcome != "completed" {
                         eprintln!("The turn ended: {outcome}");
@@ -1000,7 +1021,7 @@ async fn wait_for_reply(
             }
             Ok(Some(WatchEvent::Reconnecting { reason, .. })) => {
                 if !json_mode {
-                    eprintln!("\n(connection lost: {reason}; resuming)");
+                    eprintln!("\n(connection lost: {}; resuming)", plain(&reason));
                 }
             }
             Ok(Some(WatchEvent::Failed(message))) => return Err(err("WATCH_FAILED", message)),
@@ -1102,7 +1123,7 @@ async fn logout(json_mode: bool) -> Result<i32> {
     if json_mode {
         print_json(&json!({"ok": true, "message": message}));
     } else {
-        println!("{message}");
+        println!("{}", plain(&message));
     }
     Ok(0)
 }
@@ -1117,7 +1138,9 @@ fn finish_doctor(checks: serde_json::Map<String, Value>, ok: bool, json_mode: bo
             if let Some(object) = detail.as_object_mut() {
                 object.remove("ok");
             }
-            println!("{mark} {name:<22} {detail}");
+            // A detail can quote T3, such as its version or an error, so it prints as `--json`
+            // writes it, with every control escaped.
+            println!("{mark} {name:<22} {}", json_text(&detail, false));
         }
     }
     Ok(if ok { 0 } else { exit::UNAVAILABLE })
