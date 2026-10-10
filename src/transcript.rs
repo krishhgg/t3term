@@ -1,6 +1,7 @@
 //! Turns projection items into display blocks. The CLI prints them; the TUI styles them.
 
 use serde_json::Value;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use crate::projection::ThreadState;
 
@@ -9,6 +10,14 @@ use crate::projection::ThreadState;
 const MAX_OUTPUT_LINES: usize = 12;
 /// What one row's output can weigh, since a single line has no length of its own to bound.
 const MAX_OUTPUT_BYTES: usize = 4096;
+/// Sources a handoff names before it counts the rest. T3 lists one for each provider and model
+/// the handed-off runs used, so a real handoff has far fewer.
+const MAX_HANDOFF_SOURCES: usize = 12;
+/// Columns one end of a handoff can take. Model and provider ids are far shorter.
+const MAX_ENDPOINT_WIDTH: usize = 64;
+/// Bytes of a model or provider id that are read at all, enough for `MAX_ENDPOINT_WIDTH`
+/// columns in any script.
+const MAX_ENDPOINT_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockKind {
@@ -115,6 +124,26 @@ fn without_controls(text: &str) -> String {
         }
     }
     out
+}
+
+/// `text` cut where a terminal starts a new character: before each character with a width,
+/// except a skin tone and the character after a zero-width joiner. So an accent stays on its
+/// letter, U+FE0F on its emoji, and a joined emoji such as 👩‍💻 stays whole.
+pub(crate) fn clusters(text: &str) -> Vec<&str> {
+    let mut clusters = Vec::new();
+    let mut start = 0;
+    let mut joined = false;
+    for (index, c) in text.char_indices() {
+        let width = UnicodeWidthChar::width(c).unwrap_or(0);
+        let skin_tone = matches!(c, '\u{1F3FB}'..='\u{1F3FF}');
+        if index > 0 && width > 0 && !joined && !skin_tone {
+            clusters.push(&text[start..index]);
+            start = index;
+        }
+        joined = c == '\u{200D}';
+    }
+    clusters.push(&text[start..]);
+    clusters
 }
 
 /// The marker and detail of a context compaction, the `compaction` turn item
@@ -226,6 +255,224 @@ fn summary_text(summary: &str) -> String {
         shown.push("…");
     }
     shown.join("\n")
+}
+
+/// One end of a context handoff: a provider instance and, when the item or the thread's runs
+/// name it, the model.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Endpoint<'a> {
+    instance_id: &'a str,
+    model: Option<&'a str>,
+}
+
+impl Endpoint<'_> {
+    /// The endpoint as the transcript names it: its model, or its provider id when no model is
+    /// known or the model has no text, or `?` when neither has any.
+    fn label(&self) -> String {
+        self.model
+            .and_then(endpoint_text)
+            .or_else(|| endpoint_text(self.instance_id))
+            .unwrap_or_else(|| "?".into())
+    }
+}
+
+/// The ends of a handoff that its detail line names.
+struct Endpoints<'a> {
+    /// The first `MAX_HANDOFF_SOURCES` sources, in T3's order.
+    from: Vec<Endpoint<'a>>,
+    /// How many sources came after those. None of them is resolved.
+    more: usize,
+    to: Endpoint<'a>,
+}
+
+/// The first `MAX_HANDOFF_SOURCES` of a handoff's raw sources, each made an endpoint by
+/// `resolve`, and how many came after them. The cut comes before `resolve`, which never sees
+/// the rest, so a handoff with thousands of sources looks up at most twelve models. The count
+/// is the array's length less those, not a walk over the rest.
+fn shown_sources<'a>(
+    raw: &'a [Value],
+    resolve: impl FnMut(&'a Value) -> Endpoint<'a>,
+) -> (Vec<Endpoint<'a>>, usize) {
+    let shown = &raw[..raw.len().min(MAX_HANDOFF_SOURCES)];
+    (shown.iter().map(resolve).collect(), raw.len() - shown.len())
+}
+
+/// Where a `handoff` item took the context from and to, worked out as the nightly's
+/// `resolveHandoffEndpoints` (`packages/client-runtime/src/handoff.ts`) does for the desktop
+/// and mobile timelines. T3 stamps the source models on the item in `fromModelSelections`, in
+/// order and several for one provider when its runs used several, and the target's in
+/// `toModel`. An item from before it did has only provider ids. Then the target's model is the
+/// handoff run's, when that run is on the target's provider, and each source's is the model of
+/// the newest run on its provider that came before the handoff run. An endpoint with no model
+/// keeps its provider. Only the sources the line shows are resolved, through `shown_sources`,
+/// and a handoff stamped at both ends doesn't look for its run.
+fn endpoints<'a>(item: &'a Value, runs: &'a [Value]) -> Endpoints<'a> {
+    endpoints_with(item, runs, || {
+        item.get("runId")
+            .and_then(Value::as_str)
+            .and_then(|id| runs.iter().find(|run| str_of(run, "id") == id))
+    })
+}
+
+/// `endpoints`, with `find_run` finding the handoff's run in `runs`. It is called once for a
+/// handoff that `reads_runs`, and never for one stamped at both ends, which reads nothing of
+/// the runs.
+fn endpoints_with<'a>(
+    item: &'a Value,
+    runs: &'a [Value],
+    find_run: impl FnOnce() -> Option<&'a Value>,
+) -> Endpoints<'a> {
+    let (stamped, to_stamp) = stamps(item);
+    let handoff_run = match (stamped, to_stamp) {
+        (Some(_), Some(_)) => None,
+        _ => find_run(),
+    };
+    let to_instance = str_of(item, "toProviderInstanceId");
+    // A `toModel` with no text still wins over the run's, as `??` lets it in the nightly.
+    let to_model = to_stamp.or_else(|| {
+        handoff_run
+            .filter(|run| str_of(run, "providerInstanceId") == to_instance)
+            .and_then(run_model)
+    });
+    let (from, more) = match stamped {
+        Some(selections) => shown_sources(selections, |selection| Endpoint {
+            instance_id: str_of(selection, "instanceId"),
+            model: selection.get("model").and_then(Value::as_str),
+        }),
+        None => {
+            let before = handoff_run
+                .and_then(|run| run.get("ordinal"))
+                .and_then(Value::as_u64);
+            let ids = item
+                .get("fromProviderInstanceIds")
+                .and_then(Value::as_array)
+                .map(Vec::as_slice)
+                .unwrap_or_default();
+            shown_sources(ids, |id| {
+                let instance_id = id.as_str().unwrap_or_default();
+                Endpoint {
+                    instance_id,
+                    model: latest_model_before(runs, instance_id, before),
+                }
+            })
+        }
+    };
+    Endpoints {
+        from,
+        more,
+        to: Endpoint {
+            instance_id: to_instance,
+            model: to_model,
+        },
+    }
+}
+
+fn run_model(run: &Value) -> Option<&str> {
+    run.pointer("/modelSelection/model").and_then(Value::as_str)
+}
+
+/// The model of the newest run on `instance_id` with an ordinal below `before`, or of the
+/// newest run on it when the handoff's own run isn't known. Of two runs with one ordinal the
+/// first wins, as in the nightly's `latestRunModelBefore`.
+fn latest_model_before<'a>(
+    runs: &'a [Value],
+    instance_id: &str,
+    before: Option<u64>,
+) -> Option<&'a str> {
+    let mut latest: Option<(u64, &Value)> = None;
+    for run in runs {
+        if str_of(run, "providerInstanceId") != instance_id {
+            continue;
+        }
+        let ordinal = run.get("ordinal").and_then(Value::as_u64).unwrap_or(0);
+        if before.is_some_and(|before| ordinal >= before) {
+            continue;
+        }
+        if latest.is_none_or(|(newest, _)| ordinal > newest) {
+            latest = Some((ordinal, run));
+        }
+    }
+    latest.and_then(|(_, run)| run_model(run))
+}
+
+/// The fields of a run that a handoff's endpoints read: its ordinal, its provider and its
+/// model. A run's status and times change far more often, and they move no endpoint.
+pub fn handoff_fields(run: &Value) -> (Option<u64>, Option<String>, Option<String>) {
+    (
+        run.get("ordinal").and_then(Value::as_u64),
+        run.get("providerInstanceId")
+            .and_then(Value::as_str)
+            .map(str::to_string),
+        run_model(run).map(str::to_string),
+    )
+}
+
+/// The models T3 stamped on a handoff: its sources' in `fromModelSelections`, when that lists
+/// any, and its target's in `toModel`, even one with no text.
+fn stamps(item: &Value) -> (Option<&[Value]>, Option<&str>) {
+    let from = item
+        .get("fromModelSelections")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .filter(|selections| !selections.is_empty());
+    (from, item.get("toModel").and_then(Value::as_str))
+}
+
+/// Whether a turn item is a handoff whose endpoints read the thread's runs, because T3 stamped
+/// no source models or no target model on it. Only such a handoff looks for its run.
+pub fn reads_runs(item: &Value) -> bool {
+    str_of(item, "type") == "handoff" && !matches!(stamps(item), (Some(_), Some(_)))
+}
+
+/// A handoff's detail line: its sources, then `→` and its target, in the order of the
+/// nightly's `V2LifecycleRow.tsx`, which also drops the arrow when there is no source. Past
+/// `MAX_HANDOFF_SOURCES` sources a count such as `+3 more` stands for the rest. The desktop
+/// names an endpoint by its model's catalog name, and by its provider's display name when it
+/// has no model, both from T3's provider list. `t3term read` doesn't fetch that list, so
+/// t3term names both ends by the ids T3 sent.
+fn handoff_detail(item: &Value, runs: &[Value]) -> String {
+    let Endpoints { from, more, to } = endpoints(item, runs);
+    let mut sources: Vec<String> = from.iter().map(Endpoint::label).collect();
+    if more > 0 {
+        sources.push(format!("+{more} more"));
+    }
+    if sources.is_empty() {
+        return to.label();
+    }
+    format!("{} → {}", sources.join(", "), to.label())
+}
+
+/// A model or provider id as one line can show it: without control characters, each run of
+/// blanks and line breaks read as one space, and cut with `…` past `MAX_ENDPOINT_WIDTH`
+/// columns, at a place `clusters` finds. `None` when no text is left.
+fn endpoint_text(raw: &str) -> Option<String> {
+    // Only the start of a long id can show, so only that much is read.
+    let mut end = raw.len().min(MAX_ENDPOINT_BYTES);
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    let text = without_controls(&raw[..end])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    if text.is_empty() {
+        return None;
+    }
+    let width: usize = clusters(&text).iter().map(|piece| piece.width()).sum();
+    if end == raw.len() && width <= MAX_ENDPOINT_WIDTH {
+        return Some(text);
+    }
+    // The … takes the last column.
+    let mut cut = String::new();
+    let mut used = 0;
+    for piece in clusters(&text) {
+        used += piece.width();
+        if used >= MAX_ENDPOINT_WIDTH {
+            break;
+        }
+        cut.push_str(piece);
+    }
+    Some(format!("{}…", cut.trim_end()))
 }
 
 /// The one value a tool call is about, for a transcript row: the file, pattern or query it
@@ -341,7 +588,10 @@ fn truncate_lines(text: &str, max_lines: usize) -> String {
     )
 }
 
-pub fn describe(item: &Value) -> Option<Block> {
+/// The block for one turn item. `runs` are the runs of the item's thread, which
+/// `ThreadState::runs_for` gives. A handoff that T3 stamped no models on reads its models from
+/// them.
+pub fn describe(item: &Value, runs: &[Value]) -> Option<Block> {
     let item_type = str_of(item, "type");
     let title = str_of(item, "title");
     let block = |kind, header: String, body: String| Block {
@@ -514,7 +764,14 @@ pub fn describe(item: &Value) -> Option<Block> {
             let (header, body) = compaction(item);
             block(BlockKind::Notice, header, body)
         }
-        "system_notice" | "handoff" | "fork" | "thread_created" | "notification" => {
+        // The nightly's `V2LifecycleRow.tsx` labels every handoff this way, whatever its title,
+        // and shows where it went rather than its summary.
+        "handoff" => block(
+            BlockKind::Notice,
+            "Context handoff".into(),
+            handoff_detail(item, runs),
+        ),
+        "system_notice" | "fork" | "thread_created" | "notification" => {
             if title.is_empty() {
                 return None;
             }
@@ -532,7 +789,11 @@ pub fn describe(item: &Value) -> Option<Block> {
 }
 
 pub fn blocks(state: &ThreadState) -> Vec<Block> {
-    state.items().into_iter().filter_map(describe).collect()
+    state
+        .items()
+        .into_iter()
+        .filter_map(|item| describe(item, state.runs_for(item)))
+        .collect()
 }
 
 /// Plain text for `threads read`.
@@ -625,7 +886,7 @@ mod tests {
         // A running step has only the anchor its clock started from.
         assert_eq!(steps[1].duration_ms, None);
 
-        let block = describe(&item).expect("a checklist has a row");
+        let block = describe(&item, &[]).expect("a checklist has a row");
         assert_eq!(block.kind, BlockKind::Plan);
         assert_eq!(
             block.body,
@@ -693,7 +954,7 @@ mod tests {
             "projection": {"thread": {"id": "t"}, "turnItems": [item]},
         }))
         .expect("a snapshot");
-        let block = describe(state.items()[0]).expect("a checklist has a row");
+        let block = describe(state.items()[0], &[]).expect("a checklist has a row");
         let printed = plain_text(&state, None, false);
         for text in [&block.body, &printed] {
             let control = text.chars().find(|c| c.is_control() && *c != '\n');
@@ -820,7 +1081,7 @@ mod tests {
         ];
         for (status, before, after, header, body) in cases {
             let item = compaction_item(status, before, after);
-            let block = describe(&item).expect("a compaction has a row");
+            let block = describe(&item, &[]).expect("a compaction has a row");
             assert_eq!(block.kind, BlockKind::Notice, "{item}");
             assert_eq!(
                 (block.header.as_str(), block.body.as_str()),
@@ -833,7 +1094,7 @@ mod tests {
         let mut titled = compaction_item("running", None, None);
         titled["title"] = json!("Auto-compact");
         assert_eq!(
-            describe(&titled).expect("a row").header,
+            describe(&titled, &[]).expect("a row").header,
             "Compacting context"
         );
     }
@@ -850,7 +1111,7 @@ mod tests {
             "projection": {"thread": {"id": "t"}, "turnItems": [item]},
         }))
         .expect("a snapshot");
-        let block = describe(state.items()[0]).expect("a compaction has a row");
+        let block = describe(state.items()[0], &[]).expect("a compaction has a row");
         assert_eq!(block.header, "Context compacted 899K → 19K tokens");
         assert_eq!(
             block.body,
@@ -868,7 +1129,7 @@ mod tests {
         let mut item = compaction_item("failed", Some(json!(899_000)), None);
         item["summary"] = json!("Ran out of room");
         assert_eq!(
-            describe(&item).expect("a row").body,
+            describe(&item, &[]).expect("a row").body,
             "899K → ? tokens\nRan out of room"
         );
 
@@ -879,15 +1140,425 @@ mod tests {
             .join("\n");
         let mut item = compaction_item("completed", None, None);
         item["summary"] = json!(lines);
-        let body = describe(&item).expect("a row").body;
+        let body = describe(&item, &[]).expect("a row").body;
         assert!(body.starts_with("line 1\nline 2\n"), "{body}");
         assert!(body.ends_with("\nline 12\n…"), "{body}");
 
         // One line longer than a row's byte budget is cut on a character boundary. 界 takes
         // three bytes, so 1,365 of them fit in 4,096.
         item["summary"] = json!("界".repeat(5_000));
-        let body = describe(&item).expect("a row").body;
+        let body = describe(&item, &[]).expect("a row").body;
         assert_eq!(body, format!("{}\n…", "界".repeat(1_365)));
+    }
+
+    /// A `handoff` item as the nightly sends it (`OrchestrationV2TurnItem` in
+    /// packages/contracts/src/orchestrationV2.ts and `Orchestrator.ts:1636`), from codex_personal
+    /// to claudeAgent in run `target`, without the stamped models of newer servers. `fields`
+    /// replaces or adds fields.
+    fn handoff_item(fields: Value) -> Value {
+        let mut item = json!({
+            "id": "handoff-1",
+            "threadId": "t",
+            "runId": "target",
+            "type": "handoff",
+            "ordinal": 299,
+            "status": "completed",
+            "title": "Provider handoff",
+            "contextHandoffId": "context-handoff-1",
+            "fromProviderThreadIds": ["provider-thread-1"],
+            "toProviderThreadId": "provider-thread-2",
+            "fromProviderInstanceIds": ["codex_personal"],
+            "toProviderInstanceId": "claudeAgent",
+            "strategy": "full_thread_summary",
+            "summary": "Full conversation context for provider handoff.",
+            "updatedAt": "2026-10-08T10:00:00.000Z",
+        });
+        if let (Some(item), Some(fields)) = (item.as_object_mut(), fields.as_object()) {
+            item.extend(fields.clone());
+        }
+        item
+    }
+
+    /// A finished run on `instance` with `model`.
+    fn run(id: &str, ordinal: u64, instance: &str, model: &str) -> Value {
+        json!({"id": id, "ordinal": ordinal, "status": "completed", "providerInstanceId": instance,
+            "modelSelection": {"instanceId": instance, "model": model}})
+    }
+
+    fn detail(item: &Value, runs: &[Value]) -> String {
+        describe(item, runs).expect("a handoff has a row").body
+    }
+
+    #[test]
+    fn every_handoff_is_a_context_handoff_marker_whatever_its_title() {
+        // Untitled, and with the titles T3 gives a provider switch and imported context. None
+        // shows its title or its summary.
+        let stamped = json!({
+            "fromModelSelections": [{"instanceId": "codex_personal", "model": "gpt-5.6-sol"}],
+            "toModel": "claude-fable-5",
+        });
+        for title in [
+            Value::Null,
+            json!("Provider handoff"),
+            json!("Imported context"),
+        ] {
+            let mut item = handoff_item(stamped.clone());
+            item["title"] = title;
+            let block = describe(&item, &[]).expect("a handoff has a row");
+            assert_eq!(block.kind, BlockKind::Notice, "{item}");
+            assert_eq!(
+                (block.header.as_str(), block.body.as_str()),
+                ("Context handoff", "gpt-5.6-sol → claude-fable-5"),
+                "{item}"
+            );
+        }
+
+        // `t3term read` prints each marker and its endpoints, a failed handoff's too. The
+        // projection that `--json` prints keeps the items as T3 sent them.
+        let mut untitled = handoff_item(stamped);
+        untitled["title"] = Value::Null;
+        let failed = handoff_item(json!({
+            "id": "handoff-2",
+            "ordinal": 399,
+            "status": "failed",
+            "runId": null,
+        }));
+        let state = ThreadState::from_snapshot(&json!({
+            "snapshotSequence": 1,
+            "projection": {"thread": {"id": "t"}, "turnItems": [untitled.clone(), failed.clone()]},
+        }))
+        .expect("a snapshot");
+        assert_eq!(
+            plain_text(&state, None, false),
+            "  · Context handoff\n    gpt-5.6-sol → claude-fable-5\n  · Context handoff\n    codex_personal → claudeAgent\n"
+        );
+        assert_eq!(state.list("turnItems"), [untitled, failed]);
+    }
+
+    #[test]
+    fn stamped_endpoints_keep_every_source_model_and_win_over_the_runs() {
+        // As in the nightly's handoff.test.ts: two models from one provider, and a target that
+        // the handoff run would name differently.
+        let runs = [run("target", 2, "claudeAgent", "later-model")];
+        let two_models = json!([
+            {"instanceId": "codex_personal", "model": "source-a"},
+            {"instanceId": "codex_personal", "model": "source-b"},
+        ]);
+        let item = handoff_item(json!({
+            "fromModelSelections": two_models,
+            "toModel": "destination",
+        }));
+        assert_eq!(detail(&item, &runs), "source-a, source-b → destination");
+
+        // Sources keep T3's order, a repeat included, and one with a blank model is named by
+        // its provider.
+        let item = handoff_item(json!({
+            "fromModelSelections": [
+                {"instanceId": "cursor", "model": "composer-2"},
+                {"instanceId": "codex_personal", "model": "source-a"},
+                {"instanceId": "opencode", "model": " \t"},
+                {"instanceId": "cursor", "model": "composer-2"},
+            ],
+            "toModel": "destination",
+        }));
+        assert_eq!(
+            detail(&item, &runs),
+            "composer-2, source-a, opencode, composer-2 → destination"
+        );
+
+        // A stamped target model with no text still stands, so the provider names the target,
+        // as the nightly's `??` keeps it.
+        let item = handoff_item(json!({"fromModelSelections": two_models, "toModel": "  "}));
+        assert_eq!(detail(&item, &runs), "source-a, source-b → claudeAgent");
+
+        // With no stamped sources, the runs name them, and the stamped target still wins.
+        let runs = [
+            run("source", 1, "codex_personal", "source-model"),
+            run("target", 2, "claudeAgent", "later-model"),
+        ];
+        let item = handoff_item(json!({"fromModelSelections": [], "toModel": "destination"}));
+        assert_eq!(detail(&item, &runs), "source-model → destination");
+    }
+
+    #[test]
+    fn a_handoff_without_stamped_models_reads_them_from_the_runs() {
+        // As in the nightly's handoff.test.ts: the target's model is the handoff run's, and the
+        // source's is that of the newest run on its provider before the handoff run, wherever
+        // the runs come in the list.
+        let runs = [
+            run("later", 4, "codex_personal", "wrong-later-model"),
+            run("old", 1, "codex_personal", "old-model"),
+            run("target", 3, "claudeAgent", "destination"),
+            run("source", 2, "codex_personal", "source-model"),
+        ];
+        let item = handoff_item(json!({}));
+        assert_eq!(detail(&item, &runs), "source-model → destination");
+        // Stamped sources alone still leave the target to the handoff run.
+        let item = handoff_item(json!({
+            "fromModelSelections": [{"instanceId": "codex_personal", "model": "gpt-5.5"}],
+        }));
+        assert_eq!(detail(&item, &runs), "gpt-5.5 → destination");
+        // With no handoff run, nothing bounds the sources, so the newest run on a source's
+        // provider names it, as in the nightly, and the target keeps its provider.
+        let item = handoff_item(json!({"runId": null}));
+        assert_eq!(detail(&item, &runs), "wrong-later-model → claudeAgent");
+        // With no source at all, the target stands alone, without the arrow.
+        let item = handoff_item(json!({"fromProviderInstanceIds": []}));
+        assert_eq!(detail(&item, &runs), "destination");
+
+        // Several sources keep T3's order, and one with no run before the handoff run keeps its
+        // provider.
+        let runs = [
+            run("cursor", 1, "cursor", "composer-2"),
+            run("source", 2, "codex_personal", "source-model"),
+            run("target", 3, "claudeAgent", "destination"),
+            run("too-late", 4, "opencode", "too-late-model"),
+        ];
+        let item = handoff_item(json!({
+            "fromProviderInstanceIds": ["cursor", "opencode", "codex_personal"],
+        }));
+        assert_eq!(
+            detail(&item, &runs),
+            "composer-2, opencode, source-model → destination"
+        );
+
+        // A handoff run on another provider names no target, and without runs both ends keep
+        // their providers.
+        let item = handoff_item(json!({}));
+        let runs = [run("target", 2, "codex_personal", "wrong-model")];
+        assert_eq!(detail(&item, &runs), "codex_personal → claudeAgent");
+        assert_eq!(detail(&item, &[]), "codex_personal → claudeAgent");
+    }
+
+    #[test]
+    fn an_inherited_handoff_keeps_its_providers() {
+        // A fork inherits its parent's items but not its runs, so t3term gives an inherited
+        // handoff no runs and names both its ends by provider. The nightly differs: its
+        // timeline passes the fork's own runs, where a source can take the model of a fork run
+        // that came after the handoff. Here the fork's runs would name both ends of the
+        // parent's handoff, yet only the fork's own handoff reads them.
+        let runs = [
+            run("source", 1, "codex_personal", "source-model"),
+            run("target", 2, "claudeAgent", "destination"),
+        ];
+        let mut inherited = handoff_item(json!({}));
+        inherited["threadId"] = json!("parent");
+        let local = handoff_item(json!({"id": "handoff-2", "ordinal": 399}));
+        let state = ThreadState::from_snapshot(&json!({
+            "snapshotSequence": 1,
+            "projection": {
+                "thread": {"id": "t"},
+                "runs": runs,
+                "turnItems": [local],
+                "visibleTurnItems": [
+                    {"position": 0, "visibility": "inherited", "sourceThreadId": "parent",
+                        "sourceItemId": "handoff-1", "item": inherited},
+                    {"position": 1, "visibility": "local", "sourceThreadId": "t",
+                        "sourceItemId": "handoff-2", "item": local},
+                ],
+            },
+        }))
+        .expect("a snapshot");
+        let bodies: Vec<String> = blocks(&state).into_iter().map(|b| b.body).collect();
+        assert_eq!(
+            bodies,
+            ["codex_personal → claudeAgent", "source-model → destination"]
+        );
+    }
+
+    #[test]
+    fn a_handoffs_endpoints_are_bounded_and_never_move_the_cursor() {
+        let stamped = |source: &str, target: &str| {
+            handoff_item(json!({
+                "fromModelSelections": [{"instanceId": "codex_personal", "model": source}],
+                "toModel": target,
+            }))
+        };
+        // Made-up ids: an Esc that clears the screen, a C1 CSI, BEL, a line break and a tab,
+        // then CJK, a joined emoji and a combining accent, which a terminal draws as they are.
+        let item = stamped(
+            "gpt\u{1b}[2J-5.6\u{9b}31m\u{7}\n\tsol",
+            "日本語 👩\u{200d}💻 cafe\u{301}",
+        );
+        assert_eq!(
+            detail(&item, &[]),
+            "gpt[2J-5.631m sol → 日本語 👩\u{200d}💻 cafe\u{301}"
+        );
+
+        // A model that is only controls or blanks gives way to the provider id, which is
+        // cleaned the same way. With nothing left of either, the end reads `?`.
+        let mut item = stamped("\u{1b}\u{7}", " ");
+        item["fromModelSelections"][0]["instanceId"] = json!("codex\u{9b}2J\r\npersonal");
+        item["toProviderInstanceId"] = json!("\u{7f}");
+        assert_eq!(detail(&item, &[]), "codex2J personal → ?");
+
+        // Past 64 columns an id is cut where a terminal starts a character, and … ends it. 界
+        // and 👩‍💻 take two columns each.
+        let coder = "👩\u{200d}💻";
+        let cases = [
+            ("m".repeat(200), format!("{}…", "m".repeat(63))),
+            ("界".repeat(100), format!("{}…", "界".repeat(31))),
+            (
+                format!("a{}", coder.repeat(40)),
+                format!("a{}…", coder.repeat(31)),
+            ),
+            // Only the first 1,024 bytes are read, so … also says there was more after them.
+            (format!("a{}", "\u{7}".repeat(2_000)), "a…".to_string()),
+        ];
+        for (raw, kept) in cases {
+            assert!(kept.width() <= MAX_ENDPOINT_WIDTH, "{kept}");
+            assert_eq!(detail(&stamped(&raw, "x"), &[]), format!("{kept} → x"));
+        }
+    }
+
+    #[test]
+    fn only_the_first_twelve_sources_reach_the_resolver() {
+        // `endpoints_with`, which `endpoints` runs, turns both kinds of source list into
+        // endpoints through `shown_sources`, and the legacy kind calls `latest_model_before`
+        // only in the closure it passes. So a source that closure never receives never reaches
+        // a model lookup. The closure here records each raw source it receives.
+        let mut raw: Vec<Value> = (1..=1_000).map(|n| json!(format!("p{n}"))).collect();
+        raw[2] = json!("p1");
+        let cases = [
+            (0, 0, 0),
+            (11, 11, 0),
+            (12, 12, 0),
+            (13, 12, 1),
+            (1_000, 12, 988),
+        ];
+        for (count, resolved, more) in cases {
+            let mut seen = Vec::new();
+            let (from, rest) = shown_sources(&raw[..count], |source| {
+                seen.push(source.clone());
+                Endpoint {
+                    instance_id: source.as_str().unwrap_or_default(),
+                    model: None,
+                }
+            });
+            // The first sources come in T3's order, the repeat of p1 included.
+            assert_eq!(seen, raw[..resolved], "{count} sources");
+            assert_eq!(from.len(), resolved, "{count} sources");
+            assert_eq!(rest, more, "{count} sources");
+        }
+    }
+
+    #[test]
+    fn past_twelve_sources_both_kinds_of_handoff_count_the_rest() {
+        // Fifteen providers, each with an old run, a run before the handoff run and a run
+        // after it, so every source would name a model if it were resolved.
+        let providers: Vec<String> = (1..=15).map(|n| format!("p{n}")).collect();
+        let mut runs = vec![run("target", 100, "claudeAgent", "destination")];
+        for (n, provider) in (1..).zip(&providers) {
+            runs.push(run(&format!("{provider}-old"), n, provider, "old-model"));
+            runs.push(run(
+                &format!("{provider}-new"),
+                50 + n,
+                provider,
+                &format!("m{n}"),
+            ));
+            runs.push(run(
+                &format!("{provider}-late"),
+                100 + n,
+                provider,
+                "too-late",
+            ));
+        }
+        let shown = (1..=12)
+            .map(|n| format!("m{n}"))
+            .collect::<Vec<_>>()
+            .join(", ");
+        for (count, more, expected) in [
+            (12, 0, format!("{shown} → destination")),
+            (13, 1, format!("{shown}, +1 more → destination")),
+            (15, 3, format!("{shown}, +3 more → destination")),
+        ] {
+            let ids = &providers[..count];
+            let legacy = handoff_item(json!({"fromProviderInstanceIds": ids}));
+            assert_eq!(detail(&legacy, &runs), expected, "{count} legacy");
+
+            let selections: Vec<Value> = (1..=count)
+                .map(|n| json!({"instanceId": format!("p{n}"), "model": format!("m{n}")}))
+                .collect();
+            let stamped = handoff_item(json!({
+                "fromModelSelections": selections,
+                "toModel": "destination",
+            }));
+            assert_eq!(detail(&stamped, &runs), expected, "{count} stamped");
+
+            // Either way the endpoints hold only the twelve shown, and the count of the rest
+            // comes from the array's length.
+            for item in [&legacy, &stamped] {
+                let ends = endpoints(item, &runs);
+                assert_eq!((ends.from.len(), ends.more), (12, more), "{item}");
+            }
+        }
+    }
+
+    #[test]
+    fn a_handoff_looks_for_its_run_only_when_an_end_has_no_stamped_model() {
+        // The handoff's run is `target`. Before it codex_personal ran gpt-5.4, and the stamps
+        // name other models, so each line shows which ends came from the runs.
+        let runs = [
+            run("old", 1, "codex_personal", "gpt-5.4"),
+            run("target", 2, "claudeAgent", "claude-fable-5-1"),
+        ];
+        let stamped = json!([{"instanceId": "codex_personal", "model": "gpt-5.5"}]);
+        let cases = [
+            // Stamped at both ends, even with a target model of no text, it looks for no run.
+            (
+                json!({"fromModelSelections": stamped, "toModel": "claude-fable-5"}),
+                0,
+                "gpt-5.5 → claude-fable-5",
+            ),
+            (
+                json!({"fromModelSelections": stamped, "toModel": "  "}),
+                0,
+                "gpt-5.5 → claudeAgent",
+            ),
+            // With no target model, or one that isn't text, the target's is its run's.
+            (
+                json!({"fromModelSelections": stamped}),
+                1,
+                "gpt-5.5 → claude-fable-5-1",
+            ),
+            (
+                json!({"fromModelSelections": stamped, "toModel": 5}),
+                1,
+                "gpt-5.5 → claude-fable-5-1",
+            ),
+            // With no source models, an empty list of them or something else in their place,
+            // each source's is the model of the run before the handoff's.
+            (
+                json!({"toModel": "claude-fable-5"}),
+                1,
+                "gpt-5.4 → claude-fable-5",
+            ),
+            (
+                json!({"fromModelSelections": [], "toModel": "claude-fable-5"}),
+                1,
+                "gpt-5.4 → claude-fable-5",
+            ),
+            (
+                json!({"fromModelSelections": "gpt-5.5", "toModel": "claude-fable-5"}),
+                1,
+                "gpt-5.4 → claude-fable-5",
+            ),
+            (json!({}), 1, "gpt-5.4 → claude-fable-5-1"),
+        ];
+        for (fields, looked, line) in cases {
+            let item = handoff_item(fields);
+            let mut calls = 0;
+            let ends = endpoints_with(&item, &runs, || {
+                calls += 1;
+                runs.iter().find(|run| run["id"] == item["runId"])
+            });
+            let from: Vec<String> = ends.from.iter().map(Endpoint::label).collect();
+            let shown = format!("{} → {}", from.join(", "), ends.to.label());
+            assert_eq!((calls, shown.as_str()), (looked, line), "{item}");
+            // The TUI describes a handoff again after a run changes only when `reads_runs`.
+            assert_eq!(reads_runs(&item), looked == 1, "{item}");
+            assert_eq!(detail(&item, &runs), line, "{item}");
+        }
     }
 
     #[test]

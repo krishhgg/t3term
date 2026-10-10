@@ -149,6 +149,18 @@ The provider's summary comes next, which the desktop's timeline leaves out. t3te
 
 ![Three compaction markers in one thread: Context compacted 899K → 19K tokens over a two-line summary, Context compaction failed over 1.23M → ? tokens and its summary, and Context compaction stopped over 999 → ? tokens](docs/screenshots/compaction-states.png)
 
+### Context handoff
+
+When T3 hands a thread's context from one provider to another, the transcript and `t3term read` show a Context handoff marker, with or without a title from T3. The line under it lists the source models, then an arrow and the target model, such as `gpt-5.5, gpt-5.4 → claude-fable-5`. Sources keep T3's order, and past twelve a count such as `+3 more` stands for the rest. `t3term send --wait` and `t3term wait` print the marker and that line on stderr once, when a handoff in the turn they wait on has finished or failed.
+
+Newer T3 servers stamp the models on the handoff. For an older handoff, t3term reads them from the thread's runs as the nightly desktop does. The target's model is that of the handoff's run, and each source's is that of the latest earlier run on its provider. An end with no known model shows its provider id, such as `codex_personal`. So does each end of a handoff that a fork inherited, because the fork doesn't have its parent's runs. The desktop shows names from T3's model and provider list, which `t3term read` doesn't fetch, so t3term shows the ids T3 sent.
+
+Each end shows at most 64 columns and ends with `…` when cut. t3term drops its control characters as it does a checklist step's, and `t3term --json read` keeps the item as T3 sent it. In the TUI the marker is a rule like a compaction's, with the endpoints wrapped under it in grey and the label in red when the handoff failed. `t3term read` prints no colors, so a failed handoff reads the same there. The TUI works out the endpoints again when T3 changes the item and, for an older handoff, when a run is added or its model, provider or order changes, not on every redraw. A handoff stamped at both ends never reads the runs, and while no handoff in the transcript reads them, a run event doesn't make the TUI look the run up.
+
+![Two Context handoff markers in one thread: a grey one over gpt-5.5, gpt-5.4 → claude-fable-5, and a failed one with a red label over composer-2, gpt-5.5, opencode, composer-2 → claudeAgent](docs/screenshots/handoff-stamped.png)
+
+The thread is invented and comes from a fake T3 server. The image renders t3term's captured terminal output.
+
 ### The Working shelf
 
 The nightly desktop app has a "Working shelf" setting, off by default, that moves threads busy without you out of Active. To turn it on in t3term, add `"sidebarWorkingShelfEnabled": true` to `~/.config/t3term/settings.json` and restart t3term. The desktop's switch uses the same key, though each app keeps its own copy. With it off, the sidebar is as described above.
@@ -232,7 +244,7 @@ Set `T3TERM_NO_SAVED_LOGIN=1` to use a session that lasts one run instead. t3ter
 cargo test
 ```
 
-The unit tests cover the reducers, Markdown wrapping, the composer, the model menus, the transcript, the tasks drawer and auth command parsing. `tests/fake_server.rs` drives the real RPC client against a fake Effect RPC server, dropping the socket mid-stream to check the resume cursor, chunk acks, batched frames, duplicate suppression and error decoding. `tests/cli.rs` runs the built binary with a temporary home and checks the `--json` error and exit code when the server is gone, when it isn't on protocol 2 and when the TUI has no terminal. It also runs `t3term read` against a fake server and a fake `t3` that issues a made-up session. It checks that the plain output drops the control characters of a checklist and a compaction summary, and that `--json` writes them as escapes that decode to the text T3 sent. None of them reach a real T3 server or the Keychain, and CI runs them on macOS for every pull request.
+The unit tests cover the reducers, Markdown wrapping, the composer, the model menus, the transcript, the tasks drawer and auth command parsing. `tests/fake_server.rs` drives the real RPC client against a fake Effect RPC server, dropping the socket mid-stream to check the resume cursor, chunk acks, batched frames, duplicate suppression and error decoding. `tests/cli.rs` runs the built binary with a temporary home and checks the `--json` error and exit code when the server is gone, when it isn't on protocol 2 and when the TUI has no terminal. It also runs `t3term read` against a fake server and a fake `t3` that issues a made-up session. It checks that the plain output drops the control characters of a checklist and a compaction summary, and that `--json` writes them as escapes that decode to the text T3 sent. Another test runs `t3term send --wait` against a fake server that also plays T3's side of the WebSocket. It checks that each finished handoff in the turn prints its marker and endpoints on stderr once, even when T3 sends the item again, and that `--json` prints only the result. None of them reach a real T3 server or the Keychain, and CI runs them on macOS for every pull request.
 
 `docs/screenshots/` also holds `before-tui.png`, `after-tui.png`, `approval.png`, `streaming.gif`, `picker-model.png` and `tool-calls-failed.png`.
 

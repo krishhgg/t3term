@@ -29,6 +29,7 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 | 7 | https://github.com/krishhgg/t3term/pull/14 | Proposed plans as cards that collapse when long | `65e3d4351a0f70826c943cc160b7da6d898cd511` |
 | 8 | https://github.com/krishhgg/t3term/pull/15 | The running turn's tasks in a drawer above the composer, and checklist steps read in the nightly's shape | |
 | 9 | https://github.com/krishhgg/t3term/pull/16 | Context compaction markers with their state, token counts and summary, without handoff markers | |
+| 10 | https://github.com/krishhgg/t3term/pull/17 | Context handoff markers with their source and target models | |
 
 ## Maintenance review PRs
 

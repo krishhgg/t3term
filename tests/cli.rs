@@ -7,13 +7,19 @@
 //! command it runs either fails or is a script this file writes.
 
 use std::io::{BufRead, BufReader, Write};
-use std::net::TcpListener;
+use std::net::{TcpListener, TcpStream};
 use std::path::Path;
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
+use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+use tokio_tungstenite::tungstenite::protocol::Role;
+use tokio_tungstenite::tungstenite::{Message, WebSocket};
+
+/// A WebSocket a client opened on a fake server, after the handshake.
+type Socket = WebSocket<TcpStream>;
 
 struct Home(TempDir);
 
@@ -103,14 +109,24 @@ fn fake_server(descriptor: Value) -> (String, Arc<Mutex<Vec<String>>>) {
 }
 
 /// Answers each request with what `respond` gives for its path, or 404 for None, and records
-/// the paths requested.
+/// the paths requested. A WebSocket a client opens is closed as soon as it is open.
 fn serve(
     respond: impl Fn(&str) -> Option<Value> + Send + 'static,
+) -> (String, Arc<Mutex<Vec<String>>>) {
+    serve_sockets(respond, |_| {})
+}
+
+/// `serve`, which also hands each WebSocket a client opens to `on_socket` on a thread of its
+/// own, once the handshake is done.
+fn serve_sockets(
+    respond: impl Fn(&str) -> Option<Value> + Send + 'static,
+    on_socket: impl Fn(Socket) + Send + Sync + 'static,
 ) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let paths = Arc::new(Mutex::new(Vec::new()));
     let seen = paths.clone();
+    let on_socket = Arc::new(on_socket);
     std::thread::spawn(move || {
         for stream in listener.incoming() {
             let Ok(mut stream) = stream else { continue };
@@ -119,12 +135,30 @@ fn serve(
             if reader.read_line(&mut request_line).is_err() {
                 continue;
             }
+            // A WebSocket upgrade names its key in a header.
+            let mut key = None;
             let mut header = String::new();
             while reader.read_line(&mut header).is_ok_and(|n| n > 2) {
+                if let Some((name, value)) = header.split_once(':')
+                    && name.eq_ignore_ascii_case("sec-websocket-key")
+                {
+                    key = Some(value.trim().to_string());
+                }
                 header.clear();
             }
             let path = request_line.split_whitespace().nth(1).unwrap_or_default();
             seen.lock().unwrap().push(path.to_string());
+            if let Some(key) = key {
+                let accept = derive_accept_key(key.as_bytes());
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                );
+                let socket = WebSocket::from_raw_socket(stream, Role::Server, None);
+                let on_socket = on_socket.clone();
+                std::thread::spawn(move || on_socket(socket));
+                continue;
+            }
             let (status, body) = match respond(path) {
                 Some(value) => ("200 OK", value.to_string()),
                 None => ("404 Not Found", String::new()),
@@ -144,23 +178,52 @@ fn serve(
 /// thread `id` as `GET /api/orchestration/threads/:id` returns it, with only the fields `read`
 /// uses. Returns the server's origin.
 fn serve_thread(id: &str, title: &str, turn_items: Value) -> String {
-    let snapshot = json!({"snapshotSequence": 3, "projection": {
+    let projection = json!({
         "thread": {"id": id, "title": title},
         "runs": [],
         "runtimeRequests": [],
         "turnItems": turn_items,
-    }});
-    let descriptor = json!({"environmentId": "env-test", "label": "Fake",
-        "platform": {"os": "darwin", "arch": "arm64"}, "serverVersion": "0.0.0-test",
-        "capabilities": {}, "orchestrationProtocolVersion": 2});
+    });
+    serve_projection(id, projection)
+}
+
+/// Serves thread `id` as `serve_thread` does, with `projection` in its snapshot.
+fn serve_projection(id: &str, projection: Value) -> String {
+    let snapshot = json!({"snapshotSequence": 3, "projection": projection});
     let thread_path = format!("/api/orchestration/threads/{id}");
     let (origin, _) = serve(move |path| match path {
-        "/.well-known/t3/environment" => Some(descriptor.clone()),
+        "/.well-known/t3/environment" => Some(protocol_2_descriptor()),
         "/api/orchestration/shell" => Some(json!({"projects": [], "threads": []})),
         _ if path == thread_path => Some(snapshot.clone()),
         _ => None,
     });
     origin
+}
+
+/// The descriptor of a server on orchestration protocol 2, as in
+/// `servers_not_on_protocol_2_are_refused_before_any_login`.
+fn protocol_2_descriptor() -> Value {
+    json!({"environmentId": "env-test", "label": "Fake",
+        "platform": {"os": "darwin", "arch": "arm64"}, "serverVersion": "0.0.0-test",
+        "capabilities": {}, "orchestrationProtocolVersion": 2})
+}
+
+/// The next Effect RPC request a client sent on `socket`, past its acks and pings, or None once
+/// the socket closed.
+fn next_request(socket: &mut Socket) -> Option<Value> {
+    loop {
+        let Message::Text(text) = socket.read().ok()? else {
+            continue;
+        };
+        let message: Value = serde_json::from_str(text.as_str()).ok()?;
+        if message["_tag"] == "Request" {
+            return Some(message);
+        }
+    }
+}
+
+fn reply(socket: &mut Socket, message: Value) {
+    let _ = socket.send(Message::text(message.to_string()));
 }
 
 #[test]
@@ -318,6 +381,264 @@ fn read_shows_compactions_without_a_title_and_json_keeps_them_as_sent() {
     let control = printed.chars().find(|c| c.is_control() && *c != '\n');
     assert_eq!(control, None, "{printed:?}");
     assert_eq!(json_stdout(&read)["projection"]["turnItems"], items);
+}
+
+#[test]
+fn read_names_where_each_handoff_went_and_json_keeps_them_as_sent() {
+    // Handoffs as the nightly sends them (`OrchestrationV2TurnItem` in
+    // packages/contracts/src/orchestrationV2.ts), in a thread forked from another. The first is
+    // the parent's, which T3 stamped no models on and whose runs stay with the parent, so its
+    // providers name both ends. Then one T3 stamped with two models from one provider, under
+    // the title T3 gives imported context, an untitled one that this thread's runs name, and a
+    // failed one whose made-up model ids hold controls or run long.
+    let id = "9c4e2a71-5b3d-4e8f-a1c6-3d7b9e0f2a54";
+    let handoff = |item_id: &str, ordinal: u64, status: &str| {
+        json!({"id": item_id, "threadId": id, "type": "handoff", "ordinal": ordinal,
+            "status": status, "title": null, "fromProviderInstanceIds": ["codex_personal"],
+            "toProviderInstanceId": "claudeAgent", "strategy": "full_thread_summary",
+            "summary": "Full conversation context.", "updatedAt": "2026-10-08T10:00:00.000Z"})
+    };
+    let mut inherited = handoff("h0", 1, "completed");
+    inherited["threadId"] = json!("4b1d7c93-2e6a-4f05-9d8c-6a0e3f5b1c27");
+    inherited["runId"] = json!("parent-run");
+    inherited["title"] = json!("Provider handoff");
+    let mut stamped = handoff("h1", 3, "completed");
+    stamped["runId"] = json!("r2");
+    stamped["title"] = json!("Imported context");
+    stamped["fromModelSelections"] = json!([
+        {"instanceId": "codex_personal", "model": "gpt-5.5"},
+        {"instanceId": "codex_personal", "model": "gpt-5.4"},
+    ]);
+    stamped["toModel"] = json!("claude-fable-5");
+    let mut legacy = handoff("h2", 5, "completed");
+    legacy["runId"] = json!("r4");
+    legacy["fromProviderInstanceIds"] = json!(["cursor", "codex_personal"]);
+    let mut failed = handoff("h3", 6, "failed");
+    failed["fromModelSelections"] = json!([
+        {"instanceId": "codex_personal", "model": "gpt\u{1b}[2J-5.5\u{9b}31m\r\nmini"},
+        {"instanceId": "codex_personal", "model": "m".repeat(100)},
+    ]);
+    failed["toModel"] = json!("\u{1b}\u{7}");
+
+    // The thread's runs. The cursor run after the legacy handoff's run names nothing.
+    let run = |run_id: &str, ordinal: u64, instance: &str, model: &str| {
+        json!({"id": run_id, "ordinal": ordinal, "status": "completed",
+            "providerInstanceId": instance,
+            "modelSelection": {"instanceId": instance, "model": model}})
+    };
+    let entry = |position: u64, visibility: &str, item: &Value| {
+        json!({"position": position, "visibility": visibility,
+            "sourceThreadId": item["threadId"], "sourceItemId": item["id"],
+            "item": item})
+    };
+    let projection = json!({
+        "thread": {"id": id, "title": "Handoffs"},
+        "runs": [
+            run("r1", 1, "codex_personal", "gpt-5.5"),
+            run("r2", 2, "claudeAgent", "claude-fable-5"),
+            run("r3", 3, "cursor", "composer-2"),
+            run("r4", 4, "claudeAgent", "claude-fable-5-1"),
+            run("r5", 5, "cursor", "composer-3"),
+        ],
+        "runtimeRequests": [],
+        "turnItems": [stamped, legacy, failed],
+        "visibleTurnItems": [
+            entry(0, "inherited", &inherited),
+            entry(1, "local", &stamped),
+            entry(2, "local", &legacy),
+            entry(3, "local", &failed),
+        ],
+    });
+    let origin = serve_projection(id, projection.clone());
+    let home = Home::new();
+    home.record_server(&origin);
+    let t3 = home.fake_t3();
+
+    let read = home.run_with(&["read", id], &t3);
+    assert_eq!(read.status.code(), Some(0), "{read:?}");
+    let printed = String::from_utf8(read.stdout).expect("UTF-8");
+    let control = printed.chars().find(|c| c.is_control() && *c != '\n');
+    assert_eq!(control, None, "{printed:?}");
+    let long = "m".repeat(63);
+    let failed_row = format!("    gpt[2J-5.531m mini, {long}… → claudeAgent");
+    let rows = [
+        "  · Context handoff",
+        "    codex_personal → claudeAgent",
+        "  · Context handoff",
+        "    gpt-5.5, gpt-5.4 → claude-fable-5",
+        "  · Context handoff",
+        "    composer-2, gpt-5.5 → claude-fable-5-1",
+        "  · Context handoff",
+        failed_row.as_str(),
+    ];
+    let expected = format!("# Handoffs  ({id})\n{}\n", rows.join("\n"));
+    assert_eq!(printed, expected);
+
+    // `--json` prints the projection as T3 sent it, runs and both lists of items included,
+    // with each control as a JSON escape.
+    let read = home.run_with(&["--json", "read", id], &t3);
+    assert_eq!(read.status.code(), Some(0), "{read:?}");
+    let printed = std::str::from_utf8(&read.stdout).expect("UTF-8");
+    let control = printed.chars().find(|c| c.is_control() && *c != '\n');
+    assert_eq!(control, None, "{printed:?}");
+    assert_eq!(json_stdout(&read)["projection"], projection);
+}
+
+#[test]
+fn send_wait_says_once_where_each_handoff_in_the_turn_went() {
+    // A thread whose one run so far was on codex_personal, as `GET .../bounded` returns it.
+    let id = "6f1a3c85-9d2e-4b7f-8e04-2c5d7a1b9e36";
+    let run = |run_id: &str, ordinal: u64, status: &str, instance: &str, model: &str| {
+        json!({"id": run_id, "ordinal": ordinal, "status": status,
+            "providerInstanceId": instance,
+            "modelSelection": {"instanceId": instance, "model": model}})
+    };
+    let snapshot = json!({"snapshotSequence": 3, "projection": {
+        "thread": {"id": id, "title": "Live handoffs"},
+        "runs": [run("r0", 1, "completed", "codex_personal", "gpt-5.5")],
+        "runtimeRequests": [],
+        "turnItems": [],
+    }});
+
+    // What T3 streams once the message is dispatched: the message's run on claudeAgent, then a
+    // handoff into that run with no stamped models. The handoff runs and completes, then comes
+    // again in a replay and once more with a later `updatedAt`. Then a command, a failed
+    // handoff that T3 stamped with made-up model ids holding controls, the reply in two deltas
+    // and the end of the run. Each handoff carries the ids and summary T3 sends with it.
+    let turn = move |message_id: &str| {
+        let mut target = run("r1", 2, "running", "claudeAgent", "claude-fable-5");
+        target["userMessageId"] = json!(message_id);
+        let mut finished = target.clone();
+        finished["status"] = json!("completed");
+        let handoff = |item_id: &str, ordinal: u64, status: &str, updated_at: &str| {
+            json!({"id": item_id, "threadId": id, "runId": "r1", "type": "handoff",
+                "ordinal": ordinal, "status": status, "title": null,
+                "contextHandoffId": "context-handoff-1",
+                "fromProviderThreadIds": ["provider-thread-1"],
+                "toProviderThreadId": "provider-thread-2",
+                "fromProviderInstanceIds": ["codex_personal"],
+                "toProviderInstanceId": "claudeAgent", "strategy": "full_thread_summary",
+                "summary": "Full conversation context.", "updatedAt": updated_at})
+        };
+        let completed = handoff("h1", 3, "completed", "2026-10-08T10:00:02.000Z");
+        let mut stamped = handoff("h2", 5, "failed", "2026-10-08T10:00:05.000Z");
+        stamped["title"] = json!("Imported context");
+        stamped["fromModelSelections"] = json!([
+            {"instanceId": "codex_personal", "model": "gpt\u{1b}[2J-5.4\u{9b}31m\r\nmini"},
+        ]);
+        stamped["toModel"] = json!("\u{1b}\u{7}");
+        let command = json!({"id": "c1", "runId": "r1", "type": "command_execution",
+            "ordinal": 4, "status": "completed", "input": "ls", "output": "notes.txt",
+            "exitCode": 0});
+        let answer = |text: &str| {
+            json!({"id": "a1", "runId": "r1", "type": "assistant_message", "ordinal": 6,
+                "text": text, "streaming": true})
+        };
+        let event = |sequence: u64, kind: &str, payload: Value| {
+            json!({"kind": "event", "sequence": sequence,
+                "event": {"type": kind, "payload": payload}})
+        };
+        let item = "turn-item.updated";
+        json!([
+            {"kind": "synchronized"},
+            event(5, "run.created", target),
+            event(6, item, handoff("h1", 3, "running", "2026-10-08T10:00:01.000Z")),
+            event(7, item, completed.clone()),
+            event(7, item, completed),
+            event(8, item, handoff("h1", 3, "completed", "2026-10-08T10:00:03.000Z")),
+            event(9, item, command),
+            event(10, item, stamped),
+            event(11, item, answer("Hel")),
+            event(12, item, answer("Hello")),
+            event(13, "run.updated", finished),
+        ])
+    };
+
+    // T3's side of the WebSocket. It answers the dispatch with sequence 4 and the thread's
+    // subscription with the turn, and keeps each request.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let kept = requests.clone();
+    let on_socket = move |mut socket: Socket| {
+        let Some(dispatch) = next_request(&mut socket) else {
+            return;
+        };
+        kept.lock().unwrap().push(dispatch.clone());
+        reply(
+            &mut socket,
+            json!({"_tag": "Exit", "requestId": dispatch["id"],
+                "exit": {"_tag": "Success", "value": {"sequence": 4}}}),
+        );
+        let Some(subscribe) = next_request(&mut socket) else {
+            return;
+        };
+        kept.lock().unwrap().push(subscribe.clone());
+        let message_id = dispatch["payload"]["messageId"]
+            .as_str()
+            .unwrap_or_default();
+        reply(
+            &mut socket,
+            json!({"_tag": "Chunk", "requestId": subscribe["id"], "values": turn(message_id)}),
+        );
+        // Holds the socket open until t3term closes it.
+        while socket.read().is_ok() {}
+    };
+    let thread_path = format!("/api/orchestration/threads/{id}/bounded");
+    let (origin, _) = serve_sockets(
+        move |path| match path {
+            "/.well-known/t3/environment" => Some(protocol_2_descriptor()),
+            "/api/orchestration/shell" => Some(json!({"projects": [], "threads": []})),
+            "/api/auth/websocket-ticket" => Some(json!({"ticket": "ticket-test"})),
+            _ if path == thread_path => Some(snapshot.clone()),
+            _ => None,
+        },
+        on_socket,
+    );
+    let home = Home::new();
+    home.record_server(&origin);
+    let t3 = home.fake_t3();
+
+    // The reply streams to stdout. Each settled item of the turn gets one row on stderr, and a
+    // handoff's row has the line under it that `read` prints, here from the thread's runs.
+    // The replay and the later copy of the first handoff add nothing, a command's row stays
+    // one line, and no control, id or summary T3 sent with a handoff gets through.
+    let send = ["send", id, "Summarize", "--wait", "--timeout", "30"];
+    let sent = home.run_with(&send, &t3);
+    assert_eq!(sent.status.code(), Some(0), "{sent:?}");
+    assert_eq!(std::str::from_utf8(&sent.stdout), Ok("\nHello\n"));
+    let printed = std::str::from_utf8(&sent.stderr).expect("UTF-8");
+    let control = printed.chars().find(|c| c.is_control() && *c != '\n');
+    assert_eq!(control, None, "{printed:?}");
+    let rows = [
+        "",
+        "· Context handoff",
+        "  gpt-5.5 → claude-fable-5",
+        "",
+        "· $ ls  (exit 0)",
+        "",
+        "· Context handoff",
+        "  gpt[2J-5.431m mini → claudeAgent",
+    ];
+    assert_eq!(printed, format!("{}\n", rows.join("\n")));
+    // t3term dispatched the message, then subscribed after the snapshot it had read.
+    let seen = requests.lock().unwrap().clone();
+    assert_eq!(seen.len(), 2);
+    assert_eq!(seen[0]["tag"], "orchestration.dispatchCommand");
+    assert_eq!(seen[0]["payload"]["type"], "message.dispatch");
+    assert_eq!(seen[1]["tag"], "orchestration.subscribeThread");
+    assert_eq!(seen[1]["payload"]["afterSequence"], 3);
+
+    // With `--json`, stdout holds only the result and stderr stays empty.
+    let mut json_send = vec!["--json"];
+    json_send.extend(send);
+    let sent = home.run_with(&json_send, &t3);
+    assert_eq!(sent.status.code(), Some(0), "{sent:?}");
+    let message_id = requests.lock().unwrap()[2]["payload"]["messageId"].clone();
+    assert_eq!(
+        json_stdout(&sent),
+        json!({"ok": true, "threadId": id, "messageId": message_id, "runId": "r1",
+            "outcome": "completed", "reply": "Hello"})
+    );
+    assert_eq!(std::str::from_utf8(&sent.stderr), Ok(""));
 }
 
 #[test]
