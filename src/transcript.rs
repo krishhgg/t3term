@@ -1118,7 +1118,10 @@ pub fn plain_text(state: &ThreadState, last: Option<usize>, include_reasoning: b
                 }
             }
         } else {
-            out.push_str(&format!("\n{marker}\n\n{}\n", plain(&block.body).trim_end()));
+            out.push_str(&format!(
+                "\n{marker}\n\n{}\n",
+                plain(&block.body).trim_end()
+            ));
         }
     }
     out

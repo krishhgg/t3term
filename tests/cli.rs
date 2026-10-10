@@ -1256,9 +1256,7 @@ const NEXT: &str = "\nNext\u{7f}\u{9c}\tline";
 /// before it. One starts with the `\n` of a `\r\n` whose `\r` ended the update before it. The
 /// C1 CSI and NEL take two bytes each. The second reply starts with a `\n` of its own.
 fn reply_with_controls(message_id: &str) -> Vec<Value> {
-    let run = |status: &str| {
-        json!({"id": "r1", "ordinal": 1, "status": status, "userMessageId": message_id})
-    };
+    let run = |status: &str| json!({"id": "r1", "ordinal": 1, "status": status, "userMessageId": message_id});
     let reply = |item_id: &str, ordinal: u64, text: &str| {
         json!({"id": item_id, "runId": "r1", "type": "assistant_message", "ordinal": ordinal,
             "text": text, "streaming": true})
@@ -1433,13 +1431,13 @@ fn requests_models_and_settings_print_values_without_control_characters() {
             "prompt": prompt}],
     }});
     let provider = json!({"instanceId": "cursor\u{1b}[2J", "displayName": "Cur\u{7f}sor",
-        "status": "warn\u{9b}2Jing", "enabled": true,
-        "models": [{"slug": "grok\u{9b}31m", "name": "Grok\u{1b}[1m 4.7", "isDefault": true,
-            "capabilities": {"optionDescriptors": [
-                {"id": "fast\u{7}Mode", "type": "boolean"},
-                {"id": "reasoning\u{9b}", "type": "select",
-                    "options": [{"id": "low"}, {"id": "hi\u{1b}[2Jgh", "isDefault": true}]},
-            ]}}]});
+    "status": "warn\u{9b}2Jing", "enabled": true,
+    "models": [{"slug": "grok\u{9b}31m", "name": "Grok\u{1b}[1m 4.7", "isDefault": true,
+        "capabilities": {"optionDescriptors": [
+            {"id": "fast\u{7}Mode", "type": "boolean"},
+            {"id": "reasoning\u{9b}", "type": "select",
+                "options": [{"id": "low"}, {"id": "hi\u{1b}[2Jgh", "isDefault": true}]},
+        ]}}]});
     let config = json!({"providers": [provider]});
 
     // T3's side of the WebSocket answers `server.getConfig` with the config and each command
