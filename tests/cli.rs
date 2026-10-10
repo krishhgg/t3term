@@ -139,6 +139,30 @@ fn serve(
     (origin, paths)
 }
 
+/// Serves one thread to `read`: a protocol 2 descriptor, as in
+/// `servers_not_on_protocol_2_are_refused_before_any_login`, an empty shell, and a snapshot of
+/// thread `id` as `GET /api/orchestration/threads/:id` returns it, with only the fields `read`
+/// uses. Returns the server's origin.
+fn serve_thread(id: &str, title: &str, turn_items: Value) -> String {
+    let snapshot = json!({"snapshotSequence": 3, "projection": {
+        "thread": {"id": id, "title": title},
+        "runs": [],
+        "runtimeRequests": [],
+        "turnItems": turn_items,
+    }});
+    let descriptor = json!({"environmentId": "env-test", "label": "Fake",
+        "platform": {"os": "darwin", "arch": "arm64"}, "serverVersion": "0.0.0-test",
+        "capabilities": {}, "orchestrationProtocolVersion": 2});
+    let thread_path = format!("/api/orchestration/threads/{id}");
+    let (origin, _) = serve(move |path| match path {
+        "/.well-known/t3/environment" => Some(descriptor.clone()),
+        "/api/orchestration/shell" => Some(json!({"projects": [], "threads": []})),
+        _ if path == thread_path => Some(snapshot.clone()),
+        _ => None,
+    });
+    origin
+}
+
 #[test]
 fn a_stale_runtime_file_means_the_server_is_unavailable() {
     // Nothing can listen on port 0, so this is a runtime file left behind by a server that is gone.
@@ -207,24 +231,8 @@ fn read_prints_no_raw_control_characters_from_a_checklist() {
         .enumerate()
         .map(|(n, text)| json!({"id": format!("s{n}"), "text": text, "status": "pending"}))
         .collect();
-    // A thread snapshot as `GET /api/orchestration/threads/:id` returns it, with only the fields
-    // `read` uses. Descriptor shape as in the test above.
-    let snapshot = json!({"snapshotSequence": 3, "projection": {
-        "thread": {"id": id, "title": "Checklist"},
-        "runs": [],
-        "runtimeRequests": [],
-        "turnItems": [{"id": "todo-1", "type": "todo_list", "ordinal": 1, "steps": steps}],
-    }});
-    let descriptor = json!({"environmentId": "env-test", "label": "Fake",
-        "platform": {"os": "darwin", "arch": "arm64"}, "serverVersion": "0.0.0-test",
-        "capabilities": {}, "orchestrationProtocolVersion": 2});
-    let thread_path = format!("/api/orchestration/threads/{id}");
-    let (origin, _) = serve(move |path| match path {
-        "/.well-known/t3/environment" => Some(descriptor.clone()),
-        "/api/orchestration/shell" => Some(json!({"projects": [], "threads": []})),
-        _ if path == thread_path => Some(snapshot.clone()),
-        _ => None,
-    });
+    let items = json!([{"id": "todo-1", "type": "todo_list", "ordinal": 1, "steps": steps}]);
+    let origin = serve_thread(id, "Checklist", items);
     let home = Home::new();
     home.record_server(&origin);
     let t3 = home.fake_t3();
@@ -264,6 +272,52 @@ fn read_prints_no_raw_control_characters_from_a_checklist() {
         .filter_map(|step| step["text"].as_str())
         .collect();
     assert_eq!(texts, raw);
+}
+
+#[test]
+fn read_shows_compactions_without_a_title_and_json_keeps_them_as_sent() {
+    // Compactions as the nightly sends them (`OrchestrationV2TurnItem` in
+    // packages/contracts/src/orchestrationV2.ts), none with a title: one finished with both
+    // counts and a summary, one running with the count it started from, and one that failed
+    // with nothing more. The summary holds made-up controls, a CSI that clears the screen, a
+    // C1 CSI, a carriage return and DEL, then text that joins or combines.
+    let summary = "Kept the plan\u{1b}[2J and\u{9b}31m the tests\r\nDropped\u{7f} the logs 日本語 👩\u{200d}💻 cafe\u{301}";
+    let id = "5d2e8b17-3c4a-4f9e-8a61-0b7c9d4e2f13";
+    let items = json!([
+        {"id": "c1", "type": "compaction", "ordinal": 1, "status": "completed", "title": null,
+            "driver": null, "summary": summary,
+            "beforeTokenCount": 899_000, "afterTokenCount": 19_000},
+        {"id": "c2", "type": "compaction", "ordinal": 2, "status": "running", "title": null,
+            "driver": null, "beforeTokenCount": 12_250},
+        {"id": "c3", "type": "compaction", "ordinal": 3, "status": "failed", "title": null,
+            "driver": null},
+    ]);
+    let origin = serve_thread(id, "Compaction", items.clone());
+    let home = Home::new();
+    home.record_server(&origin);
+    let t3 = home.fake_t3();
+
+    let read = home.run_with(&["read", id], &t3);
+    assert_eq!(read.status.code(), Some(0), "{read:?}");
+    let printed = String::from_utf8(read.stdout).expect("UTF-8");
+    let rows = [
+        "  · Context compacted 899K → 19K tokens",
+        "    Kept the plan[2J and31m the tests",
+        "    Dropped the logs 日本語 👩\u{200d}💻 cafe\u{301}",
+        "  · Compacting context",
+        "    12.3K → ? tokens",
+        "  · Context compaction failed",
+    ];
+    let expected = format!("# Compaction  ({id})\n{}\n", rows.join("\n"));
+    assert_eq!(printed, expected);
+
+    // `--json` prints the items as T3 sent them, with each control as a JSON escape.
+    let read = home.run_with(&["--json", "read", id], &t3);
+    assert_eq!(read.status.code(), Some(0), "{read:?}");
+    let printed = std::str::from_utf8(&read.stdout).expect("UTF-8");
+    let control = printed.chars().find(|c| c.is_control() && *c != '\n');
+    assert_eq!(control, None, "{printed:?}");
+    assert_eq!(json_stdout(&read)["projection"]["turnItems"], items);
 }
 
 #[test]

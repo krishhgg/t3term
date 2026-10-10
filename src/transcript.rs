@@ -117,6 +117,117 @@ fn without_controls(text: &str) -> String {
     out
 }
 
+/// The marker and detail of a context compaction, the `compaction` turn item
+/// (`OrchestrationV2TurnItem` in the nightly's `packages/contracts/src/orchestrationV2.ts`),
+/// whose title T3 never shows. The label names its state as the nightly's `V2LifecycleRow.tsx`
+/// does. The desktop's timeline row uses `contextCompactionLabel` from
+/// `packages/client-runtime/src/work-log/presentation.ts` instead, which calls a failed or
+/// pending compaction compacted. Its wording is kept for a compaction that finished with both
+/// token counts, `Context compacted 899K → 19K tokens`. Any other count goes on the first
+/// detail line, with `?` for the one T3 didn't send, and the summary follows.
+fn compaction(item: &Value) -> (String, String) {
+    let label = match str_of(item, "status") {
+        "failed" => "Context compaction failed",
+        "cancelled" | "interrupted" => "Context compaction stopped",
+        "pending" | "running" | "waiting" => "Compacting context",
+        _ => "Context compacted",
+    };
+    // T3 sends each count as a whole number of tokens, when the provider reported it.
+    let count = |key: &str| item.get(key).and_then(Value::as_u64);
+    let (before, after) = (count("beforeTokenCount"), count("afterTokenCount"));
+    let tokens = || {
+        let side = |known: Option<u64>| known.map_or_else(|| "?".to_string(), token_count);
+        format!("{} → {} tokens", side(before), side(after))
+    };
+    let mut detail = Vec::new();
+    let header = match (before, after) {
+        (Some(_), Some(_)) if label == "Context compacted" => format!("{label} {}", tokens()),
+        (None, None) => label.to_string(),
+        _ => {
+            detail.push(tokens());
+            label.to_string()
+        }
+    };
+    let summary = summary_text(str_of(item, "summary"));
+    if !summary.is_empty() {
+        detail.push(summary);
+    }
+    (header, detail.join("\n"))
+}
+
+/// A token count as T3 writes it, after `formatTokens` in the nightly's
+/// `packages/shared/src/usageFormat.ts`: three significant figures and a K, M, B or T, with two
+/// decimals below 10, one below 100 and none from 100 up. Decimals that are all zero are
+/// dropped and others are kept, so 1,500 is `1.50K`. The rounding is JavaScript's, so 999,999
+/// is `1000K`.
+fn token_count(count: u64) -> String {
+    const UNITS: [(u64, &str); 4] = [
+        (1_000_000_000_000, "T"),
+        (1_000_000_000, "B"),
+        (1_000_000, "M"),
+        (1_000, "K"),
+    ];
+    let Some((unit, suffix)) = UNITS.into_iter().find(|(unit, _)| count >= *unit) else {
+        return count.to_string();
+    };
+    // T3 divides in doubles, as JavaScript does.
+    let value = count as f64 / unit as f64;
+    let digits = if value >= 100.0 {
+        0
+    } else if value >= 10.0 {
+        1
+    } else {
+        2
+    };
+    let scale = 10u64.pow(digits);
+    let rounded = to_fixed(value, digits);
+    let (whole, fraction) = (rounded / scale, rounded % scale);
+    match fraction {
+        0 => format!("{whole}{suffix}"),
+        _ => format!(
+            "{whole}.{fraction:0width$}{suffix}",
+            width = digits as usize
+        ),
+    }
+}
+
+/// JavaScript's `value.toFixed(digits)` for a value of at least 1, as a whole number of the
+/// last digit's unit: the nearest to the double's exact value, and the larger of two as near.
+/// Rust's `{:.1}` takes the even one, which would write 12,250 tokens as `12.2K` where T3
+/// shows `12.3K`.
+fn to_fixed(value: f64, digits: u32) -> u64 {
+    // A double of at least 1 is a whole number of 2^-52, which 52 decimals write exactly.
+    let exact = format!("{value:.52}");
+    let (whole, decimals) = exact.split_once('.').unwrap_or((exact.as_str(), ""));
+    let mut decimals = decimals.chars();
+    let kept: String = whole
+        .chars()
+        .chain(decimals.by_ref().take(digits as usize))
+        .collect();
+    let round_up = decimals.next().is_some_and(|digit| digit >= '5');
+    kept.parse::<u64>().unwrap_or(0) + u64::from(round_up)
+}
+
+/// A compaction's summary as the transcript shows it: its first lines with text in them,
+/// without control characters, then a line of `…` when there was more. The cut to
+/// `MAX_OUTPUT_BYTES` comes first, so a long summary is never scanned or copied whole.
+fn summary_text(summary: &str) -> String {
+    let mut end = summary.len().min(MAX_OUTPUT_BYTES);
+    while !summary.is_char_boundary(end) {
+        end -= 1;
+    }
+    let text = without_controls(&summary[..end]);
+    let mut lines = text
+        .lines()
+        .map(str::trim_end)
+        .filter(|line| !line.is_empty());
+    let mut shown: Vec<&str> = lines.by_ref().take(MAX_OUTPUT_LINES).collect();
+    if end < summary.len() || lines.next().is_some() {
+        shown.push("…");
+    }
+    shown.join("\n")
+}
+
 /// The one value a tool call is about, for a transcript row: the file, pattern or query it
 /// names. Tools differ, so this tries the keys they agree on before falling back to the whole
 /// input.
@@ -399,7 +510,11 @@ pub fn describe(item: &Value) -> Option<Block> {
             block(BlockKind::Error, "Error".into(), message.to_string())
         }
         "run_interrupt_result" => block(BlockKind::Notice, "Interrupted".into(), String::new()),
-        "system_notice" | "compaction" | "handoff" | "fork" | "thread_created" | "notification" => {
+        "compaction" => {
+            let (header, body) = compaction(item);
+            block(BlockKind::Notice, header, body)
+        }
+        "system_notice" | "handoff" | "fork" | "thread_created" | "notification" => {
             if title.is_empty() {
                 return None;
             }
@@ -595,6 +710,184 @@ mod tests {
             .filter_map(|step| step["text"].as_str())
             .collect();
         assert_eq!(kept, raw);
+    }
+
+    /// A `compaction` item as the nightly sends it (`OrchestrationV2TurnItem` in
+    /// packages/contracts/src/orchestrationV2.ts), with no title and each count only when the
+    /// provider reported one.
+    fn compaction_item(status: &str, before: Option<Value>, after: Option<Value>) -> Value {
+        let mut item = json!({
+            "id": "compaction-1",
+            "type": "compaction",
+            "ordinal": 1,
+            "status": status,
+            "title": null,
+            "driver": null,
+            "updatedAt": "2026-10-08T10:00:00.000Z",
+        });
+        if let Some(count) = before {
+            item["beforeTokenCount"] = count;
+        }
+        if let Some(count) = after {
+            item["afterTokenCount"] = count;
+        }
+        item
+    }
+
+    #[test]
+    fn a_compaction_names_its_state_and_counts_without_a_title() {
+        // Status, counts before and after, then the marker and the detail under it. Counts
+        // read as the nightly's `formatTokens` writes them, which node gave for these values.
+        let cases = [
+            ("pending", None, None, "Compacting context", ""),
+            (
+                "running",
+                Some(json!(899_000)),
+                None,
+                "Compacting context",
+                "899K → ? tokens",
+            ),
+            (
+                "waiting",
+                None,
+                Some(json!(19_000)),
+                "Compacting context",
+                "? → 19K tokens",
+            ),
+            (
+                "completed",
+                Some(json!(899_000)),
+                Some(json!(19_000)),
+                "Context compacted 899K → 19K tokens",
+                "",
+            ),
+            ("completed", None, None, "Context compacted", ""),
+            (
+                "completed",
+                Some(json!(0)),
+                Some(json!(999)),
+                "Context compacted 0 → 999 tokens",
+                "",
+            ),
+            // 12.25 is a tie, which JavaScript rounds up. 1.005 is a double just under
+            // 1.005, and 999.999 rounds past 999. Decimals that aren't all zero stay.
+            (
+                "completed",
+                Some(json!(12_250)),
+                Some(json!(1_500)),
+                "Context compacted 12.3K → 1.50K tokens",
+                "",
+            ),
+            (
+                "completed",
+                Some(json!(999_999)),
+                Some(json!(1_005)),
+                "Context compacted 1000K → 1K tokens",
+                "",
+            ),
+            (
+                "completed",
+                Some(json!(9_007_199_254_740_991_u64)),
+                Some(json!(1_234_567)),
+                "Context compacted 9007T → 1.23M tokens",
+                "",
+            ),
+            // A count that isn't a whole number of tokens is one T3 didn't send.
+            (
+                "completed",
+                Some(json!(-5)),
+                Some(json!(19_000)),
+                "Context compacted",
+                "? → 19K tokens",
+            ),
+            (
+                "failed",
+                Some(json!(899_000)),
+                Some(json!(19_000)),
+                "Context compaction failed",
+                "899K → 19K tokens",
+            ),
+            ("cancelled", None, None, "Context compaction stopped", ""),
+            (
+                "interrupted",
+                Some(json!(999)),
+                None,
+                "Context compaction stopped",
+                "999 → ? tokens",
+            ),
+            // A state the lifecycle row doesn't name reads as compacted, as it does there.
+            ("idle", None, None, "Context compacted", ""),
+        ];
+        for (status, before, after, header, body) in cases {
+            let item = compaction_item(status, before, after);
+            let block = describe(&item).expect("a compaction has a row");
+            assert_eq!(block.kind, BlockKind::Notice, "{item}");
+            assert_eq!(
+                (block.header.as_str(), block.body.as_str()),
+                (header, body),
+                "{item}"
+            );
+        }
+
+        // A title the provider gave the item doesn't replace the state.
+        let mut titled = compaction_item("running", None, None);
+        titled["title"] = json!("Auto-compact");
+        assert_eq!(
+            describe(&titled).expect("a row").header,
+            "Compacting context"
+        );
+    }
+
+    #[test]
+    fn a_compaction_summary_is_bounded_and_never_moves_the_cursor() {
+        // A made-up summary: an Esc that clears the screen, a C1 CSI, BEL, DEL, a carriage
+        // return, a tab and blank lines, then CJK, a joined emoji and a combining accent.
+        let summary = "Kept\u{1b}[2J the plan\r\nDropped\u{9b}31m the\u{7} logs\tand\u{7f} notes\n\n \t\n日本語 👩\u{200d}💻 cafe\u{301}";
+        let mut item = compaction_item("completed", Some(json!(899_000)), Some(json!(19_000)));
+        item["summary"] = json!(summary);
+        let state = ThreadState::from_snapshot(&json!({
+            "snapshotSequence": 1,
+            "projection": {"thread": {"id": "t"}, "turnItems": [item]},
+        }))
+        .expect("a snapshot");
+        let block = describe(state.items()[0]).expect("a compaction has a row");
+        assert_eq!(block.header, "Context compacted 899K → 19K tokens");
+        assert_eq!(
+            block.body,
+            "Kept[2J the plan\nDropped31m the logs and notes\n日本語 👩\u{200d}💻 cafe\u{301}"
+        );
+        // `t3term read` prints the marker and its detail, and `--json` prints the projection,
+        // which keeps the summary as T3 sent it.
+        assert_eq!(
+            plain_text(&state, None, false),
+            "  · Context compacted 899K → 19K tokens\n    Kept[2J the plan\n    Dropped31m the logs and notes\n    日本語 👩\u{200d}💻 cafe\u{301}\n"
+        );
+        assert_eq!(state.list("turnItems")[0]["summary"], summary);
+
+        // Counts the marker leaves out come before the summary.
+        let mut item = compaction_item("failed", Some(json!(899_000)), None);
+        item["summary"] = json!("Ran out of room");
+        assert_eq!(
+            describe(&item).expect("a row").body,
+            "899K → ? tokens\nRan out of room"
+        );
+
+        // Past twelve lines with text, a line of … says there was more.
+        let lines = (1..=20)
+            .map(|n| format!("line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let mut item = compaction_item("completed", None, None);
+        item["summary"] = json!(lines);
+        let body = describe(&item).expect("a row").body;
+        assert!(body.starts_with("line 1\nline 2\n"), "{body}");
+        assert!(body.ends_with("\nline 12\n…"), "{body}");
+
+        // One line longer than a row's byte budget is cut on a character boundary. 界 takes
+        // three bytes, so 1,365 of them fit in 4,096.
+        item["summary"] = json!("界".repeat(5_000));
+        let body = describe(&item).expect("a row").body;
+        assert_eq!(body, format!("{}\n…", "界".repeat(1_365)));
     }
 
     #[test]
