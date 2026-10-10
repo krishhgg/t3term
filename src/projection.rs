@@ -894,7 +894,10 @@ mod tests {
             json!({"version": 1, "type": "providerStatuses"}),
             config_change("settingsUpdated", json!({"settings": []})),
             config_change("keybindingsUpdated", json!({"keybindings": []})),
-            config_change("keybindingsUpdated", json!({"keybindings": {}, "issues": []})),
+            config_change(
+                "keybindingsUpdated",
+                json!({"keybindings": {}, "issues": []}),
+            ),
             // Events t3term doesn't ask for, or that no build knows yet.
             config_change("environmentThemesUpdated", json!({"themes": []})),
             config_change("usageLimitSourcesUpdated", json!({"sources": []})),
