@@ -27,13 +27,13 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 | 5 | https://github.com/krishhgg/t3term/pull/12 | The Plan agent hidden in model options unless the same setting turns it on | `3fde25a954e3581ec031ab7470a5ffd777b69f7c` |
 | 6 | https://github.com/krishhgg/t3term/pull/13 | An opt-in Working shelf for threads busy without the user | `25477c1d01ca5e49fdba4568c80f7790c6be7a4c` |
 | 7 | https://github.com/krishhgg/t3term/pull/14 | Proposed plans as cards that collapse when long | `65e3d4351a0f70826c943cc160b7da6d898cd511` |
-| 8 | https://github.com/krishhgg/t3term/pull/15 | The running turn's tasks in a drawer above the composer, and checklist steps read in the nightly's shape | |
-| 9 | https://github.com/krishhgg/t3term/pull/16 | Context compaction markers with their state, token counts and summary, without handoff markers | |
-| 10 | https://github.com/krishhgg/t3term/pull/17 | Context handoff markers with their source and target models | |
-| 11 | https://github.com/krishhgg/t3term/pull/18 | Hide and show the main sidebar with Ctrl+B or its toggle, remembered between runs | |
-| 12 | https://github.com/krishhgg/t3term/pull/19 | Resize the main sidebar by dragging its edge or with [ and ], remembered between runs | |
-| 13 | https://github.com/krishhgg/t3term/pull/20 | File changes in tool output: each edit's operations and a failed edit's error, with a bounded patch preview when a server sends one | |
-| 14 | https://github.com/krishhgg/t3term/pull/21 | A dismissible banner over the conversation for the thread's error, from a failed send or from T3 | |
+| 8 | https://github.com/krishhgg/t3term/pull/15 | The running turn's tasks in a drawer above the composer, and checklist steps read in the nightly's shape | `6446163e335ad527f8d6681e8ef4cc5649828cac` |
+| 9 | https://github.com/krishhgg/t3term/pull/16 | Context compaction markers with their state, token counts and summary, without handoff markers | `75d23abd5f4d746e950fc09e34017a4cbbc415ad` |
+| 10 | https://github.com/krishhgg/t3term/pull/17 | Context handoff markers with their source and target models | `19f5db9942bfa594d86dda463a0f50c60da76e39` |
+| 11 | https://github.com/krishhgg/t3term/pull/18 | Hide and show the main sidebar with Ctrl+B or its toggle, remembered between runs | `5defd769dfa89de1ccb734ededab9c811374c3c3` |
+| 12 | https://github.com/krishhgg/t3term/pull/19 | Resize the main sidebar by dragging its edge or with [ and ], remembered between runs | `e90aa599784dd9795b62c647ecbcf5dc092b0030` |
+| 13 | https://github.com/krishhgg/t3term/pull/20 | File changes in tool output: each edit's operations and a failed edit's error, with a bounded patch preview when a server sends one | `e8f9c864bf4fe0dbfc2da49e268e6fee17680dde` |
+| 14 | https://github.com/krishhgg/t3term/pull/21 | A dismissible banner over the conversation for the thread's error, from a failed send or from T3 | `7ad958f357d4a45ba1a37cd884f831968c10463a` |
 
 ## Maintenance review PRs
 
