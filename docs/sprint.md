@@ -34,6 +34,7 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 | 12 | https://github.com/krishhgg/t3term/pull/19 | Resize the main sidebar by dragging its edge or with [ and ], remembered between runs | `e90aa599784dd9795b62c647ecbcf5dc092b0030` |
 | 13 | https://github.com/krishhgg/t3term/pull/20 | File changes in tool output: each edit's operations and a failed edit's error, with a bounded patch preview when a server sends one | `e8f9c864bf4fe0dbfc2da49e268e6fee17680dde` |
 | 14 | https://github.com/krishhgg/t3term/pull/21 | A dismissible banner over the conversation for the thread's error, from a failed send or from T3 | `7ad958f357d4a45ba1a37cd884f831968c10463a` |
+| 15 | https://github.com/krishhgg/t3term/pull/22 | Live server config in the TUI, so provider and model changes reach the chips and menus without a reread | `cb51f8c619f395c2aefce8fa81e83e18e8275847` |
 
 ## Maintenance review PRs
 
@@ -45,7 +46,7 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 
 ### Audit 1: sprint PRs 1 to 10
 
-Sprint PR 10, #17, merged at `19f5db9942bfa594d86dda463a0f50c60da76e39`. The audit covered #8 to #17, from `54a5850` to that commit. Astra and Claude Fable 5.1 each finished an audit on their own, and both recommended maintenance. Sol reconciled them. Sprint PRs 11 to 14, #18 to #21, were already prepared and merged on the user's explicit go-ahead. Sol checked master at `7ad958f` after them. CI passed, its tree matches the tested head of #21, `e15c522`, and all 277 tests, a release install and the no-server smoke test passed.
+Sprint PR 10, #17, merged at `19f5db9942bfa594d86dda463a0f50c60da76e39`. The audit covered #8 to #17, from `54a5850` to that commit. Astra and Claude Fable 5.1 each finished an audit on their own, and both recommended maintenance. Sol reconciled them. Sprint PRs 11 to 14, #18 to #21, were already prepared and merged on the user's explicit go-ahead. Sol checked master at `7ad958f` after them. CI passed, its tree matches the tested head of #21, `e15c522`, and all 277 tests, a release install and the no-server smoke test passed. Sprint PR 15, #22, then merged at `cb51f8c` while #23 was a draft, and master's CI passed there too.
 
 | Finding | Found by | Outcome |
 |---|---|---|
@@ -61,4 +62,4 @@ An older concern that the TUI's App couldn't be tested offline no longer holds, 
 
 The rest needed no change. The tests reach only fake servers on 127.0.0.1 and temporary homes. The workflow pins each action to a commit SHA, reads the repository with `contents: read` and needs no secrets. Rust stays pinned to 1.95.0. The release smoke test checks that `doctor --json` exits 5 with no server and prints exactly one JSON object. macOS stays the only supported platform, with Linux as an optional build. The existing regression tests for the sidebar, settings, scrolling, the tasks drawer and caches were enough. The audit added no benchmarks, test frameworks, media migration or nightly automation.
 
-14 sprint PRs have merged. The next audit is due when sprint PR 20 merges.
+15 sprint PRs have merged. The next audit is due when sprint PR 20 merges.

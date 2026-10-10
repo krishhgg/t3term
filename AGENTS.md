@@ -5,14 +5,18 @@ t3term is a Rust terminal client for the T3 Code server. README.md documents the
 ## Who does what
 
 - The user sets scope and merges every pull request. No agent merges a pull request, whether it changes the UI or not.
-- GPT-6.1 Sol (xhigh) orchestrates the sprint. It runs all testing and computer use itself, reviews each pull request, prepares it for merge and writes its walkthrough.
+- GPT-6.1 Sol (xhigh) orchestrates the sprint. It runs all testing and computer use itself, reviews each pull request and prepares it for merge.
 - Claude Opus 5.5 (xhigh) writes the implementation, the tests and the fixes. It is the only agent that writes code.
 
 ## Pull requests
 
 - Keep them small and frequent. Open a draft early, push at each checkpoint and mark it ready when the work is done.
-- Keep a decision log in the description, in the format of pr-walkthrough's `references/decision-log.md`: what you noticed, how you confirmed it, the options you chose and rejected, what review changed and the known limits.
-- Every pull request gets a short walkthrough made with the pr-walkthrough skill (https://github.com/krishhgg/pr-walkthrough) that teaches the Rust it uses. The pages stay on the reader's machine, so never commit them.
+- Keep the description short and lead with what the pull request changes. End it with a decision log under these five headings:
+  - What I noticed: the problem or gap that started the work.
+  - How I confirmed it: the code, contract or run that showed it.
+  - Options: the approach chosen and the ones rejected, with why.
+  - What review changed: what Greptile, Sol or the user asked for and what changed as a result.
+  - Known limits: what the pull request leaves out or doesn't handle.
 - Changes to how the TUI looks carry screenshots or recordings. Keep UI and non-UI changes in separate pull requests where practical.
 - Greptile reviews every pull request. A pull request is ready for the user when CI passes and every Greptile finding is fixed or answered.
 

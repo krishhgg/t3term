@@ -37,7 +37,7 @@ use unicode_width::UnicodeWidthStr;
 
 use crate::client::{Client, IfBusy, WatchEvent};
 use crate::models::Choice;
-use crate::projection::{Applied, ShellState, ThreadState, is_active_status, status};
+use crate::projection::{Applied, ShellState, ThreadState, apply_config, is_active_status, status};
 use crate::settings::Settings;
 use crate::transcript::{self, BlockKind, ChangeLine};
 use composer::Composer;
@@ -268,8 +268,12 @@ impl Prepared {
 enum ActionResult {
     Info(String),
     Error(String),
-    /// T3's provider and model list, from `server.getConfig`.
-    Config(Value),
+    /// T3's configuration from `server.getConfig`, with the count of changes from the config
+    /// subscription when the read was asked for.
+    Config {
+        config: Value,
+        revision: u64,
+    },
     /// What one tool printed, for the row that asked. `None` when T3 couldn't be reached.
     Output {
         item_id: String,
@@ -377,7 +381,15 @@ impl OpenThread {
 struct App {
     client: Arc<Client>,
     theme: Theme,
+    /// T3's configuration, with its providers and models. The config subscription keeps it
+    /// current, and it stays as it was while the subscription reconnects.
     config: Option<Value>,
+    /// False once T3 refuses the config subscription. Each menu then reads the configuration
+    /// with `server.getConfig`, as t3term did before it subscribed.
+    config_subscribed: bool,
+    /// How many changes the config subscription has made, so a `server.getConfig` answer asked
+    /// for before the latest of them can't put older providers back.
+    config_revision: u64,
     /// Model, effort and mode choices per thread, sent with the thread's next message.
     drafts: HashMap<String, Choice>,
     /// Messages that failed to send, until they go out or reach T3 late.
@@ -488,9 +500,10 @@ impl Drop for Screen {
 async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>) -> Result<()> {
     let (actions, mut action_results) = mpsc::unbounded_channel();
     let mut shell_events = client.watch_shell(None);
+    // Dropped when the loop ends, which ends the subscription.
+    let mut config_events = client.watch_config();
     let settings = Settings::load().await;
     let mut app = App::new(client, Theme::detect(), &settings, actions);
-    app.load_config();
     let mut input = EventStream::new();
     let mut dirty = true;
     let mut last_draw = Instant::now() - FRAME;
@@ -531,6 +544,10 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
             },
             Some(event) = shell_events.recv() => {
                 app.on_shell_event(event);
+                dirty = true;
+            }
+            Some(event) = config_events.recv() => {
+                app.on_config_event(event);
                 dirty = true;
             }
             Some(event) = thread_event => {
@@ -649,6 +666,8 @@ impl App {
             client,
             theme,
             config: None,
+            config_subscribed: true,
+            config_revision: 0,
             drafts: HashMap::new(),
             unsent: Unsent::default(),
             picker: None,
@@ -715,6 +734,25 @@ impl App {
             }
             WatchEvent::Reconnecting { .. } => self.shell_connection = "reconnecting".into(),
             WatchEvent::Failed(message) => self.message = Some((message, true)),
+        }
+    }
+
+    /// Applies an item from T3's config subscription. A reconnect keeps the configuration as it
+    /// was until the new subscription's snapshot replaces it.
+    fn on_config_event(&mut self, event: WatchEvent) {
+        match event {
+            WatchEvent::Item(item) => {
+                if self.update_config(|config| apply_config(config, &item) != Applied::Ignored) {
+                    self.config_revision += 1;
+                }
+            }
+            WatchEvent::Reconnecting { .. } => {}
+            // Such as a server without the subscription. Read the configuration once now, and
+            // again each time a menu opens.
+            WatchEvent::Failed(_) => {
+                self.config_subscribed = false;
+                self.load_config();
+            }
         }
     }
 
@@ -1409,16 +1447,15 @@ impl App {
         match result {
             ActionResult::Info(text) => self.message = Some((text, false)),
             ActionResult::Error(text) => self.message = Some((text, true)),
-            ActionResult::Config(config) => {
-                // A refresh can add or drop rows, so the highlight follows its entry, not
-                // its row number.
-                let previous = self.selected_pick();
-                self.config = Some(config);
-                if self.picker.is_some() {
-                    self.select_pick(previous);
+            ActionResult::Config { config, revision } => {
+                // A change from the subscription since the read was asked for is newer than
+                // the answer.
+                if revision == self.config_revision {
+                    self.update_config(|held| {
+                        *held = Some(config);
+                        true
+                    });
                 }
-                // Its capabilities decide whether the Snoozed and Settled shelves apply.
-                self.rebuild_rows();
             }
             ActionResult::Output {
                 item_id,
@@ -1535,15 +1572,35 @@ impl App {
 
     // ---- model, effort and mode menus ----
 
-    /// Fetches T3's provider list in the background. Menus use the last copy until it arrives.
+    /// Reads T3's configuration once in the background. Menus use the last copy until it
+    /// arrives.
     fn load_config(&self) {
         let (client, results) = (self.client.clone(), self.actions.clone());
+        let revision = self.config_revision;
         tokio::spawn(async move {
             let _ = results.send(match client.server_config().await {
-                Ok(config) => ActionResult::Config(config),
+                Ok(config) => ActionResult::Config { config, revision },
                 Err(e) => ActionResult::Error(format!("Couldn't read T3's model list: {e}")),
             });
         });
+    }
+
+    /// Changes the configuration with `change`, which says whether it changed anything, and
+    /// keeps what depends on it in step. A change can add or drop menu rows, so an open menu's
+    /// highlight follows its entry, not its row number. The sidebar is laid out again when the
+    /// change turns snooze or settlement on or off, which decide whether those shelves apply.
+    fn update_config(&mut self, change: impl FnOnce(&mut Option<Value>) -> bool) -> bool {
+        let (pick, capabilities) = (self.selected_pick(), self.capabilities());
+        if !change(&mut self.config) {
+            return false;
+        }
+        if self.picker.is_some() {
+            self.select_pick(pick);
+        }
+        if self.capabilities() != capabilities {
+            self.rebuild_rows();
+        }
+        true
     }
 
     /// The open thread's settings with its draft applied.
@@ -1579,8 +1636,10 @@ impl App {
             ));
             return;
         }
-        // Provider status changes while T3 runs, so each menu refreshes the list.
-        if self.picker.is_none() {
+        // Provider status changes while T3 runs. The config subscription brings each change,
+        // so a menu reads the configuration only while the TUI has none or after T3 refused
+        // the subscription.
+        if self.picker.is_none() && (self.config.is_none() || !self.config_subscribed) {
             self.load_config();
         }
         self.focus = Focus::Composer;
@@ -6513,5 +6572,350 @@ mod tests {
         assert_eq!(app.composer.text(), "");
         assert!(banner_shows(&mut app));
         assert_eq!(banner_work(&app), before);
+    }
+
+    // ---- live server configuration ----
+
+    /// A runtime that is never driven. A read of T3's configuration that the TUI spawns on it
+    /// waits without running, so nothing connects and `reads` can count it.
+    fn idle_runtime() -> tokio::runtime::Runtime {
+        tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap()
+    }
+
+    /// How many reads of T3's configuration the TUI has started on `runtime`. Nothing else in
+    /// these tests spawns a task.
+    fn reads(runtime: &tokio::runtime::Runtime) -> usize {
+        runtime.metrics().num_alive_tasks()
+    }
+
+    /// A provider in T3's configuration with `models`, each a slug and a name.
+    fn provider(id: &str, name: &str, status: &str, models: &[(&str, &str)]) -> Value {
+        let models: Vec<Value> = models
+            .iter()
+            .map(|&(slug, title)| json!({"slug": slug, "name": title}))
+            .collect();
+        json!({"instanceId": id, "displayName": name, "enabled": true, "status": status,
+            "models": models})
+    }
+
+    /// Codex, with GPT-6 and GPT-6 Mini.
+    fn codex(status: &str) -> Value {
+        let models = [("gpt-6", "GPT-6"), ("gpt-6-mini", "GPT-6 Mini")];
+        provider("codex", "Codex", status, &models)
+    }
+
+    /// Claude, with Opus 5.5 and Haiku 4.5.
+    fn claude(status: &str) -> Value {
+        let models = [
+            ("claude-opus-5-5", "Opus 5.5"),
+            ("claude-haiku-4-5", "Haiku 4.5"),
+        ];
+        provider("claudeAgent", "Claude", status, &models)
+    }
+
+    /// A snapshot from the config subscription that lists `providers`, on a server with
+    /// `capabilities`.
+    fn config_snapshot(providers: Vec<Value>, capabilities: Value) -> WatchEvent {
+        let environment = json!({"capabilities": capabilities});
+        let config = json!({"providers": providers, "settings": {}, "environment": environment});
+        let item = json!({"version": 1, "type": "snapshot", "config": config});
+        WatchEvent::Item(item)
+    }
+
+    /// A change from the config subscription that lists every provider again.
+    fn provider_statuses(providers: Vec<Value>) -> WatchEvent {
+        let payload = json!({"providers": providers});
+        let item = json!({"version": 1, "type": "providerStatuses", "payload": payload});
+        WatchEvent::Item(item)
+    }
+
+    /// Thread `t`, open and live on Codex's GPT-6.
+    fn thread_on_codex() -> OpenThread {
+        let thread = json!({
+            "id": "t",
+            "modelSelection": {"instanceId": "codex", "model": "gpt-6"},
+            "runtimeMode": "full-access",
+            "interactionMode": "default",
+        });
+        let projection = json!({"thread": thread, "turnItems": []});
+        let item = json!({"kind": "snapshot", "snapshotSequence": 1, "projection": projection});
+        let mut open = OpenThread::new("t".into(), mpsc::unbounded_channel().1);
+        assert_eq!(open.apply(&item), Applied::Snapshot);
+        open.connection = "live".into();
+        open
+    }
+
+    /// The model chip's text in a frame 120 columns by 30 rows.
+    fn model_chip(app: &mut App) -> String {
+        let buffer = cells(app, 120, 30);
+        let chip = app.chips.iter().find(|(_, kind)| *kind == Kind::Model);
+        text_in(&buffer, chip.expect("a model chip").0)
+    }
+
+    /// The open menu's text in a frame 120 columns by 30 rows.
+    fn menu_text(app: &mut App) -> String {
+        let buffer = cells(app, 120, 30);
+        assert!(app.picker.is_some(), "no menu is open");
+        text_in(&buffer, app.picker_area)
+    }
+
+    #[test]
+    fn provider_changes_reach_the_chips_and_the_next_menu_without_a_read() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = tui(&Settings::default());
+        app.open_thread(thread_on_codex());
+        let snapshot = config_snapshot(vec![codex("ready"), claude("ready")], json!({}));
+        app.on_config_event(snapshot);
+        let chip = model_chip(&mut app);
+        assert!(chip.contains("GPT-6"), "{chip}");
+        assert!(!chip.contains("Turbo"), "{chip}");
+
+        // With no menu open, T3 renames the thread's model and finds Claude broken.
+        let models = [("gpt-6", "GPT-6 Turbo"), ("gpt-6-mini", "GPT-6 Mini")];
+        let renamed = provider("codex", "Codex", "ready", &models);
+        app.on_config_event(provider_statuses(vec![renamed, claude("error")]));
+        let chip = model_chip(&mut app);
+        assert!(chip.contains("GPT-6 Turbo"), "{chip}");
+
+        // The next menu shows both changes from the copy the TUI holds, and reads nothing.
+        alt(&mut app, 'm');
+        let menu = menu_text(&mut app);
+        assert!(menu.contains("GPT-6 Turbo"), "{menu}");
+        assert!(menu.contains("Claude (error)"), "{menu}");
+        assert_eq!(reads(&runtime), 0);
+    }
+
+    #[test]
+    fn an_open_menu_keeps_its_highlight_on_the_same_model_as_providers_change() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = tui(&Settings::default());
+        app.open_thread(thread_on_codex());
+        let snapshot = config_snapshot(vec![codex("ready"), claude("ready")], json!({}));
+        app.on_config_event(snapshot);
+        alt(&mut app, 'm');
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down);
+        }
+        let haiku = Some(Pick::Model("claudeAgent/claude-haiku-4-5".into()));
+        assert_eq!(app.selected_pick(), haiku);
+        let row = app.picker.as_ref().unwrap().selected;
+
+        // A provider listed first moves Haiku two rows down, and the highlight moves with it.
+        let models = [("composer-2", "Composer 2")];
+        let cursor = provider("cursor", "Cursor", "ready", &models);
+        let providers = vec![cursor.clone(), codex("ready"), claude("ready")];
+        app.on_config_event(provider_statuses(providers));
+        let menu = menu_text(&mut app);
+        assert!(menu.contains("Composer 2"), "{menu}");
+        assert_eq!(app.selected_pick(), haiku);
+        assert_eq!(app.picker.as_ref().unwrap().selected, row + 2);
+
+        // With Claude gone, the highlight goes to the thread's model and the menu stays open.
+        app.on_config_event(provider_statuses(vec![cursor, codex("ready")]));
+        let gpt = Some(Pick::Model("codex/gpt-6".into()));
+        assert_eq!(app.selected_pick(), gpt);
+        let menu = menu_text(&mut app);
+        assert!(!menu.contains("Haiku"), "{menu}");
+        assert_eq!(reads(&runtime), 0);
+    }
+
+    #[test]
+    fn provider_changes_leave_the_draft_and_the_composer_alone() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = tui(&Settings::default());
+        app.open_thread(thread_on_codex());
+        let snapshot = config_snapshot(vec![codex("ready"), claude("ready")], json!({}));
+        app.on_config_event(snapshot);
+        app.composer.insert_str("half a reply");
+        alt(&mut app, 'm');
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter);
+        let haiku = Some("claudeAgent/claude-haiku-4-5".to_string());
+        assert_eq!(app.drafts["t"].model, haiku);
+        let chip = model_chip(&mut app);
+        assert!(chip.contains("Haiku 4.5"), "{chip}");
+
+        // While Claude is gone, the chip falls back to the thread's model. The draft waits for
+        // Claude to come back.
+        app.on_config_event(provider_statuses(vec![codex("ready")]));
+        let chip = model_chip(&mut app);
+        assert!(chip.contains("GPT-6"), "{chip}");
+        assert_eq!(app.drafts["t"].model, haiku);
+        assert_eq!(app.composer.text(), "half a reply");
+
+        app.on_config_event(provider_statuses(vec![codex("ready"), claude("ready")]));
+        let chip = model_chip(&mut app);
+        assert!(chip.contains("Haiku 4.5"), "{chip}");
+        assert_eq!(app.composer.text(), "half a reply");
+        assert_eq!(reads(&runtime), 0);
+    }
+
+    #[test]
+    fn a_model_list_read_that_answers_after_live_config_puts_nothing_back() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = tui(&Settings::default());
+        app.open_thread(thread_on_codex());
+        // With no configuration yet, the menu reads it.
+        alt(&mut app, 'm');
+        assert_eq!(reads(&runtime), 1);
+        let menu = menu_text(&mut app);
+        assert!(menu.contains("Loading T3's model list…"), "{menu}");
+        let asked_at = app.config_revision;
+
+        // The subscription's snapshot arrives first and finds Claude broken.
+        let snapshot = config_snapshot(vec![codex("ready"), claude("error")], json!({}));
+        app.on_config_event(snapshot);
+        let menu = menu_text(&mut app);
+        assert!(menu.contains("Claude (error)"), "{menu}");
+
+        // The read answers late with an older list, which changes nothing.
+        let pi = provider("pi", "Pi", "ready", &[("pi-1", "Pi One")]);
+        let older = json!({"providers": [codex("ready"), claude("ready"), pi]});
+        let answer = ActionResult::Config {
+            config: older,
+            revision: asked_at,
+        };
+        app.on_action_result(answer);
+        let menu = menu_text(&mut app);
+        assert!(menu.contains("Claude (error)"), "{menu}");
+        assert!(!menu.contains("Pi One"), "{menu}");
+
+        // Later changes still apply, and the next menu reads nothing.
+        app.on_config_event(provider_statuses(vec![codex("ready"), claude("ready")]));
+        press(&mut app, KeyCode::Esc);
+        alt(&mut app, 'm');
+        let menu = menu_text(&mut app);
+        assert!(menu.contains("Opus 5.5"), "{menu}");
+        assert!(!menu.contains("(error)"), "{menu}");
+        assert_eq!(reads(&runtime), 1);
+    }
+
+    #[test]
+    fn a_model_list_read_fills_the_menu_until_the_first_snapshot() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = tui(&Settings::default());
+        app.open_thread(thread_on_codex());
+        alt(&mut app, 'm');
+        assert_eq!(reads(&runtime), 1);
+        let asked_at = app.config_revision;
+
+        // A change before any snapshot has nothing to apply to, so the read's answer still
+        // counts.
+        app.on_config_event(provider_statuses(vec![codex("error")]));
+        let menu = menu_text(&mut app);
+        assert!(menu.contains("Loading T3's model list…"), "{menu}");
+        let config = json!({"providers": [codex("ready"), claude("ready")]});
+        let answer = ActionResult::Config {
+            config,
+            revision: asked_at,
+        };
+        app.on_action_result(answer);
+        let menu = menu_text(&mut app);
+        assert!(menu.contains("Opus 5.5"), "{menu}");
+        assert!(!menu.contains("(error)"), "{menu}");
+
+        // The first snapshot replaces what the read brought.
+        app.on_config_event(config_snapshot(vec![codex("ready")], json!({})));
+        let menu = menu_text(&mut app);
+        assert!(menu.contains("GPT-6"), "{menu}");
+        assert!(!menu.contains("Opus 5.5"), "{menu}");
+        assert_eq!(reads(&runtime), 1);
+    }
+
+    #[test]
+    fn a_reconnect_keeps_the_config_until_a_fresh_snapshot_replaces_it() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = tui(&Settings::default());
+        let mut zulu = listed("z", "Zulu", "idle");
+        zulu["snoozedUntil"] = json!("2999-01-01T00:00:00.000Z");
+        app.on_shell_event(shell_snapshot(vec![zulu]));
+        app.open_thread(thread_on_codex());
+        let rows = screen(&mut app, 120, 30);
+        assert!(!rows.iter().any(|row| row.contains("Snoozed")), "{rows:#?}");
+
+        // The first snapshot turns snooze on, and the sidebar moves Zulu to its shelf.
+        let providers = vec![codex("ready"), claude("ready")];
+        let snapshot = config_snapshot(providers, json!({"threadSnooze": true}));
+        app.on_config_event(snapshot);
+        let rows = screen(&mut app, 120, 30);
+        let snoozed = row_showing(&rows, "Snoozed ─");
+        assert!(snoozed < row_showing(&rows, "Zulu"));
+        alt(&mut app, 'm');
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down);
+        }
+        let haiku = Some(Pick::Model("claudeAgent/claude-haiku-4-5".into()));
+        assert_eq!(app.selected_pick(), haiku);
+
+        // While the subscription reconnects, everything stays as the last snapshot left it.
+        let reason = "T3 connection lost: socket ended".to_string();
+        let retry_in = Duration::from_millis(250);
+        app.on_config_event(WatchEvent::Reconnecting { reason, retry_in });
+        assert_eq!(app.selected_pick(), haiku);
+        let menu = menu_text(&mut app);
+        assert!(menu.contains("Haiku 4.5"), "{menu}");
+        let rows = screen(&mut app, 120, 30);
+        let snoozed = row_showing(&rows, "Snoozed ─");
+        assert!(snoozed < row_showing(&rows, "Zulu"));
+
+        // The new subscription's snapshot replaces all of it, so Claude and snooze go.
+        app.on_config_event(config_snapshot(vec![codex("ready")], json!({})));
+        let gpt = Some(Pick::Model("codex/gpt-6".into()));
+        assert_eq!(app.selected_pick(), gpt);
+        let rows = screen(&mut app, 120, 30);
+        assert!(!rows.iter().any(|row| row.contains("Snoozed")), "{rows:#?}");
+        assert!(row_showing(&rows, "Active ─") < row_showing(&rows, "Zulu"));
+        assert_eq!(reads(&runtime), 0);
+    }
+
+    #[test]
+    fn after_t3_refuses_the_config_subscription_each_menu_reads_the_model_list() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = tui(&Settings::default());
+        app.open_thread(thread_on_codex());
+        // T3 refuses the subscription, and the TUI reads the configuration once at once.
+        let refusal = "Unknown request tag: subscribeServerConfig".to_string();
+        app.on_config_event(WatchEvent::Failed(refusal));
+        assert_eq!(reads(&runtime), 1);
+        let asked_at = app.config_revision;
+        let config = json!({"providers": [codex("ready"), claude("ready")]});
+        let answer = ActionResult::Config {
+            config,
+            revision: asked_at,
+        };
+        app.on_action_result(answer);
+
+        // Each menu now reads it again, and shows the last copy until the answer comes.
+        alt(&mut app, 'm');
+        assert_eq!(reads(&runtime), 2);
+        let menu = menu_text(&mut app);
+        assert!(menu.contains("Opus 5.5"), "{menu}");
+        assert!(!menu.contains("(error)"), "{menu}");
+        let config = json!({"providers": [codex("ready"), claude("error")]});
+        let answer = ActionResult::Config {
+            config,
+            revision: asked_at,
+        };
+        app.on_action_result(answer);
+        let menu = menu_text(&mut app);
+        assert!(menu.contains("Claude (error)"), "{menu}");
+
+        // Moving to another menu reads nothing more. Opening one again reads once more.
+        alt(&mut app, 'e');
+        assert_eq!(reads(&runtime), 2);
+        press(&mut app, KeyCode::Esc);
+        alt(&mut app, 'm');
+        assert_eq!(reads(&runtime), 3);
     }
 }

@@ -468,6 +468,51 @@ impl ShellState {
     }
 }
 
+/// Applies one item from T3's config subscription, `subscribeServerConfig`, to `config`, as T3's
+/// own client does in packages/client-runtime/src/state/serverConfigProjection.ts.
+///
+/// A snapshot replaces the whole configuration, so a provider it leaves out is gone. T3 sends
+/// one when a subscription opens and again whenever the configuration changes as a whole.
+/// `providerStatuses` replaces the whole provider list, never one provider. `settingsUpdated`
+/// replaces the settings, and `keybindingsUpdated` the keybindings and their issues. Each
+/// leaves every other field as it was, fields this build doesn't know included.
+///
+/// A change that comes before any configuration has nothing to apply to, and is ignored. So is
+/// an item of another version or type, such as the theme and usage-limit events t3term doesn't
+/// ask for, and one that lacks the part it changes. None of them touches the configuration held.
+pub fn apply_config(config: &mut Option<Value>, item: &Value) -> Applied {
+    if item.get("version").and_then(Value::as_u64) != Some(1) {
+        return Applied::Ignored;
+    }
+    let kind = item.get("type").and_then(Value::as_str).unwrap_or_default();
+    if kind == "snapshot" {
+        let Some(snapshot) = item.get("config").filter(|c| c["providers"].is_array()) else {
+            return Applied::Ignored;
+        };
+        *config = Some(snapshot.clone());
+        return Applied::Snapshot;
+    }
+    let Some(held) = config.as_mut().and_then(Value::as_object_mut) else {
+        return Applied::Ignored;
+    };
+    let payload = &item["payload"];
+    let keybindings = payload["keybindings"].is_array() && payload["issues"].is_array();
+    match kind {
+        "providerStatuses" if payload["providers"].is_array() => {
+            held.insert("providers".into(), payload["providers"].clone());
+        }
+        "settingsUpdated" if payload["settings"].is_object() => {
+            held.insert("settings".into(), payload["settings"].clone());
+        }
+        "keybindingsUpdated" if keybindings => {
+            held.insert("keybindings".into(), payload["keybindings"].clone());
+            held.insert("issues".into(), payload["issues"].clone());
+        }
+        _ => return Applied::Ignored,
+    }
+    Applied::Event(kind.to_string())
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -727,5 +772,143 @@ mod tests {
         assert_eq!(shell.threads.len(), 1);
         assert_eq!(shell.sequence, 5);
         assert_eq!(shell.projects[0]["repositoryIdentity"]["name"], "r");
+    }
+
+    /// A snapshot from T3's config subscription.
+    fn config_snapshot(config: Value) -> Value {
+        json!({"version": 1, "type": "snapshot", "config": config})
+    }
+
+    /// A change from T3's config subscription.
+    fn config_change(kind: &str, payload: Value) -> Value {
+        json!({"version": 1, "type": kind, "payload": payload})
+    }
+
+    fn provider(id: &str, status: &str) -> Value {
+        let model = format!("{id}-model");
+        json!({"instanceId": id, "status": status, "enabled": true, "models": [{"slug": model}]})
+    }
+
+    /// A configuration with every field the TUI reads and some it doesn't, including one no
+    /// build knows yet.
+    fn full_config(providers: Value) -> Value {
+        json!({
+            "environment": {"capabilities": {"threadSnooze": true, "threadSettlement": true}},
+            "providers": providers,
+            "settings": {"enableAssistantStreaming": true, "providers": {"codex": {}}},
+            "keybindings": [{"key": "mod+k", "command": "commandPalette.toggle"}],
+            "issues": [],
+            "availableEditors": ["cursor"],
+            "futureField": {"kept": true},
+        })
+    }
+
+    #[test]
+    fn a_config_snapshot_replaces_the_whole_config_and_drops_providers_it_leaves_out() {
+        let mut config = None;
+        let providers = json!([provider("codex", "ready"), provider("claude", "ready")]);
+        let first = full_config(providers);
+        assert_eq!(
+            apply_config(&mut config, &config_snapshot(first.clone())),
+            Applied::Snapshot
+        );
+        assert_eq!(config.as_ref(), Some(&first));
+
+        // A later snapshot is the whole configuration, so what it leaves out is gone, fields
+        // and providers alike.
+        let providers = json!([provider("codex", "error")]);
+        let second = json!({"environment": {"capabilities": {}}, "providers": providers});
+        assert_eq!(
+            apply_config(&mut config, &config_snapshot(second.clone())),
+            Applied::Snapshot
+        );
+        assert_eq!(config.as_ref(), Some(&second));
+    }
+
+    #[test]
+    fn config_changes_replace_their_own_fields_and_keep_the_rest() {
+        let providers = json!([provider("codex", "ready"), provider("claude", "ready")]);
+        let before = full_config(providers);
+        let mut config = None;
+        apply_config(&mut config, &config_snapshot(before.clone()));
+
+        // The new list is the whole list: Codex is gone though the change doesn't name it.
+        let providers = json!([provider("claude", "error"), provider("cursor", "ready")]);
+        let change = config_change("providerStatuses", json!({"providers": providers}));
+        assert_eq!(
+            apply_config(&mut config, &change),
+            Applied::Event("providerStatuses".into())
+        );
+        let mut expected = before.clone();
+        expected["providers"] = providers;
+        assert_eq!(config.as_ref(), Some(&expected));
+
+        let settings = json!({"enableAssistantStreaming": false});
+        let change = config_change("settingsUpdated", json!({"settings": settings}));
+        assert_eq!(
+            apply_config(&mut config, &change),
+            Applied::Event("settingsUpdated".into())
+        );
+        expected["settings"] = settings;
+        assert_eq!(config.as_ref(), Some(&expected));
+
+        let keybindings = json!([]);
+        let issues = json!([{"kind": "keybindings.malformed-config", "message": "bad"}]);
+        let payload = json!({"keybindings": keybindings, "issues": issues});
+        let change = config_change("keybindingsUpdated", payload);
+        assert_eq!(
+            apply_config(&mut config, &change),
+            Applied::Event("keybindingsUpdated".into())
+        );
+        expected["keybindings"] = keybindings;
+        expected["issues"] = issues;
+        assert_eq!(config.as_ref(), Some(&expected));
+    }
+
+    #[test]
+    fn config_items_that_change_nothing_leave_the_config_as_it_was() {
+        // A change before any snapshot has no configuration to apply to.
+        let mut config = None;
+        let providers = json!([provider("codex", "ready")]);
+        let early = config_change("providerStatuses", json!({"providers": providers}));
+        assert_eq!(apply_config(&mut config, &early), Applied::Ignored);
+        assert_eq!(config, None);
+        let malformed = config_snapshot(json!({"environment": {}}));
+        assert_eq!(apply_config(&mut config, &malformed), Applied::Ignored);
+        assert_eq!(config, None);
+
+        let good = full_config(providers);
+        apply_config(&mut config, &config_snapshot(good.clone()));
+        for item in [
+            // Another version, or none.
+            json!({"version": 2, "type": "snapshot", "config": {"providers": []}}),
+            json!({"type": "providerStatuses", "payload": {"providers": []}}),
+            // Snapshots without a provider list.
+            config_snapshot(json!({"environment": {}})),
+            config_snapshot(json!({"providers": {"codex": {}}})),
+            config_snapshot(Value::Null),
+            json!({"version": 1, "type": "snapshot"}),
+            // Changes without the part they change.
+            config_change("providerStatuses", json!({})),
+            config_change("providerStatuses", json!({"providers": null})),
+            json!({"version": 1, "type": "providerStatuses"}),
+            config_change("settingsUpdated", json!({"settings": []})),
+            config_change("keybindingsUpdated", json!({"keybindings": []})),
+            config_change(
+                "keybindingsUpdated",
+                json!({"keybindings": {}, "issues": []}),
+            ),
+            // Events t3term doesn't ask for, or that no build knows yet.
+            config_change("environmentThemesUpdated", json!({"themes": []})),
+            config_change("usageLimitSourcesUpdated", json!({"sources": []})),
+            config_change("somethingNew", json!({"providers": []})),
+            // Not a config item at all.
+            json!({"kind": "synchronized"}),
+            json!("snapshot"),
+        ] {
+            let applied = apply_config(&mut config, &item);
+            assert_eq!(applied, Applied::Ignored, "{item}");
+            assert_eq!(config.as_ref(), Some(&good), "{item}");
+        }
     }
 }

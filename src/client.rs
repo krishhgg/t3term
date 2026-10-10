@@ -439,6 +439,15 @@ impl Client {
             after_sequence,
         )
     }
+
+    /// Streams the server's configuration, as `spawn_config_watch` describes.
+    pub fn watch_config(self: &Arc<Self>) -> mpsc::UnboundedReceiver<WatchEvent> {
+        let client = self.clone();
+        spawn_config_watch(move || {
+            let client = client.clone();
+            Box::pin(async move { client.rpc().await })
+        })
+    }
 }
 
 /// T3 can restart the agent's session to apply these settings, so t3term changes them only
@@ -457,13 +466,41 @@ fn busy_for_settings(run: &Value) -> anyhow::Error {
 #[derive(Debug, Clone)]
 pub enum WatchEvent {
     Item(Value),
-    /// The connection dropped; the watcher is reconnecting and will resume after the last sequence.
+    /// The connection dropped. The watcher is reconnecting, and resumes after the last sequence
+    /// or starts again from a snapshot, as its stream does.
     Reconnecting {
         reason: String,
         retry_in: Duration,
     },
     /// The server refused the subscription. The watcher stopped.
     Failed(String),
+}
+
+/// Opens a connection for a watcher. Each reconnect calls it again.
+type Connect = dyn Fn() -> Pin<Box<dyn Future<Output = Result<RpcClient>> + Send>> + Send + Sync;
+
+/// Where a watcher's stream starts again after a dropped connection.
+#[derive(Clone, Copy)]
+enum Resume {
+    /// After the highest event sequence delivered, from this one at first. The orchestration
+    /// streams work this way, and their `{"kind": "synchronized"}` marker says a subscription
+    /// has caught up.
+    AfterSequence(Option<u64>),
+    /// From a new snapshot. A stream with no cursor, such as the server config, sends the whole
+    /// state first, as `{"type": "snapshot"}`.
+    Snapshot,
+}
+
+impl Resume {
+    /// Whether `item` shows the subscription working, so the next drop retries quickly.
+    fn healthy(self, item: &Value) -> bool {
+        match self {
+            Resume::AfterSequence(_) => {
+                item.get("kind").and_then(Value::as_str) == Some("synchronized")
+            }
+            Resume::Snapshot => item.get("type").and_then(Value::as_str) == Some("snapshot"),
+        }
+    }
 }
 
 /// Runs a subscription until its receiver is dropped. Tracks the highest sequence it delivered so a
@@ -477,12 +514,50 @@ pub fn spawn_watch<F>(
 where
     F: Fn() -> Pin<Box<dyn Future<Output = Result<RpcClient>> + Send>> + Send + Sync + 'static,
 {
+    watch(
+        Box::new(connect),
+        tag,
+        payload,
+        Resume::AfterSequence(after_sequence),
+    )
+}
+
+/// Runs T3's config subscription, `subscribeServerConfig`, until its receiver is dropped. Each
+/// subscription opens with a snapshot of the whole configuration and goes on with changes to
+/// parts of it. The stream has no cursor, so a resubscribe asks for nothing but a new snapshot.
+/// The payload is empty, which leaves out the theme and usage-limit events t3term doesn't read.
+pub fn spawn_config_watch<F>(connect: F) -> mpsc::UnboundedReceiver<WatchEvent>
+where
+    F: Fn() -> Pin<Box<dyn Future<Output = Result<RpcClient>> + Send>> + Send + Sync + 'static,
+{
+    watch(
+        Box::new(connect),
+        "subscribeServerConfig",
+        json!({}),
+        Resume::Snapshot,
+    )
+}
+
+fn watch(
+    connect: Box<Connect>,
+    tag: &'static str,
+    payload: Value,
+    resume: Resume,
+) -> mpsc::UnboundedReceiver<WatchEvent> {
     let (events, receiver) = mpsc::unbounded_channel();
     tokio::spawn(async move {
-        let mut last_sequence = after_sequence;
+        let mut last_sequence = match resume {
+            Resume::AfterSequence(sequence) => sequence,
+            Resume::Snapshot => None,
+        };
         let mut backoff = Duration::from_millis(250);
         loop {
-            let reason = match connect().await {
+            let connected = tokio::select! {
+                connected = connect() => connected,
+                // The consumer went away, such as a TUI that quit.
+                _ = events.closed() => return,
+            };
+            let reason = match connected {
                 Err(e) => e.to_string(),
                 Ok(rpc) => {
                     let mut request = payload.clone();
@@ -499,26 +574,12 @@ where
                             };
                             match next {
                                 Some(Ok(item)) => {
-                                    if item.get("kind").and_then(Value::as_str)
-                                        == Some("synchronized")
-                                    {
+                                    if resume.healthy(&item) {
                                         backoff = Duration::from_millis(250);
                                     }
-                                    // Enrichment snapshots do not move the resume cursor.
-                                    let enrichment =
-                                        item.get("resolvedRepositoryIdentityRoots").is_some();
-                                    let sequence = if enrichment {
-                                        None
-                                    } else {
-                                        item.get("sequence")
-                                            .or_else(|| item.get("snapshotSequence"))
-                                            .or_else(|| {
-                                                item.get("snapshot")
-                                                    .and_then(|s| s.get("snapshotSequence"))
-                                            })
-                                            .and_then(Value::as_u64)
-                                    };
-                                    if let Some(sequence) = sequence {
+                                    if let Resume::AfterSequence(_) = resume
+                                        && let Some(sequence) = delivered_sequence(&item)
+                                    {
                                         last_sequence = Some(
                                             last_sequence.map_or(sequence, |l| l.max(sequence)),
                                         );
@@ -547,9 +608,24 @@ where
             {
                 return;
             }
-            tokio::time::sleep(backoff).await;
+            tokio::select! {
+                _ = tokio::time::sleep(backoff) => {}
+                _ = events.closed() => return,
+            }
             backoff = (backoff * 2).min(MAX_BACKOFF);
         }
     });
     receiver
+}
+
+/// The event sequence an orchestration item carries, which a resubscribe resumes after.
+fn delivered_sequence(item: &Value) -> Option<u64> {
+    // Enrichment snapshots do not move the resume cursor.
+    if item.get("resolvedRepositoryIdentityRoots").is_some() {
+        return None;
+    }
+    item.get("sequence")
+        .or_else(|| item.get("snapshotSequence"))
+        .or_else(|| item.get("snapshot").and_then(|s| s.get("snapshotSequence")))
+        .and_then(Value::as_u64)
 }
