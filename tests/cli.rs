@@ -484,6 +484,63 @@ fn read_names_where_each_handoff_went_and_json_keeps_them_as_sent() {
     assert_eq!(json_stdout(&read)["projection"], projection);
 }
 
+/// A `file_change` item of run r1 in the shape the nightly sends (`OrchestrationV2TurnItem` in
+/// packages/contracts/src/orchestrationV2.ts, after `WireProjection.ts`), with counts and no
+/// `changes` or `diffStr`.
+fn edit(item_id: &str, ordinal: u64, status: &str, file_name: &str, updated_at: &str) -> Value {
+    json!({"id": item_id, "runId": "r1", "type": "file_change", "ordinal": ordinal,
+        "status": status, "title": null, "fileName": file_name, "additions": 3,
+        "deletions": 1, "updatedAt": updated_at})
+}
+
+#[test]
+fn read_prints_each_edits_row_alone_and_json_keeps_the_edits_as_sent() {
+    // A failed edit with its error in `diffStr` and 1,000 operations, an edit with a patch and
+    // one without counts. The pinned nightly strips the patch from an edit that didn't fail,
+    // but another server could send it. The failed edit's made-up name, error and paths hold
+    // controls.
+    let id = "3e7b1d94-8c2f-4a65-b0d3-7f1e9a2c5b48";
+    let at = "2026-10-09T10:00:00.000Z";
+    let name = "src/\u{1b}[2Jmain.rs\r\nnext\u{9b}31m\u{7f}";
+    let mut failed = edit("e1", 1, "failed", name, at);
+    failed["diffStr"] = json!("Not found\u{1b}]52;c;Zm9v\u{7}\nhere");
+    let changes: Vec<Value> = (0..1_000)
+        .map(|n| json!({"operation": "add", "path": format!("/repo/\u{1b}[2Jf{n}.rs")}))
+        .collect();
+    failed["changes"] = json!(changes);
+    let mut patched = edit("e2", 2, "completed", "src/lib.rs", at);
+    patched["diffStr"] = json!("@@ -1 +1 @@\n-old\n+new");
+    let mut bare = edit("e3", 3, "completed", "README.md", at);
+    bare["additions"] = json!(null);
+    bare["deletions"] = json!(null);
+    let items = json!([failed, patched, bare]);
+    let origin = serve_thread(id, "Edits", items.clone());
+    let home = Home::new();
+    home.record_server(&origin);
+    let t3 = home.fake_t3();
+
+    // Each edit prints its cleaned name and counts on one row, with none of its operations,
+    // error or patch.
+    let read = home.run_with(&["read", id], &t3);
+    assert_eq!(read.status.code(), Some(0), "{read:?}");
+    let printed = String::from_utf8(read.stdout).expect("UTF-8");
+    let rows = [
+        "  · edit src/[2Jmain.rs next31m  +3 -1",
+        "  · edit src/lib.rs  +3 -1",
+        "  · edit README.md",
+    ];
+    let expected = format!("# Edits  ({id})\n{}\n", rows.join("\n"));
+    assert_eq!(printed, expected);
+
+    // `--json` prints the edits as T3 sent them, with each control as a JSON escape.
+    let read = home.run_with(&["--json", "read", id], &t3);
+    assert_eq!(read.status.code(), Some(0), "{read:?}");
+    let printed = std::str::from_utf8(&read.stdout).expect("UTF-8");
+    let control = printed.chars().find(|c| c.is_control() && *c != '\n');
+    assert_eq!(control, None, "{printed:?}");
+    assert_eq!(json_stdout(&read)["projection"]["turnItems"], items);
+}
+
 #[test]
 fn send_wait_says_once_where_each_handoff_in_the_turn_went() {
     // A thread whose one run so far was on codex_personal, as `GET .../bounded` returns it.
@@ -639,6 +696,131 @@ fn send_wait_says_once_where_each_handoff_in_the_turn_went() {
             "outcome": "completed", "reply": "Hello"})
     );
     assert_eq!(std::str::from_utf8(&sent.stderr), Ok(""));
+}
+
+#[test]
+fn wait_says_once_when_each_edit_in_the_turn_settles() {
+    // A thread whose run r1 is working on message m1, as `GET .../bounded` returns it.
+    let id = "2a9d6e13-7f4b-4c80-9e25-8b3f1c7d0a69";
+    let run = json!({"id": "r1", "ordinal": 1, "status": "running", "userMessageId": "m1"});
+    let snapshot = json!({"snapshotSequence": 3, "projection": {
+        "thread": {"id": id, "title": "Live edits"},
+        "runs": [run.clone()],
+        "runtimeRequests": [],
+        "turnItems": [],
+    }});
+
+    // What T3 streams after the snapshot. An edit runs, then fails with its error in
+    // `diffStr`, comes again in a replay and once more with a later `updatedAt`. A second edit
+    // carries a patch, which the pinned nightly strips from an edit that didn't fail, and comes
+    // again after a command. Then the reply in two deltas and the end of the run. The first
+    // edit's made-up name, error and paths hold controls.
+    let at = |second: u32| format!("2026-10-09T10:00:{second:02}.000Z");
+    let name = "src/\u{1b}[2Jmain.rs\r\nnext\u{9b}31m\u{7f}";
+    let running = edit("e1", 1, "running", name, &at(1));
+    let mut failed = edit("e1", 1, "failed", name, &at(2));
+    failed["diffStr"] = json!("Not found\u{1b}]52;c;Zm9v\u{7}\nhere");
+    failed["changes"] = json!([
+        {"operation": "move", "oldPath": "/repo/\u{1b}[2Jold.rs", "path": "/repo/new.rs"},
+        {"operation": "add", "path": "/repo/added.rs"},
+    ]);
+    let mut failed_again = failed.clone();
+    failed_again["updatedAt"] = json!(at(3));
+    let mut patched = edit("e2", 2, "completed", "src/lib.rs", &at(4));
+    patched["diffStr"] = json!("@@ -1 +1 @@\n-old\n+new");
+    let mut patched_again = patched.clone();
+    patched_again["updatedAt"] = json!(at(6));
+    let command = json!({"id": "c1", "runId": "r1", "type": "command_execution",
+        "ordinal": 3, "status": "completed", "input": "cargo test", "output": "ok",
+        "exitCode": 0, "updatedAt": at(5)});
+    let answer = |text: &str| {
+        json!({"id": "a1", "runId": "r1", "type": "assistant_message", "ordinal": 4,
+            "text": text, "streaming": true})
+    };
+    let event = |sequence: u64, kind: &str, payload: Value| {
+        json!({"kind": "event", "sequence": sequence,
+            "event": {"type": kind, "payload": payload}})
+    };
+    let mut finished = run;
+    finished["status"] = json!("completed");
+    let item = "turn-item.updated";
+    let turn = json!([
+        {"kind": "synchronized"},
+        event(4, item, running),
+        event(5, item, failed.clone()),
+        event(5, item, failed),
+        event(6, item, failed_again),
+        event(7, item, patched),
+        event(8, item, command),
+        event(9, item, patched_again),
+        event(10, item, answer("Do")),
+        event(11, item, answer("Done")),
+        event(12, "run.updated", finished),
+    ]);
+
+    // T3's side of the WebSocket. It answers the thread's subscription with the turn, and
+    // keeps each request.
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let kept = requests.clone();
+    let on_socket = move |mut socket: Socket| {
+        let Some(subscribe) = next_request(&mut socket) else {
+            return;
+        };
+        kept.lock().unwrap().push(subscribe.clone());
+        reply(
+            &mut socket,
+            json!({"_tag": "Chunk", "requestId": subscribe["id"], "values": turn}),
+        );
+        // Holds the socket open until t3term closes it.
+        while socket.read().is_ok() {}
+    };
+    let thread_path = format!("/api/orchestration/threads/{id}/bounded");
+    let (origin, _) = serve_sockets(
+        move |path| match path {
+            "/.well-known/t3/environment" => Some(protocol_2_descriptor()),
+            "/api/orchestration/shell" => Some(json!({"projects": [], "threads": []})),
+            "/api/auth/websocket-ticket" => Some(json!({"ticket": "ticket-test"})),
+            _ if path == thread_path => Some(snapshot.clone()),
+            _ => None,
+        },
+        on_socket,
+    );
+    let home = Home::new();
+    home.record_server(&origin);
+    let t3 = home.fake_t3();
+
+    // The reply streams to stdout. Each edit gets one row on stderr, with its name cleaned,
+    // once it has settled: the first when it fails, though T3 sends it twice more, and the
+    // second once, though it comes again after the command. No operation, error or patch line
+    // is printed.
+    let waited = home.run_with(&["wait", id, "--timeout", "30"], &t3);
+    assert_eq!(waited.status.code(), Some(0), "{waited:?}");
+    assert_eq!(std::str::from_utf8(&waited.stdout), Ok("\nDone\n"));
+    let printed = std::str::from_utf8(&waited.stderr).expect("UTF-8");
+    let rows = [
+        "",
+        "· edit src/[2Jmain.rs next31m  +3 -1",
+        "",
+        "· edit src/lib.rs  +3 -1",
+        "",
+        "· $ cargo test  (exit 0)",
+    ];
+    assert_eq!(printed, format!("{}\n", rows.join("\n")));
+    // t3term only subscribed, after the snapshot it had read.
+    let seen = requests.lock().unwrap().clone();
+    assert_eq!(seen.len(), 1);
+    assert_eq!(seen[0]["tag"], "orchestration.subscribeThread");
+    assert_eq!(seen[0]["payload"]["afterSequence"], 3);
+
+    // With `--json`, stdout holds only the result and stderr stays empty.
+    let waited = home.run_with(&["--json", "wait", id, "--timeout", "30"], &t3);
+    assert_eq!(waited.status.code(), Some(0), "{waited:?}");
+    assert_eq!(
+        json_stdout(&waited),
+        json!({"ok": true, "threadId": id, "messageId": "m1", "runId": "r1",
+            "outcome": "completed", "reply": "Done"})
+    );
+    assert_eq!(std::str::from_utf8(&waited.stderr), Ok(""));
 }
 
 #[test]

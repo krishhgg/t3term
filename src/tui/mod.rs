@@ -38,7 +38,7 @@ use crate::client::{Client, IfBusy, WatchEvent};
 use crate::models::Choice;
 use crate::projection::{Applied, ShellState, ThreadState, is_active_status, status};
 use crate::settings::Settings;
-use crate::transcript::{self, BlockKind};
+use crate::transcript::{self, BlockKind, ChangeLine};
 use composer::Composer;
 use markdown::Styles;
 use picker::{Item, Kind, Pick};
@@ -3101,6 +3101,32 @@ fn fit(text: &str, width: usize) -> String {
     out
 }
 
+/// `text` cut with `…` to at most `width` columns, at a place `transcript::clusters` finds, so
+/// an accent stays on its letter and a wide character never pushes the line past `width`.
+/// `fit` can run a column over after a wide character. The sidebar and the tasks drawer allow
+/// for that, so it stays as it is.
+fn clip(text: &str, width: usize) -> String {
+    let pieces = transcript::clusters(text);
+    if pieces.iter().map(|piece| piece.width()).sum::<usize>() <= width {
+        return text.to_string();
+    }
+    if width == 0 {
+        return String::new();
+    }
+    // The … takes the last column.
+    let mut out = String::new();
+    let mut used = 0;
+    for piece in pieces {
+        used += piece.width();
+        if used >= width {
+            break;
+        }
+        out.push_str(piece);
+    }
+    out.push('…');
+    out
+}
+
 /// The icon, action and argument for a tool row, after the GUI's
 /// Eye/SquarePen/Terminal/Globe/Search icon set. The argument is drawn as a chip after the
 /// action, so a long command or path can be cut without hiding what the tool did.
@@ -3116,11 +3142,22 @@ fn tool_row(block: &transcript::Block) -> (&'static str, String, String) {
     };
     match block.item_type.as_str() {
         "command_execution" => ("❯", described("Run"), block.detail.clone()),
-        "file_change" => (
-            "✎",
-            described("Edit"),
-            block.header.trim_start_matches("edit ").to_string(),
-        ),
+        // An edit of several files is about all of them, so the argument counts them, as the
+        // nightly's `session-logic.ts` labels it `Changed 3 files`. T3's counts are for the
+        // whole item, so they stay on the row rather than go with one path.
+        "file_change" => {
+            let argument = match &block.change {
+                Some(change) if change.operations > 1 => {
+                    let files = format!("{} files", change.operations);
+                    match change.counts.as_str() {
+                        "" => files,
+                        counts => format!("{files}  {counts}"),
+                    }
+                }
+                _ => block.header.trim_start_matches("edit ").to_string(),
+            };
+            ("✎", described("Edit"), argument)
+        }
         "file_search" => ("⌕", described("Search"), block.detail.clone()),
         "web_search" => ("◎", described("Web search"), block.detail.clone()),
         "subagent" => ("⧉", block.header.clone(), block.detail.clone()),
@@ -3310,6 +3347,24 @@ fn render_block(
                 ));
             }
             lines.push(Line::from(spans));
+            // An edit's lines come cleaned and bounded from `describe`. Only their color is
+            // chosen here.
+            if let Some(change) = &block.change {
+                for (kind, line) in &change.lines {
+                    let style = match kind {
+                        ChangeLine::Operation | ChangeLine::Context => muted,
+                        ChangeLine::Note => muted.add_modifier(Modifier::ITALIC),
+                        ChangeLine::Meta => muted.add_modifier(Modifier::BOLD),
+                        ChangeLine::Hunk => Style::new().fg(t.info_fg),
+                        ChangeLine::Added => Style::new().fg(t.success),
+                        ChangeLine::Removed | ChangeLine::Error => Style::new().fg(t.error_fg),
+                    };
+                    lines.push(Line::from(vec![
+                        Span::styled("  │ ", Style::new().fg(t.border_strong)),
+                        Span::styled(clip(line, width.saturating_sub(4)), style),
+                    ]));
+                }
+            }
             if !block.body.is_empty() {
                 for line in block.body.lines() {
                     lines.push(Line::from(vec![
@@ -3442,6 +3497,7 @@ mod tests {
             run_id: "run".into(),
             tool_name: String::new(),
             request_id: String::new(),
+            change: None,
         }
     }
 
@@ -3699,6 +3755,171 @@ mod tests {
         );
         assert!(row.ends_with("Approved"), "{row}");
         assert_eq!(row.width(), 60);
+    }
+
+    #[test]
+    fn an_edit_lists_its_operations_error_and_patch_under_its_row() {
+        let theme = Theme::new(Depth::TrueColor);
+        let context = RenderContext {
+            theme: &theme,
+            text: Styles::new(&theme, theme.text()),
+            bubble: Styles::new(&theme, theme.text()),
+            reasoning: Styles::new(&theme, Style::new().fg(theme.muted)).dimmed(),
+        };
+        // An ACP edit of two files as the nightly sends it while it runs, with `fields` replaced
+        // or added, described as the TUI's prepare step describes it.
+        let edit = |fields: Value| {
+            let mut item = json!({
+                "id": "edit-1",
+                "runId": "r1",
+                "type": "file_change",
+                "ordinal": 2,
+                "status": "running",
+                "title": null,
+                "fileName": "/workspace/new.ts",
+                "additions": 4,
+                "deletions": 2,
+                "changes": [
+                    {"operation": "move", "path": "/workspace/new.ts",
+                        "oldPath": "/workspace/old.ts", "fileType": "text"},
+                    {"operation": "add", "path": "/workspace/日本/👩\u{200d}💻.md"},
+                ],
+                "updatedAt": "2026-10-09T10:00:00.000Z",
+            });
+            if let (Some(item), Some(fields)) = (item.as_object_mut(), fields.as_object()) {
+                item.extend(fields.clone());
+            }
+            transcript::describe(&item, &[]).expect("an edit has a row")
+        };
+        let running = edit(json!({}));
+
+        // Closed, the group's row stands for the edit. Opened, the edit's row counts its files,
+        // since T3's counts are for all of them, and each operation has a line.
+        let heads = bundle_tools(std::slice::from_ref(&running));
+        let head = heads[0].clone().expect("a group of one");
+        assert_eq!((head.count, head.names.as_str()), (1, "Edit"));
+        let bundle = |open: bool| {
+            Extra::Bundle(Bundle {
+                count: head.count,
+                names: head.names.clone(),
+                open,
+            })
+        };
+        let closed = render_block(&running, 60, &context, &bundle(false));
+        assert_eq!(text(&closed), vec!["› 1 tool call · Edit"]);
+        let open = render_block(&running, 60, &context, &bundle(true));
+        assert_eq!(
+            text(&open),
+            vec![
+                "⌄ 1 tool call · Edit",
+                "✎ Edit   2 files  +4 -2 ",
+                "  │ move /workspace/old.ts → /workspace/new.ts (text)",
+                "  │ add /workspace/日本/👩\u{200d}💻.md",
+            ]
+        );
+        assert_eq!(open[1].spans[0].style.fg, Some(theme.info));
+        assert_eq!(open[2].spans[0].style.fg, Some(theme.border_strong));
+        assert_eq!(open[2].spans[1].style.fg, Some(theme.muted));
+
+        // T3 sends the edit again, failed, with the provider's error where a patch would be. The
+        // error comes first, in the failure's color.
+        let failed = edit(json!({
+            "status": "failed",
+            "diffStr": "String to replace not found",
+        }));
+        let lines = render_block(&failed, 60, &context, &Extra::None);
+        assert_eq!(
+            text(&lines),
+            vec![
+                "✎ Edit   2 files  +4 -2 ",
+                "  │ String to replace not found",
+                "  │ move /workspace/old.ts → /workspace/new.ts (text)",
+                "  │ add /workspace/日本/👩\u{200d}💻.md",
+            ]
+        );
+        assert_eq!(lines[0].spans[0].style.fg, Some(theme.error_fg));
+        assert_eq!(lines[1].spans[1].style.fg, Some(theme.error_fg));
+
+        // A server that sends the patch of an edit that didn't fail, which the pinned nightly
+        // never does. Each kind of line has its own color, and the line after the hunk's counts
+        // run out is a header again.
+        let patch = [
+            "--- a/src/a.rs",
+            "+++ b/src/a.rs",
+            "@@ -1,2 +1,2 @@",
+            " fn main() {",
+            "-    old();",
+            "+    new();",
+            "\\ No newline at end of file",
+        ];
+        let patched = edit(json!({
+            "status": "completed",
+            "fileName": "src/a.rs",
+            "additions": 1,
+            "deletions": 1,
+            "changes": null,
+            "diffStr": patch.join("\n"),
+        }));
+        let lines = render_block(&patched, 60, &context, &Extra::None);
+        let rows = text(&lines);
+        assert_eq!(rows[0], "✎ Edit   src/a.rs  +1 -1 ");
+        assert_eq!(rows[1..], patch.map(|line| format!("  │ {line}")));
+        let muted = Style::new().fg(theme.muted);
+        let styles: Vec<Style> = lines[1..].iter().map(|l| l.spans[1].style).collect();
+        assert_eq!(
+            styles,
+            [
+                muted.add_modifier(Modifier::BOLD),
+                muted.add_modifier(Modifier::BOLD),
+                Style::new().fg(theme.info_fg),
+                muted,
+                Style::new().fg(theme.error_fg),
+                Style::new().fg(theme.success),
+                muted.add_modifier(Modifier::BOLD),
+            ]
+        );
+
+        // An edit that lists no changes and sends no patch has its file and counts and nothing
+        // under them.
+        let plain = edit(json!({
+            "status": "completed",
+            "fileName": "src/main.rs",
+            "changes": null,
+        }));
+        let lines = render_block(&plain, 60, &context, &Extra::None);
+        assert_eq!(text(&lines), vec!["✎ Edit   src/main.rs  +4 -2 "]);
+
+        // T3's description of the edit is its action, as for any tool. With one operation, the
+        // argument is the file.
+        let described = edit(json!({"title": "Apply the rename"}));
+        assert_eq!(tool_row(&described).1, "Apply the rename");
+        let single = edit(json!({
+            "changes": [{"operation": "modify", "path": "/workspace/new.ts"}],
+        }));
+        assert_eq!(
+            tool_row(&single),
+            ("✎", "Edit".into(), "/workspace/new.ts  +4 -2".into())
+        );
+
+        // However narrow the transcript, no row runs past it. A long line ends in …, and a wide
+        // character or joined emoji that doesn't fit before it is left out whole.
+        for width in [10, 11, 23, 24, 40, 80] {
+            for block in [&running, &failed, &patched, &plain] {
+                let rows = text(&render_block(block, width, &context, &Extra::None));
+                assert!(rows.iter().all(|row| row.width() <= width), "{rows:?}");
+            }
+        }
+        let rows = text(&render_block(&running, 40, &context, &Extra::None));
+        assert_eq!(rows[1], "  │ move /workspace/old.ts → /workspace…");
+        let rows = text(&render_block(&running, 24, &context, &Extra::None));
+        assert_eq!(rows[2], "  │ add /workspace/日本…");
+        let rows = text(&render_block(&running, 23, &context, &Extra::None));
+        assert_eq!(rows[2], "  │ add /workspace/日…");
+        assert_eq!(clip("cafe\u{301}!", 5), "cafe\u{301}!");
+        assert_eq!(clip("cafe\u{301}!", 4), "caf…");
+        assert_eq!(clip("a👩\u{200d}💻b", 4), "a👩\u{200d}💻b");
+        assert_eq!(clip("a👩\u{200d}💻b", 3), "a…");
+        assert_eq!(clip("anything", 0), "");
     }
 
     #[test]
@@ -5469,5 +5690,114 @@ mod tests {
         screen(&mut app, 120, 30);
         assert_eq!(app.sidebar.border, Rect::new(39, 0, 1, 30));
         assert_eq!(app.composer_area.x, 41);
+    }
+
+    // ---- file changes ----
+
+    #[test]
+    fn an_edit_updates_in_place_and_keeps_the_reader_where_they_were() {
+        /// How many rows show `needle`.
+        fn count(rows: &[String], needle: &str) -> usize {
+            rows.iter().filter(|row| row.contains(needle)).count()
+        }
+        let event = |sequence: u64, payload: &Value| {
+            WatchEvent::Item(json!({"kind": "event", "sequence": sequence, "event": {
+                "type": "turn-item.updated",
+                "payload": payload,
+            }}))
+        };
+        let mut app = tui(&Settings::default());
+        app.open = Some(long_thread());
+        app.composer.insert_str("draft");
+        app.focus = Focus::Transcript;
+        // After the twenty answers, a run checks the code and starts an ACP edit of two files.
+        let command = json!({"id": "cmd-1", "runId": "r1", "type": "command_execution",
+            "ordinal": 20, "status": "completed", "title": null, "input": "cargo check",
+            "exitCode": 0, "updatedAt": "2026-10-09T10:00:00.000Z"});
+        let running = json!({
+            "id": "edit-1",
+            "runId": "r1",
+            "type": "file_change",
+            "ordinal": 21,
+            "status": "running",
+            "title": null,
+            "fileName": "/workspace/new.ts",
+            "additions": 4,
+            "deletions": 2,
+            "changes": [
+                {"operation": "move", "path": "/workspace/new.ts",
+                    "oldPath": "/workspace/old.ts"},
+                {"operation": "add", "path": "/workspace/notes.md", "fileType": "text"},
+            ],
+            "updatedAt": "2026-10-09T10:00:01.000Z",
+        });
+        app.on_thread_event(event(2, &command));
+        app.on_thread_event(event(3, &running));
+
+        // Closed, the group is one row, and the edit's lines wait under it.
+        let rows = screen(&mut app, 120, 30);
+        row_showing(&rows, "› 2 tool calls · Run, Edit");
+        assert_eq!(count(&rows, "/workspace/old.ts"), 0);
+
+        // Opened, the edit's row counts its files, and each operation has a line under it.
+        app.open_bundles.insert("cmd-1".into());
+        let rows = screen(&mut app, 120, 30);
+        let edit = row_showing(&rows, "✎ Edit   2 files  +4 -2") as usize;
+        assert!(rows[edit + 1].contains("│ move /workspace/old.ts → /workspace/new.ts"));
+        assert!(rows[edit + 2].contains("│ add /workspace/notes.md (text)"));
+        let made = app.open.as_ref().unwrap().prepared.made;
+
+        // Scrolled up, the reader stays on the answer they were reading when the edit below
+        // fails and gains a line. Only the edit's block is made again.
+        for _ in 0..3 {
+            press(&mut app, KeyCode::PageUp);
+        }
+        screen(&mut app, 120, 30);
+        let (top, _) = app.anchor.clone().expect("scrolled up");
+        let mut failed = running;
+        failed["status"] = json!("failed");
+        failed["diffStr"] = json!("String to replace not found");
+        failed["updatedAt"] = json!("2026-10-09T10:00:02.000Z");
+        app.on_thread_event(event(4, &failed));
+        screen(&mut app, 120, 30);
+        assert_eq!(app.anchor.as_ref().map(|(id, _)| id), Some(&top));
+        assert!(app.scroll.rows() > 0);
+        assert_eq!(app.open.as_ref().unwrap().prepared.made, made + 1);
+
+        // At the bottom, the error comes first under the row, and nothing is drawn twice.
+        press(&mut app, KeyCode::End);
+        let rows = screen(&mut app, 120, 30);
+        let edit = row_showing(&rows, "✎ Edit   2 files  +4 -2") as usize;
+        assert!(rows[edit + 1].contains("│ String to replace not found"));
+        assert!(rows[edit + 2].contains("│ move /workspace/old.ts → /workspace/new.ts"));
+        for needle in ["✎ Edit", "to replace", "old.ts", "notes.md"] {
+            assert_eq!(count(&rows, needle), 1, "{needle}: {rows:#?}");
+        }
+
+        // A reconnect that replays the event changes nothing.
+        app.on_thread_event(event(4, &failed));
+        let rows = screen(&mut app, 120, 30);
+        assert_eq!(count(&rows, "String to replace not found"), 1);
+        assert_eq!(app.open.as_ref().unwrap().prepared.made, made + 1);
+
+        // Hiding the sidebar and showing it again rewraps every row from the blocks already
+        // made, and the draft and focus stay.
+        for hidden in [true, false] {
+            ctrl_b(&mut app);
+            let rows = screen(&mut app, 120, 30);
+            assert_eq!(app.sidebar_hidden, hidden);
+            let width = app.transcript_area.width - 1;
+            assert!(app.cache.values().all(|cached| cached.key.1 == width));
+            assert_eq!(app.open.as_ref().unwrap().prepared.made, made + 1);
+            assert_eq!(count(&rows, "String to replace not found"), 1);
+            assert_eq!(app.composer.text(), "draft");
+            assert_eq!(app.focus, Focus::Transcript);
+        }
+
+        // Verbose mode opens the group as well.
+        app.open_bundles.clear();
+        app.verbose = true;
+        let rows = screen(&mut app, 120, 30);
+        assert_eq!(count(&rows, "String to replace not found"), 1);
     }
 }

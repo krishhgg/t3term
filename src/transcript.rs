@@ -18,6 +18,11 @@ const MAX_ENDPOINT_WIDTH: usize = 64;
 /// Bytes of a model or provider id that are read at all, enough for `MAX_ENDPOINT_WIDTH`
 /// columns in any script.
 const MAX_ENDPOINT_BYTES: usize = 1024;
+/// Operations of one file change that its row lists before a count stands for the rest.
+const MAX_CHANGED_FILES: usize = 12;
+/// Bytes of a file change's path, operation or file kind that are read at all. A path is far
+/// shorter.
+const MAX_NAME_BYTES: usize = 1024;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum BlockKind {
@@ -56,6 +61,45 @@ pub struct Block {
     pub tool_name: String,
     /// For request items: the runtime request they show.
     pub request_id: String,
+    /// For `file_change` items: what the TUI shows under the row. The CLI prints only the
+    /// header, so `describe_plain` leaves this `None`.
+    pub change: Option<FileChange>,
+}
+
+/// What one line under a file change's row is, which picks its color in the TUI.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeLine {
+    /// One structured operation, such as `move /repo/old.ts → /repo/new.ts`.
+    Operation,
+    /// A failed edit's error, which T3 sends where a patch would be.
+    Error,
+    /// A patch's `diff `, `index `, `--- ` or `+++ ` line outside a hunk, or a
+    /// `\ No newline at end of file` marker.
+    Meta,
+    /// A hunk header, such as `@@ -1,3 +1,4 @@`.
+    Hunk,
+    Added,
+    Removed,
+    /// A line both sides of a hunk share, or any other line of the text.
+    Context,
+    /// What t3term left out, such as `… 3 more files`.
+    Note,
+}
+
+/// What the TUI shows under a `file_change` row: the item's counts, its structured operations
+/// and the text it carries, cleaned and bounded by `describe`. The fields come from
+/// `OrchestrationV2TurnItem` and `OrchestrationV2FileChangeDetail` in the nightly's
+/// `packages/contracts/src/orchestrationV2.ts`.
+#[derive(Debug, Clone, Default, PartialEq)]
+pub struct FileChange {
+    /// How many operations the item's `changes` lists, or 0 when none of those shown has a
+    /// path. With more than one, the row is named for them, `Changed 3 files`, as the
+    /// nightly's work log names it.
+    pub operations: usize,
+    /// T3's counts for the whole item, such as `+12 -3`, or nothing when it sent neither.
+    pub counts: String,
+    /// The lines under the row, each with what it is.
+    pub lines: Vec<(ChangeLine, String)>,
 }
 
 fn str_of<'a>(item: &'a Value, key: &str) -> &'a str {
@@ -588,10 +632,232 @@ fn truncate_lines(text: &str, max_lines: usize) -> String {
     )
 }
 
-/// The block for one turn item. `runs` are the runs of the item's thread, which
-/// `ThreadState::runs_for` gives. A handoff that T3 stamped no models on reads its models from
-/// them.
+/// A file name, path, operation or file kind from a file change as one line that is safe to
+/// print: without control characters, with line breaks read as spaces, and cut with `…` past
+/// `MAX_NAME_BYTES`. Empty when no text is left.
+fn name_text(raw: &str) -> String {
+    let mut end = raw.len().min(MAX_NAME_BYTES);
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    let text = without_controls(&raw[..end]).replace('\n', " ");
+    let text = text.trim();
+    if text.is_empty() || end == raw.len() {
+        return text.to_string();
+    }
+    format!("{text}…")
+}
+
+/// What the TUI shows under a file change's row, in the order the nightly's
+/// `V2ItemInspector.tsx` shows it: a failed edit's error, then the item's operations, then,
+/// for an edit that didn't fail, the start of the patch T3 sent.
+fn file_change(item: &Value, counts: String) -> FileChange {
+    let failed = str_of(item, "status") == "failed";
+    let text = str_of(item, "diffStr");
+    let mut lines = Vec::new();
+    // The nightly's `WireProjection.ts` keeps `diffStr` only for a failed edit, where it holds
+    // the provider's error rather than a patch.
+    if failed {
+        let (shown, note) = change_text(text);
+        lines.extend(shown.into_iter().map(|line| (ChangeLine::Error, line)));
+        lines.extend(note.map(|note| (ChangeLine::Note, note)));
+    }
+    let changes: &[Value] = item
+        .get("changes")
+        .and_then(Value::as_array)
+        .map(Vec::as_slice)
+        .unwrap_or_default();
+    // Only the operations the row lists are read.
+    let listed: Vec<String> = changes
+        .iter()
+        .take(MAX_CHANGED_FILES)
+        .filter_map(operation)
+        .collect();
+    // Without one operation that names a path, the row stands for `fileName` alone, as it does
+    // when T3 sends no `changes`.
+    let operations = if listed.is_empty() { 0 } else { changes.len() };
+    if operations > 0 {
+        let hidden = changes.len() - listed.len();
+        lines.extend(listed.into_iter().map(|op| (ChangeLine::Operation, op)));
+        if hidden > 0 {
+            let noun = if hidden == 1 { "file" } else { "files" };
+            lines.push((ChangeLine::Note, format!("… {hidden} more {noun}")));
+        }
+    }
+    if !failed {
+        let (shown, note) = change_text(text);
+        lines.extend(patch_kinds(&shown).into_iter().zip(shown));
+        lines.extend(note.map(|note| (ChangeLine::Note, note)));
+    }
+    FileChange {
+        operations,
+        counts,
+        lines,
+    }
+}
+
+/// One entry of a file change's `changes` as the nightly's `V2ItemInspector.tsx` lists it,
+/// such as `move /repo/old.ts → /repo/new.ts (text)`. `None` when it isn't a record with a
+/// path.
+fn operation(change: &Value) -> Option<String> {
+    let path = name_text(str_of(change, "path"));
+    if path.is_empty() {
+        return None;
+    }
+    let mut line = name_text(str_of(change, "operation"));
+    if !line.is_empty() {
+        line.push(' ');
+    }
+    let old_path = name_text(str_of(change, "oldPath"));
+    if !old_path.is_empty() {
+        line.push_str(&format!("{old_path} → "));
+    }
+    line.push_str(&path);
+    let kinds: Vec<String> = ["fileType", "mimeType"]
+        .into_iter()
+        .map(|key| name_text(str_of(change, key)))
+        .filter(|kind| !kind.is_empty())
+        .collect();
+    if !kinds.is_empty() {
+        line.push_str(&format!(" ({})", kinds.join(", ")));
+    }
+    Some(line)
+}
+
+/// The first `MAX_OUTPUT_LINES` lines of a text a file change carries, without control
+/// characters, and a note when there was more. The cut to `MAX_OUTPUT_BYTES` comes first, so a
+/// long patch is never scanned or copied whole. Nothing when the text is blank.
+fn change_text(raw: &str) -> (Vec<String>, Option<String>) {
+    let mut end = raw.len().min(MAX_OUTPUT_BYTES);
+    while !raw.is_char_boundary(end) {
+        end -= 1;
+    }
+    let cut = end < raw.len();
+    let text = without_controls(&raw[..end]);
+    // Line breaks before the first line or after the last carry nothing.
+    let text = text.trim_start_matches('\n').trim_end();
+    let (shown, hidden) = if text.is_empty() {
+        (Vec::new(), 0)
+    } else {
+        let mut lines = text.split('\n');
+        let shown: Vec<String> = lines
+            .by_ref()
+            .take(MAX_OUTPUT_LINES)
+            .map(String::from)
+            .collect();
+        (shown, lines.count())
+    };
+    let rest = format!("the text goes on past {MAX_OUTPUT_BYTES} bytes");
+    let note = match (hidden, cut) {
+        (0, false) => None,
+        (0, true) => Some(format!("… {rest}")),
+        (_, false) => Some(format!("… {hidden} more lines")),
+        (_, true) => Some(format!("… {hidden} more lines, and {rest}")),
+    };
+    (shown, note)
+}
+
+/// What each line of a patch is. Outside a hunk, a line is a file header or plain text. Inside
+/// one, its first character says which side it belongs to, and the counts in the hunk's header
+/// say where the hunk ends. So a removed line that reads `-- note` is a removed line rather
+/// than a file header, and a text that isn't a patch reads as plain text.
+fn patch_kinds(lines: &[String]) -> Vec<ChangeLine> {
+    const HEADERS: [&str; 16] = [
+        "diff ",
+        "index ",
+        "--- ",
+        "+++ ",
+        "new file mode",
+        "deleted file mode",
+        "old mode",
+        "new mode",
+        "similarity index",
+        "dissimilarity index",
+        "rename from",
+        "rename to",
+        "copy from",
+        "copy to",
+        "Binary files",
+        "\\",
+    ];
+    // The old and new lines the current hunk has left, or `None` outside a hunk. A header
+    // whose counts don't parse leaves the hunk open until a line no hunk has.
+    let mut left: Option<(u64, u64)> = None;
+    lines
+        .iter()
+        .map(|line| {
+            if line.starts_with("@@") {
+                left = match hunk_counts(line) {
+                    Some((0, 0)) => None,
+                    Some(counts) => Some(counts),
+                    None => Some((u64::MAX, u64::MAX)),
+                };
+                return ChangeLine::Hunk;
+            }
+            if let Some((old, new)) = left.as_mut() {
+                let kind = match line.chars().next() {
+                    Some('+') => {
+                        *new = new.saturating_sub(1);
+                        Some(ChangeLine::Added)
+                    }
+                    Some('-') => {
+                        *old = old.saturating_sub(1);
+                        Some(ChangeLine::Removed)
+                    }
+                    // Some tools trim the space from a blank line both sides share.
+                    Some(' ') | None => {
+                        *old = old.saturating_sub(1);
+                        *new = new.saturating_sub(1);
+                        Some(ChangeLine::Context)
+                    }
+                    Some('\\') => Some(ChangeLine::Meta),
+                    _ => None,
+                };
+                if let Some(kind) = kind {
+                    if (*old, *new) == (0, 0) {
+                        left = None;
+                    }
+                    return kind;
+                }
+                left = None;
+            }
+            if HEADERS.iter().any(|header| line.starts_with(header)) {
+                ChangeLine::Meta
+            } else {
+                ChangeLine::Context
+            }
+        })
+        .collect()
+}
+
+/// The old and new line counts of a hunk header, `@@ -12,3 +12,4 @@`. A range without a count
+/// has one line.
+fn hunk_counts(line: &str) -> Option<(u64, u64)> {
+    let (ranges, _) = line.strip_prefix("@@ -")?.split_once(" @@")?;
+    let (old, new) = ranges.split_once(" +")?;
+    let count = |range: &str| match range.split_once(',') {
+        Some((start, lines)) => start.parse::<u64>().ok().and(lines.parse::<u64>().ok()),
+        None => range.parse::<u64>().ok().map(|_| 1),
+    };
+    Some((count(old)?, count(new)?))
+}
+
+/// The block for one turn item, as the TUI draws it. `runs` are the runs of the item's thread,
+/// which `ThreadState::runs_for` gives. A handoff that T3 stamped no models on reads its models
+/// from them.
 pub fn describe(item: &Value, runs: &[Value]) -> Option<Block> {
+    describe_as(item, runs, true)
+}
+
+/// The block for one turn item, as the CLI prints it. The CLI prints a file change's header
+/// and none of the lines the TUI draws under it, so its `change` stays `None` and those lines
+/// are never built. Everything else is as `describe` gives it.
+pub fn describe_plain(item: &Value, runs: &[Value]) -> Option<Block> {
+    describe_as(item, runs, false)
+}
+
+/// `describe`, which builds a file change's `change` only when `with_change` is set.
+fn describe_as(item: &Value, runs: &[Value], with_change: bool) -> Option<Block> {
     let item_type = str_of(item, "type");
     let title = str_of(item, "title");
     let block = |kind, header: String, body: String| Block {
@@ -616,6 +882,7 @@ pub fn describe(item: &Value, runs: &[Value]) -> Option<Block> {
         run_id: str_of(item, "runId").to_string(),
         tool_name: str_of(item, "toolName").to_string(),
         request_id: str_of(item, "requestId").to_string(),
+        change: None,
     };
     Some(match item_type {
         "user_message" => block(
@@ -675,19 +942,21 @@ pub fn describe(item: &Value, runs: &[Value]) -> Option<Block> {
             }
         }
         "file_change" => {
-            let name = str_of(item, "fileName").to_string();
-            let mut header = format!("edit {name}");
+            let name = name_text(str_of(item, "fileName"));
             let additions = item.get("additions").and_then(Value::as_u64);
             let deletions = item.get("deletions").and_then(Value::as_u64);
-            if additions.is_some() || deletions.is_some() {
-                header.push_str(&format!(
-                    "  +{} -{}",
-                    additions.unwrap_or(0),
-                    deletions.unwrap_or(0)
-                ));
+            // T3's counts are for the whole item. It sends none per operation.
+            let counts = match (additions, deletions) {
+                (None, None) => String::new(),
+                _ => format!("+{} -{}", additions.unwrap_or(0), deletions.unwrap_or(0)),
+            };
+            let mut header = format!("edit {name}");
+            if !counts.is_empty() {
+                header.push_str(&format!("  {counts}"));
             }
             Block {
                 detail: name,
+                change: with_change.then(|| file_change(item, counts)),
                 ..block(BlockKind::Tool, header, String::new())
             }
         }
@@ -788,11 +1057,12 @@ pub fn describe(item: &Value, runs: &[Value]) -> Option<Block> {
     })
 }
 
+/// The blocks `t3term read` prints, which `describe_plain` gives.
 pub fn blocks(state: &ThreadState) -> Vec<Block> {
     state
         .items()
         .into_iter()
-        .filter_map(|item| describe(item, state.runs_for(item)))
+        .filter_map(|item| describe_plain(item, state.runs_for(item)))
         .collect()
 }
 
@@ -1578,5 +1848,513 @@ mod tests {
         let file = tool_output(&json!({"output": {"file": {"content": lines}}}));
         assert!(file.starts_with("1\n2\n"), "{file}");
         assert!(file.ends_with("\n12\n… 18 more lines"), "{file}");
+    }
+
+    /// A `file_change` item as the nightly's wire projection sends a finished one
+    /// (`OrchestrationV2TurnItem` in packages/contracts/src/orchestrationV2.ts, after
+    /// `WireProjection.ts`), with no `changes` and no `diffStr`, as a Codex or Claude edit
+    /// arrives. `fields` replaces or adds fields.
+    fn edit_item(fields: Value) -> Value {
+        let mut item = json!({
+            "id": "edit-1",
+            "threadId": "t",
+            "runId": "run-1",
+            "type": "file_change",
+            "ordinal": 12,
+            "status": "completed",
+            "title": null,
+            "fileName": "src/main.rs",
+            "additions": 3,
+            "deletions": 1,
+            "updatedAt": "2026-10-09T10:00:00.000Z",
+        });
+        if let (Some(item), Some(fields)) = (item.as_object_mut(), fields.as_object()) {
+            item.extend(fields.clone());
+        }
+        item
+    }
+
+    fn change_of(item: &Value) -> FileChange {
+        describe(item, &[])
+            .expect("an edit has a row")
+            .change
+            .expect("an edit has a change")
+    }
+
+    fn owned(lines: &[(ChangeLine, &str)]) -> Vec<(ChangeLine, String)> {
+        lines
+            .iter()
+            .map(|(kind, text)| (*kind, text.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn an_edit_lists_each_operation_as_the_desktop_does() {
+        use ChangeLine::Operation;
+        // An ACP edit names its first path as the file and lists every operation, as
+        // `structuredFileChanges` in the nightly's `AcpAdapterV2.ts` builds them. The move is
+        // the one `AcpAdapterV2.test.ts` checks for.
+        let item = edit_item(json!({
+            "title": "Edit files",
+            "fileName": "/workspace/new.ts",
+            "additions": 4,
+            "deletions": 2,
+            "changes": [
+                {"operation": "move", "path": "/workspace/new.ts", "oldPath": "/workspace/old.ts",
+                    "fileType": "text"},
+                {"operation": "add", "path": "/workspace/logo.png", "fileType": "binary",
+                    "mimeType": "image/png"},
+                {"operation": "delete", "path": "/workspace/stale.ts"},
+            ],
+        }));
+        let block = describe(&item, &[]).expect("an edit has a row");
+        assert_eq!(block.header, "edit /workspace/new.ts  +4 -2");
+        assert_eq!(block.detail, "/workspace/new.ts");
+        assert_eq!(block.title, "Edit files");
+        assert!(block.body.is_empty());
+        assert_eq!(
+            block.change,
+            Some(FileChange {
+                operations: 3,
+                counts: "+4 -2".into(),
+                lines: owned(&[
+                    (
+                        Operation,
+                        "move /workspace/old.ts → /workspace/new.ts (text)",
+                    ),
+                    (Operation, "add /workspace/logo.png (binary, image/png)"),
+                    (Operation, "delete /workspace/stale.ts"),
+                ]),
+            })
+        );
+
+        // One operation still says what it did, as in `AcpAdapterV2.test.ts`.
+        let item = edit_item(json!({
+            "fileName": "/repo/a.ts",
+            "changes": [{"operation": "modify", "path": "/repo/a.ts"}],
+        }));
+        let change = change_of(&item);
+        assert_eq!(change.operations, 1);
+        assert_eq!(change.lines, owned(&[(Operation, "modify /repo/a.ts")]));
+
+        // `t3term read` prints the row alone, and `--json` prints the item as T3 sent it.
+        let state = ThreadState::from_snapshot(&json!({
+            "snapshotSequence": 1,
+            "projection": {"thread": {"id": "t"}, "turnItems": [edit_item(json!({}))]},
+        }))
+        .expect("a snapshot");
+        assert_eq!(
+            plain_text(&state, None, false),
+            "  · edit src/main.rs  +3 -1\n"
+        );
+        assert_eq!(state.list("turnItems")[0]["additions"], 3);
+    }
+
+    #[test]
+    fn an_edit_without_usable_changes_stands_for_its_file_name() {
+        use ChangeLine::{Note, Operation};
+        // A Codex or Claude edit on the wire: the file and its counts, nothing more.
+        let change = change_of(&edit_item(json!({})));
+        assert_eq!(
+            change,
+            FileChange {
+                operations: 0,
+                counts: "+3 -1".into(),
+                lines: Vec::new(),
+            }
+        );
+
+        // Counts T3 didn't send, or sent as something other than a whole number, aren't made
+        // up. One of the two is enough for both, as the desktop shows them.
+        let cases = [
+            (json!({"additions": null, "deletions": null}), ""),
+            (json!({"additions": "3", "deletions": -1}), ""),
+            (json!({"additions": 2.5, "deletions": true}), ""),
+            (json!({"additions": 7, "deletions": null}), "+7 -0"),
+            (json!({"additions": null, "deletions": 0}), "+0 -0"),
+        ];
+        for (fields, counts) in cases {
+            let item = edit_item(fields);
+            let block = describe(&item, &[]).expect("an edit has a row");
+            let header = format!("edit src/main.rs  {counts}");
+            assert_eq!(block.header, header.trim_end(), "{item}");
+            assert_eq!(block.change.expect("a change").counts, counts, "{item}");
+        }
+
+        // `changes` that are missing, empty, the wrong type or without one path leave the
+        // file name to stand for the edit.
+        for changes in [
+            json!(null),
+            json!([]),
+            json!({"operation": "modify", "path": "/repo/a.ts"}),
+            json!("/repo/a.ts"),
+            json!([42, "x", null, {"operation": "modify"}, {"path": "  "}, {"path": 7}]),
+        ] {
+            let item = edit_item(json!({ "changes": changes }));
+            let change = change_of(&item);
+            assert_eq!((change.operations, change.lines.len()), (0, 0), "{item}");
+        }
+        // A missing file name leaves the row its counts.
+        let item = edit_item(json!({"fileName": null}));
+        let block = describe(&item, &[]).expect("an edit has a row");
+        assert_eq!(block.header, "edit   +3 -1");
+
+        // Entries without a path are counted with the rest, as the desktop counts them, and
+        // an operation or file kind that isn't text is left out.
+        let item = edit_item(json!({
+            "changes": [
+                {"path": "/repo/a.ts"},
+                42,
+                {"operation": "modify", "path": "/repo/b.ts", "oldPath": 5, "fileType": "",
+                    "mimeType": ["text/plain"]},
+            ],
+        }));
+        let change = change_of(&item);
+        assert_eq!(change.operations, 3);
+        assert_eq!(
+            change.lines,
+            owned(&[
+                (Operation, "/repo/a.ts"),
+                (Operation, "modify /repo/b.ts"),
+                (Note, "… 1 more file"),
+            ])
+        );
+    }
+
+    #[test]
+    fn a_failed_edit_shows_its_error_before_its_operations() {
+        use ChangeLine::{Error, Hunk, Note, Operation};
+        // The nightly keeps `diffStr` on the wire only for a failed edit, where it is the
+        // provider's error, as `WireProjection.test.ts` sends it.
+        let item = edit_item(json!({
+            "status": "failed",
+            "fileName": "/repo/a.ts",
+            "additions": null,
+            "deletions": null,
+            "diffStr": "String to replace not found",
+            "changes": [{"operation": "modify", "path": "/repo/a.ts"}],
+        }));
+        let block = describe(&item, &[]).expect("an edit has a row");
+        assert_eq!(block.header, "edit /repo/a.ts");
+        assert_eq!(
+            block.change.expect("a change").lines,
+            owned(&[
+                (Error, "String to replace not found"),
+                (Operation, "modify /repo/a.ts"),
+            ])
+        );
+
+        // An error that reads like a patch is still an error.
+        let item = edit_item(json!({"status": "failed", "diffStr": "@@ -1 +1 @@\n-a\n+b"}));
+        assert_eq!(
+            change_of(&item).lines,
+            owned(&[(Error, "@@ -1 +1 @@"), (Error, "-a"), (Error, "+b")])
+        );
+        // An edit that didn't fail reads the same text as a patch.
+        let item = edit_item(json!({"diffStr": "@@ -1 +1 @@\n-a\n+b"}));
+        assert_eq!(
+            change_of(&item).lines,
+            owned(&[
+                (Hunk, "@@ -1 +1 @@"),
+                (ChangeLine::Removed, "-a"),
+                (ChangeLine::Added, "+b"),
+            ])
+        );
+
+        // T3 cuts a long error at 32,768 bytes and says so. t3term reads the first 4,096 and
+        // says so too.
+        let error = format!("{}\n… output truncated for transport", "e".repeat(32_768));
+        let item = edit_item(json!({"status": "failed", "diffStr": error}));
+        let kept = "e".repeat(4_096);
+        assert_eq!(
+            change_of(&item).lines,
+            owned(&[
+                (Error, kept.as_str()),
+                (Note, "… the text goes on past 4096 bytes"),
+            ])
+        );
+
+        // A blank or missing error, or a blank patch, adds nothing.
+        for fields in [
+            json!({"status": "failed", "diffStr": " \n\t\r\n "}),
+            json!({"status": "failed", "diffStr": 42}),
+            json!({"status": "failed"}),
+            json!({"diffStr": "\n\n  \n"}),
+        ] {
+            let item = edit_item(fields);
+            assert_eq!(change_of(&item).lines, Vec::new(), "{item}");
+        }
+    }
+
+    #[test]
+    fn a_patch_marks_each_line_by_the_hunk_it_is_in() {
+        use ChangeLine::{Added, Context, Hunk, Meta, Removed};
+        let kinds = |patch: &str| -> Vec<(ChangeLine, String)> {
+            change_of(&edit_item(json!({ "diffStr": patch }))).lines
+        };
+        // Inside a hunk, `--- ` and `+++ ` are a removed and an added line. Once the hunk's
+        // counts run out, they are a file's header again.
+        let patch = [
+            "diff --git a/src/a.rs b/src/a.rs",
+            "index 1111111..2222222 100644",
+            "--- a/src/a.rs",
+            "+++ b/src/a.rs",
+            "@@ -1,3 +1,3 @@ fn main() {",
+            " fn main() {",
+            "--- old comment",
+            "+++ new comment",
+            " }",
+            "\\ No newline at end of file",
+            "diff --git a/b.txt b/b.txt",
+            "new file mode 100644",
+        ];
+        assert_eq!(
+            kinds(&patch.join("\n")),
+            owned(&[
+                (Meta, patch[0]),
+                (Meta, patch[1]),
+                (Meta, patch[2]),
+                (Meta, patch[3]),
+                (Hunk, patch[4]),
+                (Context, patch[5]),
+                (Removed, patch[6]),
+                (Added, patch[7]),
+                (Context, patch[8]),
+                (Meta, patch[9]),
+                (Meta, patch[10]),
+                (Meta, patch[11]),
+            ])
+        );
+
+        // A range without a count has one line. A blank line inside a hunk is a line both
+        // sides share. A header whose counts don't parse keeps its hunk open until a line no
+        // hunk has.
+        let patch = [
+            "@@ -1 +1 @@",
+            "-old",
+            "+new",
+            "--- a/c.txt",
+            "@@ -1,3 +1,3 @@",
+            " a",
+            "",
+            "-b",
+            "+c",
+            "@@ bogus @@",
+            "-- still removed",
+            "diff --git a/c b/c",
+        ];
+        assert_eq!(
+            kinds(&patch.join("\n")),
+            owned(&[
+                (Hunk, patch[0]),
+                (Removed, patch[1]),
+                (Added, patch[2]),
+                (Meta, patch[3]),
+                (Hunk, patch[4]),
+                (Context, patch[5]),
+                (Context, patch[6]),
+                (Removed, patch[7]),
+                (Added, patch[8]),
+                (Hunk, patch[9]),
+                (Removed, patch[10]),
+                (Meta, patch[11]),
+            ])
+        );
+
+        // Text that isn't a patch, as Claude's adapter can put in `diffStr`, is plain text,
+        // whatever its lines start with. A tab reads as one space.
+        let text = "The file /repo/a.ts has been updated.\n     1\tfn main() {\n- not a removal\n+ not an addition";
+        assert_eq!(
+            kinds(text),
+            owned(&[
+                (Context, "The file /repo/a.ts has been updated."),
+                (Context, "     1 fn main() {"),
+                (Context, "- not a removal"),
+                (Context, "+ not an addition"),
+            ])
+        );
+
+        // Hunk headers the counts are read from.
+        assert_eq!(hunk_counts("@@ -12,3 +12,4 @@"), Some((3, 4)));
+        assert_eq!(hunk_counts("@@ -1 +1 @@"), Some((1, 1)));
+        assert_eq!(hunk_counts("@@ -0,0 +1,2 @@ fn main() {"), Some((0, 2)));
+        assert_eq!(hunk_counts("@@ -a,b +c @@"), None);
+        assert_eq!(hunk_counts("@@ -1,3 +1,4"), None);
+        assert_eq!(hunk_counts("@@@ -1 -1 +1 @@@"), None);
+    }
+
+    #[test]
+    fn an_edits_names_and_patch_never_move_the_cursor() {
+        use ChangeLine::{Added, Hunk, Operation, Removed};
+        // Esc, C1 CSI, BEL, DEL, a carriage return and a tab, with an accent, CJK and a joined
+        // emoji that must stay whole.
+        let file_name = "src/\u{1b}[2Jmain.rs\r\nnext\u{7f}";
+        let item = edit_item(json!({
+            "fileName": file_name,
+            "changes": [{
+                "operation": "mo\u{7}ve",
+                "oldPath": "/repo/\u{1b}]52;c;Zm9v\u{7}old.md",
+                "path": "/repo/cafe\u{301}/日本\u{9b}31m\t👩\u{200d}💻.md",
+                "mimeType": "text/\u{1b}[1mmarkdown\n",
+            }],
+            "diffStr": "@@ -1 +1 @@\n-\u{1b}[31mred\r\n+\u{9b}0mplain\u{7}\r\n",
+        }));
+        let state = ThreadState::from_snapshot(&json!({
+            "snapshotSequence": 1,
+            "projection": {"thread": {"id": "t"}, "turnItems": [item]},
+        }))
+        .expect("a snapshot");
+        let block = describe(state.items()[0], &[]).expect("an edit has a row");
+        assert_eq!(block.header, "edit src/[2Jmain.rs next  +3 -1");
+        assert_eq!(block.detail, "src/[2Jmain.rs next");
+        assert_eq!(
+            block.change.expect("a change").lines,
+            owned(&[
+                (
+                    Operation,
+                    "move /repo/]52;c;Zm9vold.md → /repo/cafe\u{301}/日本31m 👩\u{200d}💻.md (text/[1mmarkdown)",
+                ),
+                (Hunk, "@@ -1 +1 @@"),
+                (Removed, "-[31mred"),
+                (Added, "+0mplain"),
+            ])
+        );
+        // `t3term read` prints the cleaned row, and `--json` keeps the item as T3 sent it.
+        assert_eq!(
+            plain_text(&state, None, false),
+            "  · edit src/[2Jmain.rs next  +3 -1\n"
+        );
+        assert_eq!(state.list("turnItems")[0]["fileName"], file_name);
+    }
+
+    #[test]
+    fn a_long_edit_says_what_it_left_out() {
+        use ChangeLine::{Added, Context, Error, Hunk, Note, Operation};
+        // Past twelve operations, a count stands for the rest, and the row still counts them
+        // all.
+        let changes: Vec<Value> = (0..1_000)
+            .map(|n| json!({"operation": "add", "path": format!("/repo/f{n}.rs")}))
+            .collect();
+        let change = change_of(&edit_item(json!({ "changes": changes })));
+        assert_eq!(change.operations, 1_000);
+        let mut expected: Vec<(ChangeLine, String)> = (0..12)
+            .map(|n| (Operation, format!("add /repo/f{n}.rs")))
+            .collect();
+        expected.push((Note, "… 988 more files".into()));
+        assert_eq!(change.lines, expected);
+
+        // Past twelve lines, the count of the rest.
+        let lines: Vec<String> = (1..=30).map(|n| format!("line {n}")).collect();
+        let item = edit_item(json!({"status": "failed", "diffStr": lines.join("\n")}));
+        let mut expected: Vec<(ChangeLine, String)> = lines[..12]
+            .iter()
+            .map(|line| (Error, line.clone()))
+            .collect();
+        expected.push((Note, "… 18 more lines".into()));
+        assert_eq!(change_of(&item).lines, expected);
+        // The hunk header is one of the twelve.
+        let mut patch = vec!["@@ -0,0 +1,30 @@".to_string()];
+        patch.extend((1..=30).map(|n| format!("+{n}")));
+        let lines = change_of(&edit_item(json!({ "diffStr": patch.join("\n") }))).lines;
+        assert_eq!(lines.len(), 13);
+        assert_eq!(lines[0], (Hunk, "@@ -0,0 +1,30 @@".to_string()));
+        assert_eq!(lines[11], (Added, "+11".to_string()));
+        assert_eq!(lines[12], (Note, "… 19 more lines".to_string()));
+
+        // One line longer than the byte budget is cut on a character boundary. 界 takes three
+        // bytes, so 1,365 of them fit in 4,096.
+        let item = edit_item(json!({ "diffStr": "界".repeat(5_000) }));
+        let kept = "界".repeat(1_365);
+        assert_eq!(
+            change_of(&item).lines,
+            owned(&[
+                (Context, kept.as_str()),
+                (Note, "… the text goes on past 4096 bytes"),
+            ])
+        );
+        // Lines past the budget aren't counted, so the note says the text goes on. Twenty
+        // lines of 200 bytes fit, and 96 bytes of the 21st.
+        let line = "x".repeat(199);
+        let text = [line.as_str(); 30].join("\n");
+        let lines = change_of(&edit_item(json!({ "diffStr": text }))).lines;
+        assert_eq!(lines.len(), 13);
+        let note = "… 9 more lines, and the text goes on past 4096 bytes";
+        assert_eq!(lines[12], (Note, note.to_string()));
+
+        // A name is cut at 1,024 bytes, on a character boundary, before it is cleaned.
+        let item = edit_item(json!({
+            "fileName": "界".repeat(1_000),
+            "changes": [{"operation": "modify", "path": "a".repeat(100_000)}],
+        }));
+        let block = describe(&item, &[]).expect("an edit has a row");
+        assert_eq!(block.detail, format!("{}…", "界".repeat(341)));
+        assert_eq!(
+            block.change.expect("a change").lines,
+            vec![(Operation, format!("modify {}…", "a".repeat(1_024)))]
+        );
+    }
+
+    #[test]
+    fn the_cli_prints_an_edits_row_without_building_the_lines_under_it() {
+        // Edits whose lines take work to build: a failed one with 1,000 operations whose name
+        // and error hold controls, one with a patch, and a Codex or Claude edit with neither and
+        // no counts.
+        let changes: Vec<Value> = (0..1_000)
+            .map(|n| json!({"operation": "add", "path": format!("/repo/f{n}.rs")}))
+            .collect();
+        let items = [
+            edit_item(json!({
+                "id": "edit-failed",
+                "ordinal": 1,
+                "status": "failed",
+                "fileName": "src/\u{1b}[2Jmain.rs\r\nnext\u{7f}",
+                "diffStr": format!("\u{1b}]52;c;Zm9v\u{7}{}", "not found\n".repeat(30)),
+                "changes": changes,
+            })),
+            edit_item(json!({
+                "id": "edit-patch",
+                "ordinal": 2,
+                "fileName": "src/lib.rs",
+                "additions": 1,
+                "diffStr": "@@ -1 +1 @@\n-old\n+new",
+            })),
+            edit_item(json!({
+                "id": "edit-legacy",
+                "ordinal": 3,
+                "fileName": "README.md",
+                "additions": null,
+                "deletions": null,
+            })),
+        ];
+        // The TUI's block has the lines. The CLI's block is the same block without them.
+        for item in &items {
+            let full = describe(item, &[]).expect("an edit has a row");
+            let plain = describe_plain(item, &[]).expect("an edit has a row");
+            assert!(full.change.is_some(), "{item}");
+            assert!(plain.change.is_none(), "{item}");
+            let without = Block {
+                change: None,
+                ..full
+            };
+            assert_eq!(format!("{plain:?}"), format!("{without:?}"), "{item}");
+        }
+
+        // `t3term read` prints each row alone, with its name cleaned, from blocks that have no
+        // lines.
+        let state = ThreadState::from_snapshot(&json!({
+            "snapshotSequence": 1,
+            "projection": {"thread": {"id": "t"}, "turnItems": items},
+        }))
+        .expect("a snapshot");
+        assert!(blocks(&state).iter().all(|block| block.change.is_none()));
+        let rows = [
+            "  · edit src/[2Jmain.rs next  +3 -1",
+            "  · edit src/lib.rs  +1 -1",
+            "  · edit README.md",
+        ];
+        assert_eq!(
+            plain_text(&state, None, false),
+            format!("{}\n", rows.join("\n"))
+        );
     }
 }
