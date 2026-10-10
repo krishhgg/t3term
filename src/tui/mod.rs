@@ -10,6 +10,7 @@ mod composer;
 mod markdown;
 mod picker;
 mod plan;
+mod provider;
 mod scroll;
 mod sidebar;
 mod tasks;
@@ -426,8 +427,11 @@ struct App {
     drawn_plans: Vec<plan::Drawn>,
     /// The tasks drawer above the composer. Only this window keeps whether it is open.
     tasks: tasks::Drawer,
-    /// The thread error banner over the top of the conversation, with the errors dismissed
-    /// this session and the sends that failed.
+    /// The provider status banner over the top of the conversation, for the provider instance
+    /// the composer would send with, and the notice dismissed in this window.
+    provider_banner: provider::Banner,
+    /// The thread error banner under it, with the errors dismissed this session and the sends
+    /// that failed.
     banner: banner::Banner,
     /// The item at the top of the last frame and the row of it that was showing, so a block
     /// that grows under the reader doesn't move the text.
@@ -694,6 +698,7 @@ impl App {
             expanded_plans: HashSet::new(),
             drawn_plans: Vec::new(),
             tasks: tasks::Drawer::default(),
+            provider_banner: provider::Banner::default(),
             banner: banner::Banner::default(),
             anchor: None,
             drawn_scroll: 0,
@@ -731,6 +736,8 @@ impl App {
                 }
                 self.rebuild_rows();
                 self.settle_draft();
+                // The shell's copy of the open thread names its model and provider instance.
+                self.follow_provider(false);
             }
             WatchEvent::Reconnecting { .. } => self.shell_connection = "reconnecting".into(),
             WatchEvent::Failed(message) => self.message = Some((message, true)),
@@ -762,13 +769,24 @@ impl App {
         };
         match event {
             WatchEvent::Item(item) => {
+                let applied = open.apply(&item);
                 // A fresh snapshot means the watch reconnected, so output T3 couldn't send
                 // before is worth asking for again.
-                if open.apply(&item) == Applied::Snapshot {
+                if applied == Applied::Snapshot {
                     self.cache.clear();
                     self.outputs.retry_failed();
                 }
-                self.settle_draft();
+                // The projection's thread names its model and provider instance too, which the
+                // composer goes by when the shell doesn't list the thread. Other events, such
+                // as each piece of a streamed answer, leave the provider banner alone.
+                let thread_changed = match &applied {
+                    Applied::Snapshot => true,
+                    Applied::Event(kind) => kind.starts_with("thread."),
+                    _ => false,
+                };
+                if self.settle_draft() || thread_changed {
+                    self.follow_provider(false);
+                }
                 self.drop_landed();
             }
             WatchEvent::Reconnecting { reason, .. } => {
@@ -811,6 +829,39 @@ impl App {
             Some(_) => {}
             None => self.banner.follow(None, None),
         }
+    }
+
+    /// Brings the provider banner up to date with the provider instance the composer would
+    /// send the next message with, the one the model chip shows: the open thread's selection
+    /// with its unsent choice applied. It works the selection out again only when T3's config
+    /// changed, as `config_changed` says, or when the open thread, its model selection, its
+    /// provider instance or its unsent choice did. Callers run it after the events that can
+    /// change one of those, so neither a frame nor a streamed answer looks.
+    fn follow_provider(&mut self, config_changed: bool) {
+        let inputs = {
+            let open = self.open.as_ref().and_then(|open| {
+                let thread = self.open_thread_json()?;
+                Some((open.id.as_str(), thread, self.drafts.get(&open.id)))
+            });
+            if !config_changed && !self.provider_banner.stale(open) {
+                return;
+            }
+            open.map(|(id, thread, draft)| provider::Inputs::new(id, thread, draft))
+        };
+        // The provider goes by its instance id alone. One with no models left still has its
+        // status shown, and no other provider stands in for one T3 no longer lists.
+        let selection = self.settings_view().map(|view| view.selection);
+        let instance = selection
+            .as_ref()
+            .and_then(|selection| selection["instanceId"].as_str());
+        let provider = instance
+            .zip(self.config.as_ref())
+            .and_then(|(instance, config)| {
+                crate::models::providers(config)
+                    .iter()
+                    .find(|provider| provider["instanceId"] == instance)
+            });
+        self.provider_banner.follow(inputs, provider);
     }
 
     /// Lays the sidebar's shelves out again from the shell, as of now.
@@ -1003,6 +1054,7 @@ impl App {
         // The banner shows a send to this thread that failed, until the thread's own error
         // comes with it.
         self.follow_banner();
+        self.follow_provider(false);
         self.scroll.set(0);
         self.picker = None;
         self.focus = Focus::Composer;
@@ -1115,10 +1167,20 @@ impl App {
                     self.toggle_sidebar();
                     return true;
                 }
-                // The banner lies over the transcript, so it takes what lands on it: a click on
-                // × dismisses it, a click elsewhere on it opens or closes its details, and the
-                // wheel scrolls them. Nothing reaches the rows under it.
+                // The banners lie over the transcript, so each takes what lands on it: a click
+                // on × dismisses it, a click elsewhere on it opens or closes its details, and
+                // the wheel scrolls them. Nothing reaches the rows under them. Opening one
+                // closes the other, so only one is ever open.
+                if let Some(redraw) = self.provider_banner.on_mouse(&mouse) {
+                    if self.provider_banner.expanded() {
+                        self.banner.collapse();
+                    }
+                    return redraw;
+                }
                 if let Some(redraw) = self.banner.on_mouse(&mouse) {
+                    if self.banner.expanded() {
+                        self.provider_banner.collapse();
+                    }
                     self.follow_banner();
                     return redraw;
                 }
@@ -1230,10 +1292,21 @@ impl App {
                 });
                 return;
             }
-            // While an error banner shows, from any pane and over a menu: Alt+W dismisses it,
-            // Alt+I opens or closes its details, and Alt+↑/↓ scroll details too long to show.
-            // None of them reach the composer.
+            // While a banner shows, from any pane and over a menu. Alt+N dismisses the provider
+            // banner and Alt+O opens or closes its message. Alt+W dismisses the error banner
+            // and Alt+I opens or closes its details. Opening one closes the other, so Alt+↑/↓
+            // scroll whichever is open and too long to show, ahead of the request panel and
+            // the tasks drawer. None of them reach the composer.
+            _ if self.provider_banner.on_key(&key) => {
+                if self.provider_banner.expanded() {
+                    self.banner.collapse();
+                }
+                return;
+            }
             _ if self.banner.on_key(&key) => {
+                if self.banner.expanded() {
+                    self.provider_banner.collapse();
+                }
                 self.follow_banner();
                 return;
             }
@@ -1465,7 +1538,9 @@ impl App {
                 self.outputs.store(item_id, revision, text);
             }
             ActionResult::Sent { note } => {
-                self.settle_draft();
+                if self.settle_draft() {
+                    self.follow_provider(false);
+                }
                 self.message = Some((note, false));
             }
             ActionResult::SendFailed {
@@ -1498,6 +1573,7 @@ impl App {
                 // The thread may have shown the message before this result arrived.
                 self.drop_landed();
                 self.follow_banner();
+                self.follow_provider(false);
             }
         }
     }
@@ -1552,14 +1628,14 @@ impl App {
     }
 
     /// Drops the open thread's draft once the thread has every choice in it, so the next
-    /// message doesn't undo a change made in another client.
-    fn settle_draft(&mut self) {
+    /// message doesn't undo a change made in another client. Returns whether it dropped it.
+    fn settle_draft(&mut self) -> bool {
         let (Some(open), Some(config)) = (self.open.as_ref(), self.config.as_ref()) else {
-            return;
+            return false;
         };
         let (Some(draft), Some(thread)) = (self.drafts.get(&open.id), self.open_thread_json())
         else {
-            return;
+            return false;
         };
         if matches!(
             picker::spent(config, thread, draft, self.plan_mode_enabled),
@@ -1567,7 +1643,9 @@ impl App {
         ) {
             let id = open.id.clone();
             self.drafts.remove(&id);
+            return true;
         }
+        false
     }
 
     // ---- model, effort and mode menus ----
@@ -1589,6 +1667,7 @@ impl App {
     /// keeps what depends on it in step. A change can add or drop menu rows, so an open menu's
     /// highlight follows its entry, not its row number. The sidebar is laid out again when the
     /// change turns snooze or settlement on or off, which decide whether those shelves apply.
+    /// The provider banner follows the selected provider's new status.
     fn update_config(&mut self, change: impl FnOnce(&mut Option<Value>) -> bool) -> bool {
         let (pick, capabilities) = (self.selected_pick(), self.capabilities());
         if !change(&mut self.config) {
@@ -1600,6 +1679,7 @@ impl App {
         if self.capabilities() != capabilities {
             self.rebuild_rows();
         }
+        self.follow_provider(true);
         true
     }
 
@@ -1782,6 +1862,7 @@ impl App {
                 self.drafts.insert(id, draft);
             }
         }
+        self.follow_provider(false);
     }
 
     fn submit(&mut self) {
@@ -1905,6 +1986,7 @@ impl App {
                 self.drafts.remove(&thread_id);
             }
         }
+        self.follow_provider(false);
         let (client, results) = (self.client.clone(), self.actions.clone());
         let message_id = uuid::Uuid::new_v4().to_string();
         tokio::spawn(async move {
@@ -2091,8 +2173,8 @@ impl App {
         );
         self.transcript_area = body;
         self.draw_transcript(frame, body);
-        // Over the transcript's top rows, which keep their place under it.
-        self.banner.draw(frame, body, &self.theme);
+        // Over the transcript's top rows, which keep their place under them.
+        self.draw_banners(frame, body);
         self.panel_area = panel_area;
         if !panel.is_empty() {
             self.draw_request_panel(frame, panel_area, panel);
@@ -2169,6 +2251,44 @@ impl App {
             right,
             width,
         )
+    }
+
+    /// Draws the provider banner over the top rows of `body`, the transcript's, and the thread
+    /// error banner under it, as the desktop stacks the two. Closed, they take at most half of
+    /// the rows between them. With an error to show, the provider banner leaves the error banner
+    /// half of those rows, and at least three, so on a transcript of fewer than eight rows only
+    /// the error shows. An open banner can take every row the other leaves, and the error
+    /// banner keeps what it would have when closed.
+    fn draw_banners(&mut self, frame: &mut Frame, body: Rect) {
+        let height = body.height as usize;
+        let half = (height / 2).max(1);
+        let kept = if self.banner.prints() {
+            half.min(3).max(half / 2)
+        } else {
+            0
+        };
+        let limit = if self.provider_banner.expanded() {
+            height
+        } else {
+            half
+        };
+        self.provider_banner
+            .draw(frame, body, limit.saturating_sub(kept), &self.theme);
+        let taken = self.provider_banner.area.height;
+        let below = Rect {
+            y: body.y + taken,
+            height: body.height - taken,
+            ..body
+        };
+        let room = below.height as usize;
+        let limit = if self.banner.expanded() {
+            room
+        } else if self.provider_banner.expanded() {
+            half.min(room)
+        } else {
+            half.saturating_sub(taken as usize).min(room)
+        };
+        self.banner.draw_limited(frame, below, limit, &self.theme);
     }
 
     fn draw_transcript(&mut self, frame: &mut Frame, area: Rect) {
@@ -6917,5 +7037,493 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         alt(&mut app, 'm');
         assert_eq!(reads(&runtime), 3);
+    }
+
+    // ---- the provider status banner ----
+
+    /// A provider as the nightly reports it, with GPT-6 and GPT-6 Mini, so the provider banner
+    /// reads it. `state` and `auth` say how it is.
+    fn reported(id: &str, name: &str, state: &str, auth: &str) -> Value {
+        let mut provider = codex(state);
+        provider["instanceId"] = json!(id);
+        provider["displayName"] = json!(name);
+        provider["driver"] = json!("codex");
+        provider["installed"] = json!(true);
+        provider["auth"] = json!({"status": auth});
+        provider["checkedAt"] = json!("2026-10-10T12:00:00.000Z");
+        provider
+    }
+
+    /// `provider` with `message`.
+    fn saying(mut provider: Value, message: &str) -> Value {
+        provider["message"] = json!(message);
+        provider
+    }
+
+    /// Thread `id`, open and live on `instance`'s GPT-6 as `codex_thread` has it, with the
+    /// Codex session's `last_error` and `more` in its projection.
+    fn thread_on(id: &str, instance: &str, last_error: Option<&str>, more: Value) -> OpenThread {
+        let mut more = more;
+        more["thread"] = json!({
+            "id": id,
+            "providerInstanceId": instance,
+            "activeProviderThreadId": "pt",
+            "modelSelection": {"instanceId": instance, "model": "gpt-6"},
+        });
+        codex_thread(id, last_error, more)
+    }
+
+    /// The provider banner's text in a frame 120 columns by 30 rows, empty when it drew none.
+    fn provider_text(app: &mut App) -> String {
+        let buffer = cells(app, 120, 30);
+        text_in(&buffer, app.provider_banner.area)
+    }
+
+    /// How many times the provider banner followed a selection worked out again, and cleaned a
+    /// notice it didn't have.
+    fn provider_work(app: &App) -> (usize, usize) {
+        (app.provider_banner.selects, app.provider_banner.prepares)
+    }
+
+    #[test]
+    fn the_provider_banner_stacks_over_the_error_and_each_dismisses_alone() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = tui(&Settings::default());
+        app.open_thread(thread_on("t", "codex", None, json!({})));
+        let ready = reported("codex", "Codex", "ready", "authenticated");
+        app.on_config_event(config_snapshot(vec![ready], json!({})));
+        app.composer.insert_str("half a reply");
+        app.focus = Focus::Transcript;
+        app.scroll.set(12);
+        let before = cells(&mut app, 120, 30);
+        assert_eq!(
+            app.provider_banner.area,
+            Rect::default(),
+            "ready, so no notice"
+        );
+        let (anchor, body) = (app.anchor.clone(), app.transcript_area);
+
+        // Codex fails to start, and the thread's session fails with it.
+        let failing = reported("codex", "Codex", "error", "authenticated");
+        app.on_config_event(provider_statuses(vec![saying(
+            failing,
+            "Codex can't start.",
+        )]));
+        app.on_thread_event(session_error(2, json!("Codex quit")));
+        let after = cells(&mut app, 120, 30);
+        let (provider, error) = (app.provider_banner.area, app.banner.area);
+        assert_eq!(provider.y, body.y, "the provider banner is on top");
+        assert_eq!(error.y, provider.bottom(), "the error banner is under it");
+        assert_eq!(provider.intersection(body), provider);
+        assert_eq!(error.intersection(body), error);
+        assert!(provider.height + error.height <= body.height / 2);
+        let text = text_in(&after, provider);
+        assert!(text.contains("i Codex provider status"), "{text}");
+        assert!(text.contains("Codex can't start."), "{text}");
+        assert!(text.contains("Alt+N dismiss"), "{text}");
+        assert_eq!(after[(provider.x, provider.y)].fg, app.theme.error);
+        let text = text_in(&after, error);
+        assert!(text.contains("! Codex quit"), "{text}");
+        assert!(text.contains("Alt+W dismiss"), "{text}");
+        // The rest of the transcript is as it was, and the reader is where they were.
+        for y in body.y..body.bottom() {
+            for x in body.x..body.right() {
+                let at = ratatui::layout::Position::new(x, y);
+                if !provider.contains(at) && !error.contains(at) {
+                    assert_eq!(after[(x, y)], before[(x, y)], "({x}, {y})");
+                }
+            }
+        }
+        assert_eq!(app.anchor, anchor);
+        assert_eq!(app.scroll.rows(), 12);
+
+        // Alt+W dismisses the error and leaves the provider's notice.
+        alt(&mut app, 'w');
+        screen(&mut app, 120, 30);
+        assert!(app.provider_banner.showing());
+        assert!(!app.banner.showing());
+        // Another error comes, and Alt+N dismisses the notice alone. The error moves up.
+        app.on_thread_event(session_error(3, json!("Codex quit again")));
+        screen(&mut app, 120, 30);
+        alt(&mut app, 'n');
+        screen(&mut app, 120, 30);
+        assert!(!app.provider_banner.showing());
+        assert!(app.banner.showing());
+        assert_eq!(app.banner.area.y, body.y);
+        assert_eq!(app.composer.text(), "half a reply");
+        assert_eq!(app.focus, Focus::Transcript);
+        assert_eq!(reads(&runtime), 0);
+    }
+
+    #[test]
+    fn the_banner_follows_the_instance_the_composer_would_send_with() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = tui(&Settings::default());
+        app.open_thread(thread_on("t", "codex", None, json!({})));
+        // Two instances of the same driver. Only the work one has a problem.
+        let personal = reported("codex", "Codex", "ready", "authenticated");
+        let work = reported("codex_work", "Codex work", "warning", "authenticated");
+        let work = saying(work, "Rate limited");
+        app.on_config_event(config_snapshot(vec![personal.clone(), work], json!({})));
+        assert_eq!(
+            provider_text(&mut app),
+            "",
+            "the thread is on the personal instance"
+        );
+
+        // A change to an instance the composer doesn't use shows nothing.
+        let worse = reported("codex_work", "Codex work", "error", "unauthenticated");
+        let worse = saying(worse, "Signed out");
+        app.on_config_event(provider_statuses(vec![personal.clone(), worse.clone()]));
+        assert_eq!(provider_text(&mut app), "");
+
+        // An unsent choice of the work instance's GPT-6 shows that instance's notice.
+        alt(&mut app, 'm');
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        let work_gpt = Some(Pick::Model("codex_work/gpt-6".into()));
+        assert_eq!(app.selected_pick(), work_gpt);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.drafts["t"].model.as_deref(), Some("codex_work/gpt-6"));
+        let text = provider_text(&mut app);
+        assert!(text.contains("Codex work is unauthenticated"), "{text}");
+        assert!(text.contains("Signed out"), "{text}");
+
+        // The work instance recovers, and the banner goes. It fails again, and it comes back.
+        let recovered = reported("codex_work", "Codex work", "ready", "authenticated");
+        app.on_config_event(provider_statuses(vec![personal.clone(), recovered]));
+        assert_eq!(provider_text(&mut app), "");
+        app.on_config_event(provider_statuses(vec![personal.clone(), worse.clone()]));
+        assert!(provider_text(&mut app).contains("Signed out"));
+
+        // With no models left, the choice can't be sent, so the chip and the banner go back to
+        // the thread's instance. The choice waits for the models to come back.
+        let mut emptied = worse.clone();
+        emptied["models"] = json!([]);
+        app.on_config_event(provider_statuses(vec![personal.clone(), emptied]));
+        assert_eq!(provider_text(&mut app), "");
+        assert_eq!(app.drafts["t"].model.as_deref(), Some("codex_work/gpt-6"));
+        app.on_config_event(provider_statuses(vec![personal.clone(), worse]));
+        assert!(provider_text(&mut app).contains("Signed out"));
+
+        // Choosing the thread's own model again drops the choice, and the banner with it.
+        alt(&mut app, 'm');
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.selected_pick(), Some(Pick::Model("codex/gpt-6".into())));
+        press(&mut app, KeyCode::Enter);
+        assert!(!app.drafts.contains_key("t"));
+        assert_eq!(provider_text(&mut app), "");
+        assert_eq!(reads(&runtime), 0);
+    }
+
+    #[test]
+    fn one_dismissal_holds_across_threads_until_a_selection_has_no_notice() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = tui(&Settings::default());
+        let warning = reported("codex", "Codex", "warning", "authenticated");
+        let warning = saying(warning, "Degraded");
+        let work = reported("codex_work", "Codex work", "error", "authenticated");
+        let spare = reported("codex_spare", "Codex spare", "ready", "authenticated");
+        app.on_config_event(config_snapshot(vec![warning, work, spare], json!({})));
+        assert_eq!(provider_text(&mut app), "", "no thread, no banner");
+        app.open_thread(thread_on("a", "codex", None, json!({})));
+        assert!(provider_text(&mut app).contains("Degraded"));
+        alt(&mut app, 'n');
+        assert_eq!(provider_text(&mut app), "");
+
+        // Another thread on the same instance has the same notice, so it stays dismissed.
+        app.open_thread(thread_on("b", "codex", None, json!({})));
+        assert_eq!(provider_text(&mut app), "");
+        // A thread on another instance shows that one's notice. The first stays dismissed.
+        app.open_thread(thread_on("c", "codex_work", None, json!({})));
+        let text = provider_text(&mut app);
+        assert!(text.contains("Codex work provider status"), "{text}");
+        assert!(
+            text.contains("Codex work provider is unavailable."),
+            "{text}"
+        );
+        app.open_thread(thread_on("a", "codex", None, json!({})));
+        assert_eq!(provider_text(&mut app), "");
+        // A thread on a ready instance has no notice, which ends the dismissal.
+        app.open_thread(thread_on("d", "codex_spare", None, json!({})));
+        assert_eq!(provider_text(&mut app), "");
+        app.open_thread(thread_on("a", "codex", None, json!({})));
+        assert!(provider_text(&mut app).contains("Degraded"));
+        assert_eq!(reads(&runtime), 0);
+    }
+
+    #[test]
+    fn the_banner_finds_the_threads_instance_without_models_and_after_it_leaves() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = tui(&Settings::default());
+        app.open_thread(thread_on("t", "codex", None, json!({})));
+        let ready = reported("codex", "Codex", "ready", "authenticated");
+        let other = reported("codex_work", "Codex work", "warning", "authenticated");
+        let other = saying(other, "Work is degraded");
+        app.on_config_event(config_snapshot(
+            vec![ready.clone(), other.clone()],
+            json!({}),
+        ));
+        assert_eq!(provider_text(&mut app), "");
+
+        // Codex loses its models and warns. The banner still finds it by its instance id.
+        let empty = reported("codex", "Codex", "warning", "authenticated");
+        let mut empty = saying(empty, "No models found");
+        empty["models"] = json!([]);
+        app.on_config_event(provider_statuses(vec![empty.clone(), other.clone()]));
+        let text = provider_text(&mut app);
+        assert!(text.contains("Codex provider status"), "{text}");
+        assert!(text.contains("No models found"), "{text}");
+        alt(&mut app, 'n');
+        assert_eq!(provider_text(&mut app), "");
+
+        // T3 stops listing Codex. No other instance stands in for it, and the dismissal ends.
+        app.on_config_event(provider_statuses(vec![other.clone()]));
+        assert_eq!(provider_text(&mut app), "");
+        // Codex comes back with the same notice, which shows again, and then recovers.
+        app.on_config_event(provider_statuses(vec![empty, other.clone()]));
+        assert!(provider_text(&mut app).contains("No models found"));
+        app.on_config_event(provider_statuses(vec![ready, other]));
+        assert_eq!(provider_text(&mut app), "");
+
+        // Another client moves the thread to the work instance, and its notice shows.
+        let moved = json!({
+            "id": "t",
+            "providerInstanceId": "codex_work",
+            "activeProviderThreadId": "pt",
+            "modelSelection": {"instanceId": "codex_work", "model": "gpt-6"},
+        });
+        app.on_thread_event(live(2, "thread.updated", moved));
+        assert!(provider_text(&mut app).contains("Work is degraded"));
+        assert_eq!(reads(&runtime), 0);
+    }
+
+    #[test]
+    fn streaming_frames_and_unchanged_statuses_do_no_provider_work() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = tui(&Settings::default());
+        app.open_thread(thread_on("t", "codex", None, json!({})));
+        let warning = reported("codex", "Codex", "warning", "authenticated");
+        let mut warning = saying(warning, "Degraded");
+        app.on_config_event(config_snapshot(vec![warning.clone()], json!({})));
+        screen(&mut app, 120, 30);
+        assert!(app.provider_banner.showing());
+        let start = provider_work(&app);
+
+        // A run starts, a hundred pieces of an answer stream with a frame after each, a message
+        // lands, the watch reconnects, and the reader opens the notice. None of it looks at the
+        // provider.
+        let run = json!({"id": "r1", "ordinal": 1, "status": "running", "rootNodeId": "r1-n"});
+        app.on_thread_event(live(2, "run.created", run));
+        stream(&mut app, 3, 100);
+        let message = json!({"id": "m9", "role": "user", "text": "hello"});
+        app.on_thread_event(live(103, "message.updated", message));
+        app.on_thread_event(WatchEvent::Reconnecting {
+            reason: "socket closed".into(),
+            retry_in: Duration::from_secs(1),
+        });
+        alt(&mut app, 'o');
+        screen(&mut app, 120, 30);
+        assert!(app.provider_banner.expanded());
+        assert_eq!(provider_work(&app), start);
+
+        // A thread event that keeps the model selection only compares it.
+        let renamed = json!({
+            "id": "t",
+            "title": "Renamed",
+            "providerInstanceId": "codex",
+            "activeProviderThreadId": "pt",
+            "modelSelection": {"instanceId": "codex", "model": "gpt-6"},
+        });
+        app.on_thread_event(live(104, "thread.metadata-updated", renamed));
+        assert_eq!(provider_work(&app), start);
+
+        // T3 checks Codex again every few seconds and finds it as it was. Each check works the
+        // selection out again and compares the notice, and the open banner stays open.
+        for second in 1..=5 {
+            warning["checkedAt"] = json!(format!("2026-10-10T12:00:0{second}.000Z"));
+            app.on_config_event(provider_statuses(vec![warning.clone()]));
+            screen(&mut app, 120, 30);
+        }
+        assert_eq!(provider_work(&app), (start.0 + 5, start.1));
+        assert!(app.provider_banner.expanded());
+        // A new message is a new notice, cleaned once, and it starts closed.
+        warning["message"] = json!("Degraded again");
+        app.on_config_event(provider_statuses(vec![warning]));
+        assert_eq!(provider_work(&app), (start.0 + 6, start.1 + 1));
+        assert!(!app.provider_banner.expanded());
+        assert_eq!(reads(&runtime), 0);
+    }
+
+    #[test]
+    fn one_banner_is_open_at_a_time_and_alt_arrows_scroll_the_open_one_first() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = tui(&Settings::default());
+        let lines = |what: &str| {
+            (1..=40)
+                .map(|n| format!("{what} line {n}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let request = json!({"id": "q1", "kind": "command", "status": "pending"});
+        let more = json!({"runtimeRequests": [request]});
+        app.open_thread(thread_on("t", "codex", Some(&lines("error")), more));
+        let failing = reported("codex", "Codex", "error", "authenticated");
+        let failing = saying(failing, &lines("notice"));
+        app.on_config_event(config_snapshot(vec![failing], json!({})));
+        app.composer.insert_str("half a reply");
+        screen(&mut app, 120, 40);
+        assert!(app.provider_banner.showing() && app.banner.showing());
+        assert!(app.panel_area.height > 0);
+        let down = || Event::Key(KeyEvent::new(KeyCode::Down, KeyModifiers::ALT));
+
+        // Alt+O opens the notice, which takes Alt+↓ first.
+        alt(&mut app, 'o');
+        screen(&mut app, 120, 40);
+        assert!(app.provider_banner.expanded());
+        app.on_terminal_event(down());
+        let buffer = cells(&mut app, 120, 40);
+        let text = text_in(&buffer, app.provider_banner.area);
+        assert!(text.contains("Lines 2-"), "{text}");
+        assert_eq!(app.panel_scroll, 0);
+
+        // Alt+I opens the error and closes the notice, and Alt+↓ scrolls the error.
+        alt(&mut app, 'i');
+        assert!(app.banner.expanded() && !app.provider_banner.expanded());
+        screen(&mut app, 120, 40);
+        app.on_terminal_event(down());
+        let buffer = cells(&mut app, 120, 40);
+        let text = text_in(&buffer, app.banner.area);
+        assert!(text.contains("Lines 2-"), "{text}");
+        assert_eq!(app.panel_scroll, 0);
+
+        // A click on the notice opens it and closes the error.
+        let area = app.provider_banner.area;
+        assert!(mouse(&mut app, CLICK, area.x + 2, area.y + 1));
+        assert!(app.provider_banner.expanded() && !app.banner.expanded());
+
+        // With both closed, Alt+↓ reaches the request panel.
+        alt(&mut app, 'o');
+        screen(&mut app, 120, 40);
+        assert!(!app.provider_banner.expanded() && !app.banner.expanded());
+        app.on_terminal_event(down());
+        assert_eq!(app.panel_scroll, 1);
+
+        // A click on the notice's × dismisses it alone, and nothing reaches the composer.
+        let close = app.provider_banner.close;
+        assert!(mouse(&mut app, CLICK, close.x + 1, close.y));
+        screen(&mut app, 120, 40);
+        assert!(!app.provider_banner.showing() && app.banner.showing());
+        assert_eq!(app.composer.text(), "half a reply");
+        assert_eq!(reads(&runtime), 0);
+    }
+
+    #[test]
+    fn at_any_size_the_banners_stay_apart_inside_the_transcript() {
+        let long = format!(
+            "{}\n\u{1b}[31m{}\u{7}\t👩‍💻 e\u{301}",
+            "界".repeat(300),
+            "a long line ".repeat(40)
+        );
+        let name = format!("Codex {}", "界".repeat(50));
+        let small = [(0, 0), (1, 1), (10, 5), (19, 3), (26, 4), (40, 8), (40, 12)];
+        // Growing, then shrinking, so nothing from a larger frame is left behind.
+        let large = [(60, 16), (80, 24), (200, 60), (26, 4), (80, 24)];
+        let sizes: Vec<(u16, u16)> = small.into_iter().chain(large).collect();
+        for hidden in [false, true] {
+            let settings = Settings {
+                sidebar_hidden: hidden,
+                ..Settings::default()
+            };
+            let mut app = tui(&settings);
+            app.open_thread(thread_on("t", "codex", Some(&long), json!({})));
+            let failing = saying(reported("codex", &name, "error", "authenticated"), &long);
+            app.on_config_event(config_snapshot(vec![failing], json!({})));
+            app.composer.insert_str("a draft that wraps when narrow");
+            for open in [None, Some('o'), Some('i')] {
+                if let Some(c) = open {
+                    screen(&mut app, 120, 30);
+                    alt(&mut app, c);
+                }
+                for &(width, height) in &sizes {
+                    let size = format!("{width}x{height}, open: {open:?}, hidden: {hidden}");
+                    let buffer = cells(&mut app, width, height);
+                    let body = app.transcript_area;
+                    let provider = (app.provider_banner.area, app.provider_banner.close);
+                    let error = (app.banner.area, app.banner.close);
+                    for (area, close) in [provider, error] {
+                        if area.is_empty() {
+                            assert_eq!(close, Rect::default(), "{size}");
+                            continue;
+                        }
+                        assert_eq!(area.intersection(body), area, "{size}");
+                        assert_eq!(close.intersection(area), close, "{size}");
+                        assert!(text_in(&buffer, close).contains('×'), "{size}");
+                        let printable = |c: char| c == '\n' || !c.is_control();
+                        let text = text_in(&buffer, area);
+                        assert!(text.chars().all(printable), "{size}: {text:?}");
+                    }
+                    assert!(!provider.0.intersects(error.0), "{size}");
+                    let half = (body.height / 2).max(1);
+                    if open.is_none() {
+                        assert!(provider.0.height + error.0.height <= half, "{size}");
+                    }
+                    // A closed notice gives way to the thread's error on a short transcript.
+                    if body.height < 8 && open != Some('o') {
+                        assert!(provider.0.is_empty(), "{size}");
+                    }
+                }
+            }
+            assert_eq!(app.composer.text(), "a draft that wraps when narrow");
+        }
+    }
+
+    #[test]
+    fn a_late_model_list_read_or_a_reconnect_never_brings_an_old_status_back() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = tui(&Settings::default());
+        app.open_thread(thread_on("t", "codex", None, json!({})));
+        // With no configuration yet, the menu reads it.
+        alt(&mut app, 'm');
+        assert_eq!(reads(&runtime), 1);
+        let asked_at = app.config_revision;
+        press(&mut app, KeyCode::Esc);
+
+        // The subscription's snapshot arrives first and finds Codex signed out.
+        let signed_out = reported("codex", "Codex", "error", "unauthenticated");
+        app.on_config_event(config_snapshot(vec![signed_out], json!({})));
+        let text = provider_text(&mut app);
+        assert!(text.contains("Codex is unauthenticated"), "{text}");
+        assert!(
+            text.contains("Sign in via the CLI to authenticate again."),
+            "{text}"
+        );
+
+        // The read answers late with Codex ready, which changes nothing.
+        let ready = reported("codex", "Codex", "ready", "authenticated");
+        let older = json!({"providers": [ready.clone()]});
+        let answer = ActionResult::Config {
+            config: older,
+            revision: asked_at,
+        };
+        app.on_action_result(answer);
+        assert!(provider_text(&mut app).contains("Codex is unauthenticated"));
+
+        // While the subscription reconnects the notice stays, until the new snapshot.
+        let reason = "T3 connection lost: socket ended".to_string();
+        let retry_in = Duration::from_millis(250);
+        app.on_config_event(WatchEvent::Reconnecting { reason, retry_in });
+        assert!(provider_text(&mut app).contains("Codex is unauthenticated"));
+        app.on_config_event(config_snapshot(vec![ready], json!({})));
+        assert_eq!(provider_text(&mut app), "");
+        assert_eq!(reads(&runtime), 1);
     }
 }
