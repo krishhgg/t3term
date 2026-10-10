@@ -10,6 +10,7 @@ mod picker;
 mod plan;
 mod scroll;
 mod sidebar;
+mod tasks;
 mod theme;
 mod unsent;
 
@@ -225,6 +226,8 @@ struct App {
     expanded_plans: HashSet<String>,
     /// Each plan long enough to collapse that the last frame drew, in transcript order.
     drawn_plans: Vec<plan::Drawn>,
+    /// The tasks drawer above the composer. Only this window keeps whether it is open.
+    tasks: tasks::Drawer,
     /// The item at the top of the last frame and the row of it that was showing, so a block
     /// that grows under the reader doesn't move the text.
     anchor: Option<(String, usize)>,
@@ -313,6 +316,7 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
         bundle_rows: Vec::new(),
         expanded_plans: HashSet::new(),
         drawn_plans: Vec::new(),
+        tasks: tasks::Drawer::default(),
         anchor: None,
         drawn_scroll: 0,
         verbose: settings.verbose,
@@ -484,6 +488,18 @@ impl App {
                 self.message = Some((message, true));
             }
         }
+        self.follow_tasks();
+    }
+
+    /// Brings the tasks drawer up to date with the open thread and its watch. It runs after
+    /// each change to either, so tasks that go and come back before the next frame still close
+    /// the list.
+    fn follow_tasks(&mut self) {
+        let open = self.open.as_ref();
+        self.tasks.follow(
+            open.and_then(|open| open.state.as_ref()),
+            open.is_some_and(|open| open.connection == "live"),
+        );
     }
 
     /// Lays the sidebar's shelves out again from the shell, as of now.
@@ -553,6 +569,8 @@ impl App {
         self.bundle_rows.clear();
         self.expanded_plans.clear();
         self.drawn_plans.clear();
+        // The thread has no state yet, so the drawer closes and drops the last thread's tasks.
+        self.follow_tasks();
         self.scroll.set(0);
         self.picker = None;
         self.focus = Focus::Composer;
@@ -630,6 +648,9 @@ impl App {
                     self.focus = Focus::Composer;
                     self.open_picker(kind);
                     return true;
+                }
+                if let Some(redraw) = self.tasks.on_mouse(&mouse) {
+                    return redraw;
                 }
                 match mouse.kind {
                     MouseEventKind::ScrollUp if inside(self.panel_area) => {
@@ -731,6 +752,9 @@ impl App {
                 self.on_picker_key(key);
                 return;
             }
+            // While the tasks drawer shows, Alt+T opens and closes its list, and Alt+↑/↓ scroll
+            // a list too long to show. With no drawer they go on, so Alt+T can reach `t` below.
+            _ if self.tasks.on_key(&key) => return,
             // The desktop app's model, effort and mode menus. It uses Cmd+Shift+M, E and A.
             KeyCode::Char(c @ ('m' | 'e' | 'p')) if alt => {
                 self.open_picker(match c {
@@ -1498,10 +1522,22 @@ impl App {
         } else {
             panel.len() as u16 + 2
         };
-        let [header, body, panel_area, composer_area, status_area] = Layout::vertical([
+        // The tasks drawer takes what room the panel leaves. A waiting request hides it, so the
+        // two never show together.
+        let tasks_room = main
+            .height
+            .saturating_sub(2 + 3 + composer_height + 1 + panel_height);
+        let tasks = self.tasks.lay_out(
+            main.width.saturating_sub(4) as usize,
+            tasks_room as usize,
+            area.height as usize,
+            &self.theme,
+        );
+        let [header, body, panel_area, drawer, composer_area, status_area] = Layout::vertical([
             Constraint::Length(2),
             Constraint::Min(3),
             Constraint::Length(panel_height),
+            Constraint::Length(tasks.len() as u16),
             Constraint::Length(composer_height),
             Constraint::Length(1),
         ])
@@ -1516,6 +1552,23 @@ impl App {
         self.panel_area = panel_area;
         if !panel.is_empty() {
             self.draw_request_panel(frame, panel_area, panel);
+        }
+        // A tab on the composer's top edge, a column in from its corners, with the composer's
+        // background and its text in line with the composer's.
+        self.tasks.area = Rect {
+            x: drawer.x + 1,
+            width: drawer.width.saturating_sub(2),
+            ..drawer
+        };
+        if !tasks.is_empty() {
+            let raised = Block::new().style(Style::new().bg(self.theme.raised));
+            frame.render_widget(raised, self.tasks.area);
+            let inner = Rect {
+                x: drawer.x + 2,
+                width: drawer.width.saturating_sub(4),
+                ..drawer
+            };
+            frame.render_widget(Paragraph::new(tasks), inner);
         }
         self.composer_area = composer_area;
         self.draw_composer(frame, composer_area, &composer_rows, cursor);
