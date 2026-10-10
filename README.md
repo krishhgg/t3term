@@ -93,11 +93,11 @@ The TUI follows the desktop app closely, because muscle memory is worth more tha
 | Anywhere, thread open | Alt+M model, Alt+E reasoning effort and other model options, Alt+P access, and plan mode once it's turned on |
 | Anywhere, tasks drawer showing | Alt+T open or close the task list. Alt+↑/↓ or the wheel scrolls a long list |
 | Open menu | ↑/↓ choose, Enter select, Esc close. In the model menu, type to search |
-| Sidebar | ↑/↓ or j/k select, Enter open, w open or close the Working shelf once it's turned on, e show or hide the Settled shelf, q quit |
+| Sidebar | ↑/↓ or j/k select, Enter open, w open or close the Working shelf once it's turned on, e show or hide the Settled shelf, [ and ] narrow or widen the sidebar, 0 back to its usual width, q quit |
 | Composer | Enter send (queues if the thread is busy), Alt+Enter or Ctrl+J newline, Ctrl+R swap in an unsent message, Esc to transcript |
 | Transcript | ↑/↓ scroll, g/G top/bottom, t open or close every row of tool calls, p expand or collapse the first long plan in view, Enter compose, Esc, ← or h sidebar, showing it if hidden |
 
-The wheel scrolls the transcript and the sidebar. Clicking ◧ at the top left of the conversation hides or shows the sidebar. Clicking a thread opens it, clicking the Working heading or the Settled footer opens or closes that shelf, clicking a chip under the composer opens its menu, clicking the top row of the tasks drawer opens or closes its list, and clicking a row of tool calls opens that row. Clicking the top edge of a long plan, or its Expand plan or Collapse plan button, expands or collapses that plan.
+The wheel scrolls the transcript and the sidebar. Clicking ◧ at the top left of the conversation hides or shows the sidebar, and dragging the sidebar's right edge resizes it. Clicking a thread opens it, clicking the Working heading or the Settled footer opens or closes that shelf, clicking a chip under the composer opens its menu, clicking the top row of the tasks drawer opens or closes its list, and clicking a row of tool calls opens that row. Clicking the top edge of a long plan, or its Expand plan or Collapse plan button, expands or collapses that plan.
 
 On macOS the Alt keys need Option to send Meta: "Use Option as Meta key" in Terminal, "Esc+" for the Option key in iTerm2, or `macos-option-as-alt = true` in Ghostty.
 
@@ -183,7 +183,23 @@ While the sidebar is hidden, the key hints on the status line start with `Ctrl+B
 
 t3term saves the choice in `~/.config/t3term/settings.json` under `sidebarHidden`, so the next run starts the same way. A file without the key shows the sidebar. The desktop writes its choice to a cookie that it never reads back, so it opens with the sidebar shown every time, and this key is t3term's.
 
-tmux uses Ctrl+B as its prefix. Inside tmux, press Ctrl+B twice to send one to t3term, or click ◧. The sidebar can't be resized yet.
+tmux uses Ctrl+B as its prefix. Inside tmux, press Ctrl+B twice to send one to t3term, or click ◧.
+
+### Resizing the sidebar
+
+Drag the sidebar's right edge, the one-column strip between it and the conversation, with the left mouse button. Or, with the sidebar focused, press `[` to narrow it and `]` to widen it by two columns. `0` puts back the width t3term picks, a quarter of the screen from 26 to 34 columns. On a screen at least 40 columns wide, the sidebar can be from 20 columns wide up to half the screen. A screen from 20 to 39 columns wide keeps 20 columns for the conversation and gives the sidebar the rest. Under 20 columns, the sidebar gets none and the conversation takes the whole screen. On the desktop you drag the edge of the sidebar and double-click it to reset. t3term has no double-click there, so `0` does the reset.
+
+The edge follows the pointer while the button is down, and t3term saves the width when you let go. A click on the edge, or a drag that ends where it started, saves nothing, so the width still follows the screen. A key, Ctrl+B or a terminal resize during a drag puts the edge back where it was, and Esc does nothing else. With a menu open, the first press on the edge only closes the menu. A drag needs a terminal that reports the mouse moving while a button is held. Where it doesn't, `[` and `]` still work.
+
+t3term saves the width in columns in `~/.config/t3term/settings.json` under `sidebarWidth`. A file without the key gives the width t3term picks. A screen too narrow for the saved width draws the sidebar narrower and keeps the saved width for when the screen grows again. The desktop keeps its width in pixels in the browser's storage, so this key is t3term's.
+
+| Width t3term picks, 140x44 | Dragged to 51 columns, 140x44 |
+|---|---|
+| ![t3term with no width saved: a 34-column sidebar of shelves, the thread Tasks: live run open with its plan and tasks drawer, and the draft hd in the composer](docs/screenshots/sidebar-width-default.png) | ![The same thread with the sidebar dragged to 51 columns: a card title cut short before now fits, the transcript wraps in the narrower conversation and the draft still reads hd](docs/screenshots/sidebar-width-chosen.png) |
+| **Saved 59, drawn at 40 on 80x24** | **Saved 48, 140x44 in 256 colors** |
+| ![On an 80x24 screen the saved 59 columns draw as 40, half the screen, beside the same thread's plan and tasks drawer, and the draft reads hid](docs/screenshots/sidebar-width-clamped.png) | ![A 48-column sidebar in 256 colors with Parser cleanup (fork) open and keep []0 draft unsent typed in the composer](docs/screenshots/sidebar-width-256.png) |
+
+The threads are invented and come from a fake T3 server. The images render t3term's captured terminal output, the first three in truecolor. A [screen tour](docs/screenshots/sidebar-width-screen-tour.mp4) shows the four in this order for three seconds each. It is a slideshow of the captures, not a recording, so it shows neither the pointer nor the edge moving.
 
 ### Tool calls and reasoning
 
@@ -260,7 +276,7 @@ Set `T3TERM_NO_SAVED_LOGIN=1` to use a session that lasts one run instead. t3ter
 cargo test
 ```
 
-The unit tests cover the reducers, Markdown wrapping, the composer, the model menus, the transcript, the tasks drawer, hiding the sidebar and auth command parsing. The TUI tests draw frames on ratatui's test backend with a client that never connects, and a test build keeps saved settings in memory, so no test writes `~/.config/t3term/settings.json`. `tests/fake_server.rs` drives the real RPC client against a fake Effect RPC server, dropping the socket mid-stream to check the resume cursor, chunk acks, batched frames, duplicate suppression and error decoding. `tests/cli.rs` runs the built binary with a temporary home and checks the `--json` error and exit code when the server is gone, when it isn't on protocol 2 and when the TUI has no terminal. It also runs `t3term read` against a fake server and a fake `t3` that issues a made-up session. It checks that the plain output drops the control characters of a checklist and a compaction summary, and that `--json` writes them as escapes that decode to the text T3 sent. Another test runs `t3term send --wait` against a fake server that also plays T3's side of the WebSocket. It checks that each finished handoff in the turn prints its marker and endpoints on stderr once, even when T3 sends the item again, and that `--json` prints only the result. None of them reach a real T3 server or the Keychain, and CI runs them on macOS for every pull request.
+The unit tests cover the reducers, Markdown wrapping, the composer, the model menus, the transcript, the tasks drawer, hiding and resizing the sidebar and auth command parsing. The TUI tests draw frames on ratatui's test backend with a client that never connects, and a test build keeps saved settings in memory, so no test writes `~/.config/t3term/settings.json`. `tests/fake_server.rs` drives the real RPC client against a fake Effect RPC server, dropping the socket mid-stream to check the resume cursor, chunk acks, batched frames, duplicate suppression and error decoding. `tests/cli.rs` runs the built binary with a temporary home and checks the `--json` error and exit code when the server is gone, when it isn't on protocol 2 and when the TUI has no terminal. It also runs `t3term read` against a fake server and a fake `t3` that issues a made-up session. It checks that the plain output drops the control characters of a checklist and a compaction summary, and that `--json` writes them as escapes that decode to the text T3 sent. Another test runs `t3term send --wait` against a fake server that also plays T3's side of the WebSocket. It checks that each finished handoff in the turn prints its marker and endpoints on stderr once, even when T3 sends the item again, and that `--json` prints only the result. None of them reach a real T3 server or the Keychain, and CI runs them on macOS for every pull request.
 
 `docs/screenshots/` also holds `before-tui.png`, `after-tui.png`, `approval.png`, `streaming.gif`, `picker-model.png` and `tool-calls-failed.png`.
 
@@ -273,7 +289,6 @@ The unit tests cover the reducers, Markdown wrapping, the composer, the model me
 - Linux and Windows. The code has Linux pid lookup, but only macOS has been tested, and the saved login needs the macOS Keychain, so other systems would issue a new session every run.
 - Syntax highlighting in code blocks and the project and git panel.
 - Acting on a proposed plan. The desktop's card menu copies a plan, downloads it as Markdown or saves it to the workspace, and its composer offers Implement and Implement in a new thread. t3term only shows the plan. Its collapsed card also ends at ten lines with text and `...`, where the desktop clips the preview to a fixed height and fades it out.
-- Resizing the sidebar. Ctrl+B hides and shows it, but t3term still picks its width from the terminal's.
 - Pinning, snoozing, settling and reordering threads. The sidebar shows the shelves, but moving a thread between them still takes the desktop app. The Snoozed shelf also stays open, where the desktop starts it closed. Snoozed and settled threads are full cards, where the desktop shows a one-line row with the wake or settle time.
 - Marking threads seen. The sidebar reads Done and Woke against the visit time the server keeps for each thread, but t3term doesn't report a visit when you open one, so only the desktop or another client clears those words. A server too old to keep visit times gets no Done from t3term at all, because the desktop's fallback is a visit time saved in the browser.
 
