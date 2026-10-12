@@ -600,10 +600,23 @@ async fn setup_watch_asks_for_one_thread_and_passes_on_nulls_and_snapshots_as_se
     failed["stages"][3]["endedAt"] = json!(SETUP_AT);
     failed["stages"][3]["detail"] = json!("exit 1");
     // Null first, while T3 tracks no setup, and null again once it drops the failed one.
-    let sent = [Value::Null, fetching, checking_out, scripting, failed, Value::Null];
+    let sent = [
+        Value::Null,
+        fetching,
+        checking_out,
+        scripting,
+        failed,
+        Value::Null,
+    ];
     // The middle two arrive in one chunk.
-    let chunks = [&sent[0..1], &sent[1..2], &sent[2..4], &sent[4..5], &sent[5..6]]
-        .map(|items| Value::Array(items.to_vec()));
+    let chunks = [
+        &sent[0..1],
+        &sent[1..2],
+        &sent[2..4],
+        &sent[4..5],
+        &sent[5..6],
+    ]
+    .map(|items| Value::Array(items.to_vec()));
 
     let server = tokio::spawn(async move {
         let mut socket = accept(&listener).await;
@@ -687,7 +700,13 @@ async fn setup_watch_backs_off_until_a_null_or_a_snapshot_shows_the_subscription
         let other = config_snapshot(json!([provider("codex")]));
         // Five connections that drop after these items: nothing, a null, nothing, a snapshot
         // and the config snapshot.
-        let drops = [json!([]), json!([null]), json!([]), json!([snapshot]), json!([other])];
+        let drops = [
+            json!([]),
+            json!([null]),
+            json!([]),
+            json!([snapshot]),
+            json!([other]),
+        ];
         for items in drops {
             let mut socket = accept(&listener).await;
             let id = setup_request(&mut socket, "t1").await;
@@ -776,7 +795,10 @@ async fn dropping_a_setup_watch_interrupts_its_stream_and_leaves_the_shell_watch
             requests.insert(tag, request);
         }
         let setup = requests["subscribeWorktreeSetup"]["id"].clone();
-        assert_eq!(requests["subscribeWorktreeSetup"], setup_subscription(&setup, "t1"));
+        assert_eq!(
+            requests["subscribeWorktreeSetup"],
+            setup_subscription(&setup, "t1")
+        );
         let shell = requests["orchestration.subscribeShell"]["id"].clone();
 
         send(&mut socket, chunk(&setup, json!([null]))).await;
