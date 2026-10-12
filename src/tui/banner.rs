@@ -1794,6 +1794,60 @@ mod tests {
     }
 
     #[test]
+    fn a_new_or_closed_error_leaves_alt_arrows_and_the_wheel_before_the_next_frame() {
+        let alt = KeyModifiers::ALT;
+        let lines = |what: &str| {
+            (1..=12)
+                .map(|n| format!("{what} {n}"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        let mut banner = showing(&lines("line"));
+        draw(&mut banner, 60, 30);
+        assert!(banner.on_key(&key(KeyCode::Char('i'), alt)));
+        let rows = draw(&mut banner, 60, 8);
+        assert!(rows[7].contains("Lines 1-6 of 12"), "{rows:#?}");
+        // The middle column, which the banner covers open or closed.
+        let x = 30;
+        let wheel = |kind| mouse(kind, x, 3);
+
+        // The same error again keeps it open and scrolling before the next frame.
+        banner.follow(Some("a"), Some(&runtime(&lines("line"), None)));
+        assert!(banner.on_key(&key(KeyCode::Down, alt)));
+        let rows = draw(&mut banner, 60, 8);
+        assert!(rows[7].contains("Lines 2-7 of 12"), "{rows:#?}");
+
+        // A new error on the thread takes its place, closed. Before a frame draws it, Alt+↑/↓
+        // and the wheel go on, and the banner still takes clicks where it was drawn.
+        banner.follow(Some("a"), Some(&runtime(&lines("new line"), None)));
+        assert!(banner.showing() && !banner.expanded());
+        assert!(!banner.on_key(&key(KeyCode::Down, alt)));
+        assert!(!banner.on_key(&key(KeyCode::Up, alt)));
+        assert_eq!(banner.on_mouse(&wheel(MouseEventKind::ScrollDown)), None);
+        let right = MouseEventKind::Down(MouseButton::Right);
+        assert_eq!(banner.on_mouse(&mouse(right, x, 3)), Some(false));
+
+        // Alt+I opens it, a frame draws it too long for its rows, and Alt+I closes it.
+        draw(&mut banner, 60, 8);
+        assert!(banner.on_key(&key(KeyCode::Char('i'), alt)));
+        draw(&mut banner, 60, 8);
+        assert!(banner.on_key(&key(KeyCode::Char('i'), alt)));
+        assert!(!banner.on_key(&key(KeyCode::Down, alt)));
+        assert_eq!(banner.on_mouse(&wheel(MouseEventKind::ScrollUp)), None);
+
+        // A click opens it, a frame draws it, and a second click closes it.
+        draw(&mut banner, 60, 8);
+        assert_eq!(banner.on_mouse(&mouse(CLICK, x, 1)), Some(true));
+        draw(&mut banner, 60, 8);
+        assert_eq!(banner.on_mouse(&mouse(CLICK, x, 1)), Some(true));
+        assert!(!banner.expanded());
+        assert!(!banner.on_key(&key(KeyCode::Up, alt)));
+        assert_eq!(banner.on_mouse(&wheel(MouseEventKind::ScrollDown)), None);
+        let rows = draw(&mut banner, 60, 30);
+        assert!(rows[1].contains("new line 1"), "{rows:#?}");
+    }
+
+    #[test]
     fn the_banner_takes_its_clicks() {
         let raw = "word ".repeat(100);
         let mut banner = showing(&raw);

@@ -7425,6 +7425,153 @@ mod tests {
         assert_eq!(reads(&runtime), 0);
     }
 
+    /// Forty lines of `what`, more than a banner shows on a screen 40 rows tall.
+    fn forty_lines(what: &str) -> String {
+        (1..=40)
+            .map(|n| format!("{what} line {n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    fn alt_arrow(app: &mut App, code: KeyCode) {
+        app.on_terminal_event(Event::Key(KeyEvent::new(code, KeyModifiers::ALT)));
+    }
+
+    #[test]
+    fn a_new_notice_over_an_open_one_hands_alt_arrows_to_the_request_panel_before_a_frame() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = tui(&Settings::default());
+        let request = json!({"id": "q1", "kind": "command", "status": "pending"});
+        let more = json!({"runtimeRequests": [request]});
+        app.open_thread(thread_on("t", "codex", None, more));
+        let failing = reported("codex", "Codex", "error", "authenticated");
+        let mut failing = saying(failing, &forty_lines("notice"));
+        app.on_config_event(config_snapshot(vec![failing.clone()], json!({})));
+        app.composer.insert_str("half a reply");
+        app.focus = Focus::Transcript;
+        app.scroll.set(12);
+        screen(&mut app, 120, 40);
+        assert!(app.provider_banner.showing() && !app.banner.showing());
+        assert!(app.panel_area.height > 0);
+
+        // The reader opens the notice, a frame draws it too long for its rows, and Alt+↓
+        // scrolls it. T3 checks Codex again and finds it as it was, and before the next frame
+        // Alt+↓ still scrolls the open notice.
+        alt(&mut app, 'o');
+        screen(&mut app, 120, 40);
+        alt_arrow(&mut app, KeyCode::Down);
+        failing["checkedAt"] = json!("2026-10-10T12:00:05.000Z");
+        app.on_config_event(provider_statuses(vec![failing.clone()]));
+        assert!(app.provider_banner.expanded());
+        alt_arrow(&mut app, KeyCode::Down);
+        assert_eq!(app.panel_scroll, 0);
+        let buffer = cells(&mut app, 120, 40);
+        let text = text_in(&buffer, app.provider_banner.area);
+        assert!(text.contains("Lines 3-"), "{text}");
+        let scrolled = app.scroll.rows();
+        assert!(scrolled > 0);
+
+        // Codex's message changes, so a new notice takes its place, closed. The last frame
+        // drew the open one, but before the next frame Alt+↓ and Alt+↑ reach the request
+        // panel. Nothing else moves, and nothing goes to T3.
+        failing["message"] = json!(forty_lines("new notice"));
+        app.on_config_event(provider_statuses(vec![failing]));
+        assert!(app.provider_banner.showing() && !app.provider_banner.expanded());
+        alt_arrow(&mut app, KeyCode::Down);
+        assert_eq!(app.panel_scroll, 1);
+        alt_arrow(&mut app, KeyCode::Down);
+        assert_eq!(app.panel_scroll, 2);
+        alt_arrow(&mut app, KeyCode::Up);
+        assert_eq!(app.panel_scroll, 1);
+        assert_eq!(app.composer.text(), "half a reply");
+        assert_eq!(app.focus, Focus::Transcript);
+        assert_eq!(app.scroll.rows(), scrolled);
+
+        // The next frame draws the new notice closed, at its first rows.
+        let buffer = cells(&mut app, 120, 40);
+        let text = text_in(&buffer, app.provider_banner.area);
+        assert!(text.contains("new notice line 1"), "{text}");
+        assert!(text.contains("Alt+O more"), "{text}");
+        assert!(!text.contains("Lines "), "{text}");
+        assert_eq!(reads(&runtime), 0);
+    }
+
+    #[test]
+    fn closing_a_banner_or_a_new_error_hands_on_alt_arrows_and_the_wheel_before_a_frame() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = tui(&Settings::default());
+        let request = json!({"id": "q1", "kind": "command", "status": "pending"});
+        let more = json!({"runtimeRequests": [request]});
+        app.open_thread(thread_on("t", "codex", Some(&forty_lines("error")), more));
+        let failing = reported("codex", "Codex", "error", "authenticated");
+        let failing = saying(failing, &forty_lines("notice"));
+        app.on_config_event(config_snapshot(vec![failing], json!({})));
+        app.composer.insert_str("half a reply");
+        screen(&mut app, 120, 40);
+        assert!(app.provider_banner.showing() && app.banner.showing());
+        assert!(app.panel_area.height > 0);
+
+        // Alt+O opens the notice and a frame draws it too long for its rows. Alt+O closes it,
+        // and before a frame draws it closed, Alt+↓ reaches the request panel. Alt+I does the
+        // same for the error.
+        alt(&mut app, 'o');
+        screen(&mut app, 120, 40);
+        alt(&mut app, 'o');
+        let before = app.panel_scroll;
+        alt_arrow(&mut app, KeyCode::Down);
+        assert_eq!(app.panel_scroll, before + 1);
+        screen(&mut app, 120, 40);
+        alt(&mut app, 'i');
+        screen(&mut app, 120, 40);
+        alt(&mut app, 'i');
+        let before = app.panel_scroll;
+        alt_arrow(&mut app, KeyCode::Down);
+        assert_eq!(app.panel_scroll, before + 1);
+
+        // A click closes the open notice, and the wheel where the frame drew it open scrolls
+        // the transcript under it, as it does under any closed notice.
+        screen(&mut app, 120, 40);
+        alt(&mut app, 'o');
+        screen(&mut app, 120, 40);
+        let area = app.provider_banner.area;
+        assert!(mouse(&mut app, CLICK, area.x + 2, area.y + 1));
+        assert!(!app.provider_banner.expanded());
+        let scrolled = app.scroll.rows();
+        let (x, y) = (area.x + 2, area.bottom() - 2);
+        assert!(mouse(&mut app, MouseEventKind::ScrollUp, x, y));
+        assert_eq!(app.scroll.rows(), scrolled + 3);
+
+        // The same for the error.
+        screen(&mut app, 120, 40);
+        alt(&mut app, 'i');
+        screen(&mut app, 120, 40);
+        let area = app.banner.area;
+        assert!(mouse(&mut app, CLICK, area.x + 2, area.y + 1));
+        assert!(!app.banner.expanded());
+        let scrolled = app.scroll.rows();
+        let (x, y) = (area.x + 2, area.bottom() - 2);
+        assert!(mouse(&mut app, MouseEventKind::ScrollUp, x, y));
+        assert_eq!(app.scroll.rows(), scrolled + 3);
+
+        // Codex's session error changes under the open error. The new one starts closed, and
+        // before a frame draws it, Alt+↓ reaches the request panel.
+        screen(&mut app, 120, 40);
+        alt(&mut app, 'i');
+        screen(&mut app, 120, 40);
+        app.on_thread_event(session_error(2, json!(forty_lines("new error"))));
+        assert!(app.banner.showing() && !app.banner.expanded());
+        let before = app.panel_scroll;
+        alt_arrow(&mut app, KeyCode::Down);
+        assert_eq!(app.panel_scroll, before + 1);
+        let buffer = cells(&mut app, 120, 40);
+        let text = text_in(&buffer, app.banner.area);
+        assert!(text.contains("new error line 1"), "{text}");
+        assert_eq!(app.composer.text(), "half a reply");
+        assert_eq!(reads(&runtime), 0);
+    }
+
     #[test]
     fn at_any_size_the_banners_stay_apart_inside_the_transcript() {
         let long = format!(

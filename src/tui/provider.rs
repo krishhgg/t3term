@@ -1072,6 +1072,96 @@ mod tests {
         assert!(!banner.on_key(&key(KeyCode::Down, alt)));
     }
 
+    /// Twelve lines of message, which with the title fill thirteen rows.
+    fn twelve_lines(what: &str) -> String {
+        (1..=12)
+            .map(|n| format!("{what} {n}"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn a_new_notice_over_an_open_one_leaves_alt_arrows_and_the_wheel_before_the_next_frame() {
+        let alt = KeyModifiers::ALT;
+        let mut provider = codex("warning");
+        provider["message"] = json!(twelve_lines("line"));
+        let mut banner = Banner::default();
+        banner.follow(None, Some(&provider));
+        draw(&mut banner, 60, 30, 8);
+        assert!(banner.on_key(&key(KeyCode::Char('o'), alt)));
+        let rows = draw(&mut banner, 60, 30, 8);
+        assert!(rows[7].contains("Lines 1-6 of 13"), "{rows:#?}");
+
+        // T3 checks Codex again and finds it as it was. Before the next frame, the open notice
+        // keeps where it was scrolled and still takes Alt+↓ and the wheel.
+        assert!(banner.on_key(&key(KeyCode::Down, alt)));
+        provider["checkedAt"] = json!("2026-10-10T12:00:05.000Z");
+        banner.follow(None, Some(&provider));
+        assert!(banner.expanded());
+        assert!(banner.on_key(&key(KeyCode::Down, alt)));
+        // The middle column, which the banner covers open or closed.
+        let x = 30;
+        let wheel = |kind| mouse(kind, x, 3);
+        assert_eq!(
+            banner.on_mouse(&wheel(MouseEventKind::ScrollDown)),
+            Some(true)
+        );
+        let rows = draw(&mut banner, 60, 30, 8);
+        assert!(rows[7].contains("Lines 4-9 of 13"), "{rows:#?}");
+
+        // T3's message changes, so a new notice takes its place, closed. The last frame drew
+        // the open one, but before the next frame Alt+↑/↓ and the wheel go on, as they do for
+        // any closed notice.
+        provider["message"] = json!(twelve_lines("new line"));
+        banner.follow(None, Some(&provider));
+        assert!(banner.showing() && !banner.expanded());
+        assert!(!banner.on_key(&key(KeyCode::Down, alt)));
+        assert!(!banner.on_key(&key(KeyCode::Up, alt)));
+        assert_eq!(banner.on_mouse(&wheel(MouseEventKind::ScrollDown)), None);
+        assert_eq!(banner.on_mouse(&wheel(MouseEventKind::ScrollUp)), None);
+        // It still takes the clicks that land where it was drawn, so none reaches the rows
+        // under it.
+        let right = MouseEventKind::Down(MouseButton::Right);
+        assert_eq!(banner.on_mouse(&mouse(right, x, 3)), Some(false));
+        let rows = draw(&mut banner, 60, 30, 8);
+        assert_eq!(
+            banner.area.height, 6,
+            "the title, three rows and the borders"
+        );
+        assert!(rows[2].contains("new line 1"), "{rows:#?}");
+        assert!(rows[5].contains("Alt+O more"), "{rows:#?}");
+    }
+
+    #[test]
+    fn closing_an_open_notice_leaves_alt_arrows_and_the_wheel_before_the_next_frame() {
+        let alt = KeyModifiers::ALT;
+        let mut banner = showing(&twelve_lines("line"));
+        draw(&mut banner, 60, 30, 8);
+        // The middle column, which the banner covers open or closed.
+        let x = 30;
+        let wheel = |kind| mouse(kind, x, 3);
+
+        // Alt+O opens it, a frame draws it too long for its rows, and Alt+O closes it again.
+        assert!(banner.on_key(&key(KeyCode::Char('o'), alt)));
+        draw(&mut banner, 60, 30, 8);
+        assert!(banner.on_key(&key(KeyCode::Char('o'), alt)));
+        assert!(!banner.on_key(&key(KeyCode::Down, alt)));
+        assert_eq!(banner.on_mouse(&wheel(MouseEventKind::ScrollDown)), None);
+
+        // A click opens it, a frame draws it, and a second click closes it.
+        draw(&mut banner, 60, 30, 8);
+        assert_eq!(banner.on_mouse(&mouse(CLICK, x, 3)), Some(true));
+        draw(&mut banner, 60, 30, 8);
+        assert!(banner.on_key(&key(KeyCode::Down, alt)), "open, it scrolls");
+        assert_eq!(banner.on_mouse(&mouse(CLICK, x, 3)), Some(true));
+        assert!(!banner.expanded());
+        assert!(!banner.on_key(&key(KeyCode::Up, alt)));
+        assert_eq!(banner.on_mouse(&wheel(MouseEventKind::ScrollUp)), None);
+        let rows = draw(&mut banner, 60, 30, 8);
+        assert!(rows[2].contains("line 1"), "{rows:#?}");
+        assert!(rows[5].contains("Alt+O more"), "{rows:#?}");
+    }
+
     #[test]
     fn its_keys_are_its_own_and_only_while_it_shows() {
         let alt = KeyModifiers::ALT;
