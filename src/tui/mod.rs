@@ -1,9 +1,10 @@
 //! The interactive client. It draws only after input or a server event, at most 30 times a
 //! second. Hiding, showing or resizing the sidebar draws at once, so a click that follows lands
 //! on the new layout. Two timers can wake it besides: a one-second tick, armed while the open
-//! thread has a run going or a sidebar card on screen reads Working or Goal, so the elapsed-time
-//! labels and spinners advance, and a one-shot timer for the moment the soonest snooze ends,
-//! which no server event marks. An idle TUI uses no CPU.
+//! thread has a run going, its worktree setup card on screen shows a setup still running, or a
+//! sidebar card on screen reads Working or Goal, so the elapsed-time labels and spinners
+//! advance, and a one-shot timer for the moment the soonest snooze ends, which no server event
+//! marks. An idle TUI uses no CPU.
 
 mod banner;
 mod composer;
@@ -12,6 +13,7 @@ mod picker;
 mod plan;
 mod provider;
 mod scroll;
+mod setup;
 mod sidebar;
 mod tasks;
 mod theme;
@@ -44,7 +46,7 @@ use crate::transcript::{self, BlockKind, ChangeLine};
 use composer::Composer;
 use markdown::Styles;
 use picker::{Item, Kind, Pick};
-use scroll::Scroll;
+use scroll::{Pin, Scroll};
 use sidebar::{Capabilities, Sidebar, View};
 use theme::{
     Theme, duration_label, model_display_name, monogram, now_ms, parse_iso_ms, runtime_mode_label,
@@ -69,6 +71,10 @@ const NARROWEST_SIDEBAR: u16 = 20;
 const NARROWEST_MAIN: u16 = 20;
 /// How far `[` and `]` move the sidebar's edge, in columns.
 const SIDEBAR_STEP: u16 = 2;
+
+/// Opens T3's worktree setup subscription for a thread: `Client::watch_worktree_setup`, or a
+/// test's stand-in.
+type WatchSetup = Box<dyn Fn(&str) -> mpsc::UnboundedReceiver<WatchEvent>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -202,6 +208,11 @@ struct Prepared {
     /// Handoffs whose endpoints read the thread's runs, because T3 didn't stamp models on both
     /// ends. While it's empty, `OpenThread::apply` doesn't look at what a run event changed.
     run_readers: HashSet<String>,
+    /// How many blocks are prompts, and where the first is, which place and retire the
+    /// worktree setup card. They are counted as the blocks are put in order, so a frame
+    /// doesn't look through the blocks for them.
+    users: usize,
+    first_user: Option<usize>,
 }
 
 impl Prepared {
@@ -231,6 +242,8 @@ impl Prepared {
         if !current {
             self.run_readers.clear();
         }
+        self.users = 0;
+        self.first_user = None;
         let mut kept: HashMap<String, (transcript::Block, u64)> = self
             .blocks
             .drain(..)
@@ -258,6 +271,10 @@ impl Prepared {
                     }
                 }
             };
+            if block.kind == BlockKind::User {
+                self.first_user.get_or_insert(self.blocks.len());
+                self.users += 1;
+            }
             self.blocks.push(block);
             self.versions.push(version);
         }
@@ -319,6 +336,8 @@ struct OpenThread {
     prepared: Prepared,
     /// The thread's error from T3, for the banner.
     error: banner::Derived,
+    /// The thread's worktree setup, its subscription and its card.
+    setup: setup::Watch,
 }
 
 impl OpenThread {
@@ -332,6 +351,7 @@ impl OpenThread {
             run_changes: HashMap::new(),
             prepared: Prepared::default(),
             error: banner::Derived::default(),
+            setup: setup::Watch::default(),
         }
     }
 
@@ -376,6 +396,17 @@ impl OpenThread {
         if let Some(state) = &self.state {
             self.prepared.refresh(state);
         }
+    }
+
+    /// Lays the worktree setup card out for a frame `width` columns wide, after `prepare`. The
+    /// prompts were counted as the blocks were made, and whether the turn started was noted
+    /// when an event last changed the runs, so this reads neither the items nor the runs.
+    fn lay_out_setup(&mut self, width: usize, now: i64, theme: &Theme) {
+        let turn = setup::Turn {
+            started: self.setup.turn_started,
+            follow_up: self.prepared.users > 1,
+        };
+        self.setup.lay_out(turn, width, now, theme);
     }
 }
 
@@ -466,6 +497,11 @@ struct App {
     /// The whole screen the last frame drew, which a drag and `[` and `]` work out the
     /// sidebar's width against.
     screen: Rect,
+    /// Opens the open thread's worktree setup subscription.
+    watch_setup: WatchSetup,
+    /// Set once T3 refuses the worktree setup subscription. T3 refuses it for the session or
+    /// the server, never for one thread, so no thread asks again.
+    setup_refused: bool,
     quit: bool,
 }
 
@@ -534,9 +570,20 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
             + Duration::from_millis(wake.map_or(0, |at| {
                 ((at - now_ms()).max(0) + 50).min(i32::MAX as i64) as u64
             }));
-        let thread_event = async {
-            match app.open.as_mut() {
-                Some(open) => open.events.recv().await,
+        // The open thread's watch and its worktree setup subscription, which are its own.
+        let (thread_events, setup_events) = match app.open.as_mut() {
+            Some(open) => (Some(&mut open.events), open.setup.events.as_mut()),
+            None => (None, None),
+        };
+        let thread_event = async move {
+            match thread_events {
+                Some(events) => events.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        let setup_event = async move {
+            match setup_events {
+                Some(events) => events.recv().await,
                 None => std::future::pending().await,
             }
         };
@@ -558,6 +605,8 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
                 app.on_thread_event(event);
                 dirty = true;
             }
+            // `None` once the subscription has ended, which closes it for good.
+            event = setup_event => dirty |= app.on_setup_event(event),
             Some(result) = action_results.recv() => {
                 app.on_action_result(result);
                 dirty = true;
@@ -580,16 +629,18 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
 }
 
 /// Whether a clock or spinner needs the once-a-second tick: the open thread has a run going,
-/// or the last frame drew a sidebar card that reads Working or Goal. Work the sidebar doesn't
+/// the last frame drew its worktree setup card while its subscription says the setup runs, or
+/// the last frame drew a sidebar card that reads Working or Goal. Work the sidebar doesn't
 /// show, because it is behind a closed shelf, scrolled away or in a hidden sidebar, doesn't
-/// wake the TUI.
+/// wake the TUI, and neither does a setup card out of view.
 fn needs_tick(open: Option<&OpenThread>, sidebar: &Sidebar) -> bool {
     // A closed watch never hears that its run finished, so its last state can't count.
     let open_run = open
         .filter(|o| o.connection != "closed")
         .and_then(|o| o.state.as_ref())
         .is_some_and(|s| s.active_run().is_some());
-    open_run || sidebar.drew_working()
+    let setup = open.is_some_and(|o| o.setup.ticks());
+    open_run || setup || sidebar.drew_working()
 }
 
 /// The sidebar's column, `sidebar_width` columns wide, and the main column, which takes the
@@ -666,6 +717,7 @@ impl App {
         settings: &Settings,
         actions: mpsc::UnboundedSender<ActionResult>,
     ) -> App {
+        let watcher = client.clone();
         App {
             client,
             theme,
@@ -719,6 +771,8 @@ impl App {
             picker_rows: Vec::new(),
             sidebar_toggle: Rect::default(),
             screen: Rect::default(),
+            watch_setup: Box::new(move |thread_id: &str| watcher.watch_worktree_setup(thread_id)),
+            setup_refused: false,
             quit: false,
         }
     }
@@ -738,6 +792,8 @@ impl App {
                 self.settle_draft();
                 // The shell's copy of the open thread names its model and provider instance.
                 self.follow_provider(false);
+                // It has the thread's worktree path too.
+                self.follow_setup();
             }
             WatchEvent::Reconnecting { .. } => self.shell_connection = "reconnecting".into(),
             WatchEvent::Failed(message) => self.message = Some((message, true)),
@@ -787,18 +843,69 @@ impl App {
                 if self.settle_draft() || thread_changed {
                     self.follow_provider(false);
                 }
+                // The thread's worktree path, and whether its run is preparing a worktree or
+                // has started its turn, change only with the thread or its runs.
+                let runs_changed =
+                    matches!(&applied, Applied::Event(kind) if kind.starts_with("run."));
+                if thread_changed || runs_changed {
+                    self.follow_setup();
+                }
                 self.drop_landed();
             }
             WatchEvent::Reconnecting { reason, .. } => {
                 open.connection = format!("reconnecting: {reason}")
             }
+            // The thread is closed to t3term, so its worktree setup is too.
             WatchEvent::Failed(message) => {
                 open.connection = "closed".into();
+                open.setup.close();
                 self.message = Some((message, true));
             }
         }
         self.follow_tasks();
         self.follow_banner();
+    }
+
+    /// Opens or closes the open thread's worktree setup subscription as the desktop's chat view
+    /// does (`worktreeSetupQuery` in ChatView.tsx): open while the thread has a worktree or its
+    /// activity run is preparing one, closed otherwise. It notes whether that run has started
+    /// its turn, for the card. It runs when a thread opens and after what can change these: a
+    /// snapshot, an event for the thread or a run, and the shell's copy of the thread. So
+    /// neither a frame, a key nor a piece of a streamed answer looks. A subscription that ended
+    /// for good isn't asked for again, nor is one T3 refused.
+    fn follow_setup(&mut self) {
+        let has_worktree = self
+            .open_thread_json()
+            .is_some_and(|thread| thread.get("worktreePath").is_some_and(Value::is_string));
+        let Some(open) = self.open.as_mut() else {
+            return;
+        };
+        let run = open.state.as_ref().and_then(ThreadState::activity_run);
+        let preparing = run.is_some_and(|run| status(run) == "preparing");
+        open.setup.turn_started =
+            run.is_some_and(|run| run.get("startedAt").is_some_and(|at| !at.is_null()));
+        if !has_worktree && !preparing {
+            open.setup.close();
+        } else if !self.setup_refused && open.setup.wants() {
+            open.setup.watch((self.watch_setup)(&open.id));
+        }
+    }
+
+    /// Applies an item from the open thread's worktree setup subscription, or `None` once it
+    /// ended, and says whether the card needs drawing again. A refusal says nothing: the card
+    /// only reads, and the thread works without it.
+    fn on_setup_event(&mut self, event: Option<WatchEvent>) -> bool {
+        let Some(open) = self.open.as_mut() else {
+            return false;
+        };
+        match open.setup.apply(event, &open.id) {
+            setup::Outcome::Changed => true,
+            setup::Outcome::Unchanged => false,
+            setup::Outcome::Refused => {
+                self.setup_refused = true;
+                false
+            }
+        }
     }
 
     /// Brings the tasks drawer up to date with the open thread and its watch. It runs after
@@ -1055,6 +1162,7 @@ impl App {
         // comes with it.
         self.follow_banner();
         self.follow_provider(false);
+        self.follow_setup();
         self.scroll.set(0);
         self.picker = None;
         self.focus = Focus::Composer;
@@ -1204,6 +1312,11 @@ impl App {
                     MouseEventKind::ScrollDown if inside(self.sidebar.list) => {
                         self.sidebar.move_selection(1)
                     }
+                    MouseEventKind::Down(MouseButton::Left)
+                        if inside(self.transcript_area) && self.setup_toggle_at(mouse.row) =>
+                    {
+                        self.toggle_setup()
+                    }
                     MouseEventKind::Down(MouseButton::Left) if inside(self.transcript_area) => {
                         let bundle = self
                             .bundle_rows
@@ -1245,6 +1358,10 @@ impl App {
             }
             Event::Resize(..) => {
                 self.cache.clear();
+                // The setup card's Details row moves with the width.
+                if let Some(open) = self.open.as_mut() {
+                    open.setup.drawn = None;
+                }
                 // A drag's columns don't line up with the new screen, so it ends without its
                 // width. The edge may have moved, so it takes no press until the next frame
                 // draws it.
@@ -1414,6 +1531,7 @@ impl App {
                 KeyCode::Char('G') | KeyCode::End => self.scroll.set(0),
                 KeyCode::Char('t') => self.toggle_verbose(),
                 KeyCode::Char('p') => self.toggle_first_plan(),
+                KeyCode::Char('w') if !ctrl && !alt => self.toggle_setup(),
                 KeyCode::Char('a') => self.respond("accept"),
                 KeyCode::Char('s') => self.respond("acceptForSession"),
                 KeyCode::Char('d') => self.respond("decline"),
@@ -1439,7 +1557,31 @@ impl App {
     fn toggle_plan(&mut self, id: String, header: isize) {
         self.focus = Focus::Transcript;
         let row = plan::flip(&mut self.expanded_plans, &id, header);
-        self.scroll.pin(id, row);
+        self.scroll.pin(Pin::Plan(id), row);
+    }
+
+    /// Opens or closes the worktree setup's details, as the Details button on the desktop's
+    /// card does. Only this window keeps it. The next frame keeps the Details row on the row
+    /// it was on, as a plan's toggle keeps its header, unless a key or the wheel moves the
+    /// transcript first. It does nothing unless the last frame drew the card with a Details
+    /// row, and a second toggle before the next frame does nothing either.
+    fn toggle_setup(&mut self) {
+        let Some(row) = self.open.as_mut().and_then(|open| open.setup.toggle()) else {
+            return;
+        };
+        self.focus = Focus::Transcript;
+        self.scroll.pin(Pin::Setup, row);
+    }
+
+    /// Whether screen row `row` showed the worktree setup's Details row in the last frame, and
+    /// nothing has moved it since: the transcript hasn't scrolled, the setup hasn't changed,
+    /// the screen hasn't resized and no sidebar change is waiting for a frame.
+    fn setup_toggle_at(&self, row: u16) -> bool {
+        !self.layout_changed
+            && self
+                .open
+                .as_ref()
+                .is_some_and(|open| open.setup.toggle_at(row, self.scroll.rows()))
     }
 
     /// `p` expands or collapses the first long plan in view, reading down from the top of the
@@ -2296,13 +2438,18 @@ impl App {
         let muted = Style::new().fg(t.muted);
         // Clicks and `p` act on the plans this frame draws, so the last frame's go first.
         self.drawn_plans.clear();
+        let width = area.width.saturating_sub(1).max(10);
+        let now = self.now;
         if let Some(open) = self.open.as_mut() {
             open.prepare();
+            // Clicks and `w` act on the setup card this frame draws too.
+            open.setup.drawn = None;
+            open.lay_out_setup(width as usize, now, &t);
         }
-        let Some((state, run_changes, prepared)) = self
+        let Some((state, run_changes, prepared, setup)) = self
             .open
             .as_ref()
-            .and_then(|o| Some((o.state.as_ref()?, &o.run_changes, &o.prepared)))
+            .and_then(|o| Some((o.state.as_ref()?, &o.run_changes, &o.prepared, &o.setup)))
         else {
             let hint = if self.open.is_some() {
                 "Loading thread…"
@@ -2314,7 +2461,6 @@ impl App {
             frame.render_widget(Paragraph::new(Line::styled(hint, muted)), area);
             return;
         };
-        let width = area.width.saturating_sub(1).max(10);
         let blocks = &prepared.blocks;
         // A plan that has left the thread forgets that it was expanded.
         plan::keep_present(&mut self.expanded_plans, blocks);
@@ -2428,14 +2574,37 @@ impl App {
             }
             heights.push(self.cache[&block.item_id].lines.len());
         }
+        // The worktree setup card goes under the thread's first prompt and its clock row, as the
+        // desktop puts it under the first message and its working row, or after the last block
+        // while there is no prompt. Under a prompt its rows count as the prompt's, so the anchor
+        // and the pins treat them as the prompt's own. After the last block they count as a
+        // height of their own, so the scroll's total has them.
+        let card = setup.card();
+        let host = card.and(prepared.first_user);
+        let card_at = card.map(|card| match host {
+            Some(host) => {
+                let at: usize = heights[..=host].iter().sum();
+                heights[host] += card.lines.len();
+                at
+            }
+            None => {
+                let at: usize = heights.iter().sum();
+                heights.push(card.lines.len());
+                at
+            }
+        });
         let total: usize = heights.iter().sum();
         let height = area.height as usize;
         // A plan just expanded or collapsed keeps its header on the row it had, so the click
-        // doesn't move the text, even while the view follows the bottom. A key or the wheel
-        // that moved the transcript after the toggle has already cancelled this.
-        let pinned = self.scroll.take_pin().and_then(|(id, row)| {
-            let header = self.cache.get(&id)?.toggle?.0;
-            scroll_to(blocks, &heights, &id, header, row, height)
+        // doesn't move the text, even while the view follows the bottom, and the setup card's
+        // Details row does the same when it opens or closes. A key or the wheel that moved the
+        // transcript after the toggle has already cancelled this.
+        let pinned = self.scroll.take_pin().and_then(|(pin, row)| match pin {
+            Pin::Plan(id) => {
+                let header = self.cache.get(&id)?.toggle?.0;
+                scroll_to(blocks, &heights, &id, header, row, height)
+            }
+            Pin::Setup => Some(scroll_at(total, card_at? + card?.toggle?, row, height)),
         });
         // Scrolled up, the view stays on the row it was reading: output that arrives for a
         // block on screen makes it taller, and without this the text would slide away. The
@@ -2455,6 +2624,13 @@ impl App {
         self.scroll.set(scroll);
         let end = total - scroll;
         let start = end.saturating_sub(height);
+        // The setup card's rows in view, counted from its first.
+        let card_view = card.zip(card_at).and_then(|(card, at)| {
+            let from = start.saturating_sub(at);
+            let to = end.saturating_sub(at).min(card.lines.len());
+            (from < to).then_some((card, at, from, to))
+        });
+        let mut drawn_setup = None;
 
         // Copy only the rows in view.
         let mut lines = Vec::with_capacity(height);
@@ -2465,7 +2641,9 @@ impl App {
         let mut anchor = None;
         let mut rows = Vec::new();
         let mut plans = Vec::new();
-        for ((block, block_height), bundle) in blocks.iter().zip(&heights).zip(&bundles) {
+        for (index, ((block, block_height), bundle)) in
+            blocks.iter().zip(&heights).zip(&bundles).enumerate()
+        {
             if *block_height > 0 && offset + block_height > start && offset < end {
                 let cached = &self.cache[&block.item_id];
                 let from = start.saturating_sub(offset);
@@ -2484,7 +2662,16 @@ impl App {
                 {
                     plans.push(card);
                 }
-                lines.extend(cached.lines[from..to].iter().cloned());
+                // A prompt with the setup card under it has the card's rows after its own.
+                let own = cached.lines.len();
+                lines.extend(cached.lines[from.min(own)..to.min(own)].iter().cloned());
+                if host == Some(index)
+                    && let Some((card, at, from, to)) = card_view
+                {
+                    let top = at as isize - start as isize;
+                    drawn_setup = card.drawn(from, to, top, area.y, scroll);
+                    lines.extend(card.lines[from..to].iter().cloned());
+                }
                 anchor.get_or_insert_with(|| (block.item_id.clone(), from));
                 if block.output_omitted && self.outputs.wanted(&block.item_id, &block.updated_at) {
                     wanted.push((block.item_id.clone(), block.updated_at.clone()));
@@ -2494,6 +2681,14 @@ impl App {
             if offset >= end {
                 break;
             }
+        }
+        // A card with no prompt above it follows the last block.
+        if host.is_none()
+            && let Some((card, at, from, to)) = card_view
+        {
+            let top = at as isize - start as isize;
+            drawn_setup = card.drawn(from, to, top, area.y, scroll);
+            lines.extend(card.lines[from..to].iter().cloned());
         }
         self.bundle_rows = rows;
         self.drawn_plans = plans;
@@ -2512,6 +2707,9 @@ impl App {
         }
         self.anchor = anchor.filter(|_| scroll > 0);
         self.drawn_scroll = scroll;
+        if let Some(open) = self.open.as_mut() {
+            open.setup.drawn = drawn_setup;
+        }
         for (item_id, revision) in wanted {
             self.fetch_output(item_id, revision);
         }
@@ -3044,7 +3242,8 @@ impl App {
                     .drawn_plans
                     .first()
                     .map(|card| self.expanded_plans.contains(&card.id));
-                hint = transcript_keys(self.verbose, plan);
+                let setup = self.open.as_ref().and_then(|open| open.setup.hint());
+                hint = transcript_keys(self.verbose, plan, setup);
                 hint.as_str()
             }
         };
@@ -3074,11 +3273,17 @@ impl App {
 }
 
 /// The keys the status line offers while the transcript has focus. `plan` is whether the
-/// first long plan in view, the one `p` toggles, is expanded, when there is one.
-fn transcript_keys(verbose: bool, plan: Option<bool>) -> String {
+/// first long plan in view, the one `p` toggles, is expanded, when there is one. `setup` is
+/// whether the worktree setup's details are open, while its Details row is drawn.
+fn transcript_keys(verbose: bool, plan: Option<bool>, setup: Option<bool>) -> String {
     let plan = match plan {
         Some(true) => " · p collapse plan",
         Some(false) => " · p expand plan",
+        None => "",
+    };
+    let setup = match setup {
+        Some(true) => " · w hide setup details",
+        Some(false) => " · w show setup details",
         None => "",
     };
     let calls = if verbose {
@@ -3086,7 +3291,7 @@ fn transcript_keys(verbose: bool, plan: Option<bool>) -> String {
     } else {
         "t open all"
     };
-    format!("↑↓/PgUp scroll · G bottom{plan} · click a row of calls · {calls} · Esc sidebar")
+    format!("↑↓/PgUp scroll · G bottom{plan}{setup} · click a row of calls · {calls} · Esc sidebar")
 }
 
 /// The scroll, in rows up from the bottom, that puts row `within` of block `id` on screen row
@@ -3104,12 +3309,17 @@ fn scroll_to(
     for (block, block_height) in blocks.iter().zip(heights) {
         if block.item_id == id {
             let top = above + within.min(block_height.saturating_sub(1));
-            let start = top.saturating_add_signed(-row);
-            return Some(total.saturating_sub(start + height));
+            return Some(scroll_at(total, top, row, height));
         }
         above += block_height;
     }
     None
+}
+
+/// The scroll, in rows up from the bottom of a transcript `total` rows long, that puts its row
+/// `at` on screen row `row`, which is negative above the screen.
+fn scroll_at(total: usize, at: usize, row: isize, height: usize) -> usize {
+    total.saturating_sub(at.saturating_add_signed(-row) + height)
 }
 
 // ---- block rendering ----
@@ -4271,6 +4481,7 @@ mod tests {
             run_changes: HashMap::new(),
             prepared: Prepared::default(),
             error: banner::Derived::default(),
+            setup: setup::Watch::default(),
         };
 
         // A working card on screen ticks by itself, even past a closed watch.
@@ -4356,15 +4567,28 @@ mod tests {
     #[test]
     fn the_transcript_hint_offers_p_only_with_a_long_plan_in_view() {
         assert_eq!(
-            transcript_keys(false, None),
+            transcript_keys(false, None, None),
             "↑↓/PgUp scroll · G bottom · click a row of calls · t open all · Esc sidebar"
         );
         assert_eq!(
-            transcript_keys(true, None),
+            transcript_keys(true, None, None),
             "↑↓/PgUp scroll · G bottom · click a row of calls · t close them · Esc sidebar"
         );
-        assert!(transcript_keys(false, Some(false)).contains("G bottom · p expand plan · click"));
-        assert!(transcript_keys(true, Some(true)).contains("G bottom · p collapse plan · click"));
+        assert!(
+            transcript_keys(false, Some(false), None).contains("G bottom · p expand plan · click")
+        );
+        assert!(
+            transcript_keys(true, Some(true), None).contains("G bottom · p collapse plan · click")
+        );
+        // `w` shows while the setup card's Details row is drawn, after `p`.
+        assert!(
+            transcript_keys(false, Some(false), Some(false))
+                .contains("p expand plan · w show setup details · click")
+        );
+        assert!(
+            transcript_keys(false, None, Some(true))
+                .contains("G bottom · w hide setup details · click")
+        );
     }
 
     #[test]
@@ -5018,12 +5242,15 @@ mod tests {
     /// The TUI as the event loop starts it, with a client that reaches no server. What it
     /// saves goes to `saved_in_test`, never to a settings file.
     fn tui(settings: &Settings) -> App {
-        App::new(
+        let mut app = App::new(
             Arc::new(Client::offline()),
             Theme::new(Depth::TrueColor),
             settings,
             mpsc::unbounded_channel().0,
-        )
+        );
+        // A thread with a worktree subscribes to its setup, which here sends nothing.
+        app.watch_setup = Box::new(|_: &str| mpsc::unbounded_channel().1);
+        app
     }
 
     /// Draws one frame of `app` on a screen `width` columns by `height` rows, as the event loop
