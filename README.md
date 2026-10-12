@@ -147,6 +147,10 @@ An agent writes each step's text, so the drawer, the transcript and `t3term read
 
 When the provider the composer would send the next message with isn't ready, or runs a version T3 knows is broken or doesn't support, a banner at the top of the conversation says so, as the nightly desktop's does. It lies over the transcript like the thread error banner, and above it when both show.
 
+[![An amber banner reads Codex provider status, with a warning that the provider answers slowly right now, × and Alt+N dismiss. Under it, a red banner shows the thread's provider session error, with × and Alt+W dismiss. The transcript shows around both, and the composer holds the draft draft stays here](docs/screenshots/provider-status-stacked.png)](docs/provider-status-verification.md)
+
+The thread and its errors are invented and come from a fake T3 server, and the image renders t3term's captured terminal output in truecolor. [Provider status verification](docs/provider-status-verification.md) lists what was checked, with captures of an unsupported version, a sign-in error, a long notice, 256 colors and a 42x18 screen. A [capture slideshow](docs/screenshots/provider-status-capture-slideshow.mp4) steps through six of the captures. It is a slideshow of the captures, not a recording.
+
 The provider is the one the model chip names. That is the model you picked for the thread and haven't sent yet, while T3 would still take it, else the thread's own model selection. The banner looks that provider instance up in T3's config by its id, so two instances of one driver, such as Codex and a second Codex for work, each have their own notice. It finds the instance even when T3 lists no models for it. With no thread open, or once T3's config no longer lists the instance, there is no banner, and t3term never shows another provider's status in its place.
 
 What it says follows the desktop's `ProviderStatusBanner`:
