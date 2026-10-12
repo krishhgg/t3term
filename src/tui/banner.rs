@@ -335,7 +335,8 @@ pub(super) struct Drawn {
     pub close: Rect,
     /// Whether the closed banner cut its text short.
     pub clipped: bool,
-    /// Whether the open banner's text was too long for its rows, which is when it scrolls.
+    /// Whether the open banner's text was too long for its rows. It scrolls while it stays
+    /// open.
     pub overflows: bool,
 }
 
@@ -353,37 +354,46 @@ pub(super) enum Answer {
 }
 
 /// A banner's answer to a key. Alt with `keys.dismiss` dismisses it, Alt with `keys.more`
-/// opens or closes its text, either case, and Alt+↑/↓ scroll open text too long for its rows.
-/// Plain keys and Ctrl+Alt aren't a banner's.
-pub(super) fn key_answer(key: &KeyEvent, keys: Keys, overflows: bool) -> Option<Answer> {
+/// opens or closes its text, either case, and Alt+↑/↓ scroll text that is open, as `expanded`
+/// says, and that the last frame drew too long for its rows, as `overflows` says. Closing the
+/// text, or new text taking its place, ends that at once, before the next frame draws it, so
+/// the arrows go on. Plain keys and Ctrl+Alt aren't a banner's.
+pub(super) fn key_answer(
+    key: &KeyEvent,
+    keys: Keys,
+    overflows: bool,
+    expanded: bool,
+) -> Option<Answer> {
     let modifiers = key.modifiers;
     if !modifiers.contains(KeyModifiers::ALT) || modifiers.contains(KeyModifiers::CONTROL) {
         return None;
     }
+    let scrolls = overflows && expanded;
     match key.code {
         KeyCode::Char(c) if c.eq_ignore_ascii_case(&keys.dismiss) => Some(Answer::Dismiss),
         KeyCode::Char(c) if c.eq_ignore_ascii_case(&keys.more) => Some(Answer::Toggle),
-        KeyCode::Up if overflows => Some(Answer::Scroll { down: false }),
-        KeyCode::Down if overflows => Some(Answer::Scroll { down: true }),
+        KeyCode::Up if scrolls => Some(Answer::Scroll { down: false }),
+        KeyCode::Down if scrolls => Some(Answer::Scroll { down: true }),
         _ => None,
     }
 }
 
 /// A banner's answer to the mouse, where the last frame drew it as `drawn`. A click on ×
 /// dismisses it, and a click elsewhere on it opens or closes text that doesn't fit. The wheel
-/// scrolls open text too long for its rows, and otherwise the transcript under it. The banner
-/// takes its other clicks, so a row of calls or a plan under it doesn't open, and focus stays
-/// where it was. None for events outside the banner and wheel events it leaves to the
-/// transcript.
+/// scrolls text that is still open and that the frame drew too long for its rows, as
+/// `key_answer` has it, and otherwise the transcript under it. The banner takes its other
+/// clicks, so a row of calls or a plan under it doesn't open, and focus stays where it was.
+/// None for events outside the banner and wheel events it leaves to the transcript.
 pub(super) fn mouse_answer(mouse: &MouseEvent, drawn: Drawn, expanded: bool) -> Option<Answer> {
     if !inside(drawn.area, mouse) {
         return None;
     }
+    let scrolls = drawn.overflows && expanded;
     Some(match mouse.kind {
         MouseEventKind::Down(MouseButton::Left) if inside(drawn.close, mouse) => Answer::Dismiss,
         MouseEventKind::Down(MouseButton::Left) if drawn.clipped || expanded => Answer::Toggle,
-        MouseEventKind::ScrollUp if drawn.overflows => Answer::Scroll { down: false },
-        MouseEventKind::ScrollDown if drawn.overflows => Answer::Scroll { down: true },
+        MouseEventKind::ScrollUp if scrolls => Answer::Scroll { down: false },
+        MouseEventKind::ScrollDown if scrolls => Answer::Scroll { down: true },
         MouseEventKind::ScrollUp | MouseEventKind::ScrollDown => return None,
         _ => Answer::Nothing,
     })
@@ -863,7 +873,7 @@ impl Banner {
         if !self.showing() {
             return false;
         }
-        let Some(answer) = key_answer(key, ERROR_KEYS, self.overflows) else {
+        let Some(answer) = key_answer(key, ERROR_KEYS, self.overflows, self.expanded()) else {
             return false;
         };
         self.answer(answer);

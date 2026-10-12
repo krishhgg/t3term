@@ -466,7 +466,7 @@ impl Banner {
         if !self.showing() {
             return false;
         }
-        let Some(answer) = key_answer(key, KEYS, self.overflows) else {
+        let Some(answer) = key_answer(key, KEYS, self.overflows, self.expanded()) else {
             return false;
         };
         self.answer(answer);
