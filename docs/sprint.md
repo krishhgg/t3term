@@ -37,6 +37,7 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 | 15 | https://github.com/krishhgg/t3term/pull/22 | Live server config in the TUI, so provider and model changes reach the chips and menus without a reread | `cb51f8c619f395c2aefce8fa81e83e18e8275847` |
 | 16 | https://github.com/krishhgg/t3term/pull/25 | A banner over the conversation, above the thread's error, when the provider the composer would send with isn't ready or runs a version T3 marks broken or unsupported | |
 | 17 | https://github.com/krishhgg/t3term/pull/26 | Worktree setup stream foundation: a client watcher for one thread's `subscribeWorktreeSetup`, for the setup card that comes next. Nothing in the TUI or CLI shows a setup yet | |
+| 18 | https://github.com/krishhgg/t3term/pull/27 | The open thread's worktree setup as a read-only card under its first prompt: stage progress, the setup script's last output and Details. No Cancel, Work locally, terminal or worktree preparation | |
 
 ## Maintenance review PRs
 
