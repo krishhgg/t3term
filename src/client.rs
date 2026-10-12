@@ -448,6 +448,21 @@ impl Client {
             Box::pin(async move { client.rpc().await })
         })
     }
+
+    /// Streams one thread's worktree setup, as `spawn_worktree_setup_watch` describes.
+    pub fn watch_worktree_setup(
+        self: &Arc<Self>,
+        thread_id: &str,
+    ) -> mpsc::UnboundedReceiver<WatchEvent> {
+        let client = self.clone();
+        spawn_worktree_setup_watch(
+            move || {
+                let client = client.clone();
+                Box::pin(async move { client.rpc().await })
+            },
+            thread_id,
+        )
+    }
 }
 
 /// T3 can restart the agent's session to apply these settings, so t3term changes them only
@@ -467,7 +482,7 @@ fn busy_for_settings(run: &Value) -> anyhow::Error {
 pub enum WatchEvent {
     Item(Value),
     /// The connection dropped. The watcher is reconnecting, and resumes after the last sequence
-    /// or starts again from a snapshot, as its stream does.
+    /// or starts again from the current state, as its stream does.
     Reconnecting {
         reason: String,
         retry_in: Duration,
@@ -489,6 +504,10 @@ enum Resume {
     /// From a new snapshot. A stream with no cursor, such as the server config, sends the whole
     /// state first, as `{"type": "snapshot"}`.
     Snapshot,
+    /// From the thread's current setup. `subscribeWorktreeSetup` has no cursor, and each item
+    /// is the whole state: null while T3 tracks no setup for the thread, or a whole snapshot.
+    /// The snapshot's `sequence` counts its changes and is no cursor, so nothing tracks it.
+    WorktreeSetup,
 }
 
 impl Resume {
@@ -499,8 +518,19 @@ impl Resume {
                 item.get("kind").and_then(Value::as_str) == Some("synchronized")
             }
             Resume::Snapshot => item.get("type").and_then(Value::as_str) == Some("snapshot"),
+            // T3 sends the current state, null or a snapshot, as soon as it subscribes.
+            Resume::WorktreeSetup => item.is_null() || is_worktree_setup(item),
         }
     }
+}
+
+/// Whether `item` has the fields every `WorktreeSetupSnapshot` carries that the watcher can
+/// check cheaply, as T3's packages/contracts/src/worktreeSetup.ts defines them.
+fn is_worktree_setup(item: &Value) -> bool {
+    item.get("threadId").is_some_and(Value::is_string)
+        && item.get("phase").is_some_and(Value::is_string)
+        && item.get("stages").is_some_and(Value::is_array)
+        && item.get("sequence").and_then(Value::as_u64).is_some()
 }
 
 /// Runs a subscription until its receiver is dropped. Tracks the highest sequence it delivered so a
@@ -538,6 +568,35 @@ where
     )
 }
 
+/// Runs T3's worktree setup subscription, `subscribeWorktreeSetup`, for one thread until its
+/// receiver is dropped. The payload is `{"threadId"}` alone, as `WorktreeSetupSubscribeInput`
+/// in T3's packages/contracts/src/worktreeSetup.ts defines it. T3 asks only for the
+/// session's `orchestration:read` scope (apps/server/src/auth/RpcAuthorization.ts). Each item
+/// is the thread's whole setup, `WorktreeSetupSnapshot`, or null while T3 tracks none: before
+/// a setup begins, from 30 seconds after one ends, and after T3 restarts, since it keeps
+/// setups in memory only (apps/server/src/project/WorktreeSetupTracker.ts). Every
+/// subscription opens with the current state. Items pass through as T3 sent them, nulls
+/// included.
+///
+/// The stream has no cursor, so a resubscribe sends the same payload and starts again from
+/// the current setup. A setup's `sequence` only counts its changes. T3 can start it again
+/// from 0 after a null or a restart, so the watcher neither resumes after it nor drops an
+/// item with a lower one.
+pub fn spawn_worktree_setup_watch<F>(
+    connect: F,
+    thread_id: &str,
+) -> mpsc::UnboundedReceiver<WatchEvent>
+where
+    F: Fn() -> Pin<Box<dyn Future<Output = Result<RpcClient>> + Send>> + Send + Sync + 'static,
+{
+    watch(
+        Box::new(connect),
+        "subscribeWorktreeSetup",
+        json!({"threadId": thread_id}),
+        Resume::WorktreeSetup,
+    )
+}
+
 fn watch(
     connect: Box<Connect>,
     tag: &'static str,
@@ -548,7 +607,7 @@ fn watch(
     tokio::spawn(async move {
         let mut last_sequence = match resume {
             Resume::AfterSequence(sequence) => sequence,
-            Resume::Snapshot => None,
+            Resume::Snapshot | Resume::WorktreeSetup => None,
         };
         let mut backoff = Duration::from_millis(250);
         loop {
