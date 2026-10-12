@@ -13,7 +13,7 @@ use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
-use t3term::client::{WatchEvent, spawn_config_watch, spawn_watch};
+use t3term::client::{WatchEvent, spawn_config_watch, spawn_watch, spawn_worktree_setup_watch};
 use t3term::projection::{Applied, ThreadState, apply_config};
 use t3term::rpc::{RpcClient, RpcError};
 
@@ -526,4 +526,327 @@ async fn a_refused_config_subscription_ends_the_watch_without_a_retry() {
         .await
         .expect("the server saw both interrupts")
         .unwrap();
+}
+
+// ---- the worktree setup subscription ----
+
+/// How Effect's RPC server fails the setup subscription on a server older than the method.
+const UNKNOWN_SETUP_METHOD: &str = "Unknown request tag: subscribeWorktreeSetup";
+
+/// When each made-up setup and stage starts and ends.
+const SETUP_AT: &str = "2026-10-12T09:00:00.000Z";
+
+/// The stages a setup can report, in T3's `WORKTREE_SETUP_STAGE_ORDER`.
+const SETUP_STAGES: [&str; 5] = ["fetch", "checkout", "submodules", "setup-script", "agent"];
+
+/// The setup subscription request `id` for `thread`. The payload is the thread id alone, as
+/// `WorktreeSetupSubscribeInput` defines it: no cursor, and none of the orchestration flags.
+fn setup_subscription(id: &Value, thread: &str) -> Value {
+    json!({"_tag": "Request", "id": id, "tag": "subscribeWorktreeSetup",
+        "payload": {"threadId": thread}, "headers": []})
+}
+
+/// Reads a setup subscription's request for `thread` and returns its id.
+async fn setup_request(socket: &mut Socket, thread: &str) -> Value {
+    let request = recv(socket).await;
+    let id = request["id"].clone();
+    assert!(id.is_string(), "{request}");
+    assert_eq!(request, setup_subscription(&id, thread));
+    id
+}
+
+/// A whole `WorktreeSetupSnapshot` of a running setup for thread t1, with every field T3's
+/// packages/contracts/src/worktreeSetup.ts defines, and its stages in `statuses`.
+fn setup_snapshot(sequence: u64, statuses: [&str; 5]) -> Value {
+    let stages: Vec<Value> = SETUP_STAGES
+        .iter()
+        .zip(statuses)
+        .map(|(id, status)| {
+            let started = status != "pending";
+            let ended = !matches!(status, "pending" | "running");
+            json!({"id": id, "status": status, "startedAt": started.then_some(SETUP_AT),
+                "endedAt": ended.then_some(SETUP_AT), "percent": null, "detail": null, "tail": []})
+        })
+        .collect();
+    json!({"threadId": "t1", "phase": "running", "startedAt": SETUP_AT, "endedAt": null,
+        "branch": "t3code/setup-card", "baseRef": "main", "worktreePath": null,
+        "setupScript": null, "stages": stages, "error": null, "sequence": sequence})
+}
+
+#[tokio::test]
+async fn setup_watch_asks_for_one_thread_and_passes_on_nulls_and_snapshots_as_sent() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+
+    // One setup from before it begins until T3 drops it.
+    let fetching = setup_snapshot(0, ["running", "pending", "pending", "pending", "pending"]);
+    let mut checking_out = setup_snapshot(1, ["done", "running", "pending", "pending", "pending"]);
+    checking_out["worktreePath"] = json!("/work/repo-t1");
+    checking_out["stages"][1]["percent"] = json!(40);
+    checking_out["stages"][1]["detail"] = json!("1204 files");
+    let mut scripting = setup_snapshot(2, ["done", "done", "skipped", "running", "pending"]);
+    scripting["worktreePath"] = json!("/work/repo-t1");
+    let script = json!({"name": "Install", "command": "bun install", "terminalId": "setup-t1"});
+    scripting["setupScript"] = script;
+    // Cleaning text for the terminal is for whatever prints it, so this escape stays.
+    let tail = ["bun install v1.3.0", "\u{1b}[2Kresolved 412 packages"];
+    scripting["stages"][3]["tail"] = json!(tail);
+    let mut failed = scripting.clone();
+    failed["sequence"] = json!(3);
+    failed["phase"] = json!("failed");
+    failed["endedAt"] = json!(SETUP_AT);
+    failed["error"] = json!("The setup script exited with code 1.");
+    failed["stages"][3]["status"] = json!("failed");
+    failed["stages"][3]["endedAt"] = json!(SETUP_AT);
+    failed["stages"][3]["detail"] = json!("exit 1");
+    // Null first, while T3 tracks no setup, and null again once it drops the failed one.
+    let sent = [Value::Null, fetching, checking_out, scripting, failed, Value::Null];
+    // The middle two arrive in one chunk.
+    let chunks = [&sent[0..1], &sent[1..2], &sent[2..4], &sent[4..5], &sent[5..6]]
+        .map(|items| Value::Array(items.to_vec()));
+
+    let server = tokio::spawn(async move {
+        let mut socket = accept(&listener).await;
+        let id = setup_request(&mut socket, "t1").await;
+        for values in chunks {
+            send(&mut socket, chunk(&id, values)).await;
+            assert_eq!(recv(&mut socket).await, ack(&id));
+        }
+        // Dropping the receiver interrupts the stream.
+        assert_eq!(recv(&mut socket).await, interrupt(&id));
+    });
+
+    let mut events = spawn_worktree_setup_watch(dial(url), "t1");
+    for expected in &sent {
+        assert_eq!(&item(next_event(&mut events).await), expected);
+    }
+    drop(events);
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the server saw the interrupt")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn setup_watch_asks_again_without_a_cursor_and_takes_a_count_that_started_over() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+
+    let late = setup_snapshot(41, ["done", "done", "skipped", "running", "pending"]);
+    // T3 restarted and began the setup again, so its count started over.
+    let restarted = setup_snapshot(2, ["done", "running", "pending", "pending", "pending"]);
+    // T3 restarted once more, with no setup at first, and then began one from 0.
+    let begun = setup_snapshot(0, ["running", "pending", "pending", "pending", "pending"]);
+    let connections = [
+        vec![late.clone()],
+        vec![restarted.clone()],
+        vec![Value::Null, begun.clone()],
+    ];
+
+    let server = tokio::spawn(async move {
+        let last = connections.len() - 1;
+        for (n, items) in connections.into_iter().enumerate() {
+            let mut socket = accept(&listener).await;
+            // The same request each time, however high the last count was.
+            let id = setup_request(&mut socket, "t1").await;
+            send(&mut socket, chunk(&id, Value::Array(items))).await;
+            assert_eq!(recv(&mut socket).await, ack(&id));
+            if n == last {
+                assert_eq!(recv(&mut socket).await, interrupt(&id));
+            }
+            // Earlier connections drop here, without an Exit.
+        }
+    });
+
+    let mut events = spawn_worktree_setup_watch(dial(url), "t1");
+    let reconnect = |event: Option<WatchEvent>| match event {
+        Some(WatchEvent::Reconnecting { .. }) => {}
+        other => panic!("expected a reconnect, got {other:?}"),
+    };
+    assert_eq!(item(next_event(&mut events).await), late);
+    reconnect(next_event(&mut events).await);
+    assert_eq!(item(next_event(&mut events).await), restarted);
+    reconnect(next_event(&mut events).await);
+    assert_eq!(item(next_event(&mut events).await), Value::Null);
+    assert_eq!(item(next_event(&mut events).await), begun);
+    drop(events);
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the server saw the interrupt")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn setup_watch_backs_off_until_a_null_or_a_snapshot_shows_the_subscription_works() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+
+    let server = tokio::spawn(async move {
+        let snapshot = setup_snapshot(5, ["done", "running", "pending", "pending", "pending"]);
+        // The config stream's snapshot, which is neither null nor a setup.
+        let other = config_snapshot(json!([provider("codex")]));
+        // Five connections that drop after these items: nothing, a null, nothing, a snapshot
+        // and the config snapshot.
+        let drops = [json!([]), json!([null]), json!([]), json!([snapshot]), json!([other])];
+        for items in drops {
+            let mut socket = accept(&listener).await;
+            let id = setup_request(&mut socket, "t1").await;
+            if items != json!([]) {
+                send(&mut socket, chunk(&id, items)).await;
+                assert_eq!(recv(&mut socket).await, ack(&id));
+            }
+        }
+        // A sixth that stays up until the receiver goes.
+        let mut socket = accept(&listener).await;
+        let id = setup_request(&mut socket, "t1").await;
+        send(&mut socket, chunk(&id, json!([null]))).await;
+        assert_eq!(recv(&mut socket).await, ack(&id));
+        assert_eq!(recv(&mut socket).await, interrupt(&id));
+    });
+
+    let mut events = spawn_worktree_setup_watch(dial(url), "t1");
+    let mut waits = Vec::new();
+    loop {
+        match next_event(&mut events).await {
+            Some(WatchEvent::Reconnecting { retry_in, .. }) => waits.push(retry_in.as_millis()),
+            // The sixth connection's null.
+            Some(WatchEvent::Item(Value::Null)) if waits.len() == 5 => break,
+            Some(WatchEvent::Item(_)) => {}
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    // A null or a snapshot brings the wait back to the shortest. A subscription that sends
+    // nothing doubles it, and so does one that sends anything else.
+    assert_eq!(waits, [250, 250, 500, 250, 500]);
+    drop(events);
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the server saw the interrupt")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_refused_setup_subscription_ends_the_watch_without_a_retry() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    // Effect's answer on a server without the method, and T3's for a session without
+    // `orchestration:read`, which apps/server/src/auth/RpcAuthorization.ts asks for.
+    let unknown = json!({"_tag": "Die", "defect": UNKNOWN_SETUP_METHOD});
+    let scope = json!({"_tag": "Fail", "error": {"_tag": "EnvironmentAuthorizationError",
+        "message": MISSING_SCOPE, "requiredScope": "orchestration:read"}});
+    let refusals = [(unknown, UNKNOWN_SETUP_METHOD), (scope, MISSING_SCOPE)];
+
+    let answers = refusals.clone();
+    let server = tokio::spawn(async move {
+        for (reason, _) in answers {
+            let mut socket = accept(&listener).await;
+            let id = setup_request(&mut socket, "t1").await;
+            send(&mut socket, refusal(&id, reason)).await;
+            // t3term interrupts the stream it dropped, and asks for nothing more.
+            assert_eq!(recv(&mut socket).await, interrupt(&id));
+        }
+    });
+
+    for (_, message) in refusals {
+        let mut events = spawn_worktree_setup_watch(dial(url.clone()), "t1");
+        match next_event(&mut events).await {
+            Some(WatchEvent::Failed(refused)) => assert_eq!(refused, message),
+            other => panic!("expected the refusal, got {other:?}"),
+        }
+        assert!(next_event(&mut events).await.is_none(), "it retried");
+    }
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the server saw both interrupts")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn dropping_a_setup_watch_interrupts_its_stream_and_leaves_the_shell_watch_alone() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+
+    let server = tokio::spawn(async move {
+        let mut socket = accept(&listener).await;
+        // Both subscriptions share the connection, and either can arrive first.
+        let mut requests = HashMap::new();
+        for _ in 0..2 {
+            let request = recv(&mut socket).await;
+            let tag = request["tag"].as_str().unwrap().to_string();
+            requests.insert(tag, request);
+        }
+        let setup = requests["subscribeWorktreeSetup"]["id"].clone();
+        assert_eq!(requests["subscribeWorktreeSetup"], setup_subscription(&setup, "t1"));
+        let shell = requests["orchestration.subscribeShell"]["id"].clone();
+
+        send(&mut socket, chunk(&setup, json!([null]))).await;
+        assert_eq!(recv(&mut socket).await, ack(&setup));
+        let snapshot = json!({"kind": "snapshot", "snapshot": {"snapshotSequence": 1}});
+        let values = json!([snapshot, {"kind": "synchronized"}]);
+        send(&mut socket, chunk(&shell, values)).await;
+        assert_eq!(recv(&mut socket).await, ack(&shell));
+        // The client drops the setup watch once it has both streams' items, and that
+        // interrupts the setup stream alone.
+        assert_eq!(recv(&mut socket).await, interrupt(&setup));
+        let event = json!({"kind": "thread.updated", "sequence": 2, "thread": {"id": "t1"}});
+        send(&mut socket, chunk(&shell, json!([event]))).await;
+        assert_eq!(recv(&mut socket).await, ack(&shell));
+        assert_eq!(recv(&mut socket).await, interrupt(&shell));
+    });
+
+    let rpc = RpcClient::connect_url(&url).await.unwrap();
+    let mut setup_events = spawn_worktree_setup_watch(reuse(rpc.clone()), "t1");
+    let tag = "orchestration.subscribeShell";
+    let payload = json!({"requestCompletionMarker": true});
+    let mut shell_events = spawn_watch(reuse(rpc), tag, payload, None);
+
+    assert_eq!(item(next_event(&mut setup_events).await), Value::Null);
+    let mut kinds = Vec::new();
+    while kinds.len() < 2 {
+        let next = item(next_event(&mut shell_events).await);
+        kinds.push(next["kind"].as_str().unwrap().to_string());
+    }
+    drop(setup_events);
+    // The shell watch on the same connection goes on without a reconnect.
+    let next = item(next_event(&mut shell_events).await);
+    kinds.push(next["kind"].as_str().unwrap().to_string());
+    assert_eq!(kinds, ["snapshot", "synchronized", "thread.updated"]);
+    drop(shell_events);
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the server saw both interrupts")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn dropping_the_receiver_stops_a_setup_watch_that_waits_to_retry() {
+    let calls = Arc::new(AtomicUsize::new(0));
+    let (alive, stopped) = oneshot::channel::<()>();
+    let counted = calls.clone();
+    // A connection refused at once, so the watcher waits longer before each try.
+    let connect = move || -> Connecting {
+        // The watcher holds this function, and so `alive`, until it stops.
+        let _alive = &alive;
+        counted.fetch_add(1, Ordering::SeqCst);
+        Box::pin(async { Err(anyhow::anyhow!("connection refused")) })
+    };
+    let mut events = spawn_worktree_setup_watch(connect, "t1");
+    let mut waits = Vec::new();
+    while waits.len() < 3 {
+        match next_event(&mut events).await {
+            Some(WatchEvent::Reconnecting { reason, retry_in }) => {
+                assert_eq!(reason, "connection refused");
+                waits.push(retry_in.as_millis());
+            }
+            other => panic!("expected a reconnect, got {other:?}"),
+        }
+    }
+    assert_eq!(waits, [250, 500, 1000]);
+
+    // The watcher now waits a second before its fourth try. Dropping the receiver ends the
+    // wait, so the fourth try never starts.
+    drop(events);
+    let stopped = tokio::time::timeout(Duration::from_secs(5), stopped).await;
+    assert!(stopped.expect("the watcher stops").is_err());
+    assert_eq!(calls.load(Ordering::SeqCst), 3);
 }
