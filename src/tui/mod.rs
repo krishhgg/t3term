@@ -7900,4 +7900,860 @@ mod tests {
         assert_eq!(provider_text(&mut app), "");
         assert_eq!(reads(&runtime), 1);
     }
+
+    // ---- worktree setup ----
+
+    /// Each worktree setup subscription the TUI opened, with the thread it is for and the end
+    /// that stands in for T3.
+    type Subscriptions = Arc<std::sync::Mutex<Vec<(String, mpsc::UnboundedSender<WatchEvent>)>>>;
+
+    /// The TUI with the sidebar hidden, noting each worktree setup subscription it opens.
+    fn setup_tui() -> (App, Subscriptions) {
+        let hidden = Settings {
+            sidebar_hidden: true,
+            ..Settings::default()
+        };
+        let mut app = tui(&hidden);
+        let subscriptions = Subscriptions::default();
+        let opened = subscriptions.clone();
+        app.watch_setup = Box::new(move |thread_id: &str| {
+            let (sender, events) = mpsc::unbounded_channel();
+            opened.lock().unwrap().push((thread_id.to_string(), sender));
+            events
+        });
+        (app, subscriptions)
+    }
+
+    /// The threads the subscriptions were opened for, in order.
+    fn subscribed(subscriptions: &Subscriptions) -> Vec<String> {
+        let subscriptions = subscriptions.lock().unwrap();
+        subscriptions.iter().map(|(id, _)| id.clone()).collect()
+    }
+
+    /// T3's end of the `index`th subscription.
+    fn setup_sender(
+        subscriptions: &Subscriptions,
+        index: usize,
+    ) -> mpsc::UnboundedSender<WatchEvent> {
+        subscriptions.lock().unwrap()[index].1.clone()
+    }
+
+    /// Hands the TUI what the open thread's setup subscription has waiting, as the event loop
+    /// does, and says whether any of it needs a frame.
+    fn pump(app: &mut App) -> bool {
+        let mut dirty = false;
+        loop {
+            let event = match app.open.as_mut().and_then(|o| o.setup.events.as_mut()) {
+                None => return dirty,
+                Some(events) => match events.try_recv() {
+                    Ok(event) => Some(event),
+                    Err(mpsc::error::TryRecvError::Empty) => return dirty,
+                    Err(mpsc::error::TryRecvError::Disconnected) => None,
+                },
+            };
+            dirty |= app.on_setup_event(event);
+        }
+    }
+
+    /// Sends `event` down the newest subscription and lets the TUI take it, and says whether
+    /// the TUI wants a frame for it.
+    fn deliver(app: &mut App, subscriptions: &Subscriptions, event: WatchEvent) -> bool {
+        let newest = subscriptions.lock().unwrap().len() - 1;
+        let sender = setup_sender(subscriptions, newest);
+        sender.send(event).expect("the subscription is open");
+        pump(app)
+    }
+
+    /// Thread `thread`'s worktree setup as T3 sends it, with an `Install` script.
+    fn setup_item(thread: &str, phase: &str, sequence: u64, stages: Vec<Value>) -> Value {
+        json!({"threadId": thread, "phase": phase, "startedAt": "2026-10-07T00:00:00.000Z",
+            "endedAt": null, "branch": format!("t3code/{thread}"), "baseRef": "main",
+            "worktreePath": format!("/work/repo-{thread}"),
+            "setupScript": {"name": "Install", "command": "bun install", "terminalId": "setup-1"},
+            "stages": stages, "error": null, "sequence": sequence})
+    }
+
+    /// The five stages in T3's order, with `statuses`.
+    fn setup_stages(statuses: [&str; 5]) -> Vec<Value> {
+        ["fetch", "checkout", "submodules", "setup-script", "agent"]
+            .into_iter()
+            .zip(statuses)
+            .map(|(id, status)| {
+                json!({"id": id, "status": status, "startedAt": null, "endedAt": null,
+                    "percent": null, "detail": null, "tail": []})
+            })
+            .collect()
+    }
+
+    /// The thread's run, `r1`, with its turn started or not.
+    fn setup_run(status: &str, started: bool) -> Value {
+        let started = if started {
+            json!("2026-10-07T00:00:05.000Z")
+        } else {
+            Value::Null
+        };
+        json!({"id": "r1", "status": status, "ordinal": 1, "startedAt": started})
+    }
+
+    /// One short answer after the prompt.
+    fn short_answer() -> Vec<Value> {
+        vec![
+            json!({"id": "a0", "type": "assistant_message", "ordinal": 1,
+            "text": "Looking at the login page."}),
+        ]
+    }
+
+    /// A second prompt, which makes the first turn's setup old news.
+    fn follow_up_prompt() -> Value {
+        json!({"id": "u1", "type": "user_message", "ordinal": 50, "runId": "r2",
+            "text": "Now add a test"})
+    }
+
+    /// A snapshot of thread `id`: its first prompt and then `answers`, with `runs`, in its
+    /// worktree when `worktree`.
+    fn worktree_thread(id: &str, worktree: bool, runs: Value, answers: Vec<Value>) -> WatchEvent {
+        let prompt = json!({"id": format!("{id}-u0"), "type": "user_message", "ordinal": 0,
+            "runId": "r1", "text": "Fix the login page"});
+        let items: Vec<Value> = std::iter::once(prompt).chain(answers).collect();
+        let path = if worktree {
+            json!(format!("/work/repo-{id}"))
+        } else {
+            Value::Null
+        };
+        let projection = json!({"thread": {"id": id, "worktreePath": path},
+            "turnItems": items, "runs": runs});
+        WatchEvent::Item(
+            json!({"kind": "snapshot", "snapshotSequence": 1, "projection": projection}),
+        )
+    }
+
+    /// Opens thread `id` as picking it does, and gives it `snapshot` from its watch.
+    fn open_setup_thread(app: &mut App, id: &str, snapshot: WatchEvent) {
+        app.open_thread(OpenThread::new(id.into(), mpsc::unbounded_channel().1));
+        app.on_thread_event(snapshot);
+    }
+
+    /// The setup card's rows as the next frame draws them, or none.
+    fn card_lines(app: &App) -> Vec<String> {
+        let card = app.open.as_ref().and_then(|open| open.setup.card());
+        card.map(|card| text(&card.lines)).unwrap_or_default()
+    }
+
+    fn shows(rows: &[String], needle: &str) -> bool {
+        rows.iter().any(|row| row.contains(needle))
+    }
+
+    #[test]
+    fn a_setup_shows_under_the_first_prompt_until_the_turn_takes_over() {
+        let (mut app, subscriptions) = setup_tui();
+        // The thread's run is preparing a worktree, which has no path yet.
+        let runs = json!([setup_run("preparing", false)]);
+        open_setup_thread(
+            &mut app,
+            "t",
+            worktree_thread("t", false, runs, short_answer()),
+        );
+        assert_eq!(subscribed(&subscriptions), ["t"]);
+        // T3 has no setup for the thread yet.
+        assert!(!deliver(
+            &mut app,
+            &subscriptions,
+            WatchEvent::Item(Value::Null)
+        ));
+        let rows = screen(&mut app, 80, 40);
+        assert!(!shows(&rows, "Setting up worktree"), "{rows:#?}");
+
+        // Progress shows under the prompt and before the answer.
+        let mut stages = setup_stages(["done", "running", "pending", "pending", "pending"]);
+        stages[1]["percent"] = json!(42);
+        let progress = setup_item("t", "running", 1, stages);
+        assert!(deliver(
+            &mut app,
+            &subscriptions,
+            WatchEvent::Item(progress)
+        ));
+        let rows = screen(&mut app, 80, 40);
+        let prompt = row_showing(&rows, "Fix the login page");
+        let title = row_showing(&rows, "Setting up worktree…");
+        assert!(prompt < title && title < row_showing(&rows, "Looking at the login page"));
+        assert!(rows[row_showing(&rows, "Check out files") as usize].contains("42%"));
+
+        // T3 records the worktree's path and the script starts. The agent's stage is done
+        // before the turn has started, and in that gap the whole card stays.
+        let thread = json!({"id": "t", "worktreePath": "/work/repo-t"});
+        app.on_thread_event(live(2, "thread.updated", thread));
+        let mut stages = setup_stages(["done", "done", "skipped", "running", "done"]);
+        stages[3]["tail"] = json!(["Resolving packages", "Linking dependencies"]);
+        let script = setup_item("t", "running", 2, stages);
+        assert!(deliver(&mut app, &subscriptions, WatchEvent::Item(script)));
+        let rows = screen(&mut app, 80, 40);
+        assert_eq!(row_showing(&rows, "Setting up worktree…"), title);
+        assert!(shows(&rows, "│ Linking dependencies"));
+
+        // The turn starts, and the script running on is one row with a Details row.
+        app.on_thread_event(live(3, "run.updated", setup_run("running", true)));
+        let rows = screen(&mut app, 80, 40);
+        assert!(!shows(&rows, "Setting up worktree"));
+        assert!(!shows(&rows, "Linking dependencies"));
+        let background = row_showing(&rows, "Install is still running");
+        assert!(prompt < background);
+        assert!(rows[background as usize + 1].contains("› Details"));
+        // `w` opens the stages and the script's output under that row.
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('w'));
+        let rows = screen(&mut app, 80, 40);
+        let details = row_showing(&rows, "⌄ Details");
+        assert_eq!(details, background + 1);
+        assert!(row_showing(&rows, "Fetch base branch") > details);
+        assert!(shows(&rows, "│ Linking dependencies"));
+
+        // The script finishes cleanly, and with the turn live the card retires.
+        let ready = setup_stages(["done", "done", "skipped", "done", "done"]);
+        let done = setup_item("t", "done", 3, ready);
+        assert!(deliver(&mut app, &subscriptions, WatchEvent::Item(done)));
+        let rows = screen(&mut app, 80, 40);
+        assert!(!shows(&rows, "Details") && !shows(&rows, "Worktree ready"));
+        assert!(card_lines(&app).is_empty());
+        assert_eq!(subscribed(&subscriptions), ["t"]);
+    }
+
+    #[test]
+    fn a_failed_or_cancelled_setup_stays_for_the_first_turn() {
+        for (phase, header) in [
+            ("failed", "Worktree setup failed"),
+            ("cancelled", "Worktree setup cancelled"),
+        ] {
+            let (mut app, subscriptions) = setup_tui();
+            let runs = json!([setup_run("preparing", false)]);
+            open_setup_thread(
+                &mut app,
+                "t",
+                worktree_thread("t", true, runs, short_answer()),
+            );
+            let stages = setup_stages(["done", "failed", "pending", "pending", "pending"]);
+            let mut item = setup_item("t", phase, 4, stages);
+            item["error"] = json!("git worktree add failed: t3code/t is already checked out");
+            assert!(deliver(&mut app, &subscriptions, WatchEvent::Item(item)));
+            let rows = screen(&mut app, 80, 40);
+            assert!(row_showing(&rows, header) > row_showing(&rows, "Fix the login page"));
+            // Only a failed setup shows its error, as the desktop's card does.
+            assert_eq!(
+                shows(&rows, "already checked out"),
+                phase == "failed",
+                "{phase}"
+            );
+            // The agent never started, so the whole card stays once the turn is live.
+            app.on_thread_event(live(2, "run.updated", setup_run("running", true)));
+            let rows = screen(&mut app, 80, 40);
+            assert!(shows(&rows, header), "{phase}");
+            assert!(shows(&rows, "✕ Check out files"));
+            // A follow-up retires it.
+            app.on_thread_event(live(3, "turn-item.updated", follow_up_prompt()));
+            let rows = screen(&mut app, 80, 40);
+            assert!(!shows(&rows, header), "{phase}");
+            assert!(shows(&rows, "Now add a test"));
+        }
+    }
+
+    #[test]
+    fn a_failed_setup_script_is_one_row_once_the_turn_is_live() {
+        let (mut app, subscriptions) = setup_tui();
+        let runs = json!([setup_run("preparing", false)]);
+        open_setup_thread(
+            &mut app,
+            "t",
+            worktree_thread("t", true, runs, short_answer()),
+        );
+        let mut stages = setup_stages(["done", "done", "skipped", "failed", "done"]);
+        stages[3]["tail"] = json!(["error: lockfile is out of date"]);
+        let item = setup_item("t", "done", 5, stages);
+        assert!(deliver(&mut app, &subscriptions, WatchEvent::Item(item)));
+        // Before the turn, the whole card with the script's last output.
+        let rows = screen(&mut app, 80, 40);
+        assert!(shows(&rows, "Worktree ready, setup script failed"));
+        assert!(shows(&rows, "│ error: lockfile is out of date"));
+        // During the first turn, one row that says how it went, with its Details row.
+        app.on_thread_event(live(2, "run.updated", setup_run("running", true)));
+        let rows = screen(&mut app, 80, 40);
+        let summary = row_showing(&rows, "✕ Worktree ready, setup script failed");
+        assert!(!shows(&rows, "lockfile") && !shows(&rows, "Check out files"));
+        assert!(rows[summary as usize + 1].contains("› Details"));
+        // After a follow-up, nothing.
+        app.on_thread_event(live(3, "turn-item.updated", follow_up_prompt()));
+        let rows = screen(&mut app, 80, 40);
+        assert!(!shows(&rows, "setup script failed"));
+        assert!(card_lines(&app).is_empty());
+    }
+
+    #[test]
+    fn a_new_setup_after_null_or_a_reconnect_replaces_the_held_one() {
+        let (mut app, subscriptions) = setup_tui();
+        let runs = json!([setup_run("preparing", false)]);
+        open_setup_thread(
+            &mut app,
+            "t",
+            worktree_thread("t", true, runs, short_answer()),
+        );
+        let ready = || setup_stages(["done", "done", "skipped", "done", "done"]);
+        let running = |percent: u64| {
+            let mut stages = setup_stages(["done", "running", "pending", "pending", "pending"]);
+            stages[1]["percent"] = json!(percent);
+            stages
+        };
+        let send = |app: &mut App, phase: &str, sequence: u64, stages: Vec<Value>| {
+            let item = setup_item("t", phase, sequence, stages);
+            deliver(app, &subscriptions, WatchEvent::Item(item))
+        };
+        assert!(send(&mut app, "done", 7, ready()));
+        // The same setup again, and an older one in the same subscription, change nothing.
+        assert!(!send(&mut app, "done", 7, ready()));
+        assert!(!send(&mut app, "running", 6, running(50)));
+        let rows = screen(&mut app, 80, 40);
+        assert!(shows(&rows, "Worktree ready") && !shows(&rows, "50%"));
+        // Thirty seconds after a setup ends T3 forgets it and sends null. The card stays.
+        assert!(!deliver(
+            &mut app,
+            &subscriptions,
+            WatchEvent::Item(Value::Null)
+        ));
+        let rows = screen(&mut app, 80, 40);
+        assert!(shows(&rows, "Worktree ready"));
+        // T3 counts from zero again after that, so a new setup with a lower sequence shows.
+        assert!(send(&mut app, "running", 0, running(10)));
+        let rows = screen(&mut app, 80, 40);
+        assert!(shows(&rows, "Setting up worktree…") && shows(&rows, "10%"));
+        assert!(!shows(&rows, "Worktree ready"));
+        assert!(send(&mut app, "running", 3, running(30)));
+        assert!(!send(&mut app, "running", 2, running(20)));
+        // A reconnect may meet a T3 that restarted and counts from zero too.
+        let reconnecting = WatchEvent::Reconnecting {
+            reason: "connection closed".into(),
+            retry_in: Duration::from_millis(250),
+        };
+        assert!(!deliver(&mut app, &subscriptions, reconnecting));
+        assert!(send(&mut app, "running", 1, running(60)));
+        let rows = screen(&mut app, 80, 40);
+        assert!(shows(&rows, "60%") && !shows(&rows, "30%"));
+        assert_eq!(subscribed(&subscriptions), ["t"]);
+    }
+
+    #[test]
+    fn each_thread_has_its_own_subscription_and_takes_no_other_threads_setup() {
+        let (mut app, subscriptions) = setup_tui();
+        let running = || setup_stages(["running", "pending", "pending", "pending", "pending"]);
+        open_setup_thread(
+            &mut app,
+            "a",
+            worktree_thread("a", true, json!([]), short_answer()),
+        );
+        let a = setup_item("a", "running", 1, running());
+        assert!(deliver(
+            &mut app,
+            &subscriptions,
+            WatchEvent::Item(a.clone())
+        ));
+        assert!(shows(&screen(&mut app, 80, 40), "Setting up worktree…"));
+        // A's next update is on its way when B opens. B's subscription replaces A's, and A's
+        // goes with A, update and all.
+        setup_sender(&subscriptions, 0)
+            .send(WatchEvent::Item(setup_item("a", "running", 2, running())))
+            .expect("A's subscription is open");
+        open_setup_thread(
+            &mut app,
+            "b",
+            worktree_thread("b", true, json!([]), short_answer()),
+        );
+        assert_eq!(subscribed(&subscriptions), ["a", "b"]);
+        assert!(setup_sender(&subscriptions, 0).is_closed());
+        assert!(!pump(&mut app));
+        assert!(!shows(&screen(&mut app, 80, 40), "Setting up worktree"));
+        // A's setup sent on B's subscription is not B's.
+        assert!(!deliver(&mut app, &subscriptions, WatchEvent::Item(a)));
+        assert!(!shows(&screen(&mut app, 80, 40), "Setting up worktree"));
+        assert!(card_lines(&app).is_empty());
+        // Back on A, a fresh subscription and nothing held from before.
+        open_setup_thread(
+            &mut app,
+            "a",
+            worktree_thread("a", true, json!([]), short_answer()),
+        );
+        assert_eq!(subscribed(&subscriptions), ["a", "b", "a"]);
+        assert!(setup_sender(&subscriptions, 1).is_closed());
+        assert!(!shows(&screen(&mut app, 80, 40), "Setting up worktree"));
+    }
+
+    #[test]
+    fn a_refused_subscription_is_not_asked_for_again_and_the_thread_works_on() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let (mut app, subscriptions) = setup_tui();
+        open_setup_thread(
+            &mut app,
+            "a",
+            worktree_thread("a", true, json!([]), short_answer()),
+        );
+        let refused = WatchEvent::Failed("unknown method: subscribeWorktreeSetup".into());
+        assert!(!deliver(&mut app, &subscriptions, refused));
+        // The card only reads, so a refusal says nothing.
+        assert!(app.message.is_none());
+        assert!(setup_sender(&subscriptions, 0).is_closed());
+        // T3 refuses it for the session, so neither this thread nor another asks again.
+        let thread = json!({"id": "a", "worktreePath": "/work/repo-a", "title": "Renamed"});
+        app.on_thread_event(live(2, "thread.updated", thread));
+        app.on_thread_event(live(3, "run.created", setup_run("preparing", false)));
+        open_setup_thread(
+            &mut app,
+            "b",
+            worktree_thread("b", true, json!([]), short_answer()),
+        );
+        assert_eq!(subscribed(&subscriptions), ["a"]);
+        // The thread works without it.
+        let answer = json!({"id": "a1", "type": "assistant_message", "ordinal": 2,
+            "text": "Still answering."});
+        app.on_thread_event(live(2, "turn-item.updated", answer));
+        assert!(shows(&screen(&mut app, 80, 40), "Still answering."));
+        assert_eq!(reads(&runtime), 0);
+    }
+
+    #[test]
+    fn a_subscription_that_ends_stops_for_its_thread_only() {
+        let (mut app, subscriptions) = setup_tui();
+        open_setup_thread(
+            &mut app,
+            "a",
+            worktree_thread("a", true, json!([]), short_answer()),
+        );
+        let stages = setup_stages(["running", "pending", "pending", "pending", "pending"]);
+        let item = setup_item("a", "running", 1, stages);
+        assert!(deliver(&mut app, &subscriptions, WatchEvent::Item(item)));
+        // T3 ends the stream, as dropping its end does here.
+        subscriptions.lock().unwrap().clear();
+        assert!(!pump(&mut app));
+        assert!(app.open.as_ref().unwrap().setup.events.is_none());
+        // The card keeps what it had, with no clock to move.
+        assert!(shows(&screen(&mut app, 80, 40), "Setting up worktree…"));
+        assert!(!needs_tick(app.open.as_ref(), &app.sidebar));
+        // This thread doesn't ask again. Another thread does.
+        let thread = json!({"id": "a", "worktreePath": "/work/repo-a"});
+        app.on_thread_event(live(2, "thread.updated", thread));
+        assert!(subscribed(&subscriptions).is_empty());
+        open_setup_thread(
+            &mut app,
+            "b",
+            worktree_thread("b", true, json!([]), short_answer()),
+        );
+        assert_eq!(subscribed(&subscriptions), ["b"]);
+        // The thread's watch closing closes its setup subscription too.
+        app.on_thread_event(WatchEvent::Failed("thread closed".into()));
+        assert!(setup_sender(&subscriptions, 0).is_closed());
+    }
+
+    #[test]
+    fn one_subscription_lasts_through_frames_keys_answers_and_config() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let (mut app, subscriptions) = setup_tui();
+        // A thread with no worktree and no run preparing one has no setup to watch.
+        let runs = json!([setup_run("completed", true)]);
+        open_setup_thread(
+            &mut app,
+            "t",
+            worktree_thread("t", false, runs, short_answer()),
+        );
+        assert!(subscribed(&subscriptions).is_empty());
+        // A run preparing one opens the subscription.
+        let preparing = json!({"id": "r2", "status": "preparing", "ordinal": 2, "startedAt": null});
+        app.on_thread_event(live(2, "run.created", preparing));
+        assert_eq!(subscribed(&subscriptions), ["t"]);
+        // T3 records the worktree on the thread, and the shell lists it there too.
+        let thread = json!({"id": "t", "worktreePath": "/work/repo-t"});
+        app.on_thread_event(live(3, "thread.updated", thread));
+        let mut listed_thread = listed("t", "Fix login", "running");
+        listed_thread["worktreePath"] = json!("/work/repo-t");
+        app.on_shell_event(shell_snapshot(vec![listed_thread.clone()]));
+        app.on_shell_event(thread_updated(2, listed_thread));
+        let stages = setup_stages(["done", "running", "pending", "pending", "pending"]);
+        let item = setup_item("t", "running", 1, stages);
+        assert!(deliver(&mut app, &subscriptions, WatchEvent::Item(item)));
+        // Frames, the pieces of a streamed answer, keys, the config and a toast.
+        for piece in 1..=5u64 {
+            screen(&mut app, 80, 30);
+            let answer = json!({"id": "a9", "type": "assistant_message", "ordinal": 9,
+                "text": "word ".repeat(piece as usize)});
+            app.on_thread_event(live(3 + piece, "turn-item.updated", answer));
+        }
+        press(&mut app, KeyCode::Esc);
+        for key in ['j', 'k', 'g', 'G', 'w'] {
+            press(&mut app, KeyCode::Char(key));
+            screen(&mut app, 80, 30);
+        }
+        let config = json!({"version": 1, "type": "snapshot", "config": {"providers": []}});
+        app.on_config_event(WatchEvent::Item(config));
+        app.on_action_result(ActionResult::Info("Copied".into()));
+        screen(&mut app, 80, 30);
+        assert_eq!(subscribed(&subscriptions), ["t"]);
+        assert!(!setup_sender(&subscriptions, 0).is_closed());
+
+        // A settled card is laid out once, however many frames, keys and pieces follow, until
+        // the width changes.
+        let stages = setup_stages(["done", "done", "skipped", "done", "done"]);
+        let item = setup_item("t", "done", 2, stages);
+        assert!(deliver(&mut app, &subscriptions, WatchEvent::Item(item)));
+        screen(&mut app, 80, 30);
+        let layouts = |app: &App| app.open.as_ref().unwrap().setup.layouts;
+        let before = layouts(&app);
+        for piece in 6..=10u64 {
+            let answer = json!({"id": "a9", "type": "assistant_message", "ordinal": 9,
+                "text": "word ".repeat(piece as usize)});
+            app.on_thread_event(live(3 + piece, "turn-item.updated", answer));
+            press(&mut app, KeyCode::Char('k'));
+            screen(&mut app, 80, 30);
+        }
+        assert_eq!(layouts(&app), before);
+        screen(&mut app, 90, 30);
+        assert_eq!(layouts(&app), before + 1);
+        assert_eq!(subscribed(&subscriptions), ["t"]);
+        assert_eq!(reads(&runtime), 0);
+    }
+
+    #[test]
+    fn a_malformed_setup_draws_nothing_and_breaks_nothing() {
+        let (mut app, subscriptions) = setup_tui();
+        open_setup_thread(
+            &mut app,
+            "t",
+            worktree_thread("t", true, json!([]), short_answer()),
+        );
+        let stages = setup_stages(["done", "running", "pending", "pending", "pending"]);
+        let good = setup_item("t", "running", 1, stages);
+        let broken = |key: &str, value: Value| {
+            let mut item = good.clone();
+            item[key] = value;
+            item
+        };
+        for item in [
+            json!("running"),
+            json!([good.clone()]),
+            json!({"threadId": "t"}),
+            broken("threadId", json!(7)),
+            broken("phase", json!("paused")),
+            broken("sequence", json!(-1)),
+            broken("sequence", json!(1.5)),
+            broken("stages", json!({"fetch": "done"})),
+            broken("startedAt", Value::Null),
+        ] {
+            assert!(
+                !deliver(&mut app, &subscriptions, WatchEvent::Item(item.clone())),
+                "{item}"
+            );
+        }
+        assert!(!shows(&screen(&mut app, 80, 40), "worktree"));
+        assert!(card_lines(&app).is_empty());
+        // Stages and fields T3 doesn't send that way read as absent.
+        let mut odd = good.clone();
+        odd["stages"] = json!([
+            {"id": "deploy", "status": "running"},
+            {"id": "fetch", "status": "spinning"},
+            {"id": "checkout", "status": "running", "percent": 250, "detail": 7, "tail": "x"},
+            3,
+            null,
+        ]);
+        odd["branch"] = json!(42);
+        odd["setupScript"] = json!("bun install");
+        odd["endedAt"] = json!("soon");
+        assert!(deliver(&mut app, &subscriptions, WatchEvent::Item(odd)));
+        let rows = screen(&mut app, 80, 40);
+        let checkout = &rows[row_showing(&rows, "Check out files") as usize];
+        assert!(!checkout.contains('%'), "{checkout}");
+        assert!(!shows(&rows, "deploy") && !shows(&rows, "Fetch base branch"));
+        let lines = card_lines(&app);
+        assert!(
+            lines[0].trim_end().ends_with("Setting up worktree…"),
+            "{lines:?}"
+        );
+        assert_eq!(subscribed(&subscriptions), ["t"]);
+    }
+
+    #[test]
+    fn setup_text_reaches_the_screen_clean() {
+        let (mut app, subscriptions) = setup_tui();
+        open_setup_thread(
+            &mut app,
+            "t",
+            worktree_thread("t", true, json!([]), short_answer()),
+        );
+        let mut stages = setup_stages(["done", "warning", "skipped", "failed", "pending"]);
+        stages[1]["detail"] = json!("\u{1b}[31m詳細 👩\u{200d}💻 e\u{301}\u{7}");
+        stages[3]["tail"] = json!(["\u{1b}]0;title\u{7}漢字 output\r", "\u{9b}2Jcleared\u{7f}"]);
+        let mut item = setup_item("t", "failed", 1, stages);
+        item["error"] = json!("\u{1b}]52;c;aGk=\u{7}checkout failed\u{85}\r\nfor 枝");
+        item["branch"] = json!("\u{1b}[1mfeature/漢字\u{1b}[0m");
+        item["setupScript"]["name"] = json!("\u{1b}[2JInstall\u{7}");
+        assert!(deliver(&mut app, &subscriptions, WatchEvent::Item(item)));
+        screen(&mut app, 80, 40);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('w'));
+        let buffer = cells(&mut app, 80, 40);
+        let symbols: String = buffer.content().iter().map(|cell| cell.symbol()).collect();
+        assert!(!symbols.chars().any(char::is_control), "{symbols:?}");
+        // CJK, a joined emoji and an accent stay whole. The wide characters are read from the
+        // card, since a buffer holds a blank cell after each.
+        let lines = card_lines(&app).join("\n");
+        assert!(
+            !lines.chars().any(|c| c.is_control() && c != '\n'),
+            "{lines:?}"
+        );
+        for kept in [
+            "詳細 👩\u{200d}💻 e\u{301}",
+            "漢字 output",
+            "2Jcleared",
+            "checkout failed",
+            "for 枝",
+            "feature/漢字",
+            "Install",
+        ] {
+            assert!(lines.contains(kept), "{kept:?} in {lines}");
+        }
+    }
+
+    #[test]
+    fn w_and_a_click_open_details_in_place_and_take_nothing_else() {
+        let (mut app, subscriptions) = setup_tui();
+        let runs = json!([setup_run("preparing", false)]);
+        open_setup_thread(
+            &mut app,
+            "t",
+            worktree_thread("t", true, runs, short_answer()),
+        );
+        let stages = setup_stages(["done", "done", "skipped", "done", "done"]);
+        let item = setup_item("t", "done", 1, stages);
+        assert!(deliver(&mut app, &subscriptions, WatchEvent::Item(item)));
+        let rows = screen(&mut app, 120, 40);
+        let at = row_showing(&rows, "› Details");
+        // Typed in the composer, `w` is text.
+        assert_eq!(app.focus, Focus::Composer);
+        press(&mut app, KeyCode::Char('w'));
+        assert_eq!(app.composer.text(), "w");
+        let rows = screen(&mut app, 120, 40);
+        assert_eq!(row_showing(&rows, "› Details"), at);
+        // In the transcript, the status line offers it and `w` opens Details under its row,
+        // which stays where it was.
+        press(&mut app, KeyCode::Esc);
+        let rows = screen(&mut app, 120, 40);
+        assert!(rows[39].contains("w show setup details"), "{}", rows[39]);
+        press(&mut app, KeyCode::Char('w'));
+        // A second press before the next frame does nothing.
+        press(&mut app, KeyCode::Char('w'));
+        let rows = screen(&mut app, 120, 40);
+        assert_eq!(row_showing(&rows, "⌄ Details"), at);
+        assert!(rows[at as usize + 1].contains("Branch  t3code/t"));
+        assert!(shows(&rows, "Path    /work/repo-t") && shows(&rows, "Setup   bun install"));
+        assert!(rows[39].contains("w hide setup details"), "{}", rows[39]);
+        // Alt+W is the error banner's key and leaves Details alone.
+        alt(&mut app, 'w');
+        let rows = screen(&mut app, 120, 40);
+        assert_eq!(row_showing(&rows, "⌄ Details"), at);
+        // A click on the row closes it, and the draft stays.
+        assert!(mouse(&mut app, CLICK, 10, at));
+        let rows = screen(&mut app, 120, 40);
+        assert_eq!(row_showing(&rows, "› Details"), at);
+        assert!(!shows(&rows, "Branch  t3code/t"));
+        assert_eq!(app.composer.text(), "w");
+        assert_eq!(app.focus, Focus::Transcript);
+    }
+
+    #[test]
+    fn a_click_needs_the_card_where_the_last_frame_drew_it() {
+        let (mut app, subscriptions) = setup_tui();
+        let runs = json!([setup_run("preparing", false)]);
+        let answers = answers().into_iter().take(2).collect();
+        open_setup_thread(&mut app, "t", worktree_thread("t", true, runs, answers));
+        let ready = || setup_stages(["done", "done", "skipped", "done", "done"]);
+        let item = setup_item("t", "done", 1, ready());
+        assert!(deliver(&mut app, &subscriptions, WatchEvent::Item(item)));
+        press(&mut app, KeyCode::Esc);
+        let opened = |rows: &[String]| shows(rows, "⌄ Details");
+        // Scrolled since the frame.
+        let at = row_showing(&screen(&mut app, 80, 30), "› Details");
+        press(&mut app, KeyCode::Char('k'));
+        mouse(&mut app, CLICK, 10, at);
+        assert!(!opened(&screen(&mut app, 80, 30)));
+        // The setup changed since the frame.
+        let at = row_showing(&screen(&mut app, 80, 30), "› Details");
+        let mut changed = ready();
+        changed[3]["detail"] = json!("Installed 812 packages");
+        let item = setup_item("t", "done", 2, changed);
+        assert!(deliver(&mut app, &subscriptions, WatchEvent::Item(item)));
+        mouse(&mut app, CLICK, 10, at);
+        press(&mut app, KeyCode::Char('w'));
+        assert!(!opened(&screen(&mut app, 80, 30)));
+        // The screen resized since the frame.
+        let at = row_showing(&screen(&mut app, 80, 30), "› Details");
+        app.on_terminal_event(Event::Resize(100, 30));
+        mouse(&mut app, CLICK, 10, at);
+        press(&mut app, KeyCode::Char('w'));
+        assert!(!opened(&screen(&mut app, 80, 30)));
+        // The sidebar came back since the frame.
+        let at = row_showing(&screen(&mut app, 80, 30), "› Details");
+        ctrl_b(&mut app);
+        mouse(&mut app, CLICK, 10, at);
+        ctrl_b(&mut app);
+        assert!(!opened(&screen(&mut app, 80, 30)));
+        // With nothing moved, the click opens it.
+        let at = row_showing(&screen(&mut app, 80, 30), "› Details");
+        assert!(mouse(&mut app, CLICK, 10, at));
+        let rows = screen(&mut app, 80, 30);
+        assert_eq!(row_showing(&rows, "⌄ Details"), at);
+    }
+
+    #[test]
+    fn details_open_and_close_with_their_row_in_place() {
+        // Following the bottom of a thread a little taller than the screen, and at the top of
+        // a long one.
+        for (count, key) in [(2, KeyCode::Char('G')), (20, KeyCode::Char('g'))] {
+            let (mut app, subscriptions) = setup_tui();
+            let runs = json!([setup_run("preparing", false)]);
+            let answers = answers().into_iter().take(count).collect();
+            open_setup_thread(&mut app, "t", worktree_thread("t", true, runs, answers));
+            let stages = setup_stages(["done", "done", "skipped", "done", "done"]);
+            let item = setup_item("t", "done", 1, stages);
+            assert!(deliver(&mut app, &subscriptions, WatchEvent::Item(item)));
+            press(&mut app, KeyCode::Esc);
+            press(&mut app, key);
+            let rows = screen(&mut app, 80, 30);
+            let at = row_showing(&rows, "› Details");
+            let above = rows[2..at as usize].to_vec();
+            press(&mut app, KeyCode::Char('w'));
+            let rows = screen(&mut app, 80, 30);
+            assert_eq!(row_showing(&rows, "⌄ Details"), at, "{key:?}");
+            assert_eq!(rows[2..at as usize], above, "{key:?}");
+            assert!(rows[at as usize + 1].contains("Branch"));
+            press(&mut app, KeyCode::Char('w'));
+            let rows = screen(&mut app, 80, 30);
+            assert_eq!(row_showing(&rows, "› Details"), at, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn a_card_growing_above_the_screen_leaves_the_rows_being_read() {
+        let (mut app, subscriptions) = setup_tui();
+        open_setup_thread(
+            &mut app,
+            "t",
+            worktree_thread("t", true, json!([]), answers()),
+        );
+        let stages = setup_stages(["done", "done", "skipped", "running", "pending"]);
+        let item = setup_item("t", "running", 1, stages);
+        assert!(deliver(&mut app, &subscriptions, WatchEvent::Item(item)));
+        press(&mut app, KeyCode::Esc);
+        for _ in 0..40 {
+            press(&mut app, KeyCode::Char('k'));
+        }
+        let before = screen(&mut app, 80, 30);
+        assert!(!shows(&before, "Setting up worktree"));
+        // Out of view, a running card asks for no tick.
+        assert!(!needs_tick(app.open.as_ref(), &app.sidebar));
+        // The script's output starts, and the card grows by its four rows.
+        let mut stages = setup_stages(["done", "done", "skipped", "running", "pending"]);
+        stages[3]["tail"] = json!(["Resolving packages"]);
+        let item = setup_item("t", "running", 2, stages);
+        assert!(deliver(&mut app, &subscriptions, WatchEvent::Item(item)));
+        let after = screen(&mut app, 80, 30);
+        assert_eq!(after[2..20], before[2..20]);
+    }
+
+    #[test]
+    fn only_a_running_card_in_view_needs_the_tick() {
+        let (mut app, subscriptions) = setup_tui();
+        // No run, so only the card can ask for the tick.
+        open_setup_thread(
+            &mut app,
+            "t",
+            worktree_thread("t", true, json!([]), answers()),
+        );
+        let send = |app: &mut App, phase: &str, sequence: u64| {
+            let stages = setup_stages(["done", "running", "pending", "pending", "pending"]);
+            let item = setup_item("t", phase, sequence, stages);
+            deliver(app, &subscriptions, WatchEvent::Item(item))
+        };
+        let ticks = |app: &App| needs_tick(app.open.as_ref(), &app.sidebar);
+        assert!(send(&mut app, "running", 1));
+        // Following the bottom of a long thread, the card is far above the screen.
+        screen(&mut app, 80, 30);
+        assert!(!ticks(&app));
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('g'));
+        assert!(shows(&screen(&mut app, 80, 30), "Setting up worktree…"));
+        assert!(ticks(&app));
+        // A setup that ended keeps its card with no clock to move.
+        for (phase, sequence) in [("done", 2), ("failed", 3), ("cancelled", 4)] {
+            assert!(send(&mut app, phase, sequence));
+            assert!(shows(&screen(&mut app, 80, 30), "Worktree"));
+            assert!(!ticks(&app), "{phase}");
+        }
+        // A running setup held after its subscription closed, as when the thread loses its
+        // worktree, keeps its card and no clock.
+        assert!(send(&mut app, "running", 5));
+        screen(&mut app, 80, 30);
+        assert!(ticks(&app));
+        let thread = json!({"id": "t", "worktreePath": null});
+        app.on_thread_event(live(2, "thread.updated", thread));
+        assert!(shows(&screen(&mut app, 80, 30), "Setting up worktree…"));
+        assert!(!ticks(&app));
+    }
+
+    #[test]
+    fn the_card_fits_narrow_and_tiny_windows() {
+        let (mut app, subscriptions) = setup_tui();
+        let runs = json!([setup_run("preparing", false)]);
+        open_setup_thread(
+            &mut app,
+            "t",
+            worktree_thread("t", true, runs, short_answer()),
+        );
+        let mut stages = setup_stages(["done", "running", "warning", "failed", "pending"]);
+        stages[1]["percent"] = json!(42);
+        stages[2]["detail"] = json!("詳細な説明 ".repeat(20));
+        stages[3]["tail"] = json!(["x".repeat(400), "漢字".repeat(200)]);
+        let mut item = setup_item("t", "failed", 1, stages);
+        item["error"] = json!("fatal: could not create work tree dir ".repeat(20));
+        item["worktreePath"] = json!(format!("/work/{}", "deep/".repeat(80)));
+        assert!(deliver(&mut app, &subscriptions, WatchEvent::Item(item)));
+        screen(&mut app, 80, 40);
+        press(&mut app, KeyCode::Esc);
+        press(&mut app, KeyCode::Char('w'));
+        for (width, height) in [(80, 40), (40, 12), (24, 12), (16, 12), (12, 30)] {
+            screen(&mut app, width, height);
+            let room = (width as usize).saturating_sub(3).max(10);
+            let card = app.open.as_ref().and_then(|o| o.setup.card());
+            let card = card.expect("a card");
+            assert!(text(&card.lines).iter().any(|row| row.contains("Details")));
+            for line in &card.lines {
+                assert!(line.width() <= room, "{width}: {line:?}");
+            }
+        }
+    }
+
+    #[test]
+    fn with_no_prompt_the_card_follows_the_last_block() {
+        let (mut app, subscriptions) = setup_tui();
+        let projection = json!({"thread": {"id": "t", "worktreePath": "/work/repo-t"},
+            "turnItems": short_answer(), "runs": []});
+        let snapshot = json!({"kind": "snapshot", "snapshotSequence": 1, "projection": projection});
+        open_setup_thread(&mut app, "t", WatchEvent::Item(snapshot));
+        let stages = setup_stages(["running", "pending", "pending", "pending", "pending"]);
+        let item = setup_item("t", "running", 1, stages);
+        assert!(deliver(&mut app, &subscriptions, WatchEvent::Item(item)));
+        let rows = screen(&mut app, 80, 40);
+        let answer = row_showing(&rows, "Looking at the login page");
+        assert!(answer < row_showing(&rows, "Setting up worktree…"));
+        // Once a prompt arrives, the card moves under it.
+        let prompt = json!({"id": "u0", "type": "user_message", "ordinal": 2, "runId": "r1",
+            "text": "Fix the login page"});
+        app.on_thread_event(live(2, "turn-item.updated", prompt));
+        let rows = screen(&mut app, 80, 40);
+        let prompt = row_showing(&rows, "Fix the login page");
+        assert!(row_showing(&rows, "Looking at the login page") < prompt);
+        assert!(prompt < row_showing(&rows, "Setting up worktree…"));
+    }
 }

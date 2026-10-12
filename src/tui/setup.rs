@@ -956,8 +956,90 @@ fn detail_rows(lines: &mut Vec<Line<'static>>, setup: &Setup, width: usize, t: &
 
 #[cfg(test)]
 mod tests {
+    use super::super::theme::Depth;
     use super::*;
     use serde_json::json;
+
+    const START: &str = "2026-10-07T00:00:00.000Z";
+    /// The turn before it starts, live, and after a follow-up.
+    const BEFORE: Turn = Turn {
+        started: false,
+        follow_up: false,
+    };
+    const LIVE: Turn = Turn {
+        started: true,
+        follow_up: false,
+    };
+    const FOLLOW_UP: Turn = Turn {
+        started: true,
+        follow_up: true,
+    };
+
+    /// The clock the cards here are drawn at, 30 seconds after `START`.
+    fn now() -> i64 {
+        time("2026-10-07T00:00:30.000Z").expect("a time")
+    }
+
+    fn stage(id: &str, status: &str) -> Value {
+        json!({"id": id, "status": status, "startedAt": null, "endedAt": null,
+            "percent": null, "detail": null, "tail": []})
+    }
+
+    /// A stage that took 1.2 seconds.
+    fn finished(id: &str, status: &str) -> Value {
+        let mut stage = stage(id, status);
+        stage["startedAt"] = json!(START);
+        stage["endedAt"] = json!("2026-10-07T00:00:01.200Z");
+        stage
+    }
+
+    /// The five stages in order, with `statuses`.
+    fn stages(statuses: [&str; 5]) -> Vec<Value> {
+        STAGES
+            .iter()
+            .zip(statuses)
+            .map(|((id, _), status)| stage(id, status))
+            .collect()
+    }
+
+    /// Thread `t`'s setup as T3 sends it.
+    fn snapshot(phase: &str, sequence: u64, stages: Vec<Value>) -> Value {
+        json!({"threadId": "t", "phase": phase, "startedAt": START, "endedAt": null,
+            "branch": "t3code/fix-login", "baseRef": "main", "worktreePath": "/work/repo-t1",
+            "setupScript": {"name": "Install", "command": "bun install", "terminalId": "setup-1"},
+            "stages": stages, "error": null, "sequence": sequence})
+    }
+
+    fn setup(phase: &str, stages: Vec<Value>) -> Setup {
+        Setup::parse(&snapshot(phase, 1, stages), "t").expect("a setup")
+    }
+
+    /// The card's rows as text, `width` columns wide, as of `now()`.
+    fn card_rows(setup: &Setup, turn: Turn, details: bool, width: usize) -> Vec<String> {
+        let mode = setup.mode(turn).expect("the card shows");
+        let card = lay_out(
+            setup,
+            mode,
+            details,
+            width,
+            now(),
+            &Theme::new(Depth::TrueColor),
+        );
+        card.lines
+            .iter()
+            .map(|line| {
+                line.spans
+                    .iter()
+                    .map(|span| span.content.as_ref())
+                    .collect()
+            })
+            .collect()
+    }
+
+    /// Each row without the spaces that pad it to the width.
+    fn trimmed(rows: &[String]) -> Vec<&str> {
+        rows.iter().map(|row| row.trim_end()).collect()
+    }
 
     #[test]
     fn a_snapshot_must_be_for_the_thread_and_well_formed() {
@@ -1071,5 +1153,462 @@ mod tests {
         assert_eq!(middle("漢字漢字漢字", 7), "漢…字");
         assert_eq!(middle("abc", 1), "…");
         assert_eq!(middle("abc", 0), "");
+    }
+
+    #[test]
+    fn the_card_shows_and_retires_as_the_desktop_decides() {
+        // A running setup always shows. Once the agent started and its turn is live, a script
+        // still running is one row.
+        let running = setup(
+            "running",
+            stages(["done", "done", "done", "running", "done"]),
+        );
+        assert_eq!(running.mode(BEFORE), Some(Mode::Full));
+        assert_eq!(running.mode(LIVE), Some(Mode::Background));
+        assert_eq!(running.mode(FOLLOW_UP), Some(Mode::Background));
+        // A live turn alone doesn't hand the setup off. The agent's stage has to be done too.
+        let checking_out = setup(
+            "running",
+            stages(["done", "running", "pending", "pending", "pending"]),
+        );
+        assert_eq!(checking_out.mode(LIVE), Some(Mode::Full));
+        // A clean finish shows until the turn is live, then retires.
+        let ready = setup("done", stages(["done", "done", "skipped", "done", "done"]));
+        assert_eq!(ready.mode(BEFORE), Some(Mode::Full));
+        assert_eq!(ready.mode(LIVE), None);
+        // A failed script stays as one row for the first turn and goes with a follow-up.
+        let script_failed = setup(
+            "done",
+            stages(["done", "done", "skipped", "failed", "done"]),
+        );
+        assert_eq!(script_failed.mode(BEFORE), Some(Mode::Full));
+        assert_eq!(script_failed.mode(LIVE), Some(Mode::Summary));
+        assert_eq!(script_failed.mode(FOLLOW_UP), None);
+        // A failed or cancelled setup never started the agent, so it stays whole for the first
+        // turn, and a follow-up retires it too.
+        for phase in ["failed", "cancelled"] {
+            let stopped = setup(
+                phase,
+                stages(["done", "failed", "pending", "pending", "pending"]),
+            );
+            assert_eq!(stopped.mode(BEFORE), Some(Mode::Full));
+            assert_eq!(stopped.mode(LIVE), Some(Mode::Full));
+            assert_eq!(stopped.mode(FOLLOW_UP), None);
+        }
+        assert_eq!(
+            setup("failed", stages(["done", "done", "done", "done", "done"])).mode(LIVE),
+            Some(Mode::Summary)
+        );
+    }
+
+    #[test]
+    fn stages_read_as_the_desktop_labels_them() {
+        let mut checkout = stage("checkout", "running");
+        checkout["percent"] = json!(42);
+        checkout["detail"] = json!("Updating files");
+        let mut warned = finished("submodules", "warning");
+        warned["detail"] = json!("1 submodule skipped");
+        let progress = setup(
+            "running",
+            vec![
+                finished("fetch", "done"),
+                checkout,
+                warned,
+                stage("setup-script", "pending"),
+                stage("agent", "pending"),
+            ],
+        );
+        let rows = card_rows(&progress, BEFORE, false, 60);
+        let spinner = spinner_frame(now());
+        assert!(rows[0].starts_with(&format!("{spinner} Setting up worktree…")));
+        assert!(rows[0].ends_with(" 30s"), "{:?}", rows[0]);
+        assert_eq!(rows[1], "─".repeat(60));
+        assert!(rows[2].starts_with("✓ Fetch base branch") && rows[2].ends_with(" 1.2s"));
+        // The running checkout says how far it got rather than what it is doing.
+        assert!(rows[3].contains("Check out files  42%") && !rows[3].contains("Updating"));
+        assert!(rows[4].starts_with("! Init submodules  1 submodule skipped"));
+        assert!(rows[4].ends_with(" 1.2s"));
+        // A pending stage says nothing more, and the script's row is the script's name.
+        assert_eq!(
+            trimmed(&rows[5..]),
+            ["○ Install", "○ Start agent", "› Details", ""]
+        );
+        assert!(rows.iter().all(|row| row.width() <= 60));
+
+        // Only a running checkout shows a percentage. A finished one says what it did, and a
+        // skipped stage says why, or `skipped`, with no time.
+        let mut fetching = stage("fetch", "running");
+        fetching["percent"] = json!(50);
+        let mut checked_out = finished("checkout", "done");
+        checked_out["percent"] = json!(100);
+        checked_out["detail"] = json!("Checked out 120 files");
+        let later = setup(
+            "running",
+            vec![fetching, checked_out, finished("submodules", "skipped")],
+        );
+        let rows = card_rows(&later, BEFORE, false, 60);
+        assert_eq!(rows[2].trim_end(), format!("{spinner} Fetch base branch"));
+        assert!(rows[3].starts_with("✓ Check out files  Checked out 120 files"));
+        assert!(!rows[3].contains('%'));
+        assert_eq!(rows[4].trim_end(), "− Init submodules  skipped");
+    }
+
+    #[test]
+    fn the_script_output_keeps_four_rows() {
+        let script = |status: &str, tail: Vec<String>| {
+            let mut script = stage("setup-script", status);
+            script["tail"] = json!(tail);
+            let phase = if status == "failed" {
+                "done"
+            } else {
+                "running"
+            };
+            setup(phase, vec![script])
+        };
+        let lines = |lines: &[&str]| lines.iter().map(|line| line.to_string()).collect();
+        // Output fills the box from the bottom, newest last.
+        let rows = card_rows(
+            &script("running", lines(&["resolving", "installing"])),
+            BEFORE,
+            false,
+            40,
+        );
+        assert_eq!(
+            trimmed(&rows[3..7]),
+            ["  │", "  │", "  │ resolving", "  │ installing"]
+        );
+        // A script running without output yet, or done, has no box.
+        let rows = card_rows(&script("running", Vec::new()), BEFORE, false, 40);
+        assert_eq!(rows.len(), 5);
+        let rows = card_rows(&script("done", lines(&["ok"])), BEFORE, false, 40);
+        assert_eq!(rows.len(), 5);
+        // A failed script keeps its box, empty or with its newest four lines.
+        let rows = card_rows(&script("failed", Vec::new()), BEFORE, false, 40);
+        assert!(rows[0].starts_with("Worktree ready, setup script failed"));
+        assert_eq!(trimmed(&rows[3..7]), ["  │"; 4]);
+        let many: Vec<String> = (0..50).map(|i| format!("line {i}")).collect();
+        let rows = card_rows(&script("failed", many), BEFORE, false, 40);
+        assert_eq!(
+            trimmed(&rows[3..7]),
+            ["  │ line 46", "  │ line 47", "  │ line 48", "  │ line 49"]
+        );
+        // A long line is cut to its row, never wrapped.
+        let rows = card_rows(
+            &script("failed", vec!["x".repeat(10_000)]),
+            BEFORE,
+            false,
+            40,
+        );
+        assert_eq!(rows.len(), 9);
+        assert!(
+            rows[6].ends_with('…') && rows[6].width() == 40,
+            "{:?}",
+            rows[6]
+        );
+    }
+
+    #[test]
+    fn an_error_takes_six_rows_at_most() {
+        let mut failed = snapshot(
+            "failed",
+            1,
+            stages(["done", "failed", "pending", "pending", "pending"]),
+        );
+        failed["error"] = json!("word ".repeat(1000));
+        let failed = Setup::parse(&failed, "t").expect("a setup");
+        let rows = card_rows(&failed, BEFORE, false, 40);
+        assert!(rows[0].starts_with("Worktree setup failed"));
+        let error: Vec<&String> = rows
+            .iter()
+            .filter(|row| row.starts_with("  word"))
+            .collect();
+        assert_eq!(error.len(), ERROR_ROWS);
+        assert!(error[ERROR_ROWS - 1].trim_end().ends_with('…'));
+        // A setup that didn't fail keeps its error to itself, as the desktop's does.
+        let mut done = snapshot("done", 1, Vec::new());
+        done["error"] = json!("stale");
+        let done = Setup::parse(&done, "t").expect("a setup");
+        assert!(
+            card_rows(&done, BEFORE, false, 40)
+                .iter()
+                .all(|row| !row.contains("stale"))
+        );
+    }
+
+    #[test]
+    fn details_open_under_their_row() {
+        let ready = setup("done", stages(["done", "done", "skipped", "done", "done"]));
+        let closed = card_rows(&ready, BEFORE, false, 50);
+        let open = card_rows(&ready, BEFORE, true, 50);
+        let at = closed
+            .iter()
+            .position(|row| row.starts_with("› Details"))
+            .expect("a Details row");
+        assert_eq!(open[..at], closed[..at]);
+        assert!(open[at].starts_with("⌄ Details"));
+        assert_eq!(
+            trimmed(&open[at + 1..]),
+            [
+                "  Branch  t3code/fix-login",
+                "  Base    main",
+                "  Path    /work/repo-t1",
+                "  Setup   bun install",
+                "",
+            ]
+        );
+        // A long path keeps both of its ends.
+        let mut far = snapshot("done", 1, Vec::new());
+        far["worktreePath"] = json!("/Users/someone/.t3/worktrees/repository/feature-branch-name");
+        let far = Setup::parse(&far, "t").expect("a setup");
+        let rows = card_rows(&far, BEFORE, true, 30);
+        let path = rows
+            .iter()
+            .find(|row| row.starts_with("  Path"))
+            .expect("a path row");
+        assert!(path.starts_with("  Path    /Users/"), "{path}");
+        assert!(
+            path.trim_end().ends_with("-name") && path.contains('…'),
+            "{path}"
+        );
+        assert!(path.width() <= 30);
+        // With nothing to show, a settled card has no Details row.
+        let mut bare = snapshot("done", 1, Vec::new());
+        for key in ["branch", "baseRef", "worktreePath", "setupScript"] {
+            bare[key] = Value::Null;
+        }
+        let bare = Setup::parse(&bare, "t").expect("a setup");
+        assert!(
+            card_rows(&bare, BEFORE, false, 50)
+                .iter()
+                .all(|row| !row.contains("Details"))
+        );
+    }
+
+    #[test]
+    fn a_script_running_after_the_handoff_is_one_row() {
+        let mut script = stage("setup-script", "running");
+        script["startedAt"] = json!("2026-10-07T00:00:10.000Z");
+        script["tail"] = json!(["compiling"]);
+        let background = setup(
+            "running",
+            vec![
+                finished("fetch", "done"),
+                finished("checkout", "done"),
+                script,
+                finished("agent", "done"),
+            ],
+        );
+        let rows = card_rows(&background, LIVE, false, 50);
+        let spinner = spinner_frame(now());
+        assert!(rows[0].starts_with(&format!("{spinner} Install is still running")));
+        assert!(rows[0].ends_with(" 20s"), "{:?}", rows[0]);
+        assert_eq!(trimmed(&rows[1..]), ["› Details", ""]);
+        // Details opens the stages and the script's output as well, all under the row.
+        let rows = card_rows(&background, LIVE, true, 50);
+        assert!(rows[1].starts_with("⌄ Details"));
+        assert!(rows[2].starts_with("✓ Fetch base branch"));
+        assert!(rows.iter().any(|row| row.trim_end() == "  │ compiling"));
+        assert!(
+            rows.iter()
+                .any(|row| row.starts_with("  Setup   bun install"))
+        );
+        // Without a script name it is the setup script.
+        let mut unnamed = snapshot("running", 1, vec![finished("agent", "done")]);
+        unnamed["setupScript"] = Value::Null;
+        let unnamed = Setup::parse(&unnamed, "t").expect("a setup");
+        let rows = card_rows(&unnamed, LIVE, false, 50);
+        assert!(rows[0].contains("Setup script is still running"));
+    }
+
+    #[test]
+    fn every_row_fits_its_width() {
+        let mut item = snapshot(
+            "failed",
+            1,
+            stages(["done", "running", "warning", "failed", "skipped"]),
+        );
+        item["stages"][1]["percent"] = json!(42);
+        item["stages"][2]["detail"] = json!("詳細な説明 👩\u{200d}💻 e\u{301}");
+        item["stages"][3]["tail"] = json!(["x".repeat(500), "漢字".repeat(300)]);
+        item["error"] = json!("failed ".repeat(200));
+        item["branch"] = json!("枝".repeat(300));
+        let setup = Setup::parse(&item, "t").expect("a setup");
+        for width in 1..=90 {
+            for details in [false, true] {
+                for row in card_rows(&setup, BEFORE, details, width) {
+                    assert!(row.width() <= width, "{width}: {row:?}");
+                }
+            }
+        }
+    }
+
+    /// A running setup with its checkout at `percent`, as an item from the subscription.
+    fn item(sequence: u64, percent: u64) -> Option<WatchEvent> {
+        let mut checkout = stage("checkout", "running");
+        checkout["percent"] = json!(percent);
+        Some(WatchEvent::Item(snapshot(
+            "running",
+            sequence,
+            vec![checkout],
+        )))
+    }
+
+    fn percent(watch: &Watch) -> Option<u8> {
+        watch.held.as_ref()?.stages.first()?.percent
+    }
+
+    #[test]
+    fn a_subscription_holds_the_newest_setup_it_has_seen() {
+        let mut watch = Watch::default();
+        assert!(watch.wants());
+        watch.watch(mpsc::unbounded_channel().1);
+        assert!(!watch.wants());
+        assert_eq!(watch.apply(item(5, 40), "t"), Outcome::Changed);
+        // A lower sequence in the same subscription is older news, and the same setup again is
+        // no news.
+        assert_eq!(watch.apply(item(3, 10), "t"), Outcome::Unchanged);
+        assert_eq!(watch.apply(item(5, 40), "t"), Outcome::Unchanged);
+        assert_eq!(percent(&watch), Some(40));
+        assert_eq!(watch.apply(item(6, 60), "t"), Outcome::Changed);
+        // Another thread's setup, or one that isn't a setup, changes nothing.
+        let mut other = snapshot("running", 9, Vec::new());
+        other["threadId"] = json!("u");
+        assert_eq!(
+            watch.apply(Some(WatchEvent::Item(other)), "t"),
+            Outcome::Unchanged
+        );
+        let broken = WatchEvent::Item(json!({"threadId": "t", "sequence": 9}));
+        assert_eq!(watch.apply(Some(broken), "t"), Outcome::Unchanged);
+        assert_eq!(percent(&watch), Some(60));
+        // Null keeps the setup, and T3 counts from zero again after it.
+        let null = || Some(WatchEvent::Item(Value::Null));
+        assert_eq!(watch.apply(null(), "t"), Outcome::Unchanged);
+        assert_eq!(percent(&watch), Some(60));
+        assert_eq!(watch.apply(item(0, 5), "t"), Outcome::Changed);
+        assert_eq!(watch.apply(item(1, 15), "t"), Outcome::Changed);
+        // A reconnect may meet a T3 that restarted, so its first setup replaces the held one too.
+        let reconnecting = WatchEvent::Reconnecting {
+            reason: "closed".into(),
+            retry_in: std::time::Duration::from_millis(250),
+        };
+        assert_eq!(watch.apply(Some(reconnecting), "t"), Outcome::Unchanged);
+        assert_eq!(percent(&watch), Some(15));
+        assert_eq!(watch.apply(item(0, 1), "t"), Outcome::Changed);
+        assert_eq!(percent(&watch), Some(1));
+        assert_eq!(watch.apply(item(0, 1), "t"), Outcome::Unchanged);
+        // A refusal stops the subscription for good, and so does its end.
+        let refused = WatchEvent::Failed("unknown method".into());
+        assert_eq!(watch.apply(Some(refused), "t"), Outcome::Refused);
+        assert!(watch.events.is_none() && !watch.wants());
+        assert_eq!(percent(&watch), Some(1), "the card stays as it was");
+        let mut ended = Watch::default();
+        ended.watch(mpsc::unbounded_channel().1);
+        assert_eq!(ended.apply(None, "t"), Outcome::Unchanged);
+        assert!(!ended.wants());
+        // Closed, as when the thread loses its worktree, it can open again.
+        let mut closed = Watch::default();
+        closed.watch(mpsc::unbounded_channel().1);
+        closed.close();
+        assert!(closed.events.is_none() && closed.wants());
+    }
+
+    #[test]
+    fn only_a_running_card_on_screen_ticks() {
+        let theme = Theme::new(Depth::TrueColor);
+        // A frame that lays the card out at `now` and draws all of it.
+        let draw = |watch: &mut Watch, now: i64| {
+            watch.lay_out(BEFORE, 60, now, &theme);
+            watch.drawn = watch
+                .card()
+                .and_then(|card| card.drawn(0, card.lines.len(), 0, 0, 0));
+        };
+        let mut watch = Watch::default();
+        watch.watch(mpsc::unbounded_channel().1);
+        watch.apply(item(1, 40), "t");
+        watch.lay_out(BEFORE, 60, now(), &theme);
+        assert!(!watch.ticks(), "not drawn yet");
+        draw(&mut watch, now());
+        assert!(watch.ticks());
+        // The clock moves once a second, so a frame within the second lays nothing out.
+        let layouts = watch.layouts;
+        draw(&mut watch, now() + 400);
+        assert_eq!(watch.layouts, layouts);
+        draw(&mut watch, now() + 1000);
+        assert_eq!(watch.layouts, layouts + 1);
+        // The blank row the card ends with isn't the card.
+        let card = watch.card().expect("a card");
+        let last = card.lines.len();
+        assert_eq!(card.drawn(last - 1, last, 0, 0, 0), None);
+        // Out of view it doesn't tick.
+        watch.drawn = None;
+        assert!(!watch.ticks());
+        // A setup that ended keeps its card with no clock to move.
+        let done = snapshot("done", 2, vec![finished("checkout", "done")]);
+        assert_eq!(
+            watch.apply(Some(WatchEvent::Item(done)), "t"),
+            Outcome::Changed
+        );
+        draw(&mut watch, now());
+        assert!(watch.card().is_some() && !watch.ticks());
+        let layouts = watch.layouts;
+        draw(&mut watch, now() + 5000);
+        assert_eq!(watch.layouts, layouts);
+        let failed = snapshot("failed", 3, vec![finished("checkout", "failed")]);
+        assert_eq!(
+            watch.apply(Some(WatchEvent::Item(failed)), "t"),
+            Outcome::Changed
+        );
+        draw(&mut watch, now());
+        assert!(watch.card().is_some() && !watch.ticks());
+        // A running setup held through a null, or with its subscription closed, doesn't tick.
+        watch.apply(item(4, 70), "t");
+        draw(&mut watch, now());
+        assert!(watch.ticks());
+        watch.apply(Some(WatchEvent::Item(Value::Null)), "t");
+        assert!(!watch.ticks());
+        watch.apply(item(0, 80), "t");
+        draw(&mut watch, now());
+        assert!(watch.ticks());
+        watch.close();
+        assert!(!watch.ticks());
+        // A new width or Details lays it out again.
+        let layouts = watch.layouts;
+        watch.lay_out(BEFORE, 61, now(), &theme);
+        assert_eq!(watch.layouts, layouts + 1);
+        watch.details = true;
+        watch.lay_out(BEFORE, 61, now(), &theme);
+        assert_eq!(watch.layouts, layouts + 2);
+    }
+
+    #[test]
+    fn details_toggle_only_from_a_drawn_row() {
+        let drawn = |toggle, row| Drawn {
+            toggle,
+            row,
+            scroll: 7,
+            live: false,
+        };
+        let mut watch = Watch::default();
+        assert_eq!((watch.toggle(), watch.hint()), (None, None));
+        watch.drawn = Some(drawn(Some(-3), None));
+        assert_eq!(watch.hint(), Some(false));
+        // Opening keeps the row where it was, even above the screen. The frame's record goes
+        // with it, so a second press before the next frame does nothing.
+        assert_eq!(watch.toggle(), Some(-3));
+        assert_eq!(watch.toggle(), None);
+        assert!(watch.details);
+        // Closing brings a row above the screen to its top.
+        watch.drawn = Some(drawn(Some(-3), None));
+        assert_eq!(watch.hint(), Some(true));
+        assert_eq!(watch.toggle(), Some(0));
+        assert!(!watch.details);
+        // A click lands on the row the last frame drew, at the scroll it drew.
+        watch.drawn = Some(drawn(Some(4), Some(9)));
+        assert!(watch.toggle_at(9, 7));
+        assert!(!watch.toggle_at(9, 8) && !watch.toggle_at(8, 7));
+        // A card with no Details row has nothing to toggle and keeps its record.
+        watch.drawn = Some(drawn(None, None));
+        assert_eq!((watch.toggle(), watch.hint()), (None, None));
+        assert!(watch.drawn.is_some());
     }
 }
