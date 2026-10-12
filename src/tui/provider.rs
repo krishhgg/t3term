@@ -1139,7 +1139,7 @@ mod tests {
     fn long_unicode_and_control_text_stays_inside_the_banner_at_any_size() {
         let mut provider = codex("error");
         provider["displayName"] = json!(format!(
-            "\u{1b}[31m👩‍💻 Codex\u{7} {}\u{202e}",
+            "\u{1b}[31m👩‍💻 Codex\u{7}\u{7f}\u{9b} {}\u{202e}",
             "界".repeat(3000)
         ));
         provider["message"] = json!(format!(
@@ -1171,8 +1171,21 @@ mod tests {
                         banner.shown.as_mut().unwrap().card.toggle();
                     }
                     let shown = banner.shown.as_ref().unwrap();
-                    assert!(!shown.title.chars().any(char::is_control), "{size}");
-                    assert!(shown.title.len() < 4200, "{size}");
+                    // The title is cut, so its one line feed starts the row that says so. ESC,
+                    // BEL, DEL and C1 CSI are gone and the name's Unicode is whole.
+                    let (kept, note) = shown.title.split_once('\n').expect("a cut title");
+                    assert_eq!(note, "… the title goes on past 4096 bytes", "{size}");
+                    assert!(kept.len() <= MAX_BYTES, "{size}");
+                    assert!(!kept.contains(char::is_control), "{size}");
+                    let rest = kept.strip_prefix("[31m👩‍💻 Codex ").expect("the name");
+                    assert!(rest.starts_with('界'), "{size}");
+                    assert!(rest.chars().all(|c| c == '界'), "{size}");
+                    let printed = format!(
+                        "{}\n]52;c;aGk=e\u{301}\u{301} ⚠\u{fe0f} {}",
+                        "界".repeat(500),
+                        "a".repeat(300)
+                    );
+                    assert_eq!(shown.text, printed, "{size}");
                     let cells = draw_cells(&mut banner, width, height, limit);
                     let (area, close) = (banner.area, banner.close);
                     let screen = Rect::new(0, 0, width, height);
@@ -1181,9 +1194,11 @@ mod tests {
                     assert_eq!(close.intersection(area), close, "{size}");
                     for y in 0..height {
                         for x in 0..width {
+                            let symbol = cells[(x, y)].symbol();
                             if !area.contains(Position::new(x, y)) {
-                                assert_eq!(cells[(x, y)].symbol(), " ", "{size} at {x},{y}");
+                                assert_eq!(symbol, " ", "{size} at {x},{y}");
                             }
+                            assert!(!symbol.contains(char::is_control), "{size} at {x},{y}");
                         }
                     }
                     if width < 5 || height == 0 || limit == 0 {
