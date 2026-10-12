@@ -506,7 +506,8 @@ enum Resume {
     Snapshot,
     /// From the thread's current setup. `subscribeWorktreeSetup` has no cursor, and each item
     /// is the whole state: null while T3 tracks no setup for the thread, or a whole snapshot.
-    /// The snapshot's `sequence` counts its changes and is no cursor, so nothing tracks it.
+    /// The snapshot's `sequence` counts the setup's changes. It is not a cursor, and the
+    /// watcher doesn't track it.
     WorktreeSetup,
 }
 
@@ -524,8 +525,9 @@ impl Resume {
     }
 }
 
-/// Whether `item` has the fields every `WorktreeSetupSnapshot` carries that the watcher can
-/// check cheaply, as T3's packages/contracts/src/worktreeSetup.ts defines them.
+/// Whether `item` looks like a `WorktreeSetupSnapshot` from T3's
+/// packages/contracts/src/worktreeSetup.ts. It checks the thread id, phase, stages and
+/// sequence, and leaves the other fields to whatever reads the setup.
 fn is_worktree_setup(item: &Value) -> bool {
     item.get("threadId").is_some_and(Value::is_string)
         && item.get("phase").is_some_and(Value::is_string)
