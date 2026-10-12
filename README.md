@@ -165,7 +165,7 @@ T3 sends each setup whole, and the card shows the latest one for the open thread
 
 T3 numbers a thread's setup changes and forgets a setup 30 seconds after it ends, sending null. Within one subscription a setup with a lower number than the one shown is older and is ignored. Null leaves the card as it was, as on the desktop. T3 counts from zero again after null and after it restarts, so after null or a reconnect the next setup replaces the shown one whatever its number. The desktop keeps comparing across those, and can keep an older setup on screen until the new one's number passes it.
 
-If T3 refuses the subscription, which it does for a session or a server, the TUI doesn't ask again for any thread until it restarts, and says nothing. If a subscription ends, that thread doesn't ask again until you open it again. Either way the thread works as before, and the card keeps the last setup it had, without a moving clock.
+If T3 refuses the subscription, which it does for a session or a server, or answers it with any other error, the TUI doesn't ask again for any thread until it restarts, and says nothing. The thread works as before, and the card keeps the last setup it had, without a moving clock. If T3 ends a subscription without an error or the connection drops, the TUI subscribes again after a short wait. Until the new subscription sends a setup, the card keeps the one it had, without a moving clock.
 
 A few things differ from the desktop:
 
