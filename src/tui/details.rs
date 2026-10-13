@@ -19,9 +19,12 @@
 //! sends it, the shell's copy of the thread until then, and the shell's projects. They are
 //! worked out again only after an event that can change them, and only while the details are
 //! open, so closed details cost nothing. A frame wraps them again only at a new width.
+//!
+//! A second tab lists the pull requests linked to the thread, as the desktop's panel beside
+//! its details does. `pull_requests` reads and lays them out.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
@@ -29,6 +32,7 @@ use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
 use super::environment::Identity;
+use super::pull_requests::PullRequests;
 use super::setup::bounded;
 use super::tasks::wrap;
 use super::theme::Theme;
@@ -69,6 +73,19 @@ const PATH_ROWS: usize = 8;
 /// The longest project id kept to match project events against. With a longer one, every
 /// project event counts.
 const ID: usize = 512;
+
+/// What the card shows under its tabs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum Tab {
+    /// The thread's project, workspace, branch and environment.
+    #[default]
+    Thread,
+    /// The pull requests linked to the thread.
+    PullRequests,
+}
+
+const TABS: [Tab; 2] = [Tab::Thread, Tab::PullRequests];
+const THREAD_TAB: &str = "Thread";
 
 /// How the details draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -432,6 +449,10 @@ pub(super) struct Drawn {
     pub area: Rect,
     /// The × at the right of its title row.
     pub close: Rect,
+    /// The name of each tab, in the order of `TABS`.
+    pub tabs: [Rect; 2],
+    /// The rows under the tabs.
+    pub body: Rect,
 }
 
 /// The details as the reader left them in this window.
@@ -463,6 +484,12 @@ pub(super) struct Details {
     pub return_focus: Option<Focus>,
     /// Whether a dialog took the keyboard, rather than the reader with a click or Tab.
     pub taken: bool,
+    /// The tab that shows.
+    tab: Tab,
+    /// The thread's linked pull requests, for the second tab.
+    pub pulls: PullRequests,
+    /// The time the last frame drew at, for the pull requests' relative times.
+    now: i64,
     /// How many times the facts were worked out and wrapped, so the tests can tell what a
     /// frame or an event did.
     #[cfg(test)]
@@ -484,6 +511,7 @@ impl Details {
     pub fn mark(&mut self) {
         self.stale = true;
         self.moved = true;
+        self.pulls.mark();
     }
 
     /// Notes what an item from the shell's feed changed: a snapshot, or an event for the open
@@ -542,6 +570,7 @@ impl Details {
     pub fn follow(&mut self) {
         self.mark();
         self.scroll = 0;
+        self.pulls.follow();
     }
 
     /// Whether this frame has to work the facts out for thread `open_id`: the details are
@@ -573,23 +602,90 @@ impl Details {
         self.shown.filter(|_| self.open)
     }
 
-    /// Scrolls the text `delta` rows, down for a positive one.
-    pub fn scroll_by(&mut self, delta: isize) {
-        self.scroll = self.scroll.saturating_add_signed(delta);
+    /// The tab that shows.
+    pub fn tab(&self) -> Tab {
+        self.tab
     }
 
-    /// Scrolls the text a page down, or up when `down` is false.
+    /// Shows `tab`.
+    pub fn show(&mut self, tab: Tab) {
+        if self.tab != tab {
+            self.tab = tab;
+            self.moved = true;
+        }
+    }
+
+    /// Whether this frame has to work the pull requests out for thread `open_id`, on an
+    /// environment that links them to threads when `supported` is true.
+    pub fn wants_pulls(&self, open_id: Option<&str>, supported: bool) -> bool {
+        self.open && self.pulls.wants(open_id, supported)
+    }
+
+    /// Opens or closes the selected pull request's details, while its tab shows.
+    pub fn toggle_pull(&mut self) {
+        if self.tab == Tab::PullRequests {
+            self.pulls.toggle();
+            self.moved = true;
+        }
+    }
+
+    /// A click at `column`, `row`, inside the card the last frame drew: on a tab's name it shows
+    /// that tab, and on a pull request it selects it or opens its details. Says whether it
+    /// changed what shows.
+    pub fn click(&mut self, column: u16, row: u16) -> bool {
+        let Some(drawn) = self.drawn else {
+            return false;
+        };
+        let at = Position::new(column, row);
+        if let Some(index) = drawn.tabs.iter().position(|tab| tab.contains(at)) {
+            let tab = TABS[index];
+            let changed = self.tab != tab;
+            self.show(tab);
+            return changed;
+        }
+        if self.tab != Tab::PullRequests || !drawn.body.contains(at) {
+            return false;
+        }
+        let changed = self.pulls.click(usize::from(row - drawn.body.y));
+        if changed {
+            self.moved = true;
+        }
+        changed
+    }
+
+    /// Scrolls the text `delta` rows, down for a positive one, or moves the selected pull
+    /// request `delta` links.
+    pub fn scroll_by(&mut self, delta: isize) {
+        match self.tab {
+            Tab::Thread => self.scroll = self.scroll.saturating_add_signed(delta),
+            Tab::PullRequests => self.pulls.move_by(delta),
+        }
+    }
+
+    /// Scrolls the text a page down, or up when `down` is false, or moves the selected pull
+    /// request a page.
     pub fn page(&mut self, down: bool) {
-        let page = self.page.max(1) as isize;
-        self.scroll_by(if down { page } else { -page });
+        match self.tab {
+            Tab::Thread => {
+                let page = self.page.max(1) as isize;
+                self.scroll_by(if down { page } else { -page });
+            }
+            Tab::PullRequests => self.pulls.page_by(down),
+        }
     }
 
     pub fn scroll_home(&mut self) {
-        self.scroll = 0;
+        match self.tab {
+            Tab::Thread => self.scroll = 0,
+            Tab::PullRequests => self.pulls.move_by(isize::MIN),
+        }
     }
 
     pub fn scroll_end(&mut self) {
-        self.scroll = usize::MAX / 2;
+        match self.tab {
+            Tab::Thread => self.scroll = usize::MAX / 2,
+            Tab::PullRequests => self.pulls.move_by(isize::MAX),
+        }
     }
 
     /// Forgets where the last frame drew the details, for a frame that doesn't draw them.
@@ -599,16 +695,18 @@ impl Details {
         self.moved = false;
     }
 
-    /// Draws the details as the pane at `area`. `focused` says whether they have the keyboard,
-    /// which brightens the border.
+    /// Draws the details as the pane at `area`, at time `now`. `focused` says whether they have
+    /// the keyboard, which brightens the border.
     pub fn draw_pane(
         &mut self,
         frame: &mut Frame,
         area: Rect,
         focused: bool,
+        now: i64,
         environment: &Identity,
         theme: &Theme,
     ) {
+        self.now = now;
         self.draw_card(frame, area, Layout::Pane, focused, environment, theme);
     }
 
@@ -620,9 +718,11 @@ impl Details {
         &mut self,
         frame: &mut Frame,
         screen: Rect,
+        now: i64,
         environment: &Identity,
         theme: &Theme,
     ) {
+        self.now = now;
         let width = if screen.width >= BORDER_MIN_WIDTH + 2 {
             (screen.width - 2).min(DIALOG_WIDTH)
         } else {
@@ -632,14 +732,19 @@ impl Details {
         let (top, bottom) = if screen.height >= 6 { (1, 1) } else { (0, 0) };
         let room = screen.height - top - bottom;
         let bordered = width >= BORDER_MIN_WIDTH && room >= 3;
-        let frame_rows = if bordered { 3 } else { 1 };
-        let text_width = if bordered { width - 4 } else { width };
-        let wanted = self.lines(text_width as usize, environment, theme).len() as u16 + frame_rows;
+        // The border's rows, the title row and the tabs' row.
+        let frame_rows = if bordered { 4 } else { 2 };
+        let text_width = usize::from(if bordered { width - 4 } else { width });
+        let text_rows = match self.tab {
+            Tab::Thread => self.lines(text_width, environment, theme).len(),
+            Tab::PullRequests => self.pulls.wanted(text_width, now, theme),
+        };
+        let wanted = (text_rows + frame_rows).min(usize::from(room));
         let area = Rect {
             x: screen.right() - width - margin,
             y: screen.y + top,
             width,
-            height: wanted.min(room),
+            height: wanted as u16,
         };
         self.draw_card(frame, area, Layout::Dialog, true, environment, theme);
     }
@@ -657,9 +762,9 @@ impl Details {
         &self.rows.as_ref().expect("wrapped above").lines
     }
 
-    /// Draws the card at `area`: a title row with × at its end, and the text under it, which
-    /// scrolls when it doesn't fit. With room for one, a border goes round it and names where
-    /// more text is.
+    /// Draws the card at `area`: a title row with × at its end, the tabs' row, and the tab's
+    /// text under them, which scrolls when it doesn't fit. With room for one, a border goes
+    /// round it and names where more text is.
     fn draw_card(
         &mut self,
         frame: &mut Frame,
@@ -684,13 +789,12 @@ impl Details {
             area
         };
         let width = inner.width as usize;
-        let visible = (inner.height as usize).saturating_sub(1);
-        let total = self.lines(width, environment, theme).len();
-        self.scroll = self.scroll.min(total.saturating_sub(visible));
+        // The title row and the tabs' row come first.
+        let visible = (inner.height as usize).saturating_sub(2);
         self.page = visible;
         let muted = Style::new().fg(theme.muted);
 
-        let mut lines = Vec::with_capacity(visible + 1);
+        let mut lines = Vec::with_capacity(visible + 2);
         if inner.height > 0 && width > 0 {
             let close = if width >= 4 { " ×" } else { "" };
             let title = clip("Thread details", width.saturating_sub(close.width()));
@@ -703,10 +807,31 @@ impl Details {
                 width,
             ));
         }
-        let scroll = self.scroll;
-        if let Some(rows) = self.rows.as_ref() {
-            lines.extend(rows.lines.iter().skip(scroll).take(visible).cloned());
+        let mut tabs = [Rect::default(); 2];
+        if inner.height > 1 && width > 0 {
+            let (line, places) = tabs_row(self.tab, self.pulls.count(), width, theme);
+            lines.push(line);
+            for (rect, (start, columns)) in tabs.iter_mut().zip(places) {
+                let tab = Rect::new(inner.x + start as u16, inner.y + 1, columns as u16, 1);
+                *rect = tab.intersection(inner);
+            }
         }
+        let (above, below) = match self.tab {
+            Tab::Thread => {
+                let total = self.lines(width, environment, theme).len();
+                self.scroll = self.scroll.min(total.saturating_sub(visible));
+                let scroll = self.scroll;
+                if let Some(rows) = self.rows.as_ref() {
+                    lines.extend(rows.lines.iter().skip(scroll).take(visible).cloned());
+                }
+                (scroll > 0, scroll + visible < total)
+            }
+            Tab::PullRequests => {
+                let page = self.pulls.page(width, visible, self.now, theme);
+                lines.extend(page.lines.iter().cloned());
+                (page.above, page.below)
+            }
+        };
 
         frame.render_widget(Clear, area);
         let style = Style::new().fg(theme.fg).bg(theme.popover);
@@ -721,7 +846,7 @@ impl Details {
                 .border_type(BorderType::Rounded)
                 .border_style(Style::new().fg(border))
                 .style(style);
-            let more = match (scroll > 0, scroll + visible < total) {
+            let more = match (above, below) {
                 (true, true) => Some(" more ↑↓ "),
                 (true, false) => Some(" more ↑ "),
                 (false, true) => Some(" more ↓ "),
@@ -741,12 +866,65 @@ impl Details {
         } else {
             Rect::default()
         };
+        let body = if visible > 0 {
+            Rect::new(inner.x, inner.y + 2, inner.width, visible as u16)
+        } else {
+            Rect::default()
+        };
         self.drawn = Some(Drawn {
             layout,
             area,
             close,
+            tabs,
+            body,
         });
     }
+}
+
+/// The tabs' row in `width` columns: each tab's name, the one that shows `tab` in the accent
+/// color and underlined, with the number of linked pull requests once they are known and
+/// there are some. Says where each name starts and how many columns it takes.
+fn tabs_row(
+    tab: Tab,
+    count: Option<usize>,
+    width: usize,
+    theme: &Theme,
+) -> (Line<'static>, [(usize, usize); 2]) {
+    let count = count.filter(|&count| count > 0);
+    let long = match count {
+        Some(count) => format!("Pull requests {count}"),
+        None => "Pull requests".to_string(),
+    };
+    let pulls = if THREAD_TAB.len() + 2 + long.width() <= width {
+        long
+    } else {
+        match count {
+            Some(count) => format!("PRs {count}"),
+            None => "PRs".to_string(),
+        }
+    };
+    let active = Style::new()
+        .fg(theme.primary)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let muted = Style::new().fg(theme.muted);
+    let names = [THREAD_TAB.to_string(), pulls];
+    let mut spans = Vec::new();
+    let mut places = [(0, 0); 2];
+    let mut used = 0;
+    for (index, (shown, name)) in TABS.into_iter().zip(names).enumerate() {
+        let gap = if index > 0 { 2 } else { 0 };
+        if used + gap >= width {
+            break;
+        }
+        let name = clip(&name, width - used - gap);
+        let columns = name.width();
+        let style = if shown == tab { active } else { muted };
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.push(Span::styled(name, style));
+        places[index] = (used + gap, columns);
+        used += gap + columns;
+    }
+    (Line::from(spans), places)
 }
 
 /// The rows of `facts` at `width`: each label in muted text, its values under it, and a blank

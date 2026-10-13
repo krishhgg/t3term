@@ -15,6 +15,7 @@ mod markdown;
 mod picker;
 mod plan;
 mod provider;
+mod pull_requests;
 mod scroll;
 mod setup;
 mod sidebar;
@@ -1055,6 +1056,16 @@ impl App {
         })
     }
 
+    /// Whether the environment links pull requests to threads, as its capabilities'
+    /// `threadPullRequests` says, from the same descriptor as `capabilities`.
+    fn links_supported(&self) -> bool {
+        let capabilities = match self.config.as_ref() {
+            Some(config) => &config["environment"]["capabilities"],
+            None => &self.client.runtime.capabilities,
+        };
+        capabilities["threadPullRequests"] == Value::Bool(true)
+    }
+
     fn toggle_settled(&mut self) {
         self.sidebar.show_settled = !self.sidebar.show_settled;
         self.rebuild_rows();
@@ -1313,8 +1324,10 @@ impl App {
     }
 
     /// A key for the details while they have the keyboard. Esc closes a dialog. On a pane it
-    /// gives the keyboard back and leaves the pane open. The arrows, `j` and `k`, the page
-    /// keys, Home, End, `g` and `G` scroll the text.
+    /// gives the keyboard back and leaves the pane open. ← and → or `h` and `l` switch between
+    /// the thread's tab and its pull requests'. The up and down arrows, `j` and `k`, the page
+    /// keys, Home, End, `g` and `G` scroll the thread's text, or move along its pull requests,
+    /// where Enter opens or closes the selected one's details.
     fn on_details_key(&mut self, key: KeyEvent) {
         let plain = !key
             .modifiers
@@ -1324,6 +1337,11 @@ impl App {
                 self.leave_details()
             }
             KeyCode::Esc => self.close_details(),
+            KeyCode::Left => self.details.show(details::Tab::Thread),
+            KeyCode::Char('h') if plain => self.details.show(details::Tab::Thread),
+            KeyCode::Right => self.details.show(details::Tab::PullRequests),
+            KeyCode::Char('l') if plain => self.details.show(details::Tab::PullRequests),
+            KeyCode::Enter => self.details.toggle_pull(),
             KeyCode::Up => self.details.scroll_by(-1),
             KeyCode::Char('k') if plain => self.details.scroll_by(-1),
             KeyCode::Down => self.details.scroll_by(1),
@@ -1428,9 +1446,10 @@ impl App {
                     }
                 }
                 // A dialog of the thread's details takes the mouse. A click on its × closes it,
-                // as does a click outside it, on the button too, and the wheel over it scrolls
-                // it. Nothing reaches what it covers. Until a frame draws it after a change,
-                // it takes events and does nothing with them.
+                // as does a click outside it, on the button too. A click on a tab or a pull
+                // request acts on it, and the wheel over it scrolls it. Nothing reaches what it
+                // covers. Until a frame draws it after a change, it takes events and does
+                // nothing with them.
                 if self.details_modal() {
                     let fresh = !self.details.moved && !self.layout_changed;
                     let Some(drawn) = self.details.drawn.filter(|_| fresh) else {
@@ -1438,7 +1457,9 @@ impl App {
                     };
                     match mouse.kind {
                         _ if click && inside(drawn.close) => self.close_details(),
-                        _ if click && inside(drawn.area) => return false,
+                        _ if click && inside(drawn.area) => {
+                            return self.details.click(mouse.column, mouse.row);
+                        }
                         _ if click => self.close_details(),
                         MouseEventKind::ScrollUp if inside(drawn.area) => {
                             self.details.scroll_by(-1)
@@ -1499,9 +1520,10 @@ impl App {
                     return true;
                 }
                 // The details' button opens and closes them. Their pane takes what lands on
-                // it: a click on × closes it, a click elsewhere on it gives it the keyboard,
-                // and the wheel scrolls it. Until a frame draws them after a change, the
-                // button and the pane take events and do nothing with them.
+                // it: a click on × closes it, and a click elsewhere on it acts on the tab or
+                // the pull request under it and gives it the keyboard. The wheel scrolls it.
+                // Until a frame draws them after a change, the button and the pane take events
+                // and do nothing with them.
                 let moved = self.details.moved || self.layout_changed;
                 if click && inside(self.details.button) {
                     if moved {
@@ -1520,7 +1542,10 @@ impl App {
                     }
                     match mouse.kind {
                         _ if click && inside(drawn.close) => self.close_details(),
-                        _ if click => self.focus_details(false),
+                        _ if click => {
+                            self.details.click(mouse.column, mouse.row);
+                            self.focus_details(false)
+                        }
                         MouseEventKind::ScrollUp => self.details.scroll_by(-1),
                         MouseEventKind::ScrollDown => self.details.scroll_by(1),
                         _ => return false,
@@ -2682,23 +2707,30 @@ impl App {
             Paragraph::new(self.status_line(status_area.width as usize)),
             status_area,
         );
-        // The details are worked out again only after an event that can change them, or for
-        // another thread, and wrapped again only at another width.
+        // The details and the pull requests linked to the thread are worked out again only after
+        // an event that can change them, or for another thread, and wrapped again only at
+        // another width.
         let open_id = self.open.as_ref().map(|open| open.id.as_str());
         if self.details.wants(open_id) {
             let facts = details::Facts::of(open_id, self.details_record(), self.details_projects());
             self.details.set(facts);
         }
+        let supported = self.links_supported();
+        if self.details.wants_pulls(open_id, supported) {
+            let list = pull_requests::List::of(open_id, self.details_record(), supported);
+            self.details.pulls.set(list);
+        }
+        let now = self.now;
         match shown {
             Some(details::Layout::Pane) => {
                 let pane = details::pane_area(main, body.y, composer_area.bottom());
                 let focused = self.focus == Focus::Details;
                 self.details
-                    .draw_pane(frame, pane, focused, &self.environment, &self.theme);
+                    .draw_pane(frame, pane, focused, now, &self.environment, &self.theme);
             }
             Some(details::Layout::Dialog) => {
                 self.details
-                    .draw_dialog(frame, area, &self.environment, &self.theme)
+                    .draw_dialog(frame, area, now, &self.environment, &self.theme)
             }
             None => self.details.forget_drawn(),
         }
@@ -3612,8 +3644,19 @@ impl App {
             (Focus::Composer, None) => {
                 "Enter send · Alt+Enter newline · Alt+M model · Alt+E effort · Alt+P mode · Ctrl+X interrupt"
             }
-            (Focus::Details, None) if self.details_modal() => "↑↓/PgUp scroll · Esc close",
-            (Focus::Details, None) => "↑↓/PgUp scroll · Esc leave · Alt+B close · Tab focus",
+            (Focus::Details, None) if self.details.tab() == details::Tab::PullRequests => {
+                if self.details_modal() {
+                    "↑↓ select · Enter details · ← thread · Esc close"
+                } else {
+                    "↑↓ select · Enter details · ← thread · Esc leave · Alt+B close · Tab focus"
+                }
+            }
+            (Focus::Details, None) if self.details_modal() => {
+                "↑↓/PgUp scroll · Esc close · → pull requests"
+            }
+            (Focus::Details, None) => {
+                "↑↓/PgUp scroll · Esc leave · Alt+B close · → pull requests · Tab focus"
+            }
             (Focus::Transcript, None) => {
                 let plan = self
                     .drawn_plans
@@ -10439,6 +10482,350 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.focus, Focus::Composer);
         assert_eq!(app.composer.text(), "draft");
+    }
+
+    // ---- linked pull requests ----
+
+    /// Pull request `number` of krishhgg/t3term as T3 links it to a thread, open and synced,
+    /// its checks passing and approved.
+    fn linked(number: u64, title: &str) -> Value {
+        json!({
+            "host": "github.com",
+            "repository": "krishhgg/t3term",
+            "number": number,
+            "url": format!("https://github.com/krishhgg/t3term/pull/{number}"),
+            "source": "agent",
+            "linkedAt": "2026-10-13T10:00:00.000Z",
+            "snapshot": {
+                "state": "open",
+                "title": title,
+                "headBranch": format!("feature-{number}"),
+                "baseBranch": "master",
+                "isDraft": false,
+                "updatedAt": "2026-10-13T11:00:00.000Z",
+                "syncedAt": "2026-10-13T11:59:00.000Z",
+                "checksState": "passing",
+                "reviewDecision": "approved"
+            },
+            "stack": null
+        })
+    }
+
+    /// The feature thread `t` linked to `links`, as the shell lists it and its projection has
+    /// it.
+    fn linked_thread(links: Vec<Value>) -> Value {
+        let mut thread = feature_thread();
+        thread["pullRequests"] = json!(links);
+        thread
+    }
+
+    /// `details_tui` on an environment that links pull requests to threads, with thread `t`
+    /// linked to `links`.
+    fn pulls_tui(links: Vec<Value>, sidebar_hidden: bool) -> App {
+        let mut client = Client::offline();
+        client.runtime.capabilities = json!({"threadPullRequests": true});
+        let settings = Settings {
+            sidebar_hidden,
+            ..Settings::default()
+        };
+        let mut app = App::new(
+            Arc::new(client),
+            Theme::new(Depth::TrueColor),
+            &settings,
+            mpsc::unbounded_channel().0,
+        );
+        app.watch_setup = Box::new(|_: &str| mpsc::unbounded_channel().1);
+        let other = bound("u", "q", Value::Null, Value::Null);
+        let thread = linked_thread(links);
+        app.on_shell_event(details_shell(vec![thread.clone(), other]));
+        app.on_shell_event(caught_up());
+        app.open_thread(open_bound(thread));
+        app.composer.insert_str("draft");
+        press(&mut app, KeyCode::Left);
+        app
+    }
+
+    #[test]
+    fn the_pane_lists_the_threads_pull_requests_in_a_tab_the_keys_and_the_mouse_reach() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let links = vec![linked(31, "Bound titles"), linked(32, "Lineage")];
+        let mut app = pulls_tui(links, false);
+        app.focus = Focus::Transcript;
+        cells(&mut app, 200, 50);
+        alt(&mut app, 'b');
+        let started = reads(&runtime);
+        // The thread's tab shows first, and the other counts the links.
+        let text = details_after(&mut app, 200, 50);
+        let scrolled = app.scroll.rows();
+        assert!(text.contains("Thread  Pull requests 2"), "{text}");
+        assert!(text.contains("Recorded branch"), "{text}");
+        assert!(!text.contains("#31"), "{text}");
+
+        // A click on the tab shows the links and gives the pane the keyboard.
+        let drawn = app.details.drawn.expect("the pane");
+        let tab = drawn.tabs[1];
+        assert!(mouse(&mut app, CLICK, tab.x, tab.y));
+        assert_eq!(app.details.tab(), details::Tab::PullRequests);
+        assert_eq!(app.focus, Focus::Details);
+        let buffer = cells(&mut app, 200, 50);
+        let text = details_text(&app, &buffer);
+        for shown in ["● #31 Bound titles", "● #32 Lineage", "2 open · 2 linked"] {
+            assert!(text.contains(shown), "{shown:?} in {text}");
+        }
+        assert!(!text.contains("Recorded branch"), "{text}");
+        let status = text_in(&buffer, Rect::new(0, 49, 200, 1));
+        let hint = "↑↓ select · Enter details · ← thread";
+        assert!(status.contains(hint), "{status}");
+
+        // ↓ selects the second link and Enter opens its details, and the composer, the draft
+        // and the transcript stay as they were.
+        press(&mut app, KeyCode::Down);
+        let text = details_after(&mut app, 200, 50);
+        assert!(!text.contains("Linked by the agent"), "{text}");
+        press(&mut app, KeyCode::Enter);
+        let text = details_after(&mut app, 200, 50);
+        let below = text.find("Linked by the agent").expect("the details");
+        assert!(text.find("#32").is_some_and(|at| at < below), "{text}");
+        for code in [KeyCode::Char('x'), KeyCode::Char('q'), KeyCode::Backspace] {
+            press(&mut app, code);
+        }
+        assert_eq!(app.composer.text(), "draft");
+        assert_eq!(app.scroll.rows(), scrolled);
+        assert!(!app.quit);
+
+        // ← and → switch the tabs, as `h` and `l` do.
+        for (code, tab) in [
+            (KeyCode::Left, details::Tab::Thread),
+            (KeyCode::Right, details::Tab::PullRequests),
+            (KeyCode::Char('h'), details::Tab::Thread),
+            (KeyCode::Char('l'), details::Tab::PullRequests),
+        ] {
+            press(&mut app, code);
+            assert_eq!(app.details.tab(), tab, "{code:?}");
+        }
+
+        // A click on a link selects it, and a second opens its details. Until a frame draws
+        // the pane again, a click does nothing.
+        cells(&mut app, 200, 50);
+        let drawn = app.details.drawn.expect("the pane");
+        let (x, y) = (drawn.body.x + 1, drawn.body.y);
+        assert!(mouse(&mut app, CLICK, x, y));
+        assert!(!mouse(&mut app, CLICK, x, y));
+        cells(&mut app, 200, 50);
+        assert!(mouse(&mut app, CLICK, x, y));
+        let text = details_after(&mut app, 200, 50);
+        let below = text.find("Linked by the agent").expect("the details");
+        assert!(text.find("#31").is_some_and(|at| at < below), "{text}");
+        assert!(text.find("#32").is_some_and(|at| at > below), "{text}");
+        // The wheel moves the selection.
+        assert!(mouse(&mut app, MouseEventKind::ScrollDown, x, y));
+        assert!(mouse(&mut app, MouseEventKind::ScrollUp, x, y));
+
+        // Esc gives the keyboard back, and the pane keeps its tab.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus, Focus::Transcript);
+        assert!(app.details.open);
+        assert_eq!(app.details.tab(), details::Tab::PullRequests);
+        assert_eq!(app.composer.text(), "draft");
+        // None of it asked T3 for anything or needs the tick.
+        assert_eq!(reads(&runtime), started);
+        assert!(!needs_tick(app.open.as_ref(), &app.sidebar));
+    }
+
+    #[test]
+    fn a_dialog_shows_a_links_url_as_plain_text_and_its_tabs_take_clicks() {
+        let links = vec![linked(31, "Bound titles"), linked(32, "Lineage")];
+        let mut app = pulls_tui(links, false);
+        app.focus = Focus::Transcript;
+        cells(&mut app, 80, 24);
+        alt(&mut app, 'b');
+        assert_eq!(app.focus, Focus::Details);
+        press(&mut app, KeyCode::Right);
+        let buffer = cells(&mut app, 80, 24);
+        let drawn = app.details.drawn.expect("the dialog");
+        assert_eq!(drawn.layout, details::Layout::Dialog);
+        let status = text_in(&buffer, Rect::new(0, 23, 80, 1));
+        let hint = "↑↓ select · Enter details · ← thread · Esc close";
+        assert!(status.contains(hint), "{status}");
+        // The dialog is as tall as the links and the footer, its title, its tabs and its
+        // border.
+        assert_eq!(drawn.area.height, 2 * 3 + 1 + 4);
+        let url = "https://github.com/krishhgg/t3term/pull/31";
+        assert!(!details_text(&app, &buffer).contains(url));
+        press(&mut app, KeyCode::Enter);
+        let text = details_after(&mut app, 80, 24);
+        assert!(text.contains(url), "{text}");
+        let drawn = app.details.drawn.expect("the dialog");
+        assert!(drawn.area.height > 2 * 3 + 1 + 4);
+        // A second Enter closes them.
+        press(&mut app, KeyCode::Enter);
+        assert!(!details_after(&mut app, 80, 24).contains(url));
+
+        // A click on the thread's tab shows it, and the dialog stays open with the keyboard.
+        let drawn = app.details.drawn.expect("the dialog");
+        let tab = drawn.tabs[0];
+        assert!(mouse(&mut app, CLICK, tab.x, tab.y));
+        assert_eq!(app.details.tab(), details::Tab::Thread);
+        assert!(app.details.open);
+        assert_eq!(app.focus, Focus::Details);
+        let text = details_after(&mut app, 80, 24);
+        assert!(text.contains("Recorded branch"), "{text}");
+        // A click on the tab that shows changes nothing.
+        let drawn = app.details.drawn.expect("the dialog");
+        assert!(!mouse(&mut app, CLICK, drawn.tabs[0].x, drawn.tabs[0].y));
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.details.open);
+        assert_eq!(app.focus, Focus::Transcript);
+        assert_eq!(app.composer.text(), "draft");
+    }
+
+    #[test]
+    fn hostile_and_a_thousand_links_stay_inside_the_details_at_every_size() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let hostile = format!(
+            "\u{1b}]52;c;cHduZWQ=\u{7}\u{1b}[2J{}\r\nevil",
+            "👩\u{200d}💻e\u{301}名".repeat(20_000)
+        );
+        // Short enough in bytes to be read, and longer in characters than a row keeps.
+        let mut first = linked(1, &hostile);
+        first["repository"] = json!(format!("o/{}\u{9b}x", "漢".repeat(300)));
+        let url = format!("https://github.com/{}", "\u{1b}u".repeat(100_000));
+        first["url"] = json!(url);
+        first["snapshot"]["headBranch"] = json!(&hostile);
+        let mut links = vec![first];
+        links.extend((2..=1_200).map(|number| linked(number, "A change")));
+        for sidebar_hidden in [false, true] {
+            let mut app = pulls_tui(links.clone(), sidebar_hidden);
+            cells(&mut app, 200, 50);
+            alt(&mut app, 'b');
+            app.details.show(details::Tab::PullRequests);
+            for expanded in [false, true] {
+                for (width, height) in [(200, 50), (120, 36), (80, 24), (40, 12)] {
+                    let buffer = cells(&mut app, width, height);
+                    let drawn = app.details.drawn.expect("drawn");
+                    assert_eq!(drawn.area.intersection(app.screen), drawn.area);
+                    for part in [drawn.close, drawn.tabs[0], drawn.tabs[1], drawn.body] {
+                        assert_eq!(part.intersection(drawn.area), part, "{width}x{height}");
+                    }
+                    // No cell on the screen holds a control character.
+                    for y in 0..height {
+                        for x in 0..width {
+                            let symbol = buffer[(x, y)].symbol();
+                            assert!(
+                                !symbol.contains(char::is_control),
+                                "{sidebar_hidden} {width}x{height} ({x}, {y}) {symbol:?}"
+                            );
+                        }
+                    }
+                    let text = details_text(&app, &buffer);
+                    assert!(text.contains("#1 "), "{width}x{height}: {text}");
+                    let whole = text_in(&buffer, buffer.area);
+                    assert!(!whole.contains("evil"), "{whole}");
+                }
+                if !expanded {
+                    app.details.toggle_pull();
+                }
+            }
+            // The links were read once for every frame at every size, a thousand of them.
+            assert_eq!(app.details.pulls.builds, 1);
+            assert_eq!(app.details.pulls.count(), Some(1_000));
+            assert_eq!(app.composer.text(), "draft");
+        }
+        assert_eq!(reads(&runtime), 0);
+    }
+
+    #[test]
+    fn only_news_of_the_thread_works_its_links_out_and_another_thread_starts_fresh() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = pulls_tui(vec![linked(31, "Bound titles")], false);
+        // Closed, the details read no links, whatever comes.
+        cells(&mut app, 200, 50);
+        let more = linked_thread(vec![linked(31, "Bound titles"), linked(33, "Later")]);
+        app.on_thread_event(live(2, "thread.meta-updated", more));
+        cells(&mut app, 200, 50);
+        assert_eq!(app.details.pulls.builds, 0);
+        let started = reads(&runtime);
+
+        alt(&mut app, 'b');
+        app.details.show(details::Tab::PullRequests);
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("#33 Later"), "{text}");
+        assert!(text.contains("Pull requests 2"), "{text}");
+        assert_eq!(app.details.pulls.builds, 1);
+        // Frames, an answer streaming in and news of another thread read nothing again.
+        for _ in 0..3 {
+            cells(&mut app, 200, 50);
+        }
+        let answer = json!({"id": "a20", "type": "assistant_message", "ordinal": 20,
+            "text": "Done"});
+        app.on_thread_event(live(3, "turn-item.updated", answer));
+        let other = bound("u", "q", json!("/repo/other-wt"), Value::Null);
+        app.on_shell_event(thread_updated(3, other));
+        cells(&mut app, 200, 50);
+        assert_eq!(app.details.pulls.builds, 1);
+
+        // The thread's watch drops a link, and the list follows.
+        app.focus = Focus::Details;
+        press(&mut app, KeyCode::Down);
+        let fewer = linked_thread(vec![linked(31, "Bound titles")]);
+        app.on_thread_event(live(4, "thread.meta-updated", fewer));
+        let text = details_after(&mut app, 200, 50);
+        assert!(!text.contains("#33"), "{text}");
+        assert!(text.contains("#31"), "{text}");
+        assert!(text.contains("Pull requests 1"), "{text}");
+        assert_eq!(app.details.pulls.builds, 2);
+
+        // Another thread starts at its own list, and late news of `t` never brings its links
+        // back.
+        app.open_thread(OpenThread::new("u".into(), mpsc::unbounded_channel().1));
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("No linked pull requests"), "{text}");
+        assert!(!text.contains("#31"), "{text}");
+        assert!(!text.contains("Pull requests 1"), "{text}");
+        let late = linked_thread(vec![linked(34, "Stale")]);
+        app.on_shell_event(thread_updated(4, late.clone()));
+        let stale = json!({"kind": "snapshot", "snapshotSequence": 3,
+            "projection": {"thread": late, "turnItems": []}});
+        app.on_thread_event(WatchEvent::Item(stale));
+        let after = details_after(&mut app, 200, 50);
+        assert_eq!(after, text);
+        assert_eq!(app.composer.text(), "draft");
+        assert_eq!(reads(&runtime), started);
+        assert!(!needs_tick(app.open.as_ref(), &app.sidebar));
+    }
+
+    #[test]
+    fn the_links_wait_for_the_thread_and_need_an_environment_that_links_them() {
+        // The environment's capabilities lack `threadPullRequests`, so the list is unavailable
+        // and counts nothing, whatever the thread holds.
+        let mut app = details_tui();
+        let thread = linked_thread(vec![linked(31, "Bound titles")]);
+        app.on_shell_event(thread_updated(2, thread.clone()));
+        app.open_thread(open_bound(thread));
+        cells(&mut app, 200, 50);
+        alt(&mut app, 'b');
+        app.details.show(details::Tab::PullRequests);
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Linked pull requests unavailable"), "{text}");
+        assert!(!text.contains("Pull requests 1"), "{text}");
+        assert!(!text.contains("#31"), "{text}");
+
+        // A thread neither the shell nor its watch has sent is loading until its watch closes.
+        let mut app = pulls_tui(Vec::new(), false);
+        cells(&mut app, 200, 50);
+        alt(&mut app, 'b');
+        app.details.show(details::Tab::PullRequests);
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("No linked pull requests"), "{text}");
+        app.open_thread(OpenThread::new("v".into(), mpsc::unbounded_channel().1));
+        assert!(details_after(&mut app, 200, 50).contains("Loading…"));
+        app.on_thread_event(WatchEvent::Failed("thread closed".into()));
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Unavailable"), "{text}");
+        assert!(!text.contains("Loading"), "{text}");
     }
 
     // ---- long titles ----
