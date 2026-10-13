@@ -46,6 +46,7 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 | 18 | https://github.com/krishhgg/t3term/pull/27 | The open thread's worktree setup as a read-only card under its first prompt: stage progress, the setup script's last output and Details. No Cancel, Work locally, terminal or worktree preparation | `194943b5764256bbae6bc9c7a1d34948d33d9ddc` |
 | 19 | https://github.com/krishhgg/t3term/pull/28 | The environment's label, host and port under the sidebar's wordmark, and a dot that follows the sidebar's own feed, not the open thread's watch. The breadcrumb's row shows both while the sidebar is hidden. No environment list or selector | `f210cd8ac137872b95388ac4e11c097d8b0cf159` |
 | 20 | https://github.com/krishhgg/t3term/pull/29 | The open thread's project, workspace, recorded branch and environment, read-only, in a pane beside the conversation or a dialog on a narrow screen, opened with Alt+B or a button in the title row. No Git status, actions, scripts or tabbed right panel | `739cead6795dd0a80151d657c48721c109dea86f` |
+| 21 | https://github.com/krishhgg/t3term/pull/33 | Lineage in the thread details: the parent, forks, context transfers, running agents and a closed Previous agents group with its failed count, 6 rows and then 12 more at a time. ↑, ↓, Enter and clicks open a related thread the shell lists. Read-only, with no Stop, Merge back, Disconnect or new fork. Not merged | |
 
 ## Maintenance review PRs
 
