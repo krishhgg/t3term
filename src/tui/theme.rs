@@ -176,8 +176,8 @@ impl Theme {
         Style::new().fg(self.fg)
     }
 
-    pub fn project_color(&self, name: &str) -> Color {
-        self.project_colors[project_color_index(name)]
+    pub fn project_color(&self, badge: &Badge) -> Color {
+        self.project_colors[badge.color]
     }
 
     /// A glyph standing in for the provider's logo.
@@ -196,6 +196,24 @@ impl Theme {
 }
 
 // ---- project identity, as in apps/web/src/projectIdentity.ts ----
+
+/// A project's monogram and color, from its whole title. Working them out reads all of the
+/// title, so the sidebar's `Badges` keeps them from one change of the project to the next.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Badge {
+    pub letters: String,
+    /// The color's place in `PROJECT_COLORS`.
+    color: usize,
+}
+
+impl Badge {
+    pub fn of(title: &str) -> Badge {
+        Badge {
+            letters: monogram(title),
+            color: project_color_index(title),
+        }
+    }
+}
 
 /// Two letters for a project without an icon: the first glyph, then the first digit in the
 /// first word, else the first glyph of the last word, else the last glyph of the word.
@@ -398,6 +416,20 @@ mod tests {
             project_color_index("ABC"),
             "case does not change the color"
         );
+    }
+
+    #[test]
+    fn a_badge_comes_from_the_whole_title() {
+        // The last word of a long title still gives the second letter and colors the badge.
+        let long = format!("alpha {} zulu", "x".repeat(10_000));
+        let badge = Badge::of(&long);
+        assert_eq!(badge.letters, "AZ");
+        assert_eq!(badge.color, project_color_index(&long));
+        assert_ne!(badge, Badge::of(&format!("alpha {}", "x".repeat(10_000))));
+        // A missing project shows as "Project", and a blank title colors as one.
+        assert_eq!(Badge::of("Project").letters, "PT");
+        assert_eq!(Badge::of("").letters, "PR");
+        assert_eq!(Badge::of("").color, Badge::of("Project").color);
     }
 
     #[test]

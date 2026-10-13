@@ -10,6 +10,7 @@ mod banner;
 mod composer;
 mod details;
 mod environment;
+mod label;
 mod markdown;
 mod picker;
 mod plan;
@@ -51,10 +52,8 @@ use environment::{Feed, Identity};
 use markdown::Styles;
 use picker::{Item, Kind, Pick};
 use scroll::{Pin, Scroll};
-use sidebar::{Capabilities, Sidebar, View};
-use theme::{
-    Theme, duration_label, model_display_name, monogram, now_ms, parse_iso_ms, runtime_mode_label,
-};
+use sidebar::{Badges, Capabilities, Sidebar, View};
+use theme::{Theme, duration_label, model_display_name, now_ms, parse_iso_ms, runtime_mode_label};
 use unsent::{Failed, Unsent};
 
 const FRAME: Duration = Duration::from_millis(33);
@@ -438,6 +437,8 @@ struct App {
     unsent: Unsent,
     picker: Option<Picker>,
     shell: Option<ShellState>,
+    /// The badge of each project in `shell`, which the sidebar's cards and the breadcrumb show.
+    badges: Badges,
     /// Where the sidebar's thread feed stands, which the sidebar's dot shows. The open
     /// thread's watch keeps its own state.
     feed: Feed,
@@ -764,6 +765,7 @@ impl App {
             unsent: Unsent::default(),
             picker: None,
             shell: None,
+            badges: Badges::default(),
             feed: Feed::Connecting,
             environment,
             sidebar: Sidebar::with_working(
@@ -820,10 +822,10 @@ impl App {
     fn on_shell_event(&mut self, event: WatchEvent) {
         match event {
             WatchEvent::Item(item) => {
-                let applied = self
-                    .shell
-                    .get_or_insert_with(ShellState::default)
-                    .apply(&item);
+                let shell = self.shell.get_or_insert_with(ShellState::default);
+                let applied = shell.apply(&item);
+                // A project's badge is worked out again only when the project changes.
+                self.badges.note(&applied, &item, shell);
                 // The details show the shell's copy of the open thread until its watch sends
                 // the thread, and its project from the shell's.
                 let open_id = self.open.as_ref().map(|open| open.id.as_str());
@@ -1192,7 +1194,7 @@ impl App {
         sidebar::find_thread(self.shell.as_ref()?, id)
     }
 
-    fn project_title(&self, project_id: &str) -> String {
+    fn project_title(&self, project_id: &str) -> &str {
         sidebar::project_title(self.shell.as_ref(), project_id)
     }
 
@@ -2526,6 +2528,7 @@ impl App {
             let view = View {
                 theme: &self.theme,
                 shell: self.shell.as_ref(),
+                badges: &self.badges,
                 open_id: self.open.as_ref().map(|o| o.id.as_str()),
                 focused: self.focus == Focus::Sidebar,
                 now: self.now,
@@ -2709,19 +2712,27 @@ impl App {
     fn header_line(&self, width: usize, with_environment: bool) -> Line<'static> {
         let t = &self.theme;
         let muted = Style::new().fg(t.muted);
+        // The breadcrumb borrows the titles as T3 sent them and reads only what it has room for.
         let (mut left, title, title_style, mut right) = match self.open.as_ref() {
-            None => {
-                let hint = String::from("Pick a thread in the sidebar");
-                (Vec::new(), hint, muted, Vec::new())
-            }
+            None => (
+                Vec::new(),
+                "Pick a thread in the sidebar",
+                muted,
+                Vec::new(),
+            ),
             Some(open) => match self.open_thread_json() {
-                None => (Vec::new(), String::from("Loading…"), muted, Vec::new()),
+                None => (Vec::new(), "Loading…", muted, Vec::new()),
                 Some(thread) => {
-                    let project = self.project_title(str_of(thread, "projectId"));
-                    let badge = monogram(&project);
-                    let color = t.project_color(&project);
+                    let project_id = str_of(thread, "projectId");
+                    let badge = self.badges.get(project_id);
+                    let bold = Style::new()
+                        .fg(t.project_color(badge))
+                        .add_modifier(Modifier::BOLD);
+                    // The project's name is cut to the row's width, more than the row has after
+                    // the badge, so a long name runs off the row as it did whole.
+                    let project = label::cut(self.project_title(project_id), width);
                     let left = vec![
-                        Span::styled(badge, Style::new().fg(color).add_modifier(Modifier::BOLD)),
+                        Span::styled(badge.letters.clone(), bold),
                         Span::styled(format!(" {project}"), muted),
                         Span::styled("  /  ", Style::new().fg(t.border_strong)),
                     ];
@@ -2733,23 +2744,29 @@ impl App {
                             Style::new().fg(t.warning_fg),
                         )]
                     };
-                    let title: String = str_of(thread, "title").into();
-                    (left, title, Style::new().fg(t.fg), right)
+                    (left, str_of(thread, "title"), Style::new().fg(t.fg), right)
                 }
             },
         };
         let left_width: usize = left.iter().map(|s| s.content.width()).sum();
-        // `fit` can run a column over after a wide character, so a title leaves one spare.
+        // The title leaves a column spare before what follows it, as it did when `fit` could run
+        // a column over, so the row keeps its layout.
         let lead = left_width + usize::from(!left.is_empty());
         if with_environment {
             let state: usize = right.iter().map(|s| s.content.width()).sum();
-            let kept = title.width().min(KEPT_TITLE);
+            let kept = label::columns(title, KEPT_TITLE);
             let room = width.saturating_sub(lead + state + kept).min(width / 3);
             right.extend(environment::chip(&self.environment, self.feed, room, t));
         }
         let right_width: usize = right.iter().map(|s| s.content.width()).sum();
         let room = width.saturating_sub(lead + right_width);
-        left.push(Span::styled(fit(&title, room), title_style));
+        // With no room, the `…` alone takes that spare column.
+        let shown = if room == 0 && !title.is_empty() {
+            String::from("…")
+        } else {
+            label::cut(title, room)
+        };
+        left.push(Span::styled(shown, title_style));
         row(left, right, width)
     }
 
@@ -4800,6 +4817,7 @@ mod tests {
             let view = View {
                 theme: &theme,
                 shell: Some(&shell),
+                badges: &Badges::of(&shell),
                 open_id: None,
                 focused: false,
                 now: now_ms(),
@@ -10421,6 +10439,259 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.focus, Focus::Composer);
         assert_eq!(app.composer.text(), "draft");
+    }
+
+    // ---- long titles ----
+
+    /// How many times a frame shows a project's badge, two ASCII letters, in `color`.
+    fn badges_in(buffer: &ratatui::buffer::Buffer, letters: &str, color: Color) -> usize {
+        let (first, second) = letters.split_at(1);
+        let shows = |x: u16, y: u16, letter: &str| {
+            let cell = &buffer[(x, y)];
+            cell.symbol() == letter && cell.fg == color
+        };
+        let area = buffer.area;
+        (0..area.height)
+            .flat_map(|y| (1..area.width).map(move |x| (x, y)))
+            .filter(|&(x, y)| shows(x - 1, y, first) && shows(x, y, second))
+            .count()
+    }
+
+    /// A shell event that lists project `id` titled `title`.
+    fn project_updated(sequence: u64, id: &str, title: &str) -> WatchEvent {
+        let project = json!({"id": id, "title": title});
+        let item = json!({"kind": "project.updated", "sequence": sequence, "project": project});
+        WatchEvent::Item(item)
+    }
+
+    #[test]
+    fn a_badge_is_worked_out_when_its_project_changes_and_never_for_a_frame() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        // The badge's second letter and its color come from the end of a title no row shows.
+        let name = format!("alpha {} zulu", "x".repeat(200_000));
+        let colors = Theme::new(Depth::TrueColor).project_colors;
+        let color = |title: &str| colors[theme::project_color_index(title)];
+        let thread = bound("t", "p", Value::Null, json!("main"));
+        let projects = json!([{"id": "p", "title": &name}, {"id": "q", "title": "Other"}]);
+        let snapshot = json!({"snapshotSequence": 1, "projects": projects,
+            "threads": [thread.clone()]});
+        let shell = json!({"kind": "snapshot", "snapshot": snapshot});
+        let mut app = tui(&Settings::default());
+        app.on_shell_event(WatchEvent::Item(shell));
+        app.on_shell_event(caught_up());
+        app.open_thread(open_bound(thread.clone()));
+        // The snapshot worked out a badge for each of its projects.
+        assert_eq!((app.badges.prepares, app.badges.count()), (2, 2));
+        let first = app.badges.get("p").clone();
+        assert_eq!(first.letters, "AZ");
+        // The sidebar's card and the breadcrumb show it in the whole title's color.
+        let buffer = cells(&mut app, 120, 36);
+        assert_eq!(badges_in(&buffer, "AZ", color(&name)), 2);
+
+        // Frames at every size, with the sidebar shown or hidden, work out no badge.
+        for hidden in [false, true] {
+            if hidden {
+                ctrl_b(&mut app);
+            }
+            for (width, height) in [(200, 50), (120, 36), (80, 24), (40, 12)] {
+                cells(&mut app, width, height);
+                cells(&mut app, width, height);
+            }
+        }
+        assert_eq!(app.badges.prepares, 2);
+        // Hidden, the sidebar's card is gone and the breadcrumb still shows the badge.
+        let buffer = cells(&mut app, 120, 36);
+        assert_eq!(badges_in(&buffer, "AZ", color(&name)), 1);
+        ctrl_b(&mut app);
+
+        // Nor do an update to a thread, the open thread's output, the feed catching up, the
+        // enrichment of a repository or a project update the shell has already had.
+        let mut renamed = thread.clone();
+        renamed["title"] = json!("Fix the login form");
+        app.on_shell_event(thread_updated(2, renamed));
+        let answer = json!({"id": "a20", "type": "assistant_message", "ordinal": 20,
+            "text": "Done"});
+        app.on_thread_event(live(2, "turn-item.updated", answer));
+        app.on_shell_event(caught_up());
+        let enrichment = json!({"kind": "snapshot", "snapshot": {"projects": []},
+            "resolvedRepositoryIdentityRoots": []});
+        app.on_shell_event(WatchEvent::Item(enrichment));
+        app.on_shell_event(project_updated(2, "p", "Bravo Yankee"));
+        cells(&mut app, 120, 36);
+        assert_eq!(app.badges.prepares, 2);
+        assert_eq!(app.badges.get("p"), &first);
+
+        // A rename works out the project's badge again.
+        app.on_shell_event(project_updated(3, "p", "Bravo Yankee"));
+        assert_eq!(app.badges.prepares, 3);
+        assert_eq!(app.badges.get("p"), &theme::Badge::of("Bravo Yankee"));
+        let drawn = chrome(&mut app, 120, 36);
+        assert!(
+            drawn
+                .header
+                .contains("BY Bravo Yankee  /  Fix the login form"),
+            "{drawn:?}"
+        );
+        let buffer = cells(&mut app, 120, 36);
+        assert_eq!(badges_in(&buffer, "BY", color("Bravo Yankee")), 2);
+
+        // Removing the project drops its badge, and its thread shows as in no project.
+        let removed = json!({"kind": "project.removed", "sequence": 4, "projectId": "p"});
+        app.on_shell_event(WatchEvent::Item(removed));
+        assert_eq!(app.badges.prepares, 3);
+        assert!(!app.badges.has("p"));
+        assert_eq!(app.badges.count(), 1);
+        let drawn = chrome(&mut app, 120, 36);
+        assert!(
+            drawn.header.contains("PT Project  /  Fix the login form"),
+            "{drawn:?}"
+        );
+
+        // Restored, the project has its first badge again, in the same color.
+        app.on_shell_event(project_updated(5, "p", &name));
+        assert_eq!(app.badges.prepares, 4);
+        assert_eq!(app.badges.get("p"), &first);
+        let buffer = cells(&mut app, 120, 36);
+        assert_eq!(badges_in(&buffer, "AZ", color(&name)), 2);
+
+        // A snapshot without project q works out the badges again and keeps none for q.
+        let snapshot = json!({"snapshotSequence": 6, "projects": [{"id": "p", "title": &name}],
+            "threads": [thread]});
+        let shell = json!({"kind": "snapshot", "snapshot": snapshot});
+        app.on_shell_event(WatchEvent::Item(shell));
+        assert_eq!((app.badges.prepares, app.badges.count()), (5, 1));
+        assert!(!app.badges.has("q"));
+        assert_eq!(app.badges.get("p"), &first);
+        assert_eq!(reads(&runtime), 0);
+    }
+
+    /// The TUI connected to Studio Mac, with thread `t` of Demo titled `title` on `branch`
+    /// listed and open, the transcript scrolled up and a draft in the composer.
+    fn titled(title: &str, branch: &str) -> App {
+        let mut thread = bound("t", "p", Value::Null, json!(branch));
+        thread["title"] = json!(title);
+        let mut app = tui_at(Some("Studio Mac"), "http://127.0.0.1:51024");
+        app.on_shell_event(details_shell(vec![thread.clone()]));
+        app.on_shell_event(caught_up());
+        app.open_thread(open_bound(thread));
+        app.focus = Focus::Composer;
+        app.composer.insert_str("half a thought");
+        app.scroll.set(12);
+        app
+    }
+
+    /// Where the last frame of `app` put the details' button, the transcript, the composer and
+    /// the sidebar's list.
+    fn layout(app: &App) -> [Rect; 4] {
+        [
+            app.details.button,
+            app.transcript_area,
+            app.composer_area,
+            app.sidebar.list,
+        ]
+    }
+
+    #[test]
+    fn a_huge_title_and_branch_move_nothing_else_on_the_screen() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let title = format!(
+            "\u{1b}]0;x\u{7}Fix the login page {}\r\nevil",
+            "👩\u{200d}💻e\u{301}名".repeat(20_000)
+        );
+        let branch = format!("\u{1b}[31mfeature/{}\u{1b}[0m\nevil", "名".repeat(100_000));
+        let mut plain = titled("Fix the login page", "feature/login");
+        let mut huge = titled(&title, &branch);
+        let whole = "Studio Mac · 127.0.0.1:51024";
+        // Whether a row shows any of the address.
+        let address = |row: &str| row.contains(|c: char| c == '·' || c.is_ascii_digit());
+        // The breadcrumb up to the slash before the title.
+        let lead = |drawn: &Chrome| Some(drawn.header.split_once("/  ")?.0.to_string());
+        for hidden in [false, true] {
+            if hidden {
+                ctrl_b(&mut plain);
+                ctrl_b(&mut huge);
+            }
+            for (width, height) in [(200, 50), (120, 36), (80, 24), (40, 12)] {
+                let at = format!("{hidden} {width}x{height}");
+                let plain_drawn = chrome(&mut plain, width, height);
+                let huge_drawn = chrome(&mut huge, width, height);
+                // The environment shows as it does beside the short title. Where a row has no
+                // room for the whole address, `environment::chip` shows the label alone or
+                // nothing, and never part of the port. The dots, the status line and the
+                // sidebar's top rows are as they were.
+                let shown = header_identity(&huge_drawn);
+                assert_eq!(shown, header_identity(&plain_drawn), "{at}");
+                for row in [shown, huge_drawn.environment.trim()] {
+                    assert!(row == whole || !address(row), "{at}: {huge_drawn:?}");
+                }
+                assert_eq!(huge_drawn.sidebar_dot, plain_drawn.sidebar_dot, "{at}");
+                assert_eq!(huge_drawn.header_dot, plain_drawn.header_dot, "{at}");
+                assert_eq!(huge_drawn.status, plain_drawn.status, "{at}");
+                assert_eq!(huge_drawn.wordmark, plain_drawn.wordmark, "{at}");
+                assert_eq!(huge_drawn.environment, plain_drawn.environment, "{at}");
+                assert_eq!(lead(&huge_drawn), lead(&plain_drawn), "{at}");
+                // The details' button, the transcript and the composer are where they were and
+                // hold the same cells, and the reader is where they were.
+                let plain_cells = cells(&mut plain, width, height);
+                let huge_cells = cells(&mut huge, width, height);
+                assert_eq!(layout(&huge), layout(&plain), "{at}");
+                for area in &layout(&plain)[..3] {
+                    for y in area.y..area.bottom() {
+                        for x in area.x..area.right() {
+                            assert_eq!(huge_cells[(x, y)], plain_cells[(x, y)], "{at} ({x}, {y})");
+                        }
+                    }
+                }
+                assert_eq!(
+                    (huge.scroll.rows(), &huge.anchor),
+                    (plain.scroll.rows(), &plain.anchor),
+                    "{at}"
+                );
+                assert_eq!(huge.focus, Focus::Composer, "{at}");
+                assert_eq!(huge.composer.text(), "half a thought", "{at}");
+                // No cell holds a control character, and the text after the line break never
+                // shows.
+                for y in 0..height {
+                    for x in 0..width {
+                        let symbol = huge_cells[(x, y)].symbol();
+                        assert!(
+                            !symbol.contains(char::is_control),
+                            "{at} ({x}, {y}) {symbol:?}"
+                        );
+                    }
+                }
+                let text = text_in(&huge_cells, huge_cells.area);
+                assert!(!text.contains("evil"), "{at}: {text}");
+                // The title and the branch show by their printable characters.
+                if width == 200 {
+                    assert!(
+                        huge_drawn.header.contains("]0;xFix the login page"),
+                        "{at}: {huge_drawn:?}"
+                    );
+                    let list = text_in(&huge_cells, huge.sidebar.list);
+                    assert_eq!(list.contains("[31mfeature/"), !hidden, "{at}: {list}");
+                }
+            }
+        }
+        assert_eq!(reads(&runtime), 0);
+    }
+
+    #[test]
+    fn a_title_keeps_a_spare_column_and_shows_an_ellipsis_without_room() {
+        let mut app = tui(&Settings::default());
+        let thread = bound("t", "p", Value::Null, Value::Null);
+        app.on_shell_event(shell_snapshot(vec![thread.clone()]));
+        app.open_thread(open_bound(thread));
+        let shown = |width| app.header_line(width, false).to_string();
+        // "DO Demo  /  " takes twelve columns, and the title leaves the row's last column.
+        assert_eq!(shown(21), "DO Demo  /  Thread t ");
+        assert_eq!(shown(20), "DO Demo  /  Thread… ");
+        assert_eq!(shown(14), "DO Demo  /  … ");
+        // With no room, the `…` alone takes that column, and past the row's end when it must.
+        assert_eq!(shown(13), "DO Demo  /  …");
+        assert_eq!(shown(5), "DO Demo  /  …");
     }
 
     // ---- everything at once ----

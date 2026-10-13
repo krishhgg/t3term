@@ -42,9 +42,10 @@ use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
 use super::environment::{Feed, Identity};
-use super::theme::{self, Theme, monogram, parse_iso_ms, relative_time};
+use super::label;
+use super::theme::{self, Badge, Theme, parse_iso_ms, relative_time};
 use super::{fit, row, spinner_frame, str_of, with_bg};
-use crate::projection::{ShellState, is_terminal_status, status};
+use crate::projection::{Applied, ShellState, is_terminal_status, status};
 
 /// The lifecycle features a server supports, from its environment descriptor.
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
@@ -1151,18 +1152,114 @@ pub fn find_thread<'a>(shell: &'a ShellState, id: &str) -> Option<&'a Value> {
     shell.threads.iter().find(|t| str_of(t, "id") == id)
 }
 
-/// A project's title, or `Project` when the shell doesn't have it.
-pub fn project_title(shell: Option<&ShellState>, project_id: &str) -> String {
+/// A project's title as T3 sent it, or `Project` when the shell doesn't have the project.
+pub fn project_title<'a>(shell: Option<&'a ShellState>, project_id: &str) -> &'a str {
     shell
         .and_then(|s| s.projects.iter().find(|p| str_of(p, "id") == project_id))
-        .map(|p| str_of(p, "title").to_string())
-        .unwrap_or_else(|| "Project".into())
+        .map_or("Project", |p| str_of(p, "title"))
+}
+
+/// The badge of each project the shell has, by the project's id, worked out from its whole
+/// title when the shell's feed brings the project and kept until the feed changes or removes
+/// it. A frame looks a badge up, so neither a frame nor an event for a thread reads a title
+/// that can be any length.
+pub struct Badges {
+    by_project: HashMap<String, Badge>,
+    /// The badge of `Project`, which stands in for a project the shell doesn't have.
+    missing: Badge,
+    /// How many badges were worked out from a project's title, so the tests can tell what a
+    /// frame or an event did.
+    #[cfg(test)]
+    pub prepares: usize,
+}
+
+impl Default for Badges {
+    fn default() -> Badges {
+        Badges {
+            by_project: HashMap::new(),
+            missing: Badge::of("Project"),
+            #[cfg(test)]
+            prepares: 0,
+        }
+    }
+}
+
+impl Badges {
+    /// Follows what an item from the shell's feed did to `shell`'s projects. A snapshot works
+    /// out every project's badge again, and an update or a removal that project's. Events for
+    /// threads and the enrichment of a project's repository change no title, so they leave
+    /// the badges as they are.
+    pub fn note(&mut self, applied: &Applied, item: &Value, shell: &ShellState) {
+        match applied {
+            Applied::Snapshot => {
+                self.by_project.clear();
+                for project in &shell.projects {
+                    // The shell finds the first project with an id, so the badge is its.
+                    if !self.by_project.contains_key(str_of(project, "id")) {
+                        self.prepare(project);
+                    }
+                }
+            }
+            Applied::Event(kind) if kind == "project.updated" || kind == "project.removed" => {
+                let id = item
+                    .pointer("/project/id")
+                    .or_else(|| item.get("projectId"))
+                    .and_then(Value::as_str)
+                    .unwrap_or_default();
+                match shell.projects.iter().find(|p| str_of(p, "id") == id) {
+                    Some(project) => self.prepare(project),
+                    None => {
+                        self.by_project.remove(id);
+                    }
+                }
+            }
+            _ => {}
+        }
+    }
+
+    /// Every project's badge, as a snapshot of `shell` would leave them.
+    #[cfg(test)]
+    pub fn of(shell: &ShellState) -> Badges {
+        let mut badges = Badges::default();
+        badges.note(&Applied::Snapshot, &Value::Null, shell);
+        badges
+    }
+
+    fn prepare(&mut self, project: &Value) {
+        let badge = Badge::of(str_of(project, "title"));
+        self.by_project
+            .insert(str_of(project, "id").to_string(), badge);
+        #[cfg(test)]
+        {
+            self.prepares += 1;
+        }
+    }
+
+    /// The badge of the project with id `project_id`, or the one for `Project` when the shell
+    /// doesn't have it.
+    pub fn get(&self, project_id: &str) -> &Badge {
+        self.by_project.get(project_id).unwrap_or(&self.missing)
+    }
+
+    /// Whether the project with id `project_id` has a badge of its own.
+    #[cfg(test)]
+    pub fn has(&self, project_id: &str) -> bool {
+        self.by_project.contains_key(project_id)
+    }
+
+    /// How many projects have a badge of their own.
+    #[cfg(test)]
+    pub fn count(&self) -> usize {
+        self.by_project.len()
+    }
 }
 
 /// What the sidebar needs from the rest of the app to draw.
 pub struct View<'a> {
     pub theme: &'a Theme,
     pub shell: Option<&'a ShellState>,
+    /// The badges of the shell's projects.
+    pub badges: &'a Badges,
     pub open_id: Option<&'a str>,
     /// Whether the sidebar has the keyboard, which colors the highlight's bar.
     pub focused: bool,
@@ -1184,24 +1281,29 @@ impl View<'_> {
         cursor: bool,
     ) -> Vec<Line<'static>> {
         let t = self.theme;
+        // The card borrows the titles and the branch as T3 sent them and reads only what it has
+        // room for.
         let title = thread
             .map(|t| str_of(t, "title"))
             .filter(|s| !s.is_empty())
-            .unwrap_or("Untitled")
-            .to_string();
-        let project = thread
-            .map(|t| project_title(self.shell, str_of(t, "projectId")))
-            .unwrap_or_default();
-        let badge = monogram(&project);
+            .unwrap_or("Untitled");
+        let unlisted;
+        let (project, badge) = match thread {
+            Some(thread) => {
+                let id = str_of(thread, "projectId");
+                (project_title(self.shell, id), self.badges.get(id))
+            }
+            None => {
+                unlisted = Badge::of("");
+                ("", &unlisted)
+            }
+        };
         let inner = width.saturating_sub(2);
         // The status keeps its width and the project name gives way, down to a one-column
         // ellipsis and one column of gap.
         let (status_label, status_color) =
-            self.thread_status(thread, inner.saturating_sub(badge.width() + 3));
-        let branch = thread
-            .map(|t| str_of(t, "branch"))
-            .unwrap_or("")
-            .to_string();
+            self.thread_status(thread, inner.saturating_sub(badge.letters.width() + 3));
+        let branch = thread.map(|t| str_of(t, "branch")).unwrap_or("");
         let (glyph, glyph_color) = t.provider_glyph(
             thread
                 .map(|t| str_of(&t["modelSelection"], "instanceId"))
@@ -1218,30 +1320,33 @@ impl View<'_> {
             Span::raw(" ")
         };
         let muted = Style::new().fg(t.sidebar_muted);
-        let project_room = inner.saturating_sub(badge.width() + status_label.width() + 2);
+        let project_room = inner.saturating_sub(badge.letters.width() + status_label.width() + 2);
         let line1 = row(
             vec![
                 Span::styled(
-                    badge.clone(),
+                    badge.letters.clone(),
                     Style::new()
-                        .fg(t.project_color(&project))
+                        .fg(t.project_color(badge))
                         .add_modifier(Modifier::BOLD),
                 ),
-                Span::styled(format!(" {}", fit(&project, project_room)), muted),
+                Span::styled(format!(" {}", label::cut(project, project_room)), muted),
             ],
             vec![Span::styled(status_label, Style::new().fg(status_color))],
             inner,
         );
         let line2 = row(
             vec![Span::styled(
-                fit(&title, inner),
+                label::cut(title, inner),
                 Style::new().fg(t.sidebar_fg),
             )],
             Vec::new(),
             inner,
         );
         let line3 = row(
-            vec![Span::styled(fit(&branch, inner.saturating_sub(2)), muted)],
+            vec![Span::styled(
+                label::cut(branch, inner.saturating_sub(2)),
+                muted,
+            )],
             vec![Span::styled(glyph, Style::new().fg(glyph_color))],
             inner,
         );
@@ -2410,9 +2515,11 @@ mod tests {
         size: (u16, u16),
     ) -> Buffer {
         let theme = Theme::new(Depth::TrueColor);
+        let badges = shell.map(Badges::of).unwrap_or_default();
         let view = View {
             theme: &theme,
             shell,
+            badges: &badges,
             open_id: open,
             focused: true,
             now: now(),
@@ -2756,6 +2863,7 @@ mod tests {
         let view = View {
             theme: &theme,
             shell: None,
+            badges: &Badges::default(),
             open_id: None,
             focused: true,
             now: now(),
