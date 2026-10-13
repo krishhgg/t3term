@@ -8,6 +8,7 @@
 
 mod banner;
 mod composer;
+mod details;
 mod environment;
 mod markdown;
 mod picker;
@@ -45,6 +46,7 @@ use crate::projection::{Applied, ShellState, ThreadState, apply_config, is_activ
 use crate::settings::Settings;
 use crate::transcript::{self, BlockKind, ChangeLine};
 use composer::Composer;
+use details::Details;
 use environment::{Feed, Identity};
 use markdown::Styles;
 use picker::{Item, Kind, Pick};
@@ -86,6 +88,9 @@ enum Focus {
     Sidebar,
     Transcript,
     Composer,
+    /// The thread's details: a dialog of them, which always has the keyboard while it shows,
+    /// or their pane, after a click on it or Tab.
+    Details,
 }
 
 /// A drag of the sidebar's right edge, from the left button going down on it until it comes
@@ -504,6 +509,8 @@ struct App {
     picker_rows: Vec<(u16, usize)>,
     /// The button at the top left of the conversation that hides and shows the sidebar.
     sidebar_toggle: Rect,
+    /// The open thread's details, which only this window opens and closes.
+    details: Details,
     /// The whole screen the last frame drew, which a drag and `[` and `]` work out the
     /// sidebar's width against.
     screen: Rect,
@@ -690,13 +697,22 @@ fn sidebar_width(width: u16, chosen: Option<u16>) -> u16 {
 }
 
 /// The pane Tab moves focus to from `focus`, or BackTab when `forward` is false. A hidden
-/// sidebar is left out of the cycle.
-fn cycle(focus: Focus, forward: bool, sidebar_hidden: bool) -> Focus {
-    let panes: &[Focus] = if sidebar_hidden {
-        &[Focus::Composer, Focus::Transcript]
-    } else {
-        &[Focus::Sidebar, Focus::Composer, Focus::Transcript]
-    };
+/// sidebar is left out of the cycle, and the thread's details are in it while `details` says
+/// they show as a pane.
+fn cycle(focus: Focus, forward: bool, sidebar_hidden: bool, details: bool) -> Focus {
+    let panes: Vec<Focus> = [
+        Focus::Sidebar,
+        Focus::Composer,
+        Focus::Transcript,
+        Focus::Details,
+    ]
+    .into_iter()
+    .filter(|pane| match pane {
+        Focus::Sidebar => !sidebar_hidden,
+        Focus::Details => details,
+        Focus::Composer | Focus::Transcript => true,
+    })
+    .collect();
     let at = panes.iter().position(|&pane| pane == focus).unwrap_or(0);
     let step = if forward { 1 } else { panes.len() - 1 };
     panes[(at + step) % panes.len()]
@@ -705,6 +721,15 @@ fn cycle(focus: Focus, forward: bool, sidebar_hidden: bool) -> Focus {
 /// The spinner frame for a wall-clock time, so every spinner on screen turns together.
 fn spinner_frame(now: i64) -> &'static str {
     SPINNER[(now / 1000).rem_euclid(SPINNER.len() as i64) as usize]
+}
+
+/// The main column `main` less a blank column on each side, like the GUI's padding.
+fn padded(main: Rect) -> Rect {
+    Rect {
+        x: main.x + 1,
+        width: main.width.saturating_sub(2),
+        ..main
+    }
 }
 
 fn str_of<'a>(value: &'a Value, key: &str) -> &'a str {
@@ -782,6 +807,7 @@ impl App {
             picker_area: Rect::default(),
             picker_rows: Vec::new(),
             sidebar_toggle: Rect::default(),
+            details: Details::default(),
             screen: Rect::default(),
             watch_setup: Box::new(move |thread_id: &str| watcher.watch_worktree_setup(thread_id)),
             setup_refused: false,
@@ -794,9 +820,14 @@ impl App {
     fn on_shell_event(&mut self, event: WatchEvent) {
         match event {
             WatchEvent::Item(item) => {
-                self.shell
+                let applied = self
+                    .shell
                     .get_or_insert_with(ShellState::default)
                     .apply(&item);
+                // The details show the shell's copy of the open thread until its watch sends
+                // the thread, and its project from the shell's.
+                let open_id = self.open.as_ref().map(|open| open.id.as_str());
+                self.details.note_shell(&applied, &item, open_id);
                 if item["kind"] == "synchronized" {
                     self.feed = Feed::Live;
                 }
@@ -813,6 +844,8 @@ impl App {
             // message goes with the next key, and the dot stays.
             WatchEvent::Failed(message) => {
                 self.feed = Feed::Failed;
+                // Projects the details wait for won't come now.
+                self.details.mark();
                 self.message = Some((message, true));
             }
         }
@@ -844,6 +877,7 @@ impl App {
         match event {
             WatchEvent::Item(item) => {
                 let applied = open.apply(&item);
+                self.details.note_thread(&applied);
                 // A fresh snapshot means the watch reconnected, so output T3 couldn't send
                 // before is worth asking for again.
                 if applied == Applied::Snapshot {
@@ -877,6 +911,8 @@ impl App {
             WatchEvent::Failed(message) => {
                 open.connection = "closed".into();
                 open.setup.close();
+                // The details go by the shell's copy of the thread from now on.
+                self.details.mark();
                 self.message = Some((message, true));
             }
         }
@@ -1188,6 +1224,9 @@ impl App {
         self.follow_banner();
         self.follow_provider(false);
         self.follow_setup();
+        // Open details show the new thread from the next frame, which works its details out
+        // before it draws them.
+        self.details.follow();
         self.scroll.set(0);
         self.picker = None;
         self.focus = Focus::Composer;
@@ -1197,6 +1236,130 @@ impl App {
         // The thread that was open may have been listed on a closed Settled shelf only
         // because it was open.
         self.rebuild_rows();
+    }
+
+    // ---- thread details ----
+
+    /// The main column of a screen `area`, its padding taken off, as a frame lays it out.
+    fn main_column(&self, area: Rect) -> Rect {
+        padded(columns(area, self.sidebar_columns(area.width)).1)
+    }
+
+    /// Opens or closes the thread's details, as Alt+B and their button do. Details that open
+    /// as a dialog take the keyboard. A pane beside the conversation leaves it where it was,
+    /// so typing in the composer goes on. Closing gives it back to the pane that had it.
+    fn toggle_details(&mut self) {
+        if self.details.open {
+            self.close_details();
+            return;
+        }
+        self.details.toggle();
+        self.layout_changed = true;
+        if details::layout(self.main_column(self.screen)) == details::Layout::Dialog {
+            self.focus_details();
+        }
+    }
+
+    /// Closes the details, if they are open, and gives the keyboard back from them.
+    fn close_details(&mut self) {
+        if self.details.open {
+            self.details.toggle();
+            self.layout_changed = true;
+        }
+        self.leave_details();
+    }
+
+    /// Gives the details the keyboard, noting the pane that had it. An open menu closes.
+    fn focus_details(&mut self) {
+        if self.focus != Focus::Details {
+            self.details.return_focus = Some(self.focus);
+            self.focus = Focus::Details;
+        }
+        self.picker = None;
+    }
+
+    /// Gives the keyboard back from the details to the pane that had it before them, or to the
+    /// composer. A sidebar hidden since gives it to the transcript, as hiding it does.
+    fn leave_details(&mut self) {
+        if self.focus != Focus::Details {
+            return;
+        }
+        self.focus = match self.details.return_focus.take() {
+            Some(Focus::Sidebar) if self.sidebar_hidden => {
+                if self.open.is_some() {
+                    Focus::Transcript
+                } else {
+                    Focus::Composer
+                }
+            }
+            Some(focus @ (Focus::Sidebar | Focus::Transcript | Focus::Composer)) => focus,
+            Some(Focus::Details) | None => Focus::Composer,
+        };
+    }
+
+    /// Whether the details are a dialog with the keyboard and the mouse: they have focus and
+    /// the last frame didn't draw them as a pane. That includes the moment between Alt+B
+    /// opening them as a dialog and the frame that draws it.
+    fn details_modal(&self) -> bool {
+        self.focus == Focus::Details && self.details.shown() != Some(details::Layout::Pane)
+    }
+
+    /// A key for the details while they have the keyboard. Esc closes a dialog. On a pane it
+    /// gives the keyboard back and leaves the pane open. The arrows, `j` and `k`, the page
+    /// keys, Home, End, `g` and `G` scroll the text.
+    fn on_details_key(&mut self, key: KeyEvent) {
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Esc if self.details.shown() == Some(details::Layout::Pane) => {
+                self.leave_details()
+            }
+            KeyCode::Esc => self.close_details(),
+            KeyCode::Up => self.details.scroll_by(-1),
+            KeyCode::Char('k') if plain => self.details.scroll_by(-1),
+            KeyCode::Down => self.details.scroll_by(1),
+            KeyCode::Char('j') if plain => self.details.scroll_by(1),
+            KeyCode::PageUp => self.details.page(false),
+            KeyCode::PageDown => self.details.page(true),
+            KeyCode::Home => self.details.scroll_home(),
+            KeyCode::Char('g') if plain => self.details.scroll_home(),
+            KeyCode::End => self.details.scroll_end(),
+            KeyCode::Char('G') if plain => self.details.scroll_end(),
+            _ => {}
+        }
+    }
+
+    /// The open thread's record for its details. While its watch is open, that is the
+    /// projection's once the watch sends it, and the shell's copy until then. After the watch
+    /// closes, the shell's copy, which still changes, comes first. A projection whose thread
+    /// has another id counts as none. Without either, the thread is loading until the watch
+    /// sends a projection or closes, and unavailable after.
+    fn details_record(&self) -> details::Record<'_> {
+        let Some(open) = self.open.as_ref() else {
+            return details::Record::None;
+        };
+        let closed = open.connection == "closed";
+        let projection = open
+            .state
+            .as_ref()
+            .map(ThreadState::thread)
+            .filter(|thread| thread.get("id").and_then(Value::as_str) == Some(open.id.as_str()));
+        match (projection, self.shell_thread(&open.id)) {
+            (Some(thread), _) if !closed => details::Record::Found(thread),
+            (_, Some(thread)) | (Some(thread), None) => details::Record::Found(thread),
+            (None, None) if closed || open.state.is_some() => details::Record::Unavailable,
+            (None, None) => details::Record::Loading,
+        }
+    }
+
+    /// The shell's projects for the details, or why it has none yet.
+    fn details_projects(&self) -> details::Projects<'_> {
+        match self.shell.as_ref() {
+            Some(shell) => details::Projects::Listed(&shell.projects),
+            None if self.feed == Feed::Failed => details::Projects::Failed,
+            None => details::Projects::Loading,
+        }
     }
 
     // ---- input ----
@@ -1252,6 +1415,29 @@ impl App {
                         _ => return false,
                     }
                 }
+                // A dialog of the thread's details takes the mouse. A click on its × closes it,
+                // as does a click outside it, on the button too, and the wheel over it scrolls
+                // it. Nothing reaches what it covers. Until a frame draws it after a change,
+                // it takes events and does nothing with them.
+                if self.details_modal() {
+                    let fresh = !self.details.moved && !self.layout_changed;
+                    let Some(drawn) = self.details.drawn.filter(|_| fresh) else {
+                        return false;
+                    };
+                    match mouse.kind {
+                        _ if click && inside(drawn.close) => self.close_details(),
+                        _ if click && inside(drawn.area) => return false,
+                        _ if click => self.close_details(),
+                        MouseEventKind::ScrollUp if inside(drawn.area) => {
+                            self.details.scroll_by(-1)
+                        }
+                        MouseEventKind::ScrollDown if inside(drawn.area) => {
+                            self.details.scroll_by(1)
+                        }
+                        _ => return false,
+                    }
+                    return true;
+                }
                 let chip = self
                     .chips
                     .iter()
@@ -1298,6 +1484,35 @@ impl App {
                 }
                 if click && inside(self.sidebar_toggle) {
                     self.toggle_sidebar();
+                    return true;
+                }
+                // The details' button opens and closes them. Their pane takes what lands on
+                // it: a click on × closes it, a click elsewhere on it gives it the keyboard,
+                // and the wheel scrolls it. Until a frame draws them after a change, the
+                // button and the pane take events and do nothing with them.
+                let moved = self.details.moved || self.layout_changed;
+                if click && inside(self.details.button) {
+                    if moved {
+                        return false;
+                    }
+                    self.toggle_details();
+                    return true;
+                }
+                if let Some(drawn) = self
+                    .details
+                    .drawn
+                    .filter(|drawn| drawn.layout == details::Layout::Pane && inside(drawn.area))
+                {
+                    if moved {
+                        return false;
+                    }
+                    match mouse.kind {
+                        _ if click && inside(drawn.close) => self.close_details(),
+                        _ if click => self.focus_details(),
+                        MouseEventKind::ScrollUp => self.details.scroll_by(-1),
+                        MouseEventKind::ScrollDown => self.details.scroll_by(1),
+                        _ => return false,
+                    }
                     return true;
                 }
                 // The banners lie over the transcript, so each takes what lands on it: a click
@@ -1392,6 +1607,9 @@ impl App {
                 // draws it.
                 self.end_drag(false);
                 self.sidebar.border = Rect::default();
+                // The details' button and the details may have moved too, so they take no
+                // click until then.
+                self.details.moved = true;
                 true
             }
             _ => false,
@@ -1423,6 +1641,18 @@ impl App {
             // From any pane, an open menu included, and never typed into the composer.
             KeyCode::Char('b') if ctrl => {
                 self.toggle_sidebar();
+                return;
+            }
+            // The thread's details, from any pane, an open menu included, and never typed into
+            // the composer.
+            KeyCode::Char('b') if alt => {
+                self.toggle_details();
+                return;
+            }
+            // A dialog of the details takes every other key, so Esc closes it before it moves
+            // focus anywhere, and nothing reaches the conversation under it.
+            _ if self.details_modal() => {
+                self.on_details_key(key);
                 return;
             }
             // Answer approvals from any pane. Terminals report Esc followed quickly by a letter as Alt.
@@ -1483,14 +1713,19 @@ impl App {
             }
             KeyCode::Tab | KeyCode::BackTab => {
                 let forward = key.code == KeyCode::Tab;
-                self.focus = cycle(self.focus, forward, self.sidebar_hidden);
+                let pane = self.details.shown() == Some(details::Layout::Pane);
+                match cycle(self.focus, forward, self.sidebar_hidden, pane) {
+                    Focus::Details => self.focus_details(),
+                    next => self.focus = next,
+                }
                 return;
             }
-            KeyCode::PageUp => {
+            // The page keys scroll the transcript from any pane but the details'.
+            KeyCode::PageUp if self.focus != Focus::Details => {
                 self.scroll.set(self.scroll.rows() + self.page());
                 return;
             }
-            KeyCode::PageDown => {
+            KeyCode::PageDown if self.focus != Focus::Details => {
                 self.scroll
                     .set(self.scroll.rows().saturating_sub(self.page()));
                 return;
@@ -1564,6 +1799,7 @@ impl App {
                 KeyCode::Esc | KeyCode::Left | KeyCode::Char('h') => self.focus_sidebar(),
                 _ => {}
             },
+            Focus::Details => self.on_details_key(key),
         }
     }
 
@@ -2256,6 +2492,16 @@ impl App {
         self.layout_changed = false;
         self.screen = area;
         let (sidebar, main) = columns(area, self.sidebar_columns(area.width));
+        // The main column keeps one blank column on each side, like the GUI's padding.
+        let main = padded(main);
+        // How the details fit decides the conversation's width. A dialog has the keyboard, so
+        // it takes it before the sidebar and the composer draw whether they have it.
+        let shown = self.details.open.then(|| details::layout(main));
+        match shown {
+            Some(details::Layout::Dialog) => self.focus_details(),
+            Some(details::Layout::Pane) => {}
+            None => self.leave_details(),
+        }
         // The wake timer usually moves a woken thread first, but it runs on a clock that
         // stops while the machine sleeps. A hidden sidebar keeps its rows current too, so it
         // comes back as T3 has it.
@@ -2277,18 +2523,20 @@ impl App {
             self.sidebar.draw(frame, sidebar, &view);
         }
 
-        // The main column keeps one blank column on each side, like the GUI's padding.
-        let main = Rect {
-            x: main.x + 1,
-            width: main.width.saturating_sub(2),
-            ..main
+        // Beside the details' pane, the conversation narrows. The title row and the status line
+        // keep the main column's width.
+        let conversation = match shown {
+            Some(details::Layout::Pane) => details::beside(main),
+            _ => main,
         };
-        let (composer_rows, cursor) = self.composer.layout(main.width.saturating_sub(4) as usize);
+        let (composer_rows, cursor) = self
+            .composer
+            .layout(conversation.width.saturating_sub(4) as usize);
         // Text rows, a spacer, the chips row and two borders.
         let composer_height = composer_rows.len().clamp(1, COMPOSER_MAX_ROWS) as u16 + 4;
         // The panel leaves the header, three transcript rows, the composer and the status line
         // their space, less its own two borders.
-        let panel_width = main.width.saturating_sub(4) as usize;
+        let panel_width = conversation.width.saturating_sub(4) as usize;
         let panel_room = main.height.saturating_sub(2 + 3 + composer_height + 1 + 2);
         let panel = match self.request_panel(panel_width) {
             Some(panel) => self.panel_rows(panel, panel_width, panel_room as usize),
@@ -2305,7 +2553,7 @@ impl App {
             .height
             .saturating_sub(2 + 3 + composer_height + 1 + panel_height);
         let tasks = self.tasks.lay_out(
-            main.width.saturating_sub(4) as usize,
+            conversation.width.saturating_sub(4) as usize,
             tasks_room as usize,
             area.height as usize,
             &self.theme,
@@ -2318,7 +2566,15 @@ impl App {
             Constraint::Length(composer_height),
             Constraint::Length(1),
         ])
-        .areas(main);
+        .areas(conversation);
+        let header = Rect {
+            width: main.width,
+            ..header
+        };
+        let status_area = Rect {
+            width: main.width,
+            ..status_area
+        };
 
         // The toggle leads the header, where the desktop's sits in its title bar, so a hidden
         // sidebar always has a way back. The breadcrumb follows it.
@@ -2331,9 +2587,37 @@ impl App {
             )),
             self.sidebar_toggle,
         );
+        // The details' button ends the row, as the desktop's ends its title bar, when the row
+        // has room for both buttons.
+        let button_width = details::BUTTON.width() as u16;
+        let button_room = button_width + 1;
+        self.details.button = if header.width >= self.sidebar_toggle.width + 1 + button_room {
+            Rect::new(header.right() - button_width, header.y, button_width, 1)
+        } else {
+            Rect::default()
+        };
+        let button_style = if self.details.open {
+            Style::new()
+                .fg(self.theme.primary)
+                .bg(self.theme.chip_bg)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::new().fg(self.theme.muted).bg(self.theme.chip_bg)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::styled(details::BUTTON, button_style)),
+            self.details.button,
+        );
+        let taken = if self.details.button.width > 0 {
+            button_room
+        } else {
+            0
+        };
         let breadcrumb = Rect {
             x: header.x + self.sidebar_toggle.width + 1,
-            width: header.width.saturating_sub(self.sidebar_toggle.width + 1),
+            width: header
+                .width
+                .saturating_sub(self.sidebar_toggle.width + 1 + taken),
             ..header
         };
         // A hidden sidebar, or one too narrow for its dot, leaves the environment to the
@@ -2374,8 +2658,8 @@ impl App {
         self.picker_rows.clear();
         if self.picker.is_some() {
             let above = Rect {
-                height: composer_area.y.saturating_sub(main.y),
-                ..main
+                height: composer_area.y.saturating_sub(conversation.y),
+                ..conversation
             };
             self.draw_picker(frame, above);
         }
@@ -2383,6 +2667,26 @@ impl App {
             Paragraph::new(self.status_line(status_area.width as usize)),
             status_area,
         );
+        // The details are worked out again only after an event that can change them, or for
+        // another thread, and wrapped again only at another width.
+        let open_id = self.open.as_ref().map(|open| open.id.as_str());
+        if self.details.wants(open_id) {
+            let facts = details::Facts::of(open_id, self.details_record(), self.details_projects());
+            self.details.set(facts);
+        }
+        match shown {
+            Some(details::Layout::Pane) => {
+                let pane = details::pane_area(main, body.y, composer_area.bottom());
+                let focused = self.focus == Focus::Details;
+                self.details
+                    .draw_pane(frame, pane, focused, &self.environment, &self.theme);
+            }
+            Some(details::Layout::Dialog) => {
+                self.details
+                    .draw_dialog(frame, area, &self.environment, &self.theme)
+            }
+            None => self.details.forget_drawn(),
+        }
     }
 
     /// The GUI's breadcrumb: project, a slash, the thread title, and the open thread's watch at
@@ -3279,6 +3583,8 @@ impl App {
             (Focus::Composer, None) => {
                 "Enter send · Alt+Enter newline · Alt+M model · Alt+E effort · Alt+P mode · Ctrl+X interrupt"
             }
+            (Focus::Details, None) if self.details_modal() => "↑↓/PgUp scroll · Esc close",
+            (Focus::Details, None) => "↑↓/PgUp scroll · Esc leave · Alt+B close · Tab focus",
             (Focus::Transcript, None) => {
                 let plan = self
                     .drawn_plans
@@ -8958,7 +9264,8 @@ mod tests {
         environment: String,
         /// The sidebar's list.
         list: String,
-        /// The main column's top row, with the toggle and the breadcrumb.
+        /// The main column's top row, with the toggle and the breadcrumb, up to the details'
+        /// button.
         header: String,
         /// The main column's bottom row.
         status: String,
@@ -8972,6 +9279,10 @@ mod tests {
         let buffer = cells(app, width, height);
         // The main column starts after the sidebar's edge, at 0 with the sidebar hidden.
         let main = app.sidebar.border.right();
+        let end = match app.details.button {
+            button if button.width > 0 => button.x,
+            _ => width,
+        };
         let dot = |columns: std::ops::Range<u16>| {
             columns
                 .map(|x| &buffer[(x, 0)])
@@ -8982,7 +9293,7 @@ mod tests {
             wordmark: text_in(&buffer, Rect::new(0, 0, main, 1)),
             environment: text_in(&buffer, Rect::new(0, 1, main, 1)),
             list: text_in(&buffer, app.sidebar.list),
-            header: text_in(&buffer, Rect::new(main, 0, width - main, 1)),
+            header: text_in(&buffer, Rect::new(main, 0, end - main, 1)),
             status: text_in(&buffer, Rect::new(main, height - 1, width - main, 1)),
             sidebar_dot: dot(0..main),
             header_dot: dot(main..width),
@@ -9141,13 +9452,14 @@ mod tests {
             header.contains("Pick a thread in the sidebar"),
             "{header:?}"
         );
+        // The details' button ends the row, so the breadcrumb has five columns fewer.
         let header = chrome(&mut app, 40, 24).header;
-        assert!(header.trim_end().ends_with("  ● Studio…"), "{header:?}");
-        assert!(header.contains("Pick a thread in the s…"), "{header:?}");
+        assert!(header.trim_end().ends_with("  ● Stud…"), "{header:?}");
+        assert!(header.contains("Pick a thread in th…"), "{header:?}");
         // Too narrow for it beside the title's 16 columns, the row is the title's.
         let drawn = chrome(&mut app, 24, 24);
         assert_eq!(drawn.header_dot, None);
-        assert!(drawn.header.contains("Pick a thread in"), "{drawn:?}");
+        assert!(drawn.header.contains("Pick a threa…"), "{drawn:?}");
 
         // At no width, hidden or shown, does any of the origin but its host and port show.
         for hidden in [true, false] {
