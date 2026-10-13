@@ -9010,7 +9010,7 @@ mod tests {
         assert!(!drawn.wordmark.contains("connecting"), "{drawn:?}");
         assert_eq!(drawn.sidebar_dot, Some(emerald));
         assert!(drawn.status.contains("● live  ·"), "{drawn:?}");
-        assert_eq!(drawn.environment.trim(), "Studio Mac · 127.0…3773");
+        assert_eq!(drawn.environment.trim(), "Studio Mac");
 
         // The open thread's watch closes. The status line and the breadcrumb say so, and the
         // sidebar's dot stays green for the feed that is still live.
@@ -9026,7 +9026,7 @@ mod tests {
         assert_eq!(drawn.header_dot, None, "the sidebar shows the environment");
         assert!(!drawn.wordmark.contains("closed"), "{drawn:?}");
         assert_eq!(drawn.sidebar_dot, Some(emerald));
-        assert_eq!(drawn.environment.trim(), "Studio Mac · 127.0…3773");
+        assert_eq!(drawn.environment.trim(), "Studio Mac");
     }
 
     #[test]

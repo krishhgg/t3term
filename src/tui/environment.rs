@@ -28,8 +28,9 @@ const HOST: usize = 253;
 const ORIGIN: usize = 2048;
 /// Between the label and the address, and between the feed's word and the label.
 const SEPARATOR: &str = " · ";
-/// The fewest columns the address is cut to before it is left out, enough for `127.0…3773`.
-const SHORTEST_ADDRESS: usize = 10;
+/// The fewest columns a domain name is cut to, with its `…`, before the address is left out:
+/// three at each end, as in `stu…com`.
+const SHORTEST_HOST: usize = 7;
 /// The fewest columns the header gives the identity after the dot or the feed's word.
 const SHORTEST_CHIP: usize = 4;
 
@@ -44,6 +45,12 @@ pub struct Identity {
     /// its scheme implies. Never the origin's user name, password, path, query or fragment.
     /// None when the origin doesn't parse or has no host.
     address: Option<String>,
+    /// How many bytes at the end of `address` are its port and the colon before it, such as
+    /// `:3773`, which a cut keeps whole. 0 for a port the scheme implies.
+    port: usize,
+    /// Whether the address's host is a domain name, which a cut can shorten in the middle. An
+    /// IP address shows whole or not at all, so none of its digits go missing.
+    domain: bool,
     /// The two widths in columns, so a frame where both fit measures neither again.
     label_width: usize,
     address_width: usize,
@@ -55,53 +62,70 @@ impl Identity {
         let label = label
             .map(|label| bounded(label, LABEL))
             .filter(|label| !label.is_empty());
-        let address = address(origin);
+        let (address, port, domain) = match address(origin) {
+            Some((address, port, domain)) => (Some(address), port, domain),
+            None => (None, 0, false),
+        };
         Identity {
             label_width: label.as_deref().map_or(0, str::width),
             address_width: address.as_deref().map_or(0, str::width),
             label,
             address,
+            port,
+            domain,
         }
     }
 
     /// The label and the address in at most `width` columns. Both show when they fit. When
-    /// they don't, the address is cut in the middle, keeping its port, down to
-    /// `SHORTEST_ADDRESS` columns, then left out, and then the label is cut with `…`. Without
-    /// a label the address takes its place, and without either there is nothing.
+    /// they don't, a domain name is cut in the middle in front of its whole port, down to
+    /// `SHORTEST_HOST` columns, and an IP address isn't cut. An address that still doesn't fit
+    /// is left out, and then the label is cut with `…`. Without a label the address takes its
+    /// place on the same terms, and without either there is nothing.
     pub fn spans(&self, width: usize, label: Style, address: Style) -> Vec<Span<'static>> {
         if width == 0 {
             return Vec::new();
         }
-        let separated = self.label_width + SEPARATOR.width();
-        match (&self.label, &self.address) {
-            (Some(name), Some(at)) if separated + self.address_width <= width => vec![
+        let Some(name) = &self.label else {
+            return self
+                .fitted_address(width)
+                .map(|at| vec![Span::styled(at, address)])
+                .unwrap_or_default();
+        };
+        let after = width.checked_sub(self.label_width + SEPARATOR.width());
+        match after.and_then(|room| self.fitted_address(room)) {
+            Some(at) => vec![
                 Span::styled(name.clone(), label),
                 Span::styled(SEPARATOR, address),
-                Span::styled(at.clone(), address),
+                Span::styled(at, address),
             ],
-            (Some(name), Some(at)) if separated + SHORTEST_ADDRESS <= width => vec![
-                Span::styled(name.clone(), label),
-                Span::styled(SEPARATOR, address),
-                Span::styled(middle(at, width - separated), address),
-            ],
-            (Some(name), _) if self.label_width <= width => {
-                vec![Span::styled(name.clone(), label)]
-            }
-            (Some(name), _) => vec![Span::styled(clip(name, width), label)],
-            (None, Some(at)) if self.address_width <= width => {
-                vec![Span::styled(at.clone(), address)]
-            }
-            (None, Some(at)) => vec![Span::styled(middle(at, width), address)],
-            (None, None) => Vec::new(),
+            None if self.label_width <= width => vec![Span::styled(name.clone(), label)],
+            None => vec![Span::styled(clip(name, width), label)],
         }
+    }
+
+    /// The address in at most `width` columns: whole when it fits, and otherwise, for a domain
+    /// name, its host cut in the middle to at least `SHORTEST_HOST` columns, then its whole
+    /// port. None for an IP address that doesn't fit whole, or a name with too little room.
+    fn fitted_address(&self, width: usize) -> Option<String> {
+        let at = self.address.as_deref()?;
+        if self.address_width <= width {
+            return Some(at.to_string());
+        }
+        if !self.domain {
+            return None;
+        }
+        let (host, port) = at.split_at(at.len() - self.port);
+        let room = width.checked_sub(port.width())?;
+        (room >= SHORTEST_HOST).then(|| format!("{}{port}", middle(host, room)))
     }
 }
 
-/// The host and port of `origin`, or None when it doesn't parse or names no host. Only the
-/// host and the port are read, so nothing else in the origin, such as credentials in
-/// `T3TERM_ORIGIN`, can reach the screen. A non-ASCII domain comes back in its ASCII form, as
-/// the URL parser writes it.
-fn address(origin: &str) -> Option<String> {
+/// The host and port of `origin`, how many bytes at its end are the port and its colon, and
+/// whether the host is a domain name rather than an IP address. None when the origin doesn't
+/// parse or names no host. Only the host and the port are read, so nothing else in the origin,
+/// such as credentials in `T3TERM_ORIGIN`, can reach the screen. A non-ASCII domain comes back
+/// in its ASCII form, as the URL parser writes it.
+fn address(origin: &str) -> Option<(String, usize, bool)> {
     if origin.len() > ORIGIN {
         return None;
     }
@@ -110,9 +134,13 @@ fn address(origin: &str) -> Option<String> {
     if host.is_empty() {
         return None;
     }
+    let domain = url.domain().is_some();
     Some(match url.port() {
-        Some(port) => format!("{host}:{port}"),
-        None => host,
+        Some(port) => {
+            let port = format!(":{port}");
+            (format!("{host}{port}"), port.len(), domain)
+        }
+        None => (host, 0, domain),
     })
 }
 
@@ -311,11 +339,9 @@ mod tests {
         let both = Identity::new(Some("Studio Mac"), "http://127.0.0.1:3773");
         assert_eq!(fitted(&both, 80), "Studio Mac · 127.0.0.1:3773");
         assert_eq!(fitted(&both, 27), "Studio Mac · 127.0.0.1:3773");
-        // The address is cut in the middle, so its port stays, down to ten columns.
-        assert_eq!(fitted(&both, 26), "Studio Mac · 127.0.…1:3773");
-        assert_eq!(fitted(&both, 23), "Studio Mac · 127.0…3773");
-        // Then it goes, and then the label is cut.
-        assert_eq!(fitted(&both, 22), "Studio Mac");
+        // An IP address isn't cut, so it goes when it doesn't fit, and then the label is cut.
+        assert_eq!(fitted(&both, 26), "Studio Mac");
+        assert_eq!(fitted(&both, 23), "Studio Mac");
         assert_eq!(fitted(&both, 10), "Studio Mac");
         assert_eq!(fitted(&both, 9), "Studio M…");
         assert_eq!(fitted(&both, 1), "…");
@@ -325,7 +351,8 @@ mod tests {
         // shows alone.
         let address = Identity::new(None, "http://[::1]:3773");
         assert_eq!(fitted(&address, 40), "[::1]:3773");
-        assert_eq!(fitted(&address, 7), "[::…773");
+        assert_eq!(fitted(&address, 10), "[::1]:3773");
+        assert_eq!(fitted(&address, 9), "");
         let label = Identity::new(Some("Studio Mac"), "not a url");
         assert_eq!(fitted(&label, 40), "Studio Mac");
         assert_eq!(fitted(&Identity::new(None, "not a url"), 40), "");
