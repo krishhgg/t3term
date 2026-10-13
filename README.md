@@ -303,6 +303,10 @@ The dot by the wordmark shows the sidebar's own feed, T3's `orchestration.subscr
 
 The feed shares the TUI's one WebSocket with the open thread's watch, so a dropped connection usually shows in both. Nothing watches the socket itself, though, so the dot is the feed's state and not the connection's. The open thread's watch keeps its own state at the end of the breadcrumb and at the start of the status line. A thread whose watch closes doesn't turn the dot red, and a live thread doesn't hide a feed that dropped or closed. With no thread open, the status line names the feed's state.
 
+[![The sidebar's first row reads T3 Code, then closed and a dot in red, over Fixture Mac · 127.0.0.1:51024. On the right the open thread Live: replies coming shows its latest replies, the status line starts with a green dot and live, and the composer holds the draft demo draft kept](docs/screenshots/environment-feed-closed.png)](docs/environment-chrome-verification.md)
+
+The environment and its threads are invented and come from a fake T3 server, and the image renders t3term's captured terminal output in truecolor. [Environment chrome verification](docs/environment-chrome-verification.md) lists what was checked, with captures of the identity row, the sidebar hidden, a reconnecting feed, a thread whose watch closed beside a live feed, a hostile label, a 40x12 screen and 256 colors. A [capture slideshow](docs/screenshots/environment-capture-slideshow.mp4) steps through six of the captures. It is a slideshow of the captures, not a recording.
+
 While the sidebar is hidden, or too narrow for its dot, the end of the breadcrumb's row shows the dot, the feed's word while it isn't live, and as much of the environment as fits. It takes at most a third of the row and leaves the thread's title its first 16 columns. As the row narrows the environment is cut and then left out, then the word goes, then the dot. The environment and the dot take no clicks and have no key, and t3term asks T3 for nothing more to show them.
 
 ### Tool calls and reasoning
