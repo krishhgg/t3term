@@ -2,6 +2,12 @@
 
 The sprint builds the feature groups in [parity.md](parity.md), in that order, one small pull request at a time. It started on 2026-10-08. AGENTS.md says who does what, and only the user merges.
 
+## Priorities from 2026-10-13
+
+On 2026-10-13 the user changed the sprint's order. UI and UX come first, then Lineage, choosing an agent's environment and T3 Connect, PR reviews and embedded terminals. They go ahead of the group order in [parity.md](parity.md), which stays unedited as the record of the original plan. Nightly sync automation and the legacy context meter stay deferred.
+
+The user also asked about the sidebar's groups on the left. They reported that its header is crowded and that the Active heading is confusing without a Working shelf. They chose separate Working, Done and Settled shelves that each open and close, with Working and Done open by default and Settled closed, in T3 Code's order and with spacing that suits a terminal. That work gets its own pull request, apart from Lineage.
+
 ## Audit every ten merged sprint PRs
 
 Sprint PRs are the feature and infrastructure pull requests the sprint merges into master. The CI foundation is sprint PR 1. PR #7, which added the parity plan, came before the sprint and does not count.
@@ -48,7 +54,7 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 | https://github.com/krishhgg/t3term/pull/23 | 1 | A CI concurrency group for each push to master, Greptile rule scopes and context brought up to date, and CLI tests for exit codes 7, 1 and 6 | `cf17b7ac16ccc00272e2c08ce9094e3bf261bc5c` |
 | https://github.com/krishhgg/t3term/pull/24 | 1 | Plain CLI output without control characters from T3 text, ids, names and errors, with `--json` unchanged | `1efb6a3052a5d3448fdd7fbb8dbf2bac694f0b46` |
 | https://github.com/krishhgg/t3term/pull/30 | 2 | Greptile context for the worktree setup stream, the TUI's real wake rules and the verification pages, and tests of one shared connection drop, a crowded thread and control characters across the whole screen | `7bf41aff45d52f1c72f5cf1fc876c3879b08a0de` |
-| https://github.com/krishhgg/t3term/pull/31 | 2 | The breadcrumb and the sidebar's cards read a title, a branch or a project's name only as far as the row shows, and keep each project's badge until the project changes | |
+| https://github.com/krishhgg/t3term/pull/31 | 2 | The breadcrumb and the sidebar's cards read a title, a branch or a project's name only as far as the row shows, and keep each project's badge until the project changes | `f77df53450f54f0cef9906d995a69c4f3616d39d` |
 
 ## Audits
 
@@ -105,6 +111,6 @@ Sol checked #30's source at `24b250a` with Rust 1.95.0. Its one source change si
 
 Sol checked #31 at `e9390bf` with Rust 1.95.0. Clippy over all targets with `-D warnings` passed. `cargo fmt --all -- --check` failed on four lines formatted by hand. `cargo test --locked` stopped in the library with 397 passed and 1 failed, so the later suites didn't run. The failure was in `a_huge_title_and_branch_move_nothing_else_on_the_screen`, at 80x24 with the sidebar hidden. The test expected the breadcrumb to show the whole address or nothing, and it showed the label "Studio Mac" alone, as the short title's frame did. `environment::chip` keeps the label and leaves out an address that doesn't fit whole, and `the_sidebar_and_the_header_keep_the_whole_port` already checks that, so the expectation was wrong and the app needed no change. The test now checks that the environment matches the short title's frame and that any address it shows keeps its whole port. Sol also found that `label::cut` kept a lone combining mark or joiner at zero columns, because neither takes a column. A row of no columns now reads and shows nothing. The docs of `label.rs` now give the exact read bound, which counts the one character read to learn whether the text goes on.
 
-Sol checked #31 again at `3b86aa9` with Rust 1.95.0. `cargo fmt --all -- --check`, Clippy over all targets with `-D warnings`, `cargo test --locked` and `cargo build --locked` passed. The 432 tests are 398 in the library, 2 in main.rs, 18 CLI and 14 fake RPC, with no doctests, so the PR adds 11 to master's 421. That count is for the PR's unmerged source. Sol also ran the builds of `7bf41af` and `3b86aa9` against a fake server on 127.0.0.1 and viewed captures of a long CJK project name and of one with a tab and a line break. [Bounded titles verification](bounded-titles-verification.md) records the runs and four of the captures. CI and Greptile at the PR's final head, and the user's merge, are pending.
+Sol checked #31 again at `3b86aa9` with Rust 1.95.0. `cargo fmt --all -- --check`, Clippy over all targets with `-D warnings`, `cargo test --locked` and `cargo build --locked` passed. The 432 tests are 398 in the library, 2 in main.rs, 18 CLI and 14 fake RPC, with no doctests, so the PR adds 11 to master's 421. That count is for the PR's unmerged source. Sol also ran the builds of `7bf41af` and `3b86aa9` against a fake server on 127.0.0.1 and viewed captures of a long CJK project name and of one with a tab and a line break. [Bounded titles verification](bounded-titles-verification.md) records the runs and four of the captures. The PR's final head, `7987da5`, added only that page and its captures. CI passed there, and Greptile Review gave it 5/5 with no findings. On the user's go-ahead, #31 merged at `f77df53450f54f0cef9906d995a69c4f3616d39d`, whose tree is the same as `7987da5`'s.
 
 20 sprint PRs have merged. The next audit is due when sprint PR 30 merges.

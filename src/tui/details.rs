@@ -19,6 +19,11 @@
 //! sends it, the shell's copy of the thread until then, and the shell's projects. They are
 //! worked out again only after an event that can change them, and only while the details are
 //! open, so closed details cost nothing. A frame wraps them again only at a new width.
+//!
+//! Lineage comes last, after the environment: the threads related to the open one, which
+//! lineage.rs works out as the desktop's `ThreadRelationshipsPanel` does. ↑ and ↓ choose
+//! among its rows, and Enter or a click opens the chosen thread the way the sidebar opens one.
+//! It is worked out again only after an event that can change it, as the facts are.
 
 use ratatui::Frame;
 use ratatui::layout::Rect;
@@ -29,10 +34,11 @@ use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
 use super::environment::Identity;
+use super::lineage::{self, Group, Lineage, Paging, Target};
 use super::setup::bounded;
 use super::tasks::wrap;
 use super::theme::Theme;
-use super::{Focus, clip, row};
+use super::{Focus, clip, row, with_bg};
 use crate::projection::Applied;
 use crate::transcript::{clusters, without_controls};
 
@@ -418,10 +424,19 @@ fn tail(text: &str, max: usize) -> (&str, bool) {
     (&text[begin..], begin > 0)
 }
 
-/// The facts wrapped at one width.
+/// The facts and Lineage wrapped at one width.
 struct Rows {
     width: usize,
     lines: Vec<Line<'static>>,
+    /// The line of each Lineage row that Enter or a click acts on, in order.
+    targets: Vec<(usize, Target)>,
+}
+
+impl Rows {
+    /// The first Lineage row at or below line `top`, by its place among them.
+    fn first_from(&self, top: usize) -> Option<usize> {
+        self.targets.iter().position(|(line, _)| *line >= top)
+    }
 }
 
 /// Where the last frame drew the details, for the mouse.
@@ -463,12 +478,27 @@ pub(super) struct Details {
     pub return_focus: Option<Focus>,
     /// Whether a dialog took the keyboard, rather than the reader with a click or Tab.
     pub taken: bool,
+    /// The Lineage section a frame worked out, for the thread it names.
+    lineage: Option<Lineage>,
+    /// Set when an event may have changed the Lineage section, as `stale` is for the facts.
+    lineage_stale: bool,
+    /// How much of each Lineage group shows.
+    paging: Paging,
+    /// The Lineage row ↑ and ↓ chose, which Enter acts on.
+    selected: Option<Target>,
+    /// Set when the choice moved, so the next frame scrolls its row into view.
+    reveal: bool,
+    /// Where the last frame drew each Lineage row it showed, for the mouse.
+    targets: Vec<(Rect, Target)>,
     /// How many times the facts were worked out and wrapped, so the tests can tell what a
     /// frame or an event did.
     #[cfg(test)]
     pub prepares: usize,
     #[cfg(test)]
     pub wraps: usize,
+    /// How many times the Lineage section was worked out.
+    #[cfg(test)]
+    pub lineage_prepares: usize,
 }
 
 impl Details {
@@ -476,52 +506,73 @@ impl Details {
     pub fn toggle(&mut self) {
         self.open = !self.open;
         self.scroll = 0;
+        self.selected = None;
         self.shown = None;
         self.moved = true;
     }
 
-    /// Notes that the facts may have changed, as a thread's watch reconnecting or closing can.
+    /// Notes that the facts and Lineage may have changed, as a thread's watch reconnecting or
+    /// closing can.
     pub fn mark(&mut self) {
-        self.stale = true;
-        self.moved = true;
+        self.note(true, true);
+    }
+
+    /// Notes that the facts, Lineage or both may have changed.
+    fn note(&mut self, facts: bool, links: bool) {
+        self.stale |= facts;
+        self.lineage_stale |= links;
+        self.moved |= facts || links;
     }
 
     /// Notes what an item from the shell's feed changed: a snapshot, or an event for the open
-    /// thread, `open_id`, or for its project. Others, such as an enrichment of a project's
-    /// repository or an event for another thread, leave the facts as they are.
+    /// thread, `open_id`, or for its project. An event for a thread related to the open one,
+    /// or one that names it as its parent, changes Lineage. Others, such as an enrichment of a
+    /// project's repository or an event for another thread, leave both as they are.
     pub fn note_shell(&mut self, applied: &Applied, item: &Value, open_id: Option<&str>) {
-        let names_open = |id: Option<&Value>| {
-            open_id.is_some_and(|open_id| id.and_then(Value::as_str) == Some(open_id))
-        };
-        let changed = match applied {
-            Applied::Snapshot => true,
-            Applied::Event(kind) => match kind.as_str() {
-                "thread.updated" => names_open(item.pointer("/thread/id")),
-                "thread.removed" => names_open(item.get("threadId")),
-                "project.updated" => self.names_project(item.pointer("/project/id")),
-                "project.removed" => self.names_project(item.get("projectId")),
-                _ => false,
-            },
+        let names_open = |id: Option<&str>| open_id.is_some_and(|open_id| id == Some(open_id));
+        let related = |id: Option<&str>| match (id, self.lineage.as_ref()) {
+            (Some(id), Some(lineage)) => lineage.relates(id),
             _ => false,
         };
-        if changed {
-            self.mark();
-        }
+        let (facts, links) = match applied {
+            Applied::Snapshot => (true, true),
+            Applied::Event(kind) => match kind.as_str() {
+                "thread.updated" => {
+                    let thread = &item["thread"];
+                    let id = thread.get("id").and_then(Value::as_str);
+                    // A thread that names the open one as its parent can be a new fork.
+                    let child = names_open(lineage::parent_of(thread));
+                    (names_open(id), names_open(id) || child || related(id))
+                }
+                "thread.removed" => {
+                    let id = item.get("threadId").and_then(Value::as_str);
+                    (names_open(id), names_open(id) || related(id))
+                }
+                "project.updated" => (self.names_project(item.pointer("/project/id")), false),
+                "project.removed" => (self.names_project(item.get("projectId")), false),
+                _ => (false, false),
+            },
+            _ => (false, false),
+        };
+        self.note(facts, links);
     }
 
     /// Notes what an item from the open thread's watch changed: a snapshot, an event for the
     /// thread itself, or the watch saying it caught up, which ends the wait for a thread it
-    /// never sent. Each piece of a streamed answer and each run event leave the facts as they
-    /// are.
+    /// never sent. An agent's or a context transfer's event changes Lineage only. Each piece of
+    /// a streamed answer and each run event leave both as they are.
     pub fn note_thread(&mut self, applied: &Applied) {
-        let changed = match applied {
-            Applied::Snapshot | Applied::Synchronized => true,
-            Applied::Event(kind) => kind.starts_with("thread."),
-            _ => false,
+        let (facts, links) = match applied {
+            Applied::Snapshot => (true, true),
+            Applied::Synchronized => (true, false),
+            Applied::Event(kind) if kind.starts_with("thread.") => (true, true),
+            Applied::Event(kind) => {
+                let links = kind == "subagent.updated" || kind.starts_with("context-transfer.");
+                (false, links)
+            }
+            _ => (false, false),
         };
-        if changed {
-            self.mark();
-        }
+        self.note(facts, links);
     }
 
     /// Whether a project event naming `id` can change the facts: it names their project, or
@@ -538,10 +589,13 @@ impl Details {
     }
 
     /// Follows another thread that opened. Its facts are worked out before a frame draws the
-    /// details again, so the last thread's never show for it.
+    /// details again, so the last thread's never show for it. Lineage starts over with its
+    /// first rows and nothing chosen.
     pub fn follow(&mut self) {
         self.mark();
         self.scroll = 0;
+        self.paging = Paging::default();
+        self.selected = None;
     }
 
     /// Whether this frame has to work the facts out for thread `open_id`: the details are
@@ -568,6 +622,171 @@ impl Details {
         self.stale = false;
     }
 
+    /// Whether this frame has to work Lineage out for thread `open_id`, as `wants` says for the
+    /// facts.
+    pub fn wants_lineage(&self, open_id: Option<&str>) -> bool {
+        self.open
+            && (self.lineage_stale
+                || self
+                    .lineage
+                    .as_ref()
+                    .is_none_or(|lineage| lineage.thread_id() != open_id))
+    }
+
+    /// Takes the Lineage section a frame worked out. The rows are wrapped again only when it
+    /// differs.
+    pub fn set_lineage(&mut self, lineage: Lineage) {
+        #[cfg(test)]
+        {
+            self.lineage_prepares += 1;
+        }
+        if self.lineage.as_ref() != Some(&lineage) {
+            self.rows = None;
+            self.lineage = Some(lineage);
+            self.keep_choice();
+        }
+        self.lineage_stale = false;
+    }
+
+    /// Keeps the chosen row while it shows. When Show more goes because its group shows all,
+    /// the group's last row is chosen. Any other row that went leaves nothing chosen.
+    fn keep_choice(&mut self) {
+        let Some(lineage) = self.lineage_shown() else {
+            self.selected = None;
+            return;
+        };
+        self.selected = match self.selected.as_ref() {
+            Some(target) if lineage.has(target) => Some(target.clone()),
+            Some(Target::More(group)) => lineage
+                .last_row(*group)
+                .map(|row| Target::Thread(row.id.clone())),
+            _ => None,
+        };
+    }
+
+    /// The Lineage section, when it shows: it describes the thread the facts do, and it has
+    /// rows or running agents.
+    fn lineage_shown(&self) -> Option<&Lineage> {
+        let thread_id = self.facts.as_ref()?.thread_id.as_deref()?;
+        self.lineage
+            .as_ref()
+            .filter(|lineage| lineage.thread_id() == Some(thread_id) && lineage.shows())
+    }
+
+    /// The Lineage rows Enter or a click acts on, in order.
+    fn lineage_targets(&self) -> Vec<Target> {
+        self.lineage_shown()
+            .map(Lineage::targets)
+            .unwrap_or_default()
+    }
+
+    /// Where the chosen row is among `targets`.
+    fn chosen(&self, targets: &[Target]) -> Option<usize> {
+        let selected = self.selected.as_ref()?;
+        targets.iter().position(|target| target == selected)
+    }
+
+    pub fn paging(&self) -> &Paging {
+        &self.paging
+    }
+
+    /// The Lineage row ↑ and ↓ chose.
+    pub fn selected(&self) -> Option<&Target> {
+        self.selected.as_ref()
+    }
+
+    /// Chooses a Lineage row, as a click on it does.
+    pub fn choose(&mut self, target: Target) {
+        self.selected = Some(target);
+    }
+
+    /// Whether thread `id` has a Lineage row that shows and can open.
+    pub fn can_open(&self, id: &str) -> bool {
+        self.lineage_shown()
+            .and_then(|lineage| lineage.row(id))
+            .is_some_and(|row| row.available)
+    }
+
+    /// The Lineage row the last frame drew at column `x` of screen row `y`.
+    pub fn target_at(&self, x: u16, y: u16) -> Option<Target> {
+        self.targets
+            .iter()
+            .find(|(area, _)| y == area.y && x >= area.x && x < area.right())
+            .map(|(_, target)| target.clone())
+    }
+
+    /// Shows up to `lineage::PAGE` more rows of `group`.
+    pub fn show_more(&mut self, group: Group) {
+        self.paging.show_more(group);
+        self.note(false, true);
+        self.reveal = true;
+    }
+
+    /// Opens or closes Previous agents.
+    pub fn toggle_previous(&mut self) {
+        self.paging.toggle_previous();
+        self.note(false, true);
+        self.reveal = true;
+    }
+
+    /// Chooses the next Lineage row, or with none chosen the first at or below the top of the
+    /// text. Past the last one, or without Lineage rows, it scrolls the text down a row.
+    pub fn down(&mut self) {
+        let targets = self.lineage_targets();
+        let next = match (self.chosen(&targets), self.rows.as_ref()) {
+            (Some(at), _) => Some(at + 1),
+            (None, Some(rows)) => rows.first_from(self.scroll),
+            (None, None) => Some(0),
+        };
+        match next.and_then(|at| targets.get(at)) {
+            Some(target) => {
+                self.selected = Some(target.clone());
+                self.reveal = true;
+            }
+            None => self.scroll_by(1),
+        }
+    }
+
+    /// Chooses the Lineage row before the chosen one. From the first one, or with none chosen,
+    /// it leaves none chosen and scrolls the text up a row.
+    pub fn up(&mut self) {
+        let targets = self.lineage_targets();
+        match self.chosen(&targets) {
+            Some(at) if at > 0 => {
+                self.selected = Some(targets[at - 1].clone());
+                self.reveal = true;
+            }
+            _ => {
+                self.selected = None;
+                self.scroll_by(-1);
+            }
+        }
+    }
+
+    /// What the status line says Enter does: None when Lineage has no rows to choose, nothing
+    /// while none is chosen, and else what Enter does with the chosen row.
+    pub fn lineage_keys(&self) -> Option<String> {
+        let lineage = self.lineage_shown()?;
+        if !lineage.has_targets() {
+            return None;
+        }
+        let Some(selected) = self.selected.as_ref() else {
+            return Some(String::new());
+        };
+        Some(match selected {
+            Target::Thread(id) => match lineage.row(id) {
+                Some(row) if row.available => {
+                    format!("Enter open {}", row.relation.name().to_lowercase())
+                }
+                Some(row) => format!("{} unavailable", row.relation.name()),
+                None => String::new(),
+            },
+            Target::More(group) => format!("Enter show {} more", lineage.more(*group)),
+            Target::Previous if self.paging.previous_open() => "Enter hide previous agents".into(),
+            Target::Previous => "Enter show previous agents".into(),
+        })
+    }
+
     /// How the last frame drew the details, while they are open.
     pub fn shown(&self) -> Option<Layout> {
         self.shown.filter(|_| self.open)
@@ -578,17 +797,26 @@ impl Details {
         self.scroll = self.scroll.saturating_add_signed(delta);
     }
 
-    /// Scrolls the text a page down, or up when `down` is false.
+    /// Scrolls the text `delta` rows for the wheel, which leaves no Lineage row chosen.
+    pub fn wheel(&mut self, delta: isize) {
+        self.selected = None;
+        self.scroll_by(delta);
+    }
+
+    /// Scrolls the text a page down, or up when `down` is false. Like the other keys that
+    /// scroll the text, it leaves no Lineage row chosen.
     pub fn page(&mut self, down: bool) {
         let page = self.page.max(1) as isize;
-        self.scroll_by(if down { page } else { -page });
+        self.wheel(if down { page } else { -page });
     }
 
     pub fn scroll_home(&mut self) {
+        self.selected = None;
         self.scroll = 0;
     }
 
     pub fn scroll_end(&mut self) {
+        self.selected = None;
         self.scroll = usize::MAX / 2;
     }
 
@@ -597,6 +825,7 @@ impl Details {
         self.drawn = None;
         self.shown = None;
         self.moved = false;
+        self.targets.clear();
     }
 
     /// Draws the details as the pane at `area`. `focused` says whether they have the keyboard,
@@ -644,17 +873,37 @@ impl Details {
         self.draw_card(frame, area, Layout::Dialog, true, environment, theme);
     }
 
-    /// The facts wrapped at `width`, from the last frame when it had the same width.
+    /// The facts and Lineage wrapped at `width`, from the last frame when it had the same
+    /// width.
     fn lines(&mut self, width: usize, environment: &Identity, theme: &Theme) -> &[Line<'static>] {
         if self.rows.as_ref().map(|rows| rows.width) != Some(width) {
             #[cfg(test)]
             {
                 self.wraps += 1;
             }
-            let lines = wrap_facts(self.facts.as_ref(), width, environment, theme);
-            self.rows = Some(Rows { width, lines });
+            let mut lines = wrap_facts(self.facts.as_ref(), width, environment, theme);
+            let mut targets = Vec::new();
+            if let Some(lineage) = self.lineage_shown().filter(|_| width > 0) {
+                lines.push(Line::default());
+                lineage.lines(width, theme, &mut lines, &mut targets);
+            }
+            self.rows = Some(Rows {
+                width,
+                lines,
+                targets,
+            });
         }
         &self.rows.as_ref().expect("wrapped above").lines
+    }
+
+    /// The line of the chosen Lineage row in the wrapped text.
+    fn selected_line(&self) -> Option<usize> {
+        let selected = self.selected.as_ref()?;
+        let rows = self.rows.as_ref()?;
+        rows.targets
+            .iter()
+            .find(|(_, target)| target == selected)
+            .map(|(line, _)| *line)
     }
 
     /// Draws the card at `area`: a title row with × at its end, and the text under it, which
@@ -686,6 +935,15 @@ impl Details {
         let width = inner.width as usize;
         let visible = (inner.height as usize).saturating_sub(1);
         let total = self.lines(width, environment, theme).len();
+        // A row ↑ or ↓ chose, or Show more added rows above, comes into view.
+        let reveal = std::mem::take(&mut self.reveal);
+        if let Some(line) = self.selected_line().filter(|_| reveal) {
+            if line < self.scroll {
+                self.scroll = line;
+            } else if visible > 0 && line >= self.scroll + visible {
+                self.scroll = line + 1 - visible;
+            }
+        }
         self.scroll = self.scroll.min(total.saturating_sub(visible));
         self.page = visible;
         let muted = Style::new().fg(theme.muted);
@@ -704,8 +962,23 @@ impl Details {
             ));
         }
         let scroll = self.scroll;
+        // The chosen row shows highlighted while the details have the keyboard.
+        let chosen = self.selected_line().filter(|_| focused);
+        self.targets.clear();
         if let Some(rows) = self.rows.as_ref() {
-            lines.extend(rows.lines.iter().skip(scroll).take(visible).cloned());
+            for (index, line) in rows.lines.iter().enumerate().skip(scroll).take(visible) {
+                if Some(index) == chosen {
+                    lines.push(Line::from(with_bg(line.spans.clone(), theme.highlight)));
+                } else {
+                    lines.push(line.clone());
+                }
+            }
+            for (line, target) in &rows.targets {
+                if (scroll..scroll + visible).contains(line) {
+                    let y = inner.y + 1 + (line - scroll) as u16;
+                    self.targets.push((Rect::new(inner.x, y, inner.width, 1), target.clone()));
+                }
+            }
         }
 
         frame.render_widget(Clear, area);
@@ -1216,5 +1489,184 @@ mod tests {
         );
         let rows = text(&wrap_facts(Some(&facts), 10, &identity, &theme));
         assert_eq!(rows.last().map(String::as_str), Some("Studio[2J"));
+    }
+
+    fn event(kind: &str) -> Applied {
+        Applied::Event(kind.into())
+    }
+
+    /// `row` with its runs of spaces made one.
+    fn squeezed(row: &str) -> String {
+        row.split_whitespace().collect::<Vec<_>>().join(" ")
+    }
+
+    #[test]
+    fn only_events_that_can_change_lineage_mark_it() {
+        let mut details = Details {
+            open: true,
+            ..Details::default()
+        };
+        let projects = [project("p", "Demo", "/r")];
+        let record = thread(Value::Null, Value::Null);
+        details.set(facts_of(&record, &projects));
+        let fork = json!({"id": "f", "lineage": {"parentThreadId": "t"}});
+        let threads = [record.clone(), fork];
+        let paging = Paging::default();
+        details.set_lineage(Lineage::of(Some("t"), &threads, None, &paging));
+        assert!(!details.wants_lineage(Some("t")));
+        assert!(details.wants_lineage(Some("u")), "another thread opened");
+
+        let quiet = [
+            (event("thread.updated"), json!({"thread": {"id": "u"}})),
+            (event("thread.removed"), json!({"threadId": "u"})),
+            (event("project.updated"), json!({"project": {"id": "p"}})),
+            (event("enrichment"), json!({})),
+            (Applied::Synchronized, json!({})),
+        ];
+        for (applied, item) in &quiet {
+            details.note_shell(applied, item, Some("t"));
+            assert!(!details.wants_lineage(Some("t")), "{applied:?} {item}");
+        }
+        // A new fork or agent names t as its parent, by its lineage or the run it came from.
+        let child = json!({"thread": {"id": "g", "lineage": {"parentThreadId": "t"}}});
+        let forked = json!({"thread": {"id": "g", "forkedFrom": {"type": "run", "threadId": "t"}}});
+        let loud = [
+            (Applied::Snapshot, json!({})),
+            (event("thread.updated"), json!({"thread": {"id": "t"}})),
+            (event("thread.updated"), json!({"thread": {"id": "f"}})),
+            (event("thread.updated"), child),
+            (event("thread.updated"), forked),
+            (event("thread.removed"), json!({"threadId": "f"})),
+        ];
+        for (applied, item) in &loud {
+            details.note_shell(applied, item, Some("t"));
+            assert!(details.wants_lineage(Some("t")), "{applied:?} {item}");
+            details.set_lineage(Lineage::of(Some("t"), &threads, None, &paging));
+        }
+        for applied in [
+            event("turn-item.updated"),
+            event("run.updated"),
+            Applied::Synchronized,
+            Applied::Duplicate,
+        ] {
+            details.note_thread(&applied);
+            assert!(!details.wants_lineage(Some("t")), "{applied:?}");
+        }
+        details.set(facts_of(&record, &projects));
+        for applied in [
+            event("subagent.updated"),
+            event("context-transfer.created"),
+            event("context-transfer.updated"),
+        ] {
+            details.note_thread(&applied);
+            assert!(details.wants_lineage(Some("t")), "{applied:?}");
+            assert!(!details.wants(Some("t")), "the facts stay: {applied:?}");
+            details.set_lineage(Lineage::of(Some("t"), &threads, None, &paging));
+        }
+        for applied in [Applied::Snapshot, event("thread.meta-updated")] {
+            details.note_thread(&applied);
+            assert!(details.wants_lineage(Some("t")), "{applied:?}");
+            details.set_lineage(Lineage::of(Some("t"), &threads, None, &paging));
+        }
+        // Show more and Previous agents work it out again. Closed details don't.
+        details.toggle_previous();
+        assert!(details.wants_lineage(Some("t")));
+        details.open = false;
+        assert!(!details.wants_lineage(Some("t")));
+    }
+
+    #[test]
+    fn the_arrows_choose_lineage_rows_and_the_keys_say_what_enter_does() {
+        let theme = Theme::new(Depth::TrueColor);
+        let identity = Identity::default();
+        let mut details = Details {
+            open: true,
+            ..Details::default()
+        };
+        let record = thread(Value::Null, Value::Null);
+        details.set(facts_of(&record, &[]));
+        details.lines(30, &identity, &theme);
+        // Without Lineage the arrows scroll, as they always did.
+        details.down();
+        assert_eq!((details.selected(), details.scroll), (None, 1));
+        assert_eq!(details.lineage_keys(), None);
+        details.up();
+        assert_eq!(details.scroll, 0);
+
+        let mut lead = record.clone();
+        lead["lineage"] = json!({"parentThreadId": "gone"});
+        let fork = json!({"id": "f", "title": "Fork", "lineage": {"parentThreadId": "t"}});
+        let threads = [lead, fork];
+        details.set_lineage(Lineage::of(Some("t"), &threads, None, &Paging::default()));
+        let rows = text(details.lines(30, &identity, &theme));
+        let at = rows.iter().position(|row| row == "Lineage").unwrap();
+        assert_eq!(rows[at - 1], "", "a blank row before it");
+        assert_eq!(squeezed(&rows[at + 1]), "↑ gone Unavailable");
+        assert_eq!(squeezed(&rows[at + 2]), "↳ Fork Unknown");
+        assert_eq!(rows.len(), at + 3);
+        assert_eq!(details.lineage_keys().as_deref(), Some(""));
+
+        details.down();
+        assert_eq!(details.selected(), Some(&Target::Thread("gone".into())));
+        let keys = details.lineage_keys();
+        assert_eq!(keys.as_deref(), Some("Parent thread unavailable"));
+        assert!(!details.can_open("gone"));
+        details.down();
+        assert_eq!(details.lineage_keys().as_deref(), Some("Enter open fork"));
+        assert!(details.can_open("f"));
+        // Past the last row, the text scrolls and the choice stays.
+        let scroll = details.scroll;
+        details.down();
+        assert_eq!(details.selected(), Some(&Target::Thread("f".into())));
+        assert_eq!(details.scroll, scroll + 1);
+        details.up();
+        assert_eq!(details.selected(), Some(&Target::Thread("gone".into())));
+        // Up from the first row leaves none chosen.
+        details.up();
+        assert_eq!(details.selected(), None);
+        // The wheel and the page keys leave none chosen too.
+        details.down();
+        details.wheel(1);
+        assert_eq!(details.selected(), None);
+        details.down();
+        assert!(details.selected().is_some());
+        details.page(true);
+        assert_eq!(details.selected(), None);
+        // Another thread starts with none chosen.
+        details.down();
+        details.follow();
+        assert_eq!(details.selected(), None);
+    }
+
+    #[test]
+    fn show_more_hands_its_choice_to_the_last_row_it_adds() {
+        let theme = Theme::new(Depth::TrueColor);
+        let identity = Identity::default();
+        let mut details = Details {
+            open: true,
+            ..Details::default()
+        };
+        let record = thread(Value::Null, Value::Null);
+        details.set(facts_of(&record, &[]));
+        let mut threads = vec![record];
+        for i in 0..8 {
+            let fork = json!({"id": format!("f{i}"), "lineage": {"parentThreadId": "t"}});
+            threads.push(fork);
+        }
+        let lineage = |details: &Details| Lineage::of(Some("t"), &threads, None, details.paging());
+        details.set_lineage(lineage(&details));
+        details.lines(30, &identity, &theme);
+        for _ in 0..7 {
+            details.down();
+        }
+        assert_eq!(details.selected(), Some(&Target::More(Group::Related)));
+        let keys = details.lineage_keys();
+        assert_eq!(keys.as_deref(), Some("Enter show 2 more"));
+        details.show_more(Group::Related);
+        assert!(details.wants_lineage(Some("t")));
+        details.set_lineage(lineage(&details));
+        // All eight show, by id as none has a time, so f7 comes last.
+        assert_eq!(details.selected(), Some(&Target::Thread("f7".into())));
+        assert_eq!(details.lineage_prepares, 2);
     }
 }
