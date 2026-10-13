@@ -484,16 +484,16 @@ mod tests {
             origin: None,
         };
         let refused = [
-            (format!("http://192.0.2.1:{port}"), "ENVIRONMENT_NOT_LOCAL"),
-            ("https://example.com".to_string(), "ENVIRONMENT_NOT_LOCAL"),
-            (format!("{origin}/api"), "ENVIRONMENT_ORIGIN_INVALID"),
-            (format!("http://user:secret@127.0.0.1:{port}"), "ENVIRONMENT_ORIGIN_INVALID"),
-            (format!("ftp://127.0.0.1:{port}"), "ENVIRONMENT_ORIGIN_INVALID"),
-            (format!("127.0.0.1:{port}"), "ENVIRONMENT_ORIGIN_INVALID"),
+            ("http://192.0.2.1:3773", "ENVIRONMENT_NOT_LOCAL"),
+            ("https://example.com", "ENVIRONMENT_NOT_LOCAL"),
+            ("http://127.0.0.1:9/api", "ENVIRONMENT_ORIGIN_INVALID"),
+            ("http://user:pw@127.0.0.1:9", "ENVIRONMENT_ORIGIN_INVALID"),
+            ("ftp://127.0.0.1:9", "ENVIRONMENT_ORIGIN_INVALID"),
+            ("127.0.0.1:9", "ENVIRONMENT_ORIGIN_INVALID"),
         ];
         for (origin, expected) in refused {
             let target = Target::Local(LocalTarget {
-                origin: Some(origin.clone()),
+                origin: Some(origin.into()),
                 ..b.clone()
             });
             let connected = Client::connect(&target, &[Scope::Read], "1m").await;

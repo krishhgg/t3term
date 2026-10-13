@@ -205,6 +205,38 @@ fn serve_sockets(
     respond: impl Fn(&str) -> Option<Value> + Send + 'static,
     on_socket: impl Fn(Socket) + Send + Sync + 'static,
 ) -> (String, Arc<Mutex<Vec<String>>>) {
+    serve_replies(move |path| respond(path).map(Reply::Json), on_socket)
+}
+
+/// How a fake server answers a request.
+enum Reply {
+    /// 200, with this JSON.
+    Json(Value),
+    /// A redirect with this status to this URL.
+    Redirect(u16, String),
+}
+
+/// The HTTP response a fake server writes for `reply`, or a 404 when there is none.
+fn response(reply: Option<Reply>) -> String {
+    let (status, headers, body) = match reply {
+        Some(Reply::Json(value)) => ("200 OK".to_string(), String::new(), value.to_string()),
+        Some(Reply::Redirect(code, to)) => {
+            let location = format!("Location: {to}\r\n");
+            (format!("{code} Redirect"), location, String::new())
+        }
+        None => ("404 Not Found".to_string(), String::new(), String::new()),
+    };
+    format!(
+        "HTTP/1.1 {status}\r\n{headers}Content-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    )
+}
+
+/// `serve_sockets`, with `respond` choosing how to answer each path, a redirect included.
+fn serve_replies(
+    respond: impl Fn(&str) -> Option<Reply> + Send + 'static,
+    on_socket: impl Fn(Socket) + Send + Sync + 'static,
+) -> (String, Arc<Mutex<Vec<String>>>) {
     let listener = TcpListener::bind("127.0.0.1:0").unwrap();
     let origin = format!("http://{}", listener.local_addr().unwrap());
     let paths = Arc::new(Mutex::new(Vec::new()));
@@ -242,15 +274,7 @@ fn serve_sockets(
                 std::thread::spawn(move || on_socket(socket));
                 continue;
             }
-            let (status, body) = match respond(path) {
-                Some(value) => ("200 OK", value.to_string()),
-                None => ("404 Not Found", String::new()),
-            };
-            let _ = write!(
-                stream,
-                "HTTP/1.1 {status}\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
-                body.len()
-            );
+            let _ = stream.write_all(response(respond(path)).as_bytes());
         }
     });
     (origin, paths)
@@ -1952,6 +1976,221 @@ fn a_named_environment_that_fails_a_check_gets_no_login_and_no_other_server_is_t
     assert_eq!(*old_paths.lock().unwrap(), [descriptor; 2]);
     assert_eq!(*pinned.paths.lock().unwrap(), [descriptor]);
     assert!(fresh.paths.lock().unwrap().is_empty());
+    assert_eq!(home.t3_log(), "");
+}
+
+#[test]
+fn a_named_environment_whose_server_redirects_gets_no_login_and_its_target_no_request() {
+    // A is the saved default and the server T3TERM_ORIGIN names. T3CODE_HOME records no
+    // server, so a command that can't reach the server it chose has nowhere else to go.
+    let home = Home::new();
+    let t3 = home.logging_t3();
+    let a = serve_environment("env-a", THREAD_A);
+    let a_home = home.t3_home("env a/.t3", Some("env-a"), Some(&a.origin));
+    // B points every request at A, as a server that took over B's port might.
+    let a_origin = a.origin.clone();
+    let (b, b_paths) = serve_replies(
+        move |path| Some(Reply::Redirect(302, format!("{a_origin}{path}"))),
+        |_| {},
+    );
+    let b_home = home.t3_home("env b/.t3", Some("env-b"), Some(&b));
+    let local = |t3_home: &Path| json!({"kind": "local", "t3Home": t3_home});
+    home.save_environments(&json!({"default": "a", "environments": {
+        "a": local(&a_home),
+        "b": local(&b_home),
+    }}));
+    let near_a = |args: &[&str]| {
+        let mut command = home.command(args, &t3);
+        command.env("T3TERM_ORIGIN", &a.origin);
+        command.output().expect("run t3term")
+    };
+
+    // Each command stops at the redirect of B's descriptor, before it logs in, and `logout`
+    // removes nothing.
+    let threads = near_a(&["--json", "--environment", "b", "threads"]);
+    assert_error(&threads, 4, "T3_REDIRECTED");
+    let sent = near_a(&["--json", "--environment", "b", "send", THREAD_B, "Hi"]);
+    assert_error(&sent, 4, "T3_REDIRECTED");
+    let logged_out = near_a(&["--json", "--environment", "b", "logout"]);
+    assert_error(&logged_out, 4, "T3_REDIRECTED");
+
+    // Legacy discovery, with T3TERM_ORIGIN naming B, passes B over rather than follow it, and
+    // finds no other server.
+    let mut legacy = home.command(&["--json", "threads"], &t3);
+    legacy.env("T3TERM_ORIGIN", &b);
+    assert_error(&legacy.output().unwrap(), 5, "T3_SERVER_UNAVAILABLE");
+
+    // A was asked for nothing, B for its descriptor alone, and no session was issued.
+    let reached = a.paths.lock().unwrap().clone();
+    assert!(reached.is_empty(), "A was asked for {reached:?}");
+    let descriptor = "/.well-known/t3/environment";
+    assert_eq!(*b_paths.lock().unwrap(), [descriptor; 4]);
+    assert_eq!(home.t3_log(), "");
+}
+
+/// Serves environment env-b as `serve_environment` does, except that two routes point at
+/// `elsewhere`: THREAD_B's full snapshot, with a 302, and the WebSocket ticket, with a 307,
+/// which asks for the same method and body again there. Returns the origin and the paths
+/// requested, a WebSocket's included.
+fn serve_redirecting_b(elsewhere: &str) -> (String, Arc<Mutex<Vec<String>>>) {
+    let mut descriptor = protocol_2_descriptor();
+    descriptor["environmentId"] = json!("env-b");
+    let listed = json!({"id": THREAD_B, "projectId": "p1", "title": "env-b",
+        "status": "idle", "updatedAt": "2026-10-13T10:00:00.000Z"});
+    let shell = json!({"projects": [], "threads": [listed]});
+    let snapshot = json!({"snapshotSequence": 3, "projection": {
+        "thread": {"id": THREAD_B, "title": "env-b"},
+        "runs": [],
+        "runtimeRequests": [],
+        "turnItems": [],
+    }});
+    let thread = format!("/api/orchestration/threads/{THREAD_B}");
+    let bounded = format!("{thread}/bounded");
+    let elsewhere = elsewhere.to_string();
+    serve_replies(
+        move |path| {
+            let moved = format!("{elsewhere}{path}");
+            match path {
+                "/.well-known/t3/environment" => Some(Reply::Json(descriptor.clone())),
+                "/api/orchestration/shell" => Some(Reply::Json(shell.clone())),
+                "/api/auth/websocket-ticket" => Some(Reply::Redirect(307, moved)),
+                _ if path == bounded => Some(Reply::Json(snapshot.clone())),
+                _ if path == thread => Some(Reply::Redirect(302, moved)),
+                _ => None,
+            }
+        },
+        |_| {},
+    )
+}
+
+#[test]
+fn a_request_a_named_environment_redirects_stops_there_and_its_target_gets_nothing() {
+    // A is the saved default, the server T3CODE_HOME records and the one T3TERM_ORIGIN names,
+    // and B's redirects point at it.
+    let home = Home::new();
+    let t3 = home.logging_t3();
+    let a = serve_environment("env-a", THREAD_A);
+    let (b, b_paths) = serve_redirecting_b(&a.origin);
+    home.record_server(&a.origin);
+    let a_home = home.t3_home("env a/.t3", Some("env-a"), Some(&a.origin));
+    let b_home = home.t3_home("env b/.t3", Some("env-b"), Some(&b));
+    let b_dir = b_home.to_str().unwrap();
+    for (name, dir) in [("a", a_home.to_str().unwrap()), ("b", b_dir)] {
+        home.run_ok(&["environment", "add", name, "--t3-home", dir]);
+    }
+    home.run_ok(&["environment", "default", "a"]);
+    let near_a = |args: &[&str]| {
+        let mut command = home.command(args, &t3);
+        command.env("T3TERM_ORIGIN", &a.origin);
+        command.output().expect("run t3term")
+    };
+
+    // B's descriptor matches its home, so each command logs in and then stops at a redirect:
+    // `read` at its thread's, and `send` at the ticket's, before it opens the WebSocket its
+    // message would go on.
+    let read = near_a(&["--json", "--environment", "b", "read", THREAD_B]);
+    assert_error(&read, 4, "T3_REDIRECTED");
+    let sent = near_a(&["--json", "--environment", "b", "send", THREAD_B, "Hi"]);
+    assert_error(&sent, 4, "T3_REDIRECTED");
+
+    // A was asked for nothing, B for these alone, and each session was revoked against B's
+    // home.
+    let reached = a.paths.lock().unwrap().clone();
+    assert!(reached.is_empty(), "A was asked for {reached:?}");
+    let thread = format!("/api/orchestration/threads/{THREAD_B}");
+    let bounded = format!("{thread}/bounded");
+    let asked = [
+        "/.well-known/t3/environment",
+        "/api/orchestration/shell",
+        thread.as_str(),
+        "/.well-known/t3/environment",
+        "/api/orchestration/shell",
+        bounded.as_str(),
+        "/api/auth/websocket-ticket",
+    ];
+    assert_eq!(*b_paths.lock().unwrap(), asked);
+    let logins = session_log(b_dir, READ_SCOPE) + &session_log(b_dir, OPERATE_SCOPES);
+    assert_eq!(home.t3_log(), logins);
+}
+
+#[test]
+fn logging_out_of_a_named_environment_touches_its_login_alone() {
+    // With nothing running and no environment chosen, `logout` finds no server, so it removes
+    // every saved login. With saved logins off, as in every run here, there are none.
+    let home = Home::new();
+    let t3 = home.logging_t3();
+    let message = |output: Output| {
+        assert_eq!(output.status.code(), Some(0), "{output:?}");
+        json_stdout(&output)["message"].clone()
+    };
+    let logged_out = message(home.run_with(&["--json", "logout"], &t3));
+    assert_eq!(logged_out, "No saved logins.");
+
+    // A runs, and is the default, the server T3CODE_HOME records and the one T3TERM_ORIGIN
+    // names. B is down, since nothing listens on port 0. Up runs. Other answers for a home
+    // other than imposter's. 192.0.2.1 is a documentation address off this machine.
+    let a = serve_environment("env-a", THREAD_A);
+    let up = serve_environment("env-up", THREAD_B);
+    let other = serve_environment("env-other", THREAD_B);
+    home.record_server(&a.origin);
+    let a_home = home.t3_home("env a/.t3", Some("env-a"), Some(&a.origin));
+    let b_home = home.t3_home("env b/.t3", Some("env-b"), Some("http://127.0.0.1:0"));
+    let up_home = home.t3_home("up/.t3", Some("env-up"), Some(&up.origin));
+    let imposter = home.t3_home("imposter/.t3", Some("env-mine"), Some(&other.origin));
+    let lan = home.t3_home("lan/.t3", Some("env-lan"), Some("http://192.0.2.1:3773"));
+    let local = |t3_home: &Path| json!({"kind": "local", "t3Home": t3_home});
+    let mut file = json!({"default": "a", "environments": {
+        "a": local(&a_home),
+        "b": local(&b_home),
+        "up": local(&up_home),
+        "imposter": local(&imposter),
+        "lan": local(&lan),
+        "far": {"kind": "local", "t3Home": b_home, "origin": "http://192.0.2.1:3773"},
+        "paired": {"kind": "paired", "t3Home": b_home},
+    }});
+    home.save_environments(&file);
+    let near_a = |args: &[&str]| {
+        let mut command = home.command(args, &t3);
+        command.env("T3TERM_ORIGIN", &a.origin);
+        // `logout` locks a login in the temporary directory. Keep the lock in this home.
+        command.env("TMPDIR", home.0.path());
+        command.output().expect("run t3term")
+    };
+
+    // B's server is down, so `logout` removes B's login without a revoke: B's alone, found by
+    // the environment id B's home holds, and not every saved login.
+    let b_down = "No saved login for environment b.";
+    let logged_out = message(near_a(&["--json", "--environment", "b", "logout"]));
+    assert_eq!(logged_out, b_down);
+    // A running server gets the logout of its own login.
+    let logged_out = message(near_a(&["--json", "--environment", "up", "logout"]));
+    assert_eq!(logged_out, format!("No saved login for {}.", up.origin));
+
+    // A target that fails a check removes nothing.
+    let refusals = [
+        ("imposter", 4, "T3_ENVIRONMENT_MISMATCH"),
+        ("lan", 4, "ENVIRONMENT_NOT_LOCAL"),
+        ("far", 4, "ENVIRONMENT_NOT_LOCAL"),
+        ("paired", 4, "ENVIRONMENT_UNSUPPORTED"),
+        ("missing", 3, "ENVIRONMENT_NOT_FOUND"),
+    ];
+    for (name, exit_code, code) in refusals {
+        let logged_out = near_a(&["--json", "--environment", name, "logout"]);
+        assert_error(&logged_out, exit_code, code);
+    }
+
+    // With B the default, `logout` alone logs out of B too, though T3CODE_HOME records A.
+    file["default"] = json!("b");
+    home.save_environments(&file);
+    assert_eq!(message(home.run_with(&["--json", "logout"], &t3)), b_down);
+
+    // A was asked for nothing, the others for their descriptor alone, and no session was
+    // issued or revoked.
+    let reached = a.paths.lock().unwrap().clone();
+    assert!(reached.is_empty(), "A was asked for {reached:?}");
+    let descriptor = "/.well-known/t3/environment";
+    assert_eq!(*up.paths.lock().unwrap(), [descriptor]);
+    assert_eq!(*other.paths.lock().unwrap(), [descriptor]);
     assert_eq!(home.t3_log(), "");
 }
 
