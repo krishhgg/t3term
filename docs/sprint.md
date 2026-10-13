@@ -41,6 +41,7 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 | Pull request | Audit | What it does | Merge commit |
 |---|---|---|---|
 | https://github.com/krishhgg/t3term/pull/23 | 1 | A CI concurrency group for each push to master, Greptile rule scopes and context brought up to date, and CLI tests for exit codes 7, 1 and 6 | |
+| https://github.com/krishhgg/t3term/pull/24 | 1 | Plain CLI output without control characters from T3 text, ids, names and errors, with `--json` unchanged | |
 
 ## Audits
 
@@ -56,7 +57,7 @@ Sprint PR 10, #17, merged at `19f5db9942bfa594d86dda463a0f50c60da76e39`. The aud
 | Greptile's protocol-fidelity rule left out main.rs, transcript.rs and src/tui/, which read the nightly's fields. Its idle-cost rule left out main.rs and transcript.rs, where the CLI formats items on each event | Astra and Fable | Fixed by #23. Sol's review of #23 also added models.rs, which reads the providers, models and option descriptors in the server config. It corrected the rule's reconnect wording too. The shell and thread subscriptions resume with `afterSequence`, and `subscribeServerConfig` sends an empty payload and starts from a fresh snapshot on each reconnect, as #22 does |
 | `.greptile/files.json` called research/next-steps.md the agreed plan. It is the earlier proposal, and its CLI syntax never shipped | Sol's reconciliation | Fixed by #23. The context now gives README.md as the current commands, docs/parity.md as the pinned plan whose statuses are the baseline, docs/parity-inventory.md for the desktop's source, as Fable proposed, and this file for the process and what merged |
 | No CLI test reached exit 7 or 6 through a real wait, or exit 1 through a failed run | Fable | Fixed by #23 |
-| Plain CLI output still prints thread titles, messages and tool text from the server with their control characters, in `read`, `projects`, `threads` and the `wait` stream, through `transcript::plain_text` and `describe_plain`. Checklist steps, compaction summaries, handoff endpoints and edit file names are cleaned, and `--json` escapes everything. The gap predates the sprint, and #15 and #16 noted it | Fable | Open. It needs its own CLI cleanup maintenance PR after #23 |
+| Plain CLI output still prints thread titles, messages and tool text from the server with their control characters, in `read`, `projects`, `threads` and the `wait` stream, through `transcript::plain_text` and `describe_plain`. Checklist steps, compaction summaries, handoff endpoints and edit file names are cleaned, and `--json` escapes everything. The gap predates the sprint, and #15 and #16 noted it | Fable | Fixed by [#24](https://github.com/krishhgg/t3term/pull/24), which also cleans `watch`, `requests`, `approve`, `interrupt`, `models`, `settings`, `doctor` and the error report. `--json` keeps every value as T3 sent it |
 
 An older concern that the TUI's App couldn't be tested offline no longer holds, because #21 made offline App tests possible.
 
