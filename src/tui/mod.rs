@@ -872,7 +872,8 @@ impl App {
     /// its turn, for the card. It runs when a thread opens and after what can change these: a
     /// snapshot, an event for the thread or a run, and the shell's copy of the thread. So
     /// neither a frame, a key nor a piece of a streamed answer looks. A subscription that ended
-    /// for good isn't asked for again, nor is one T3 refused.
+    /// for good isn't asked for again, nor is one T3 refused, nor one for a thread whose watch
+    /// closed.
     fn follow_setup(&mut self) {
         let has_worktree = self
             .open_thread_json()
@@ -880,6 +881,12 @@ impl App {
         let Some(open) = self.open.as_mut() else {
             return;
         };
+        // The closed watch closed the setup subscription, and hears nothing more of the
+        // thread's runs. So neither the runs as it last saw them nor the shell's copy of the
+        // thread opens another. The thread subscribes again when it opens with a new watch.
+        if open.connection == "closed" {
+            return;
+        }
         let run = open.state.as_ref().and_then(ThreadState::activity_run);
         let preparing = run.is_some_and(|run| status(run) == "preparing");
         open.setup.turn_started =
