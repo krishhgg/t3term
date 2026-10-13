@@ -21,14 +21,14 @@ Sol drove the runs through these cases and inspected the captures. The list reco
 
 - The label and the address in the sidebar's second row, with the shelf list starting on the row it did before. Sol dragged the sidebar wider with the identity in view.
 - The sidebar hidden, with the dot and the identity at the end of the breadcrumb's row. A click on the identity did nothing, and the focus and the draft `demo draft kept` stayed. The draft also stayed through showing and hiding the sidebar.
-- The feed held for 60 seconds and then subscribed again, while the open thread's watch stayed live and its replies kept arriving. The dot was amber and read `reconnecting` until the feed caught up.
+- Sol had the fixture hold the feed's resubscriptions while the open thread's watch stayed live and its replies kept arriving. The dot was amber and read `reconnecting` until the feed caught up.
 - The feed failed for good while the thread stayed live. The dot turned red and read `closed`, and it stayed red after the message cleared. With the sidebar hidden, the breadcrumb's row showed the closed feed.
 - The thread's watch closed while the feed's dot stayed green. The breadcrumb and the status line read `closed`.
 - In the 256-color run, a whole-socket drop made both the feed and the thread's watch reconnect, and both recovered.
 - With the `synchronized` marker withheld, the feed stayed `reconnecting` until the marker arrived.
 - A capture right after a cold start shows `connecting`.
 - Changing the descriptor's label or T3's config while t3term ran left the identity as it was until a restart. With no label or a blank one, the address showed alone. The hostile label showed cleaned, its CJK, kana, Hangul and combining accent kept whole, and cut with `…` before the address and its port.
-- Sol selected a thread with a CJK title while the sidebar was hidden.
+- With the sidebar showing, Sol selected a thread with a CJK title there and typed the draft `resize draft survives`. Sol then hid the sidebar and inspected the breadcrumb's row.
 - A resize to 12x8 didn't crash t3term, and the draft `resize draft survives` showed whole again at 200x50. A 12x8 window clips the screen, so not every control or the identity shows there.
 
 A restart drops an unsent draft, as it did before this pull request. The draft stays through resizes, showing and hiding the sidebar and clicks, not a restart.
@@ -78,13 +78,13 @@ Sol took no native Terminal screenshots. Each image renders one `tmux capture-pa
 
 | Hostile label, truecolor 200x50 | Narrow, truecolor 40x12 |
 |---|---|
-| ![No thread open. The sidebar's second row reads Fixture Mac [31mred ]52;c;eA==osc 2J bel 漢字かな한글 café zzzzzzz… · 127.0.0.1:51024: the printable rest of the escape codes with their control characters gone, the CJK, kana, Hangul and accented letter whole, and the label cut with … before the address and its port](screenshots/environment-unicode.png) | ![A 40x12 screen with the hostile label: the first row is T3 Code and an amber dot with no room for its word, the second is Fixture Mac [31m… with no address, the thread cards are cut with …, and the composer wraps the draft resize draft survives](screenshots/environment-narrow.png) |
+| ![No thread open. The sidebar's second row reads Fixture Mac [31mred ]52;c;eA==osc 2J bel 漢字かな한글 café zzzzzzz… · 127.0.0.1:51024: the printable rest of the escape codes with their control characters gone, the CJK, kana, Hangul and accented letter whole, and the label cut with … before the address and its port](screenshots/environment-unicode.png) | ![A 40x12 screen with the hostile label: the first row is T3 Code and an amber dot with no room for its word, the second is Fixture Mac \[31m… with no address, the thread cards are cut with …, and the composer wraps the draft resize draft survives](screenshots/environment-narrow.png) |
 
 The [capture slideshow](screenshots/environment-capture-slideshow.mp4) is an 18-second H.264 video at 1600x980 and 30 frames a second. It holds six truecolor captures still for 3 seconds each: the identity, the hidden sidebar, the reconnecting feed, the closed feed, the closed thread watch and the hostile label. Sol checked it with ffprobe, decoded every frame and inspected samples. It is a slideshow of still captures, not a recording, so it doesn't show how long each step took.
 
 ## What this doesn't show
 
-- Nothing here ran against a live T3 server or over a real network.
+- The fake servers spoke real TCP and WebSocket, but only on loopback, 127.0.0.1. No live T3 server or remote host took part.
 - The dot is the feed's state. A connection problem the feed doesn't see doesn't show.
 - The label is read once, at start, and t3term connects to one environment.
 - Credentials in an origin, IPv6, `localhost` and implied ports were checked only offline.
