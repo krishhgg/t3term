@@ -1,6 +1,6 @@
 # Environment chrome verification
 
-This page records how GPT-6.1 Sol checked the sidebar's environment row and feed dot from [PR #28](https://github.com/krishhgg/t3term/pull/28) in the t3term binary, on 2026-10-12, at source `a55c60d77d9ac0a9066cfaff28cca428db6ca8c1`. The README's [The environment and its connection](../README.md#the-environment-and-its-connection) section describes the behavior. Nothing here measures speed, CPU, memory, battery or latency.
+This page records how GPT-6.1 Sol checked the sidebar's environment row and feed dot from [PR #28](https://github.com/krishhgg/t3term/pull/28) in the t3term binary, on 2026-10-12, at source `a55c60d77d9ac0a9066cfaff28cca428db6ca8c1`. The README's [The environment and its connection](../README.md#the-environment-and-its-connection) section describes the behavior. Nothing here measures speed, CPU, memory, battery or latency. The [port preservation follow-up](#port-preservation-follow-up) at the end covers a later fix, at `c0c20d6`, with its own checks and run.
 
 The dot shows the state of the sidebar's feed, T3's `orchestration.subscribeShell`. t3term has no monitor for the WebSocket itself, so nothing here checks one. It also connects to one environment, so nothing here checks a list or a selector.
 
@@ -94,3 +94,52 @@ The [capture slideshow](screenshots/environment-capture-slideshow.mp4) is an 18-
 ## Where the evidence is
 
 The captures, their plain-text copies, the raw terminal output and the fixture logs stay on the machine that ran the checks, in `/private/tmp/t3term-pr28-fixture-yolgse82` and `/private/tmp/t3term-pr28-fixture-8q_6g76a`. They aren't committed or published, and neither are the fixture script and the renderer. The images on this page render t3term's captured terminal output, and everything in them comes from the fake server. They are not screenshots of a terminal app, or of t3term connected to a live T3 server.
+
+## Port preservation follow-up
+
+Everything above checked source `a55c60d`. This section covers a later fix, at source `c0c20d6978b67e8e5cef497fdbda19f0df54f6ec`, and its numbers are its own.
+
+Greptile found that at `a55c60d` the sidebar's row could cut a port. At 80 columns, `Studio Mac` left 10 columns for the address, and `127.0.0.1:51024` showed as `127.0…1024`. The eight images and the slideshow above come from `a55c60d`. Their addresses show whole only because their rows were wide enough, or, in the narrow one, because the address was left out, so they don't show the fix.
+
+Commit `14e50f2` adds four tests, and `c0c20d6` changes how an address is cut:
+
+- An IP address, IPv4 or IPv6, shows whole with its port or doesn't show at all. IPv6 keeps its brackets.
+- A domain name is cut in the middle in front of its whole port, keeping at least three characters at each end, as in `stu…com:3773` for `studio.example.com:3773`.
+- An address that doesn't fit either way is left out. The label still comes first and is cut only after the address is gone, in the sidebar's row and in the breadcrumb's row.
+- t3term works out the port's length and whether the host is a domain name once, when it parses the origin at start. Drawing a frame parses nothing.
+
+### Checks
+
+Sol checked out `14e50f2` on its own, built it in a separate target directory and ran `cargo test --locked --lib whole_port`. All four new tests failed against the old code. Among the strings they reported were `Studio Mac · 127.0…1024` and `[::1…024`. At `c0c20d6` Sol ran `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings` and `cargo test --locked`, and all of them passed. The 391 tests are 357 library, 2 main, 18 CLI and 14 fake RPC tests, the 387 above plus the four new ones. [CI run 38346457442](https://github.com/krishhgg/t3term/actions/runs/38346457442) passed at `c0c20d6` on macOS, job 115128919451, and on the Linux build job, 115128919309.
+
+Two of the new tests are in `src/tui/environment.rs`. They fit 13 identities to every width from 0 to 64 columns, with IPv4, IPv6, `localhost` and domain addresses, ports of 1, 4 and 5 digits, no label, and labels with CJK or combining characters. The other two are App tests in `src/tui/mod.rs`. They draw the sidebar's row and the breadcrumb's row at 80 columns, with the sidebar dragged wider and with it hidden, and at widths up to 200. The fix also changed four older assertions that expected `127.0…3773` or `[::…773`.
+
+### The fake-server run
+
+Sol ran one more fake-server run at `c0c20d6`, set up as above. The fake T3 server listened on 127.0.0.1 only, at port 54339, picked at random, and served the normal label, `Fixture Mac`. The run had its own temporary `HOME` and `T3CODE_HOME`, `T3TERM_NO_SAVED_LOGIN=1`, `env -i`, the stand-in `t3` command and a private tmux socket. The terminal was truecolor, at 80x24 and then 120x36.
+
+t3term started once and exited with status 0. The server issued one session and revoked it, and opened and closed one socket. It received one `subscribeShell`, one `subscribeServerConfig` and one `subscribeThread`, and no `server.getConfig` read, `subscribeWorktreeSetup` request or orchestration command. All seven control-character counts were 0, which says little here, since the label held no control characters. The fake server and the tmux server stopped, and their files stay on disk in `/private/tmp/t3term-pr28-fixture-r5a30jjy`.
+
+Sol inspected six captures:
+
+- At 80x24, with the sidebar at its default width, the sidebar's row read `Fixture Mac` alone.
+- With the sidebar's edge dragged to column 26, 10 columns were left for the address, and the row read `Fixture Mac` alone. At column 30, with 14 columns, it still did.
+- At column 31, 15 columns held `127.0.0.1:54339`, and the row read `Fixture Mac · 127.0.0.1:54339`. In the same capture `Quiet: finished` is selected and the composer holds the draft `five digit demo draft`.
+- With the sidebar hidden at 80 columns, the breadcrumb's row showed `Fixture Mac` without the address. At 120x36 it showed the whole `Fixture Mac · 127.0.0.1:54339`, and the draft was still there.
+
+### Images
+
+Sol rendered three of the captures with the Swift renderer described above and inspected them. Like the eight above, they render tmux's cells and are not native Terminal screenshots. The first two are 80x24 and the third is 120x36.
+
+| Address left out, truecolor 80x24 | Whole address, truecolor 80x24 |
+|---|---|
+| ![No thread open. The sidebar's first row reads T3 Code and a green dot, and its second row reads Fixture Mac alone, since the 10 columns left are too few for 127.0.0.1:54339. The Active shelf follows, and the status line starts with a green dot and live](screenshots/environment-port-omitted.png) | ![The sidebar's edge dragged to column 31: T3 Code and a green dot, then Fixture Mac · 127.0.0.1:54339 whole. Quiet: finished is selected and open, its fixture replies show on the right, and the composer holds five digit demo draft](screenshots/environment-port-whole.png) |
+
+![The sidebar hidden at 120x36: the breadcrumb reads CD Chrome Desk / Quiet: finished, and the row ends with a green dot and Fixture Mac · 127.0.0.1:54339. The transcript shows the fixture's replies, the composer still holds five digit demo draft, and the status line starts with a green dot and live, then Ctrl+B sidebar](screenshots/environment-port-hidden.png)
+
+### What the follow-up doesn't show
+
+- Domain names and IPv6 were checked only by the offline tests. The fixture served 127.0.0.1, so no cut domain name showed on screen, and nothing used DNS or an IPv6 network.
+- Credentials in an origin are still checked only offline.
+- t3term keeps at most 253 characters of a host, the longest a DNS name can be, and a longer one already ends in `…`. Cutting it again would show two, and no test covers that.
+- This run measured no speed, CPU, memory or idle behavior, and there is no new recording.
