@@ -1256,7 +1256,7 @@ impl App {
         self.details.toggle();
         self.layout_changed = true;
         if details::layout(self.main_column(self.screen)) == details::Layout::Dialog {
-            self.focus_details();
+            self.focus_details(true);
         }
     }
 
@@ -1270,10 +1270,15 @@ impl App {
     }
 
     /// Gives the details the keyboard, noting the pane that had it. An open menu closes.
-    fn focus_details(&mut self) {
+    /// `by_dialog` says a dialog took it, rather than the reader with a click or Tab, so the
+    /// keyboard goes back if the dialog turns into a pane. A pane never takes it by itself.
+    fn focus_details(&mut self, by_dialog: bool) {
         if self.focus != Focus::Details {
             self.details.return_focus = Some(self.focus);
             self.focus = Focus::Details;
+            self.details.taken = by_dialog;
+        } else if !by_dialog {
+            self.details.taken = false;
         }
         self.picker = None;
     }
@@ -1281,6 +1286,7 @@ impl App {
     /// Gives the keyboard back from the details to the pane that had it before them, or to the
     /// composer. A sidebar hidden since gives it to the transcript, as hiding it does.
     fn leave_details(&mut self) {
+        self.details.taken = false;
         if self.focus != Focus::Details {
             return;
         }
@@ -1334,12 +1340,16 @@ impl App {
     /// projection's once the watch sends it, and the shell's copy until then. After the watch
     /// closes, the shell's copy, which still changes, comes first. A projection whose thread
     /// has another id counts as none. Without either, the thread is loading until the watch
-    /// sends a projection or closes, and unavailable after.
+    /// sends a projection, says it caught up or closes, and unavailable after.
     fn details_record(&self) -> details::Record<'_> {
         let Some(open) = self.open.as_ref() else {
             return details::Record::None;
         };
         let closed = open.connection == "closed";
+        let answered = open
+            .state
+            .as_ref()
+            .is_some_and(|state| state.synchronized || !state.projection.is_empty());
         let projection = open
             .state
             .as_ref()
@@ -1348,7 +1358,7 @@ impl App {
         match (projection, self.shell_thread(&open.id)) {
             (Some(thread), _) if !closed => details::Record::Found(thread),
             (_, Some(thread)) | (Some(thread), None) => details::Record::Found(thread),
-            (None, None) if closed || open.state.is_some() => details::Record::Unavailable,
+            (None, None) if closed || answered => details::Record::Unavailable,
             (None, None) => details::Record::Loading,
         }
     }
@@ -1508,7 +1518,7 @@ impl App {
                     }
                     match mouse.kind {
                         _ if click && inside(drawn.close) => self.close_details(),
-                        _ if click => self.focus_details(),
+                        _ if click => self.focus_details(false),
                         MouseEventKind::ScrollUp => self.details.scroll_by(-1),
                         MouseEventKind::ScrollDown => self.details.scroll_by(1),
                         _ => return false,
@@ -1715,7 +1725,7 @@ impl App {
                 let forward = key.code == KeyCode::Tab;
                 let pane = self.details.shown() == Some(details::Layout::Pane);
                 match cycle(self.focus, forward, self.sidebar_hidden, pane) {
-                    Focus::Details => self.focus_details(),
+                    Focus::Details => self.focus_details(false),
                     next => self.focus = next,
                 }
                 return;
@@ -2495,10 +2505,12 @@ impl App {
         // The main column keeps one blank column on each side, like the GUI's padding.
         let main = padded(main);
         // How the details fit decides the conversation's width. A dialog has the keyboard, so
-        // it takes it before the sidebar and the composer draw whether they have it.
+        // it takes it before the sidebar and the composer draw whether they have it. A pane it
+        // turns into gives it back.
         let shown = self.details.open.then(|| details::layout(main));
         match shown {
-            Some(details::Layout::Dialog) => self.focus_details(),
+            Some(details::Layout::Dialog) => self.focus_details(true),
+            Some(details::Layout::Pane) if self.details.taken => self.leave_details(),
             Some(details::Layout::Pane) => {}
             None => self.leave_details(),
         }
@@ -9685,5 +9697,709 @@ mod tests {
         assert!(crate::settings::saved_in_test().sidebar_hidden);
         assert!(app.open.is_none() && app.picker.is_none() && app.drag.is_none());
         assert_eq!(app.composer.text(), "half a thought");
+    }
+
+    // ---- thread details ----
+
+    /// The shell's snapshot with project `p`, Demo in /repo/demo, and project `q`, Other in
+    /// /repo/other, listing `threads`.
+    fn details_shell(threads: Vec<Value>) -> WatchEvent {
+        let projects = json!([
+            {"id": "p", "title": "Demo", "workspaceRoot": "/repo/demo"},
+            {"id": "q", "title": "Other", "workspaceRoot": "/repo/other"},
+        ]);
+        let snapshot = json!({"snapshotSequence": 1, "projects": projects, "threads": threads});
+        WatchEvent::Item(json!({"kind": "snapshot", "snapshot": snapshot}))
+    }
+
+    /// Thread `id` as T3 records it, in `project`, with `worktree` and `branch`.
+    fn bound(id: &str, project: &str, worktree: Value, branch: Value) -> Value {
+        let mut thread = listed(id, &format!("Thread {id}"), "idle");
+        thread["projectId"] = json!(project);
+        thread["worktreePath"] = worktree;
+        thread["branch"] = branch;
+        thread
+    }
+
+    /// `thread`, open and live, its projection holding it and twenty answers.
+    fn open_bound(thread: Value) -> OpenThread {
+        let id = str_of(&thread, "id").to_string();
+        let snapshot = json!({"kind": "snapshot", "snapshotSequence": 1,
+            "projection": {"thread": thread, "turnItems": answers()}});
+        let mut open = OpenThread::new(id, mpsc::unbounded_channel().1);
+        assert_eq!(open.apply(&snapshot), Applied::Snapshot);
+        open.connection = "live".into();
+        open
+    }
+
+    /// The thread `t` in a worktree of Demo on `feature/a`, as the shell lists it and its
+    /// projection has it.
+    fn feature_thread() -> Value {
+        bound(
+            "t",
+            "p",
+            json!("/repo/.t3/worktrees/feature-a"),
+            json!("feature/a"),
+        )
+    }
+
+    /// The TUI with the sidebar listing thread `t` in a worktree of Demo and thread `u` in
+    /// Other's local checkout, `t` open, and a draft in the composer with its cursor before
+    /// the last letter.
+    fn details_tui() -> App {
+        let mut app = tui(&Settings::default());
+        let other = bound("u", "q", Value::Null, Value::Null);
+        app.on_shell_event(details_shell(vec![feature_thread(), other]));
+        app.on_shell_event(caught_up());
+        app.open_thread(open_bound(feature_thread()));
+        app.composer.insert_str("draft");
+        press(&mut app, KeyCode::Left);
+        app
+    }
+
+    /// The text of the details in `buffer`, where the last frame drew them, or none.
+    fn details_text(app: &App, buffer: &ratatui::buffer::Buffer) -> String {
+        app.details
+            .drawn
+            .map(|drawn| text_in(buffer, drawn.area))
+            .unwrap_or_default()
+    }
+
+    /// Draws a frame `width` columns by `height` rows and returns the text of the details.
+    fn details_after(app: &mut App, width: u16, height: u16) -> String {
+        let buffer = cells(app, width, height);
+        details_text(app, &buffer)
+    }
+
+    #[test]
+    fn thread_details_start_closed_and_open_beside_the_conversation() {
+        let mut app = details_tui();
+        let buffer = cells(&mut app, 200, 50);
+        assert!(!app.details.open);
+        assert_eq!(app.details.drawn, None);
+        let wide = app.composer_area;
+        // The button ends the title row, a column in from the screen's edge.
+        assert_eq!(app.details.button, Rect::new(196, 0, 3, 1));
+        assert_eq!(text_in(&buffer, app.details.button), " ◨ ");
+
+        alt(&mut app, 'b');
+        assert!(app.details.open);
+        assert_eq!(
+            app.focus,
+            Focus::Composer,
+            "a pane leaves the keyboard alone"
+        );
+        assert!(app.layout_changed, "the next frame waits for nothing");
+        let text = details_after(&mut app, 200, 50);
+        let drawn = app.details.drawn.expect("the pane");
+        assert_eq!(drawn.layout, details::Layout::Pane);
+        // The conversation keeps all but the pane's 36 columns and a blank one.
+        assert_eq!(app.composer_area.width, wide.width - 37);
+        assert_eq!(drawn.area.x, app.composer_area.right() + 1);
+        assert_eq!(drawn.area.y, app.transcript_area.y);
+        assert_eq!(drawn.area.bottom(), app.composer_area.bottom());
+        for shown in [
+            "Thread details",
+            "×",
+            "Project",
+            "Demo",
+            "Workspace",
+            "Worktree · feature-a",
+            "/repo/.t3/worktrees/feature-a",
+            "Recorded branch",
+            "feature/a",
+            "Environment",
+            "127.0.0.1:9",
+        ] {
+            assert!(text.contains(shown), "{shown:?} in {text}");
+        }
+        // Typing still goes to the composer, at its cursor.
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.composer.text(), "drafxt");
+
+        // Alt+B closes it, and the conversation takes its columns back.
+        alt(&mut app, 'b');
+        assert!(!app.details.open);
+        cells(&mut app, 200, 50);
+        assert_eq!(app.details.drawn, None);
+        assert_eq!(app.composer_area, wide);
+        press(&mut app, KeyCode::Char('y'));
+        assert_eq!(app.composer.text(), "drafxyt");
+    }
+
+    #[test]
+    fn a_narrow_screen_shows_a_dialog_that_esc_closes_before_it_moves_focus() {
+        for (width, height) in [(120, 36), (80, 24), (40, 12)] {
+            let mut app = details_tui();
+            app.focus = Focus::Transcript;
+            cells(&mut app, width, height);
+            alt(&mut app, 'b');
+            assert_eq!(app.focus, Focus::Details, "{width}x{height}");
+            let buffer = cells(&mut app, width, height);
+            let drawn = app.details.drawn.expect("the dialog");
+            assert_eq!(drawn.layout, details::Layout::Dialog);
+            assert_eq!(drawn.area.intersection(app.screen), drawn.area);
+            let text = details_text(&app, &buffer);
+            assert!(text.contains("Thread details"), "{width}x{height}: {text}");
+            let status = text_in(&buffer, Rect::new(0, height - 1, width, 1));
+            assert!(
+                width < 80 || status.contains("↑↓/PgUp scroll · Esc close"),
+                "{status}"
+            );
+            // Every key but the global ones stays in the dialog. No letter reaches the composer,
+            // Tab moves nothing and `q` doesn't quit.
+            for code in [
+                KeyCode::Char('x'),
+                KeyCode::Tab,
+                KeyCode::BackTab,
+                KeyCode::Enter,
+                KeyCode::Char('q'),
+                KeyCode::Left,
+            ] {
+                press(&mut app, code);
+            }
+            assert_eq!(app.focus, Focus::Details);
+            assert_eq!(app.composer.text(), "draft");
+            assert!(!app.quit);
+            // Esc closes it and gives the keyboard back to the transcript, which a second Esc
+            // would have left for the sidebar.
+            press(&mut app, KeyCode::Esc);
+            assert!(!app.details.open);
+            assert_eq!(app.focus, Focus::Transcript, "{width}x{height}");
+            cells(&mut app, width, height);
+            assert_eq!(app.details.drawn, None);
+            // The draft kept its cursor.
+            app.focus = Focus::Composer;
+            press(&mut app, KeyCode::Char('x'));
+            assert_eq!(app.composer.text(), "drafxt");
+        }
+    }
+
+    #[test]
+    fn the_details_follow_the_screen_and_a_pane_keeps_no_keyboard_a_dialog_took() {
+        let mut app = details_tui();
+        cells(&mut app, 200, 50);
+        alt(&mut app, 'b');
+        cells(&mut app, 200, 50);
+        assert_eq!(app.details.shown(), Some(details::Layout::Pane));
+        assert_eq!(app.focus, Focus::Composer);
+        // Narrower, the pane turns into a dialog with the keyboard.
+        app.on_terminal_event(Event::Resize(120, 36));
+        cells(&mut app, 120, 36);
+        assert_eq!(app.details.shown(), Some(details::Layout::Dialog));
+        assert_eq!(app.focus, Focus::Details);
+        // Hiding the sidebar makes room for the pane again, and the keyboard goes back.
+        ctrl_b(&mut app);
+        cells(&mut app, 120, 36);
+        assert_eq!(app.details.shown(), Some(details::Layout::Pane));
+        assert_eq!(app.focus, Focus::Composer);
+        // A short screen has no room for the pane either.
+        cells(&mut app, 120, 14);
+        assert_eq!(app.details.shown(), Some(details::Layout::Dialog));
+        assert_eq!(app.focus, Focus::Details);
+
+        // Tiny screens, then a big one again. The details fit whatever there is, and the
+        // keyboard and the draft come back as they were.
+        ctrl_b(&mut app);
+        for (width, height) in [(0, 0), (1, 1), (2, 2), (10, 5), (19, 3), (26, 4), (200, 50)] {
+            app.on_terminal_event(Event::Resize(width, height));
+            for _ in 0..2 {
+                cells(&mut app, width, height);
+                let whole = Rect::new(0, 0, width, height);
+                let drawn = app.details.drawn.expect("drawn");
+                for area in [drawn.area, drawn.close, app.details.button] {
+                    assert_eq!(area.intersection(whole), area, "{width}x{height}");
+                }
+                assert!(app.details.open);
+            }
+        }
+        assert_eq!(app.details.shown(), Some(details::Layout::Pane));
+        assert_eq!(app.focus, Focus::Composer);
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.composer.text(), "drafxt");
+    }
+
+    #[test]
+    fn tab_and_a_click_give_the_pane_the_keyboard_and_esc_gives_it_back() {
+        let mut app = details_tui();
+        cells(&mut app, 200, 50);
+        alt(&mut app, 'b');
+        cells(&mut app, 200, 50);
+        // Tab goes round the sidebar, the composer, the transcript and the pane.
+        let order = focus_after(&mut app, &[KeyCode::Tab; 4]);
+        assert_eq!(
+            order,
+            [
+                Focus::Transcript,
+                Focus::Details,
+                Focus::Sidebar,
+                Focus::Composer
+            ]
+        );
+        let order = focus_after(&mut app, &[KeyCode::BackTab; 2]);
+        assert_eq!(order, [Focus::Sidebar, Focus::Details]);
+        // In the pane, letters and Enter do nothing, and the page keys scroll the pane, not
+        // the transcript.
+        let scrolled = app.scroll.rows();
+        for code in [
+            KeyCode::Char('x'),
+            KeyCode::Enter,
+            KeyCode::PageUp,
+            KeyCode::PageDown,
+        ] {
+            press(&mut app, code);
+        }
+        assert_eq!(app.scroll.rows(), scrolled);
+        assert_eq!(app.composer.text(), "draft");
+        let buffer = cells(&mut app, 200, 50);
+        let status = text_in(&buffer, Rect::new(0, 49, 200, 1));
+        assert!(status.contains("Esc leave · Alt+B close"), "{status}");
+        // Esc gives the keyboard back to the pane before the details, and the pane stays.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus, Focus::Sidebar);
+        assert!(app.details.open);
+
+        // A click on the pane gives it the keyboard, and Alt+B gives it back as it closes.
+        app.focus = Focus::Transcript;
+        cells(&mut app, 200, 50);
+        let drawn = app.details.drawn.expect("the pane");
+        assert!(mouse(&mut app, CLICK, drawn.area.x + 3, drawn.area.y + 3));
+        assert_eq!(app.focus, Focus::Details);
+        assert!(app.details.open);
+        alt(&mut app, 'b');
+        assert!(!app.details.open);
+        assert_eq!(app.focus, Focus::Transcript);
+    }
+
+    #[test]
+    fn the_button_and_the_pane_take_clicks_only_where_the_last_frame_drew_them() {
+        let mut app = details_tui();
+        cells(&mut app, 200, 50);
+        let button = app.details.button;
+        assert!(mouse(&mut app, CLICK, button.x + 1, button.y));
+        assert!(app.details.open);
+        assert_eq!(app.focus, Focus::Composer);
+        // Until a frame draws the pane, another click on the button does nothing.
+        assert!(!mouse(&mut app, CLICK, button.x + 1, button.y));
+        assert!(app.details.open);
+        cells(&mut app, 200, 50);
+        let drawn = app.details.drawn.expect("the pane");
+        // A click on × closes it, and one on the button opens it again.
+        assert!(mouse(&mut app, CLICK, drawn.close.x + 1, drawn.close.y));
+        assert!(!app.details.open);
+        cells(&mut app, 200, 50);
+        assert!(mouse(&mut app, CLICK, button.x, button.y));
+        cells(&mut app, 200, 50);
+        let drawn = app.details.drawn.expect("the pane");
+        let (x, y) = (drawn.area.x + 3, drawn.area.y + 3);
+
+        // After a change that can move what the pane shows, a resize or another thread, a
+        // click on the pane or the button goes nowhere until the next frame.
+        let changes: [fn(&mut App); 3] = [
+            |app| {
+                let moved = bound("t", "p", json!("/repo/feature-b"), json!("feature/b"));
+                app.on_shell_event(thread_updated(2, moved));
+            },
+            |app| {
+                app.on_terminal_event(Event::Resize(200, 50));
+            },
+            |app| app.open_thread(OpenThread::new("u".into(), mpsc::unbounded_channel().1)),
+        ];
+        for change in changes {
+            change(&mut app);
+            assert!(!mouse(&mut app, CLICK, x, y));
+            assert!(!mouse(&mut app, CLICK, button.x + 1, button.y));
+            assert!(app.details.open);
+            assert_ne!(app.focus, Focus::Details);
+            cells(&mut app, 200, 50);
+        }
+        // Drawn again, the pane takes the click.
+        assert!(mouse(&mut app, CLICK, x, y));
+        assert_eq!(app.focus, Focus::Details);
+    }
+
+    #[test]
+    fn a_dialog_takes_the_mouse_until_a_click_outside_or_on_its_close_button() {
+        let mut app = details_tui();
+        app.focus = Focus::Transcript;
+        cells(&mut app, 80, 24);
+        alt(&mut app, 'b');
+        // Before a frame draws it, the dialog takes clicks and does nothing with them.
+        assert!(!mouse(&mut app, CLICK, 2, 3));
+        assert!(app.details.open);
+        cells(&mut app, 80, 24);
+        let drawn = app.details.drawn.expect("the dialog");
+        // A click inside it does nothing. One outside closes it and reaches nothing under it.
+        assert!(!mouse(&mut app, CLICK, drawn.area.x + 3, drawn.area.y + 3));
+        assert!(app.details.open);
+        let selected = app.sidebar.selected_thread_id().map(str::to_string);
+        assert!(mouse(&mut app, CLICK, 2, 3));
+        assert!(!app.details.open);
+        assert_eq!(app.focus, Focus::Transcript);
+        assert_eq!(
+            app.sidebar.selected_thread_id().map(str::to_string),
+            selected
+        );
+        assert_eq!(app.open.as_ref().map(|open| open.id.as_str()), Some("t"));
+
+        // Opened with the button, it takes the keyboard, and × closes it.
+        cells(&mut app, 80, 24);
+        let button = app.details.button;
+        assert!(mouse(&mut app, CLICK, button.x + 1, button.y));
+        assert_eq!(app.focus, Focus::Details);
+        cells(&mut app, 80, 24);
+        let drawn = app.details.drawn.expect("the dialog");
+        assert!(mouse(&mut app, CLICK, drawn.close.x + 1, drawn.close.y));
+        assert!(!app.details.open);
+        assert_eq!(app.focus, Focus::Transcript);
+    }
+
+    #[test]
+    fn the_details_scroll_with_keys_and_the_wheel_and_stop_at_their_ends() {
+        let mut app = tui(&Settings::default());
+        let path = format!("/repo/{}/deep", "x".repeat(200));
+        let thread = bound("t", "p", json!(path), json!("feature/a"));
+        app.on_shell_event(details_shell(vec![thread.clone()]));
+        app.open_thread(open_bound(thread));
+        cells(&mut app, 40, 12);
+        alt(&mut app, 'b');
+        let top = details_after(&mut app, 40, 12);
+        assert!(top.contains("Project") && top.contains("more ↓"), "{top}");
+        assert!(!top.contains("Recorded branch"), "{top}");
+        press(&mut app, KeyCode::Down);
+        let down = details_after(&mut app, 40, 12);
+        assert!(
+            !down.contains("Project") && down.contains("more ↑↓"),
+            "{down}"
+        );
+        assert!(
+            down.contains("Thread details"),
+            "the title row stays: {down}"
+        );
+        // Past the end, the next frame stops at the last row.
+        for _ in 0..100 {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        let end = details_after(&mut app, 40, 12);
+        assert!(end.contains("Recorded branch") && end.contains("127.0.0.1:9"));
+        assert!(end.contains("more ↑") && !end.contains("more ↑↓"), "{end}");
+        press(&mut app, KeyCode::Char('k'));
+        assert!(details_after(&mut app, 40, 12).contains("more ↑↓"));
+        for (code, expected) in [
+            (KeyCode::Char('g'), &top),
+            (KeyCode::Char('G'), &end),
+            (KeyCode::Home, &top),
+            (KeyCode::End, &end),
+            (KeyCode::Up, &end),
+            (KeyCode::Home, &top),
+            (KeyCode::PageUp, &top),
+        ] {
+            press(&mut app, code);
+            let text = details_after(&mut app, 40, 12);
+            assert_eq!(&text == expected, code != KeyCode::Up, "{code:?}: {text}");
+        }
+        press(&mut app, KeyCode::PageDown);
+        assert_ne!(details_after(&mut app, 40, 12), top);
+        press(&mut app, KeyCode::PageUp);
+        assert_eq!(details_after(&mut app, 40, 12), top);
+        // The wheel over the dialog scrolls it.
+        let drawn = app.details.drawn.expect("the dialog");
+        let (x, y) = (drawn.area.x + 3, drawn.area.y + 3);
+        assert!(mouse(&mut app, MouseEventKind::ScrollDown, x, y));
+        assert_eq!(details_after(&mut app, 40, 12), down);
+        assert!(mouse(&mut app, MouseEventKind::ScrollUp, x, y));
+        assert_eq!(details_after(&mut app, 40, 12), top);
+        assert_eq!(app.composer.text(), "");
+    }
+
+    #[test]
+    fn the_pane_rewraps_the_transcript_and_keeps_the_reader_in_place() {
+        let mut app = details_tui();
+        app.focus = Focus::Transcript;
+        cells(&mut app, 200, 30);
+        for _ in 0..3 {
+            press(&mut app, KeyCode::PageUp);
+        }
+        cells(&mut app, 200, 30);
+        let wide = app.transcript_area.width;
+        let (top, _) = app.anchor.clone().expect("scrolled up");
+        let prepared = &app.open.as_ref().unwrap().prepared;
+        let (made, versions) = (prepared.made, prepared.versions.clone());
+        for open in [true, false] {
+            alt(&mut app, 'b');
+            assert_eq!(app.focus, Focus::Transcript, "the transcript keeps focus");
+            cells(&mut app, 200, 30);
+            assert_eq!(app.details.shown().is_some(), open);
+            assert_eq!(app.transcript_area.width < wide, open);
+            // Every block is wrapped again at the new width, from the blocks already made.
+            let prepared = &app.open.as_ref().unwrap().prepared;
+            assert_eq!(prepared.made, made, "a block was made again");
+            assert_eq!(prepared.versions, versions);
+            // The same answer is at the top, and the transcript is still scrolled up.
+            assert_eq!(app.anchor.as_ref().map(|(id, _)| id), Some(&top));
+            assert!(app.scroll.rows() > 0);
+            assert_eq!(app.composer.text(), "draft");
+        }
+    }
+
+    #[test]
+    fn the_details_follow_another_thread_and_the_last_ones_never_come_back() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = details_tui();
+        cells(&mut app, 200, 50);
+        alt(&mut app, 'b');
+        assert!(details_after(&mut app, 200, 50).contains("feature-a"));
+        let started = reads(&runtime);
+
+        // Thread u opens before its watch sends anything. The shell's copy stands in.
+        app.open_thread(OpenThread::new("u".into(), mpsc::unbounded_channel().1));
+        let text = details_after(&mut app, 200, 50);
+        for shown in [
+            "Other",
+            "Local checkout · other",
+            "/repo/other",
+            "None recorded",
+        ] {
+            assert!(text.contains(shown), "{shown:?} in {text}");
+        }
+        assert!(
+            !text.contains("feature") && !text.contains("Demo"),
+            "{text}"
+        );
+
+        // Late news of thread t changes nothing: the shell's update of it, and a projection of
+        // it on the new thread's watch.
+        let prepares = app.details.prepares;
+        let moved = bound("t", "p", json!("/repo/feature-b"), json!("feature/b"));
+        app.on_shell_event(thread_updated(2, moved));
+        assert_eq!(details_after(&mut app, 200, 50), text);
+        assert_eq!(app.details.prepares, prepares);
+        let late = bound("t", "p", json!("/old"), json!("old"));
+        let stale = json!({"kind": "snapshot", "snapshotSequence": 3,
+            "projection": {"thread": late, "turnItems": []}});
+        app.on_thread_event(WatchEvent::Item(stale));
+        assert_eq!(details_after(&mut app, 200, 50), text);
+
+        // A thread neither the shell nor its watch has sent is loading until its watch closes.
+        app.open_thread(OpenThread::new("v".into(), mpsc::unbounded_channel().1));
+        let text = details_after(&mut app, 200, 50);
+        assert_eq!(text.matches("Loading…").count(), 3, "{text}");
+        assert!(
+            !text.contains("Other") && !text.contains("feature"),
+            "{text}"
+        );
+        app.on_thread_event(WatchEvent::Failed("thread closed".into()));
+        let text = details_after(&mut app, 200, 50);
+        assert_eq!(text.matches("Unavailable").count(), 3, "{text}");
+        assert!(!text.contains("Loading"), "{text}");
+        // A watch that says it caught up without sending the thread ends the wait too.
+        app.open_thread(OpenThread::new("w".into(), mpsc::unbounded_channel().1));
+        assert_eq!(
+            details_after(&mut app, 200, 50).matches("Loading…").count(),
+            3
+        );
+        app.on_thread_event(WatchEvent::Item(json!({"kind": "synchronized"})));
+        let text = details_after(&mut app, 200, 50);
+        assert_eq!(text.matches("Unavailable").count(), 3, "{text}");
+        // None of it asked T3 for anything or needs the tick.
+        assert_eq!(reads(&runtime), started);
+        assert!(!needs_tick(app.open.as_ref(), &app.sidebar));
+    }
+
+    #[test]
+    fn live_changes_show_and_only_changes_that_can_matter_work_the_details_out() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = details_tui();
+        let project = |sequence: u64, project: Value| {
+            WatchEvent::Item(json!({"kind": "project.updated", "sequence": sequence,
+                "project": project}))
+        };
+        // Closed, the details work nothing out, whatever comes.
+        cells(&mut app, 200, 50);
+        let renamed = json!({"id": "p", "title": "Demo renamed", "workspaceRoot": "/repo/demo"});
+        app.on_shell_event(project(2, renamed));
+        cells(&mut app, 200, 50);
+        assert_eq!((app.details.prepares, app.details.wraps), (0, 0));
+        let started = reads(&runtime);
+
+        alt(&mut app, 'b');
+        assert!(details_after(&mut app, 200, 50).contains("Demo renamed"));
+        assert_eq!((app.details.prepares, app.details.wraps), (1, 1));
+        // Frames, keys, an answer streaming in and news of another thread or project work
+        // nothing out again and wrap nothing again.
+        for _ in 0..3 {
+            cells(&mut app, 200, 50);
+        }
+        for code in [KeyCode::Char('a'), KeyCode::Left, KeyCode::Right] {
+            press(&mut app, code);
+        }
+        let answer = json!({"id": "a20", "type": "assistant_message", "ordinal": 20,
+            "text": "Done"});
+        app.on_thread_event(live(2, "turn-item.updated", answer));
+        let other = bound("u", "q", json!("/repo/other-wt"), Value::Null);
+        app.on_shell_event(thread_updated(3, other));
+        let other = json!({"id": "q", "title": "Other renamed", "workspaceRoot": "/repo/o"});
+        app.on_shell_event(project(4, other));
+        app.on_shell_event(caught_up());
+        cells(&mut app, 200, 50);
+        assert_eq!((app.details.prepares, app.details.wraps), (1, 1));
+
+        // The thread's watch moves it to another worktree and branch, and the details follow.
+        let moved = bound(
+            "t",
+            "p",
+            json!("/repo/.t3/worktrees/feature-b"),
+            json!("feature/b"),
+        );
+        app.on_thread_event(live(3, "thread.meta-updated", moved));
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Worktree · feature-b"), "{text}");
+        assert!(
+            text.contains("feature/b") && !text.contains("feature-a"),
+            "{text}"
+        );
+        assert_eq!(app.details.prepares, 2);
+        // Back in the local checkout, the project's folder names it, and follows the project.
+        let local = bound("t", "p", Value::Null, json!("main"));
+        app.on_thread_event(live(4, "thread.meta-updated", local));
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Local checkout · demo") && text.contains("/repo/demo"));
+        let moved = json!({"id": "p", "title": "Demo", "workspaceRoot": "/srv/demo-moved"});
+        app.on_shell_event(project(5, moved));
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Local checkout · demo-moved"), "{text}");
+        assert!(text.contains("/srv/demo-moved"), "{text}");
+        assert_eq!(app.details.prepares, 4);
+
+        // Closed, they work nothing out until they open again, and then show what changed.
+        alt(&mut app, 'b');
+        let unbranched = bound("t", "p", Value::Null, Value::Null);
+        app.on_thread_event(live(5, "thread.meta-updated", unbranched));
+        cells(&mut app, 200, 50);
+        assert_eq!(app.details.prepares, 4);
+        alt(&mut app, 'b');
+        assert!(details_after(&mut app, 200, 50).contains("None recorded"));
+        assert_eq!(app.details.prepares, 5);
+        // None of it asked T3 for anything or needs the tick.
+        assert_eq!(reads(&runtime), started);
+        assert!(!needs_tick(app.open.as_ref(), &app.sidebar));
+    }
+
+    #[test]
+    fn the_threads_projection_comes_first_until_its_watch_closes() {
+        let mut app = details_tui();
+        // The watch's projection has a newer branch than the shell's copy.
+        let ahead = bound(
+            "t",
+            "p",
+            json!("/repo/.t3/worktrees/feature-a"),
+            json!("feature/a-2"),
+        );
+        app.on_thread_event(live(2, "thread.meta-updated", ahead));
+        cells(&mut app, 200, 50);
+        alt(&mut app, 'b');
+        assert!(details_after(&mut app, 200, 50).contains("feature/a-2"));
+        // Once the watch closes, the shell's copy, which still changes, stands in.
+        app.on_thread_event(WatchEvent::Failed("thread closed".into()));
+        let text = details_after(&mut app, 200, 50);
+        assert!(
+            text.contains("feature/a") && !text.contains("feature/a-2"),
+            "{text}"
+        );
+        let local = bound("t", "p", Value::Null, json!("fix"));
+        app.on_shell_event(thread_updated(2, local));
+        let text = details_after(&mut app, 200, 50);
+        assert!(
+            text.contains("Local checkout · demo") && text.contains("fix"),
+            "{text}"
+        );
+    }
+
+    #[test]
+    fn hostile_and_huge_fields_stay_inside_the_details_at_every_size() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = tui(&Settings::default());
+        let hostile = format!(
+            "\u{1b}]52;c;cHduZWQ=\u{7}\u{1b}[2J{}\r\nevil",
+            "👩\u{200d}💻e\u{301}名".repeat(20_000)
+        );
+        let root = format!("/r/{}", "\u{9b}x".repeat(200_000));
+        let project = json!({"id": "p", "title": &hostile, "workspaceRoot": root});
+        let worktree = format!("/w/{}\u{1b}[31m/last", "y".repeat(500_000));
+        let thread = bound("t", "p", json!(worktree), json!(&hostile));
+        let snapshot = json!({"snapshotSequence": 1, "projects": [project],
+            "threads": [thread.clone()]});
+        app.on_shell_event(WatchEvent::Item(
+            json!({"kind": "snapshot", "snapshot": snapshot}),
+        ));
+        app.open_thread(open_bound(thread));
+        cells(&mut app, 200, 50);
+        alt(&mut app, 'b');
+        for (width, height) in [(200, 50), (120, 36), (80, 24), (40, 12), (24, 8)] {
+            let buffer = cells(&mut app, width, height);
+            let drawn = app.details.drawn.expect("drawn");
+            assert_eq!(drawn.area.intersection(app.screen), drawn.area);
+            for y in drawn.area.top()..drawn.area.bottom() {
+                for x in drawn.area.left()..drawn.area.right() {
+                    let symbol = buffer[(x, y)].symbol();
+                    assert!(
+                        !symbol.contains(char::is_control),
+                        "{width}x{height} ({x}, {y}) {symbol:?}"
+                    );
+                }
+            }
+            let text = details_text(&app, &buffer);
+            assert!(text.contains("Thread details"), "{width}x{height}: {text}");
+            assert!(!text.contains("evil"), "{text}");
+        }
+        // The folder at the end of the long path still names the worktree.
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Worktree · last"), "{text}");
+        // The values were worked out once, on the first frame that showed them.
+        assert_eq!(app.details.prepares, 1);
+        assert_eq!(reads(&runtime), 0);
+    }
+
+    #[test]
+    fn the_details_share_the_screen_with_menus_and_banners() {
+        let mut app = tui(&Settings::default());
+        app.on_shell_event(details_shell(vec![]));
+        let thread = json!({"id": "t", "projectId": "p", "worktreePath": null, "branch": "main",
+            "providerInstanceId": "codex", "activeProviderThreadId": "pt"});
+        app.open_thread(codex_thread(
+            "t",
+            Some("Codex quit"),
+            json!({"thread": thread}),
+        ));
+        app.composer.insert_str("draft");
+        cells(&mut app, 200, 50);
+        alt(&mut app, 'b');
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Local checkout · demo"), "{text}");
+        // The error banner lies over the narrowed transcript, clear of the pane.
+        let pane = app.details.drawn.expect("the pane").area;
+        assert!(app.banner.showing());
+        assert!(app.banner.area.width > 0);
+        assert!(app.banner.area.right() <= app.transcript_area.right());
+        assert!(app.transcript_area.right() < pane.x);
+        // A menu opens over the conversation beside the pane, and the pane stays.
+        app.picker = Some(mode_menu());
+        cells(&mut app, 200, 50);
+        assert!(app.picker_area.width > 0);
+        assert!(app.picker_area.right() < pane.x);
+        assert_eq!(app.details.drawn.map(|drawn| drawn.area), Some(pane));
+        // Closing the pane leaves the menu open. A dialog closes it, as it takes the keyboard.
+        alt(&mut app, 'b');
+        assert!(app.picker.is_some());
+        cells(&mut app, 80, 24);
+        alt(&mut app, 'b');
+        assert!(app.picker.is_none());
+        assert_eq!(app.focus, Focus::Details);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(app.composer.text(), "draft");
     }
 }

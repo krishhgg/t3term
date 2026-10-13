@@ -441,6 +441,8 @@ pub(super) struct Details {
     pub button: Rect,
     /// The pane that had the keyboard before the details took it.
     pub return_focus: Option<Focus>,
+    /// Whether a dialog took the keyboard, rather than the reader with a click or Tab.
+    pub taken: bool,
     /// How many times the facts were worked out and wrapped, so the tests can tell what a
     /// frame or an event did.
     #[cfg(test)]
@@ -487,12 +489,13 @@ impl Details {
         }
     }
 
-    /// Notes what an item from the open thread's watch changed: a snapshot or an event for
-    /// the thread itself. Each piece of a streamed answer and each run event leave the facts as
-    /// they are.
+    /// Notes what an item from the open thread's watch changed: a snapshot, an event for the
+    /// thread itself, or the watch saying it caught up, which ends the wait for a thread it
+    /// never sent. Each piece of a streamed answer and each run event leave the facts as they
+    /// are.
     pub fn note_thread(&mut self, applied: &Applied) {
         let changed = match applied {
-            Applied::Snapshot => true,
+            Applied::Snapshot | Applied::Synchronized => true,
             Applied::Event(kind) => kind.starts_with("thread."),
             _ => false,
         };
@@ -1109,6 +1112,7 @@ mod tests {
         }
         for applied in [
             Applied::Snapshot,
+            Applied::Synchronized,
             Applied::Event("thread.meta-updated".into()),
         ] {
             details.note_thread(&applied);
