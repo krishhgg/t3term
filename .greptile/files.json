@@ -11,7 +11,7 @@
     {
       "path": "docs/parity-inventory.md",
       "description": "The source inventory behind parity.md at the same pin: the desktop's commands, features, keys and layout, each cited to a file and line in T3 Code's source. Its statuses describe t3term at commit a244ccd",
-      "scope": ["src/tui/**", "src/transcript.rs"]
+      "scope": ["src/tui/**", "src/transcript.rs", "src/client.rs", "src/projection.rs", "src/models.rs", "tests/fake_server.rs"]
     },
     {
       "path": "docs/sprint.md",
