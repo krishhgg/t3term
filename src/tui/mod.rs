@@ -9464,14 +9464,17 @@ mod tests {
             header.contains("Pick a thread in the sidebar"),
             "{header:?}"
         );
-        // The details' button ends the row, so the breadcrumb has five columns fewer.
+        // The details' button ends the padded row. ◨ is one column wide, so " ◨ " takes three
+        // columns, with a blank one before it. At 40 the row's 38 columns hold the toggle and
+        // its gap, four, then the breadcrumb, 30, then the gap and the button, four. Without
+        // the button the breadcrumb had 34.
         let header = chrome(&mut app, 40, 24).header;
-        assert!(header.trim_end().ends_with("  ● Stud…"), "{header:?}");
-        assert!(header.contains("Pick a thread in th…"), "{header:?}");
+        assert_eq!(app.details.button, Rect::new(36, 0, 3, 1));
+        assert_eq!(header, "  ◧  Pick a thread in th…  ● Studi… ");
         // Too narrow for it beside the title's 16 columns, the row is the title's.
         let drawn = chrome(&mut app, 24, 24);
         assert_eq!(drawn.header_dot, None);
-        assert!(drawn.header.contains("Pick a threa…"), "{drawn:?}");
+        assert_eq!(drawn.header, "  ◧  Pick a thread… ");
 
         // At no width, hidden or shown, does any of the origin but its host and port show.
         for hidden in [true, false] {

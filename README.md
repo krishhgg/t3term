@@ -312,7 +312,7 @@ While the sidebar is hidden, or too narrow for its dot, the end of the breadcrum
 
 ### Thread details
 
-Alt+B, or a click on ◨ at the right end of the title row, opens the open thread's details. Either one closes them again. ◨ and the space before it take the row's last five columns, so the breadcrumb ends five columns sooner than it did. The details show four things:
+Alt+B, or a click on ◨ at the right end of the title row, opens the open thread's details. Either one closes them again. The button is ◨ with a space on each side, three columns, and a blank column separates it from the breadcrumb, so the breadcrumb ends four columns sooner than it did. The details show four things:
 
 - Project: the title of the thread's project, from the sidebar's feed.
 - Workspace: `Worktree · feature-a` and the path under it when T3 recorded a worktree path for the thread. Otherwise `Local checkout · demo` and the project's folder. The name is the path's last folder, as the desktop names it.
