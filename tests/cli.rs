@@ -8,7 +8,7 @@
 
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
 use std::sync::{Arc, Mutex};
 
@@ -31,14 +31,43 @@ impl Home {
         Home(dir.unwrap())
     }
 
-    /// Writes `server-runtime.json` the way T3 does
-    /// (apps/server/src/serverRuntimeState.ts, v0.0.46-nightly.20261007.2787).
+    /// Records a server at `origin` in the T3 home that T3CODE_HOME names.
     fn record_server(&self, origin: &str) {
-        let dir = self.0.path().join(".t3/userdata");
-        std::fs::create_dir_all(&dir).unwrap();
-        let state = json!({"version": 1, "pid": std::process::id(), "port": 0, "origin": origin,
-            "startedAt": "2026-10-08T00:00:00.000Z"});
-        std::fs::write(dir.join("server-runtime.json"), state.to_string()).unwrap();
+        record_runtime(&self.0.path().join(".t3/userdata"), origin);
+    }
+
+    /// Makes a T3 home at `dir` under this home, as a T3 server started with `--base-dir` there
+    /// leaves it: `userdata/environment-id` holding `environment_id`, and when `origin` is
+    /// given, the record of a server running there. Returns the home's path.
+    fn t3_home(&self, dir: &str, environment_id: Option<&str>, origin: Option<&str>) -> PathBuf {
+        let t3_home = self.0.path().join(dir);
+        let userdata = t3_home.join("userdata");
+        std::fs::create_dir_all(&userdata).unwrap();
+        if let Some(id) = environment_id {
+            std::fs::write(userdata.join("environment-id"), format!("{id}\n")).unwrap();
+        }
+        if let Some(origin) = origin {
+            record_runtime(&userdata, origin);
+        }
+        t3_home
+    }
+
+    /// Where t3term saves environments in this home.
+    fn environments_path(&self) -> PathBuf {
+        self.0.path().join(".config/t3term/environments.json")
+    }
+
+    /// What `environments.json` holds.
+    fn environments(&self) -> Value {
+        let text = std::fs::read_to_string(self.environments_path()).unwrap();
+        serde_json::from_str(&text).unwrap()
+    }
+
+    /// Writes `environments.json` by hand, as a person or a later t3term might.
+    fn save_environments(&self, file: &Value) {
+        let path = self.environments_path();
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(path, file.to_string()).unwrap();
     }
 
     fn run(&self, args: &[&str]) -> Output {
@@ -46,11 +75,25 @@ impl Home {
         self.run_with(args, "false")
     }
 
+    /// Runs t3term as `run` does, and fails unless it exits 0.
+    #[track_caller]
+    fn run_ok(&self, args: &[&str]) -> Output {
+        let output = self.run(args);
+        assert_eq!(output.status.code(), Some(0), "{args:?}: {output:?}");
+        output
+    }
+
     /// Runs t3term in the home directory, with `t3` as the command that issues and revokes its
     /// sessions.
     fn run_with(&self, args: &[&str], t3: &str) -> Output {
+        self.command(args, t3).output().expect("run t3term")
+    }
+
+    /// The command `run_with` runs, for a test that changes its environment first.
+    fn command(&self, args: &[&str], t3: &str) -> Command {
         let home: &Path = self.0.path();
-        Command::new(env!("CARGO_BIN_EXE_t3term"))
+        let mut command = Command::new(env!("CARGO_BIN_EXE_t3term"));
+        command
             .args(args)
             .current_dir(home)
             .env_clear()
@@ -59,9 +102,8 @@ impl Home {
             .env("T3CODE_HOME", home.join(".t3"))
             .env("T3TERM_NO_SAVED_LOGIN", "1")
             .env("T3TERM_T3_COMMAND", t3)
-            .stdin(Stdio::null())
-            .output()
-            .expect("run t3term")
+            .stdin(Stdio::null());
+        command
     }
 
     /// Writes a `t3` that issues a made-up session and accepts its revoke, and returns the
@@ -78,6 +120,47 @@ esac
         std::fs::write(&path, script).unwrap();
         "/bin/sh ./t3.sh".to_string()
     }
+
+    /// `fake_t3`, which also adds a line to `t3.log` in the home for each session it issues or
+    /// revokes: which it did, the `--base-dir` it was given, and the scopes it issued or the
+    /// session it revoked.
+    fn logging_t3(&self) -> String {
+        let script = r#"action="$3"
+session="$4"
+base=""
+scopes=""
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    --base-dir) base="$2"; shift ;;
+    --scope) scopes="$scopes $2"; shift ;;
+  esac
+  shift
+done
+case "$action" in
+  issue)
+    echo "issue|$base|${scopes# }" >> t3.log
+    echo '{"sessionId": "session-test", "token": "token-test"}'
+    ;;
+  revoke) echo "revoke|$base|$session" >> t3.log ;;
+esac
+"#;
+        std::fs::write(self.0.path().join("t3.sh"), script).unwrap();
+        "/bin/sh ./t3.sh".to_string()
+    }
+
+    /// What `logging_t3` wrote, or "" when it issued and revoked nothing.
+    fn t3_log(&self) -> String {
+        std::fs::read_to_string(self.0.path().join("t3.log")).unwrap_or_default()
+    }
+}
+
+/// Writes `server-runtime.json` in `state_dir` the way T3 does
+/// (apps/server/src/serverRuntimeState.ts, v0.0.46-nightly.20261007.2787).
+fn record_runtime(state_dir: &Path, origin: &str) {
+    std::fs::create_dir_all(state_dir).unwrap();
+    let state = json!({"version": 1, "pid": std::process::id(), "port": 0, "origin": origin,
+        "startedAt": "2026-10-08T00:00:00.000Z"});
+    std::fs::write(state_dir.join("server-runtime.json"), state.to_string()).unwrap();
 }
 
 /// With `--json`, stdout must hold exactly one JSON value and nothing else.
@@ -1613,4 +1696,378 @@ fn no_command_without_a_terminal_is_a_usage_error() {
     // The home is empty, so reaching for a server would exit 5 instead of 2.
     let home = Home::new();
     assert_error(&home.run(&["--json"]), 2, "NOT_A_TERMINAL");
+}
+
+/// A thread on environment A's server, and one on B's.
+const THREAD_A: &str = "a1c4e7f0-2b5d-4e8a-9c3f-6d0b2e5a8c11";
+const THREAD_B: &str = "b2d5f8a1-3c6e-4f9b-8d4a-7e1c3f6b9d22";
+/// The scopes t3term asks for to read, and to read and operate.
+const READ_SCOPE: &str = "orchestration:read";
+const OPERATE_SCOPES: &str = "orchestration:read orchestration:operate";
+
+/// A fake T3 server for one environment.
+struct FakeEnvironment {
+    origin: String,
+    /// Every path requested, the WebSocket's included.
+    paths: Arc<Mutex<Vec<String>>>,
+    /// Every Effect RPC request sent on its WebSockets.
+    requests: Arc<Mutex<Vec<Value>>>,
+}
+
+/// Serves environment `environment_id` on protocol 2, as a T3 server started for one T3 home
+/// would. Its shell lists one idle thread, `thread`, and a message dispatched to it gets
+/// sequence 4, as in `serve_turn`. A shell subscription gets a snapshot, so `doctor` passes.
+fn serve_environment(environment_id: &str, thread: &str) -> FakeEnvironment {
+    let mut descriptor = protocol_2_descriptor();
+    descriptor["environmentId"] = json!(environment_id);
+    let listed = json!({"id": thread, "projectId": "p1", "title": environment_id,
+        "status": "idle", "updatedAt": "2026-10-13T10:00:00.000Z"});
+    let shell = json!({"projects": [], "threads": [listed]});
+    let snapshot = json!({"snapshotSequence": 3, "projection": {
+        "thread": {"id": thread, "title": environment_id},
+        "runs": [],
+        "runtimeRequests": [],
+        "turnItems": [],
+    }});
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let kept = requests.clone();
+    let on_socket = move |mut socket: Socket| {
+        while let Some(request) = next_request(&mut socket) {
+            kept.lock().unwrap().push(request.clone());
+            if request["tag"] == "orchestration.dispatchCommand" {
+                reply(
+                    &mut socket,
+                    json!({"_tag": "Exit", "requestId": request["id"],
+                        "exit": {"_tag": "Success", "value": {"sequence": 4}}}),
+                );
+            } else if request["tag"] == "orchestration.subscribeShell" {
+                let first = json!({"kind": "snapshot", "snapshot": {"snapshotSequence": 1}});
+                reply(
+                    &mut socket,
+                    json!({"_tag": "Chunk", "requestId": request["id"], "values": [first]}),
+                );
+            }
+        }
+    };
+    let thread_path = format!("/api/orchestration/threads/{thread}/bounded");
+    let (origin, paths) = serve_sockets(
+        move |path| match path {
+            "/.well-known/t3/environment" => Some(descriptor.clone()),
+            "/api/orchestration/shell" => Some(shell.clone()),
+            "/api/auth/websocket-ticket" => Some(json!({"ticket": "ticket-test"})),
+            _ if path == thread_path => Some(snapshot.clone()),
+            _ => None,
+        },
+        on_socket,
+    );
+    FakeEnvironment {
+        origin,
+        paths,
+        requests,
+    }
+}
+
+/// The ids of the threads `threads --json` listed.
+fn listed_ids(output: &Output) -> Vec<Value> {
+    assert_eq!(output.status.code(), Some(0), "{output:?}");
+    let threads = json_stdout(output)["threads"].clone();
+    threads
+        .as_array()
+        .expect("threads")
+        .iter()
+        .map(|thread| thread["id"].clone())
+        .collect()
+}
+
+/// What `logging_t3` writes for one session t3term issued with `scopes` against the T3 home
+/// `home` and then revoked.
+fn session_log(home: &str, scopes: &str) -> String {
+    format!("issue|{home}|{scopes}\nrevoke|{home}|session-test\n")
+}
+
+#[test]
+fn a_named_environment_gets_every_request_and_every_login() {
+    // Two T3 servers on this machine, each started with a T3 home of its own. A is the saved
+    // default, the server T3CODE_HOME records and the one T3TERM_ORIGIN names, so a command
+    // that fell back to anything would reach A.
+    let home = Home::new();
+    let t3 = home.logging_t3();
+    let a = serve_environment("env-a", THREAD_A);
+    let b = serve_environment("env-b", THREAD_B);
+    home.record_server(&a.origin);
+    let a_home = home.t3_home("env a/.t3", Some("env-a"), Some(&a.origin));
+    let b_home = home.t3_home("env b/.t3", Some("env-b"), Some(&b.origin));
+    let b_dir = b_home.to_str().unwrap();
+    for (name, dir) in [("a", a_home.to_str().unwrap()), ("b", b_dir)] {
+        home.run_ok(&["environment", "add", name, "--t3-home", dir]);
+    }
+    home.run_ok(&["environment", "default", "a"]);
+    let near_a = |args: &[&str]| {
+        let mut command = home.command(args, &t3);
+        command.env("T3TERM_ORIGIN", &a.origin);
+        command.output().expect("run t3term")
+    };
+
+    // `--environment b` sends `threads`, `send` and `doctor` to B.
+    let threads = near_a(&["--json", "--environment", "b", "threads"]);
+    assert_eq!(listed_ids(&threads), [THREAD_B]);
+    let sent = near_a(&["--json", "--environment", "b", "send", THREAD_B, "Hi"]);
+    assert_eq!(sent.status.code(), Some(0), "{sent:?}");
+    assert_eq!(json_stdout(&sent)["sequence"], 4);
+    let requests = b.requests.lock().unwrap().clone();
+    let dispatched: Vec<&Value> = requests
+        .iter()
+        .filter(|request| request["tag"] == "orchestration.dispatchCommand")
+        .map(|request| &request["payload"]["threadId"])
+        .collect();
+    assert_eq!(dispatched, [THREAD_B]);
+    let doctor = near_a(&["--json", "--environment", "b", "doctor"]);
+    assert_eq!(doctor.status.code(), Some(0), "{doctor:?}");
+    let checks = json_stdout(&doctor)["checks"].clone();
+    let named = json!({"ok": true, "name": "b", "t3Home": b_dir});
+    assert_eq!(checks["environment"], named);
+    assert_eq!(checks["server"]["origin"], b.origin);
+
+    // Each logged in with B's T3 home and revoked its session there.
+    let read = session_log(b_dir, READ_SCOPE);
+    let mut logins = read.clone() + &session_log(b_dir, OPERATE_SCOPES) + &read;
+    assert_eq!(home.t3_log(), logins);
+
+    // With B the default, a command that names no environment goes to B too, though
+    // T3CODE_HOME records A.
+    home.run_ok(&["environment", "default", "b"]);
+    let threads = home.run_with(&["--json", "threads"], &t3);
+    assert_eq!(listed_ids(&threads), [THREAD_B]);
+    logins += &read;
+    assert_eq!(home.t3_log(), logins);
+    let reached = a.paths.lock().unwrap().clone();
+    assert!(reached.is_empty(), "A was asked for {reached:?}");
+
+    // T3TERM_ORIGIN still comes before the default, as it did before environments, and the
+    // login uses the T3 home discovery reads.
+    let threads = near_a(&["--json", "threads"]);
+    assert_eq!(listed_ids(&threads), [THREAD_A]);
+    let ambient = home.0.path().join(".t3");
+    logins += &session_log(ambient.to_str().unwrap(), READ_SCOPE);
+    assert_eq!(home.t3_log(), logins);
+}
+
+#[test]
+fn a_named_environment_that_fails_a_check_gets_no_login_and_no_other_server_is_tried() {
+    // A is the saved default, the server T3CODE_HOME records and the one T3TERM_ORIGIN names,
+    // as in `a_named_environment_gets_every_request_and_every_login`.
+    let home = Home::new();
+    let t3 = home.logging_t3();
+    let a = serve_environment("env-a", THREAD_A);
+    home.record_server(&a.origin);
+    let a_home = home.t3_home("env a/.t3", Some("env-a"), Some(&a.origin));
+
+    // Servers that answer for the wrong T3 home, for a home that holds no id, for a home with
+    // no record of the server's process, and on protocol 1.
+    let other = serve_environment("env-other", THREAD_B);
+    let fresh = serve_environment("env-fresh", THREAD_B);
+    let pinned = serve_environment("env-pinned", THREAD_B);
+    let mut descriptor = protocol_2_descriptor();
+    descriptor["orchestrationProtocolVersion"] = json!(1);
+    let (old, old_paths) = fake_server(descriptor);
+
+    // Nothing listens on port 0, and 192.0.2.1 is a documentation address off this machine.
+    let down = home.t3_home("down/.t3", Some("env-down"), Some("http://127.0.0.1:0"));
+    let unstarted = home.t3_home("unstarted/.t3", Some("env-unstarted"), None);
+    let imposter = home.t3_home("imposter/.t3", Some("env-mine"), Some(&other.origin));
+    let unverified = home.t3_home("unverified/.t3", None, Some(&fresh.origin));
+    let pinned_home = home.t3_home("pinned/.t3", Some("env-pinned"), None);
+    let old_home = home.t3_home("old/.t3", Some("env-test"), Some(&old));
+    let lan = home.t3_home("lan/.t3", Some("env-lan"), Some("http://192.0.2.1:3773"));
+    let local = |t3_home: &Path| json!({"kind": "local", "t3Home": t3_home});
+    let mut file = json!({"default": "a", "environments": {
+        "a": local(&a_home),
+        "down": local(&down),
+        "unstarted": local(&unstarted),
+        "imposter": local(&imposter),
+        "unverified": local(&unverified),
+        "pinned": {"kind": "local", "t3Home": pinned_home, "origin": pinned.origin},
+        "old": local(&old_home),
+        "lan": local(&lan),
+        "far": {"kind": "local", "t3Home": a_home, "origin": "http://192.0.2.1:3773"},
+        "paired": {"kind": "paired", "t3Home": a_home},
+    }});
+    home.save_environments(&file);
+    let near_a = |args: &[&str]| {
+        let mut command = home.command(args, &t3);
+        command.env("T3TERM_ORIGIN", &a.origin);
+        command.output().expect("run t3term")
+    };
+
+    let refusals = [
+        ("down", 5, "T3_SERVER_UNAVAILABLE"),
+        ("unstarted", 5, "T3_SERVER_UNAVAILABLE"),
+        ("imposter", 4, "T3_ENVIRONMENT_MISMATCH"),
+        ("unverified", 4, "T3_ENVIRONMENT_UNVERIFIED"),
+        ("old", 4, "T3_PROTOCOL_UNSUPPORTED"),
+        ("lan", 4, "ENVIRONMENT_NOT_LOCAL"),
+        ("far", 4, "ENVIRONMENT_NOT_LOCAL"),
+        ("paired", 4, "ENVIRONMENT_UNSUPPORTED"),
+        ("missing", 3, "ENVIRONMENT_NOT_FOUND"),
+        ("Missing", 2, "ENVIRONMENT_NAME_INVALID"),
+    ];
+    for (name, exit_code, code) in refusals {
+        let threads = near_a(&["--json", "--environment", name, "threads"]);
+        assert_error(&threads, exit_code, code);
+        let sent = near_a(&["--json", "--environment", name, "send", THREAD_B, "Hi"]);
+        assert_error(&sent, exit_code, code);
+    }
+
+    // `doctor` says which environment it checked and that its server is down.
+    let doctor = near_a(&["--json", "--environment", "down", "doctor"]);
+    assert_eq!(doctor.status.code(), Some(5), "{doctor:?}");
+    let checks = json_stdout(&doctor)["checks"].clone();
+    assert_eq!(checks["environment"]["name"], "down");
+    assert_eq!(checks["server"]["ok"], false);
+
+    // An origin saved with no record of the server's process leaves t3term no `t3` to log in
+    // with unless T3TERM_T3_COMMAND names one, and t3term stops there too.
+    let mut pinned_run = home.command(&["--json", "--environment", "pinned", "threads"], &t3);
+    pinned_run
+        .env("T3TERM_ORIGIN", &a.origin)
+        .env_remove("T3TERM_T3_COMMAND");
+    assert_error(&pinned_run.output().unwrap(), 5, "T3_AUTH_UNAVAILABLE");
+
+    // A default that names no saved environment, or a file that doesn't parse, stops every
+    // command that names no environment, since t3term can't tell which server was chosen.
+    file["default"] = json!("gone");
+    home.save_environments(&file);
+    let threads = home.run_with(&["--json", "threads"], &t3);
+    assert_error(&threads, 3, "ENVIRONMENT_NOT_FOUND");
+    std::fs::write(home.environments_path(), r#"{"default": "#).unwrap();
+    let threads = home.run_with(&["--json", "threads"], &t3);
+    assert_error(&threads, 1, "ENVIRONMENTS_UNREADABLE");
+
+    // A was asked for nothing, the servers that answered were asked for their descriptor
+    // alone, and no session was issued.
+    let reached = a.paths.lock().unwrap().clone();
+    assert!(reached.is_empty(), "A was asked for {reached:?}");
+    let descriptor = "/.well-known/t3/environment";
+    assert_eq!(*other.paths.lock().unwrap(), [descriptor; 2]);
+    assert_eq!(*old_paths.lock().unwrap(), [descriptor; 2]);
+    assert_eq!(*pinned.paths.lock().unwrap(), [descriptor]);
+    assert!(fresh.paths.lock().unwrap().is_empty());
+    assert_eq!(home.t3_log(), "");
+}
+
+#[test]
+fn environments_are_saved_listed_renamed_and_removed_without_a_server() {
+    // No T3 home here records a server and `t3` fails, so a command that reached for a server
+    // would fail.
+    let home = Home::new();
+    let config = home.0.path().join(".config/t3term");
+    std::fs::create_dir_all(&config).unwrap();
+    // Settings beside the environments, which none of these commands may change.
+    let settings = "{\"theme\": \"dark\"}\n";
+    std::fs::write(config.join("settings.json"), settings).unwrap();
+
+    let none = "No saved environments. Commands go to the server discovery finds.\n";
+    let listed = home.run_ok(&["environment", "list"]);
+    assert_eq!(printed(&listed), (none, ""));
+    let listed = home.run_ok(&["--json", "environment", "list"]);
+    let empty = json!({"ok": true, "default": null, "environments": []});
+    assert_eq!(json_stdout(&listed), empty);
+
+    // A relative T3 home is saved from the directory t3term ran in, and an origin in one form.
+    let mut add_a = vec!["--json", "environment", "add", "a"];
+    add_a.extend(["--t3-home", "rel home", "--origin", "HTTP://[::1]:3773/"]);
+    let added = home.run_ok(&add_a);
+    let rel_home = std::fs::canonicalize(home.0.path())
+        .unwrap()
+        .join("rel home");
+    let a = json!({"name": "a", "kind": "local", "t3Home": rel_home,
+        "origin": "http://[::1]:3773", "default": false});
+    assert_eq!(json_stdout(&added), json!({"ok": true, "environment": a}));
+    let add_b = ["environment", "add", "b", "--t3-home", "/b", "--default"];
+    let added = home.run_ok(&add_b);
+    let made_default = "Saved environment b and made it the default.\n";
+    assert_eq!(printed(&added), (made_default, ""));
+
+    // Each refusal has its own code and exit code, and saves nothing.
+    let saved = home.environments();
+    let refusals = [
+        ("add a --t3-home /a", 4, "ENVIRONMENT_EXISTS"),
+        ("add Work --t3-home /w", 2, "ENVIRONMENT_NAME_INVALID"),
+        ("add w! --t3-home /w", 2, "ENVIRONMENT_NAME_INVALID"),
+        (
+            "add c --t3-home /c --origin http://192.168.1.5:3773",
+            4,
+            "ENVIRONMENT_NOT_LOCAL",
+        ),
+        (
+            "add c --t3-home /c --origin http://127.0.0.1:3773/api",
+            2,
+            "ENVIRONMENT_ORIGIN_INVALID",
+        ),
+        ("rename missing c", 3, "ENVIRONMENT_NOT_FOUND"),
+        ("rename a b", 4, "ENVIRONMENT_EXISTS"),
+        ("rename a C", 2, "ENVIRONMENT_NAME_INVALID"),
+        ("remove b", 4, "ENVIRONMENT_IS_DEFAULT"),
+        ("remove missing", 3, "ENVIRONMENT_NOT_FOUND"),
+        ("default missing", 3, "ENVIRONMENT_NOT_FOUND"),
+    ];
+    for (args, exit_code, code) in refusals {
+        let mut all = vec!["--json", "environment"];
+        all.extend(args.split(' '));
+        assert_error(&home.run(&all), exit_code, code);
+    }
+    assert_eq!(home.environments(), saved);
+
+    // Keys a later t3term might write, at the top of the file and in an environment, last
+    // through every change below. `list` shows none of them, so a key such as a token, which
+    // no t3term writes there, never prints.
+    let mut file = saved;
+    file["future"] = json!({"version": 2});
+    file["environments"]["a"]["token"] = json!("made-up");
+    home.save_environments(&file);
+    let listed = home.run_ok(&["--json", "environment", "list"]);
+    let b = json!({"name": "b", "kind": "local", "t3Home": "/b", "origin": null,
+        "default": true});
+    let all = json!({"ok": true, "default": "b", "environments": [a, b]});
+    assert_eq!(json_stdout(&listed), all);
+    let listed = home.run_ok(&["environment", "list"]);
+    let rows = format!(
+        "  a            local  {}  http://[::1]:3773\n* b            local  /b\n",
+        rel_home.display()
+    );
+    assert_eq!(printed(&listed), (rows.as_str(), ""));
+
+    // The default follows a rename, can be cleared and set again, and then the old default
+    // can be removed.
+    let renamed = home.run_ok(&["--json", "environment", "rename", "b", "c"]);
+    let mut c = b.clone();
+    c["name"] = json!("c");
+    let expected = json!({"ok": true, "renamed": "b", "environment": c});
+    assert_eq!(json_stdout(&renamed), expected);
+    let cleared = home.run_ok(&["environment", "default", "--clear"]);
+    let discovery = "Commands that name no environment now go to the server discovery finds.\n";
+    assert_eq!(printed(&cleared), (discovery, ""));
+    let chosen = home.run_ok(&["--json", "environment", "default", "a"]);
+    assert_eq!(json_stdout(&chosen), json!({"ok": true, "default": "a"}));
+    let removed = home.run_ok(&["--json", "environment", "remove", "c"]);
+    assert_eq!(json_stdout(&removed), json!({"ok": true, "removed": "c"}));
+
+    let left = json!({
+        "default": "a",
+        "environments": {"a": {"kind": "local", "t3Home": rel_home,
+            "origin": "http://[::1]:3773", "token": "made-up"}},
+        "future": {"version": 2},
+    });
+    assert_eq!(home.environments(), left);
+    let kept = std::fs::read_to_string(config.join("settings.json")).unwrap();
+    assert_eq!(kept, settings);
+
+    // A file that doesn't parse is reported, and no change writes over it.
+    std::fs::write(home.environments_path(), r#"{"default": "#).unwrap();
+    let listed = home.run(&["--json", "environment", "list"]);
+    assert_error(&listed, 1, "ENVIRONMENTS_UNREADABLE");
+    let added = home.run(&["--json", "environment", "add", "d", "--t3-home", "/d"]);
+    assert_error(&added, 1, "ENVIRONMENTS_UNREADABLE");
+    let text = std::fs::read_to_string(home.environments_path()).unwrap();
+    assert_eq!(text, r#"{"default": "#);
 }
