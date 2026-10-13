@@ -823,6 +823,207 @@ fn wait_says_once_when_each_edit_in_the_turn_settles() {
     assert_eq!(std::str::from_utf8(&waited.stderr), Ok(""));
 }
 
+/// One event of a thread's subscription, as `orchestration.subscribeThread` streams it.
+fn stream_event(sequence: u64, kind: &str, payload: Value) -> Value {
+    json!({"kind": "event", "sequence": sequence, "event": {"type": kind, "payload": payload}})
+}
+
+/// Serves thread `id` to `send --wait` and `wait`: a protocol 2 descriptor, an empty shell, a
+/// WebSocket ticket, and `snapshot` as `GET .../bounded` returns it. T3's side of the WebSocket
+/// answers a dispatch with sequence 4, and the thread's subscription with what `turn` gives for
+/// the id of the message dispatched, or for "" when there was none. It keeps each request and
+/// holds the socket open until t3term closes it. Returns the server's origin and the requests.
+fn serve_turn(
+    id: &str,
+    snapshot: Value,
+    turn: impl Fn(&str) -> Value + Send + Sync + 'static,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let kept = requests.clone();
+    let on_socket = move |mut socket: Socket| {
+        let mut message_id = String::new();
+        while let Some(request) = next_request(&mut socket) {
+            kept.lock().unwrap().push(request.clone());
+            if request["tag"] == "orchestration.dispatchCommand" {
+                message_id = request["payload"]["messageId"]
+                    .as_str()
+                    .unwrap_or_default()
+                    .to_string();
+                reply(
+                    &mut socket,
+                    json!({"_tag": "Exit", "requestId": request["id"],
+                        "exit": {"_tag": "Success", "value": {"sequence": 4}}}),
+                );
+            } else if request["tag"] == "orchestration.subscribeThread" {
+                let values = turn(&message_id);
+                reply(
+                    &mut socket,
+                    json!({"_tag": "Chunk", "requestId": request["id"], "values": values}),
+                );
+            }
+        }
+    };
+    let thread_path = format!("/api/orchestration/threads/{id}/bounded");
+    let (origin, _) = serve_sockets(
+        move |path| match path {
+            "/.well-known/t3/environment" => Some(protocol_2_descriptor()),
+            "/api/orchestration/shell" => Some(json!({"projects": [], "threads": []})),
+            "/api/auth/websocket-ticket" => Some(json!({"ticket": "ticket-test"})),
+            _ if path == thread_path => Some(snapshot.clone()),
+            _ => None,
+        },
+        on_socket,
+    );
+    (origin, requests)
+}
+
+/// Serves thread `id` to `wait` as `serve_turn` does, with its run r1 working on message m1,
+/// and streams `events` after the snapshot.
+fn serve_working_thread(id: &str, events: Vec<Value>) -> String {
+    let run = json!({"id": "r1", "ordinal": 1, "status": "running", "userMessageId": "m1"});
+    let snapshot = json!({"snapshotSequence": 3, "projection": {
+        "thread": {"id": id, "title": "Working"},
+        "runs": [run],
+        "runtimeRequests": [],
+        "turnItems": [],
+    }});
+    let mut turn = vec![json!({"kind": "synchronized"})];
+    turn.extend(events);
+    let turn = Value::Array(turn);
+    let (origin, _) = serve_turn(id, snapshot, move |_| turn.clone());
+    origin
+}
+
+/// Part of run r1's reply, as T3 streams it.
+fn partial_answer(text: &str) -> Value {
+    json!({"id": "a1", "runId": "r1", "type": "assistant_message", "ordinal": 1,
+        "text": text, "streaming": true})
+}
+
+#[test]
+fn wait_exits_7_when_the_turn_asks_for_an_approval() {
+    // The reply starts, then the agent asks to run a command, in the shape of
+    // `OrchestrationV2RuntimeRequest` in packages/contracts/src/orchestrationV2.ts
+    // (v0.0.46-nightly.20261007.2787). T3 sends the request before the turn item that shows it
+    // (apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts), so the stream ends there.
+    let id = "4c8f1a26-9e3b-4d70-a5c2-6b1e8d3f7a90";
+    let request = json!({"id": "q1", "nodeId": "n1", "providerTurnId": null,
+        "nativeRequestRef": null, "kind": "command", "status": "pending",
+        "responseCapability": {"type": "live", "providerSessionId": "provider-session-1"},
+        "createdAt": "2026-10-09T10:00:00.000Z", "resolvedAt": null});
+    let events = vec![
+        stream_event(4, "turn-item.updated", partial_answer("Checking first")),
+        stream_event(5, "runtime-request.updated", request),
+    ];
+    let origin = serve_working_thread(id, events);
+    let home = Home::new();
+    home.record_server(&origin);
+    let t3 = home.fake_t3();
+
+    // The reply so far is on stdout, and stderr says where to answer the request.
+    let waited = home.run_with(&["wait", id, "--timeout", "30"], &t3);
+    assert_eq!(waited.status.code(), Some(7), "{waited:?}");
+    assert_eq!(std::str::from_utf8(&waited.stdout), Ok("Checking first\n"));
+    let printed = format!("The turn is waiting for approval. Run `t3term requests {id}`.\n");
+    assert_eq!(std::str::from_utf8(&waited.stderr), Ok(printed.as_str()));
+
+    // With `--json`, stdout holds one object with the outcome and the reply so far.
+    let waited = home.run_with(&["--json", "wait", id, "--timeout", "30"], &t3);
+    assert_eq!(waited.status.code(), Some(7), "{waited:?}");
+    assert_eq!(
+        json_stdout(&waited),
+        json!({"ok": true, "threadId": id, "messageId": "m1", "runId": "r1",
+            "outcome": "needs-attention", "reply": "Checking first"})
+    );
+    assert_eq!(std::str::from_utf8(&waited.stderr), Ok(""));
+}
+
+#[test]
+fn wait_exits_1_when_the_run_fails() {
+    // The reply starts, then the run fails.
+    let id = "1e6d3b97-4a2c-4f85-8d10-9c7a5e2b4f63";
+    let failed = json!({"id": "r1", "ordinal": 1, "status": "failed", "userMessageId": "m1"});
+    let events = vec![
+        stream_event(4, "turn-item.updated", partial_answer("Half a reply")),
+        stream_event(5, "run.updated", failed),
+    ];
+    let origin = serve_working_thread(id, events);
+    let home = Home::new();
+    home.record_server(&origin);
+    let t3 = home.fake_t3();
+
+    // The reply so far is on stdout, and stderr says how the turn ended.
+    let waited = home.run_with(&["wait", id, "--timeout", "30"], &t3);
+    assert_eq!(waited.status.code(), Some(1), "{waited:?}");
+    assert_eq!(std::str::from_utf8(&waited.stdout), Ok("Half a reply\n"));
+    assert_eq!(
+        std::str::from_utf8(&waited.stderr),
+        Ok("The turn ended: failed\n")
+    );
+
+    // With `--json`, the wait itself worked, so `ok` is true and the outcome says the run
+    // failed. stdout holds that one object.
+    let waited = home.run_with(&["--json", "wait", id, "--timeout", "30"], &t3);
+    assert_eq!(waited.status.code(), Some(1), "{waited:?}");
+    assert_eq!(
+        json_stdout(&waited),
+        json!({"ok": true, "threadId": id, "messageId": "m1", "runId": "r1",
+            "outcome": "failed", "reply": "Half a reply"})
+    );
+    assert_eq!(std::str::from_utf8(&waited.stderr), Ok(""));
+}
+
+#[test]
+fn send_wait_that_runs_out_of_time_exits_6_and_names_the_message() {
+    // A thread with no runs. Once the message is dispatched, T3 starts its run and streams
+    // nothing more, so the turn outlasts a one-second `--timeout`.
+    let id = "7b2e9c40-1d5f-4a83-b6e7-0c4d8f2a9e15";
+    let snapshot = json!({"snapshotSequence": 3, "projection": {
+        "thread": {"id": id, "title": "Slow turn"},
+        "runs": [],
+        "runtimeRequests": [],
+        "turnItems": [],
+    }});
+    let (origin, requests) = serve_turn(id, snapshot, |message_id| {
+        let run = json!({"id": "r1", "ordinal": 1, "status": "running",
+            "userMessageId": message_id});
+        json!([{"kind": "synchronized"}, stream_event(5, "run.created", run)])
+    });
+    let home = Home::new();
+    home.record_server(&origin);
+    let t3 = home.fake_t3();
+
+    // What t3term says when it stops waiting on the last message it dispatched. T3 has the
+    // message, so the error names it and says not to send it again.
+    let gave_up = || {
+        let seen = requests.lock().unwrap();
+        let dispatch = seen
+            .iter()
+            .rfind(|r| r["tag"] == "orchestration.dispatchCommand")
+            .expect("a dispatch");
+        let message_id = dispatch["payload"]["messageId"].as_str().expect("an id");
+        format!(
+            "The message was sent ({message_id}), but the turn did not finish in time. Do not resend it."
+        )
+    };
+
+    // Nothing of the turn reaches stdout, and stderr has the error.
+    let send = ["send", id, "Summarize", "--wait", "--timeout", "1"];
+    let sent = home.run_with(&send, &t3);
+    assert_eq!(sent.status.code(), Some(6), "{sent:?}");
+    assert_eq!(std::str::from_utf8(&sent.stdout), Ok(""));
+    let printed = format!("t3term: {} [THREAD_WAIT_TIMEOUT]\n", gave_up());
+    assert_eq!(std::str::from_utf8(&sent.stderr), Ok(printed.as_str()));
+
+    // With `--json`, stdout holds only the error object.
+    let mut json_send = vec!["--json"];
+    json_send.extend(send);
+    let sent = home.run_with(&json_send, &t3);
+    assert_error(&sent, 6, "THREAD_WAIT_TIMEOUT");
+    assert_eq!(json_stdout(&sent)["error"]["message"], gave_up());
+    assert_eq!(std::str::from_utf8(&sent.stderr), Ok(""));
+}
+
 #[test]
 fn no_command_without_a_terminal_is_a_usage_error() {
     // The home is empty, so reaching for a server would exit 5 instead of 2.

@@ -11,8 +11,11 @@ permissions:
   contents: read
 
 concurrency:
-  group: ci-${{ github.event.pull_request.number || github.ref }}
-  # A new push to a pull request replaces its running check. Every push to master finishes.
+  # A new push to a pull request replaces its running check. Each push to master gets a group of
+  # its own. GitHub cancels a pending run when a newer run joins its group, even with
+  # cancel-in-progress off, so one group for master let a quick series of merges cancel most of
+  # their checks.
+  group: ci-${{ github.event.pull_request.number || github.sha }}
   cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
