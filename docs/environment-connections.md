@@ -2,7 +2,7 @@
 
 t3term can save named environments and send a command to one of them with `--environment NAME`. Each environment is a T3 home on this machine, the directory a T3 server keeps its state in, and optionally the loopback origin of that server. A saved environment is strict: t3term talks to its server and no other, and logs in only once that server proves it belongs to the T3 home.
 
-Remote environments, pairing and T3 Connect aren't supported yet. The last section says what t3term refuses and why.
+Remote environments, pairing and T3 Connect aren't supported yet. The last two sections say what t3term refuses and why, and what T3 Connect would take.
 
 ## Saving environments
 
@@ -43,14 +43,20 @@ A default that names an environment no longer saved stops every command that nam
 
 For a saved environment, in this order:
 
-1. The origin, saved or recorded, is on this machine: 127.0.0.0/8, `::1` or `localhost`. t3term logs in by running the server's own `t3` against the T3 home, and it never sends that login off the machine.
+1. The T3 home is an absolute path, and the origin, saved or recorded, is on this machine: 127.0.0.0/8, `::1` or `localhost`. t3term logs in by running the server's own `t3` against the T3 home, and it never sends that login off the machine. A program that builds a target with the t3term library gets the same check when it connects, before t3term reads the home.
 2. The T3 home holds `userdata/environment-id`. t3term reaches no server until it has read it.
-3. The server answers `/.well-known/t3/environment` at the origin.
+3. The server answers `/.well-known/t3/environment` at the origin itself. An answer that redirects stops the command with `T3_REDIRECTED`.
 4. The `environmentId` the server reports is the id the T3 home holds. A server that belongs to another home, such as one that took over the port, gets no login.
 5. The server speaks orchestration protocol 2.
 6. t3term runs `t3 auth session issue --base-dir <T3 home>`. It finds `t3` from the pid in `server-runtime.json`, and uses that pid only when the record names the same origin t3term connected to. `T3TERM_T3_COMMAND` replaces the program, and t3term still passes the environment's T3 home as `--base-dir`.
 
 T3 writes `environment-id` in the state directory and reports the same id in its descriptor (apps/server/src/environment/ServerEnvironment.ts:89-177 at T3 f570bd21). A server started with `--base-dir` or `T3CODE_HOME` keeps its state in `userdata` under that home, even as a dev server (apps/server/src/cli/config.ts:319-332 and apps/server/src/config.ts:139-142).
+
+## Redirects and proxies
+
+t3term sends each HTTP request straight to the server it chose. It follows no redirect. When a server answers the descriptor, or any request after login, with a redirect, the command stops with `T3_REDIRECTED`, and the request, its token and its body never reach the server the redirect names. At T3 f570bd21 no route t3term calls redirects. t3term uses no proxy either, so `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` don't apply, and a request for a server on this machine stays on it. The WebSocket already worked this way.
+
+Discovery without a saved environment follows the same rule. A server that `T3TERM_ORIGIN` names or `T3CODE_HOME` records and that answers with a redirect is passed over, as one that doesn't answer is, and t3term tries the next one.
 
 ## Errors
 
@@ -59,7 +65,7 @@ Every error uses an existing exit code. With `--json` it prints `{"ok": false, "
 | Code | Exit | When |
 | --- | --- | --- |
 | `ENVIRONMENT_NAME_INVALID` | 2 | A name breaks the naming rule. |
-| `ENVIRONMENT_HOME_INVALID` | 2 | `--t3-home` is empty or isn't UTF-8. |
+| `ENVIRONMENT_HOME_INVALID` | 2 | `--t3-home` is empty or isn't UTF-8, or a target a program built has a relative T3 home. |
 | `ENVIRONMENT_ORIGIN_INVALID` | 2 | An origin isn't http or https, or has a user, a path, a query or a fragment. |
 | `ENVIRONMENT_INVALID` | 2 | A saved environment has no kind, a relative `t3Home` or an origin that isn't text. |
 | `ENVIRONMENT_NOT_FOUND` | 3 | No environment of that name is saved, or the default names one that isn't. |
@@ -69,6 +75,7 @@ Every error uses an existing exit code. With `--json` it prints `{"ok": false, "
 | `ENVIRONMENT_UNSUPPORTED` | 4 | A saved environment's kind isn't `local`. |
 | `T3_ENVIRONMENT_UNVERIFIED` | 4 | The T3 home holds no `userdata/environment-id`. |
 | `T3_ENVIRONMENT_MISMATCH` | 4 | The server reports another environment id. |
+| `T3_REDIRECTED` | 4 | A saved environment's server answered the descriptor with a redirect, or a server answered a request after login with one. |
 | `T3_PROTOCOL_UNSUPPORTED` | 4 | The server isn't on orchestration protocol 2. |
 | `T3_SERVER_UNAVAILABLE` | 5 | No origin is saved or recorded, or the server didn't answer. |
 | `T3_AUTH_UNAVAILABLE` | 5 | No recorded pid to find `t3` from, and no `T3TERM_T3_COMMAND`. |
@@ -81,9 +88,9 @@ Every error uses an existing exit code. With `--json` it prints `{"ok": false, "
 
 The saved login in the Keychain is keyed by the environment id the server reports, as before. A saved environment and discovery share one login when they reach the same server, and renaming or removing an environment leaves its login alone.
 
-`t3term --environment NAME logout` revokes that environment's saved login and removes it from the Keychain. When the environment's server isn't running, t3term removes that environment's login only, using the id its T3 home holds, and can't revoke it. When the check fails any other way, such as a server that reports another environment id, logout removes nothing and reports the error. With a saved default, `t3term logout` acts on the default the same way. Without either, it works as before: with no server running, it removes every t3term login.
+`t3term --environment NAME logout` revokes that environment's saved login and removes it from the Keychain. When the environment's server isn't running, t3term removes that environment's login only, using the id its T3 home holds, and can't revoke it. When the check fails any other way, such as a server that reports another environment id or answers with a redirect, logout removes nothing and reports the error. With a saved default, `t3term logout` acts on the default the same way. Without either, it works as before: with no server running, it removes every t3term login.
 
-A session that lasts one run, with `T3TERM_NO_SAVED_LOGIN=1`, is revoked against the same T3 home it was issued from.
+With `T3TERM_NO_SAVED_LOGIN=1`, t3term keeps no login. It reads, saves and deletes nothing in the Keychain, so `logout` finds no saved login. Each command uses a session that lasts one run, revoked against the same T3 home it was issued from.
 
 ## The file
 
@@ -108,8 +115,30 @@ It holds names, paths and origins, and never a login or a token. A change follow
 
 ## Not supported yet
 
-- Remote environments. t3term refuses an origin off this machine, and a saved kind other than `local`, before it reaches any server. T3 pairs a remote client by exchanging a one-time `t3 pair` credential at the server's `/oauth/token` for a bearer token, and t3term has no secret store for that token yet.
-- T3 Connect. Signing in to T3's cloud and reaching an environment through its relay need a client the relay accepts, and t3term isn't one yet.
+- Remote environments. t3term refuses an origin off this machine, and a saved kind other than `local`, before it reaches any server. T3 pairs a remote client by exchanging a one-time `t3 pair` credential at the server's `/oauth/token` for a bearer token. t3term's HTTP client is built without TLS, and its saved logins don't hold a remote token yet.
+- T3 Connect. The next section says what T3's clients do and what t3term lacks.
 - A picker in the TUI. The TUI opens on the environment the command chose, and the sidebar names it as before.
 - A dev server started with `--dev-url` and no base dir keeps its state in `~/.t3/dev`, which a saved environment doesn't read. Discovery still finds it.
 - `remove` doesn't revoke the environment's login. Run `t3term --environment NAME logout` first.
+
+## T3 Connect
+
+T3 Connect reaches an environment through T3's relay. t3term doesn't do it yet. This section reads the source at T3 f570bd21 for what T3's own clients do and what stands in t3term's way. No part of it has been tried against T3's cloud.
+
+### How T3's clients connect
+
+1. The client signs in to T3's Clerk instance and asks Clerk for a token from the `t3-relay` JWT template, whose audience is `t3-code-relay` (docs/operations/connect-setup.md:50-61). The web app signs in in the browser. The desktop app signs in through Clerk's Electron integration, which returns to `t3code://app/`, and the Android app through `clerk://<applicationId>.callback`. T3's Clerk administrator puts each of those redirects on an allowlist (connect-setup.md:63-88).
+2. It trades that token at the relay's `POST /v1/client/dpop-token` for an access token bound to a DPoP key it holds, good for 30 minutes. The request names a `client_id`, `t3-web` from the web app or `t3-mobile` from the mobile app, which decides the scopes the token may carry (packages/contracts/src/relay.ts:747-770, infra/relay/src/auth/RelayTokens.ts:63-81, apps/web/src/cloud/managedRelayLayer.ts:80).
+3. With that token it asks the relay for one environment, `POST /v1/environments/:environmentId/connect`, and gets the environment's endpoint and a one-time bootstrap credential.
+4. It reads the endpoint's descriptor and checks the environment id, then exchanges the bootstrap credential at the environment's `/oauth/token` for an access token bound to the same key (packages/client-runtime/src/authorization/service.ts:278-360).
+
+T3's CLI signs in another way. `https://app.t3.codes/connect` signs the user in, then sends the browser to Clerk's authorize page for T3's public CLI OAuth app, which returns the code to the CLI's listener at `http://127.0.0.1:34338/callback` (connect-setup.md:37-48, apps/web/src/cloud/connectCliAuth.ts:12-46). The CLI gets a Clerk OAuth access token, not a template token.
+
+### What t3term lacks
+
+- A token the exchange takes. The relay's account routes, such as listing and linking environments, take a template token or a Clerk OAuth access token (infra/relay/src/http/Api.ts:1656-1698). The DPoP exchange in step 2 takes only a Clerk session token with the relay's audience (Api.ts:1020-1025). So an OAuth app, T3's or one registered for t3term, could list environments but not connect to one. Connecting takes a Clerk session in T3's instance, or a relay that accepts an OAuth token at the exchange.
+- A sign-in of its own. T3's Clerk administrator registers each way in: the CLI's OAuth app and its loopback redirect, and the desktop and Android redirects. t3term won't use T3's CLI client id or present itself as T3's web app. An OAuth app or a sign-in redirect for t3term is T3's to register, and only a redirect gives t3term a session.
+- A client id. `client_id` is `t3-web` or `t3-mobile` and nothing else. It is neither a secret nor a registration, since it only picks scopes, but t3term would send neither, so an id for t3term is a change to the relay's contract and its scope table.
+- Its own parts. DPoP needs an ES256 key and a signed proof for each request. The relay and a remote endpoint need TLS, which t3term's HTTP client and WebSocket are built without. The tokens need the Keychain.
+
+A paired remote environment needs none of T3's cloud. `t3 pair` issues a one-time credential, and the environment's `/oauth/token` exchanges it for a bearer token (packages/client-runtime/src/authorization/remote.ts:115-140). For that t3term needs TLS, a saved token and the descriptor check above, and no change to T3.
