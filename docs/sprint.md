@@ -35,6 +35,7 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 | 13 | https://github.com/krishhgg/t3term/pull/20 | File changes in tool output: each edit's operations and a failed edit's error, with a bounded patch preview when a server sends one | `e8f9c864bf4fe0dbfc2da49e268e6fee17680dde` |
 | 14 | https://github.com/krishhgg/t3term/pull/21 | A dismissible banner over the conversation for the thread's error, from a failed send or from T3 | `7ad958f357d4a45ba1a37cd884f831968c10463a` |
 | 15 | https://github.com/krishhgg/t3term/pull/22 | Live server config in the TUI, so provider and model changes reach the chips and menus without a reread | `cb51f8c619f395c2aefce8fa81e83e18e8275847` |
+| 16 | https://github.com/krishhgg/t3term/pull/25 | A banner over the conversation, above the thread's error, when the provider the composer would send with isn't ready or runs a version T3 marks broken or unsupported | |
 
 ## Maintenance review PRs
 

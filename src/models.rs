@@ -27,7 +27,7 @@ pub const ULTRATHINK: &str = "ultrathink";
 const ULTRATHINK_PREFIX: &str = "Ultrathink:";
 
 /// What the user asked to change. `None` keeps the thread's current value.
-#[derive(Debug, Default, Clone)]
+#[derive(Debug, Default, Clone, PartialEq)]
 pub struct Choice {
     /// `instance/slug`, a slug, or a model name.
     pub model: Option<String>,
