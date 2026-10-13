@@ -8348,6 +8348,124 @@ mod tests {
         assert!(setup_sender(&subscriptions, 0).is_closed());
     }
 
+    /// Thread `id` as the shell lists it, titled `title`, with its worktree's path when
+    /// `worktree`.
+    fn listed_setup_thread(id: &str, title: &str, worktree: bool) -> Value {
+        let mut thread = listed(id, title, "idle");
+        thread["worktreePath"] = if worktree {
+            json!(format!("/work/repo-{id}"))
+        } else {
+            Value::Null
+        };
+        thread
+    }
+
+    #[test]
+    fn a_closed_thread_watch_opens_no_setup_subscription_again() {
+        // A thread in its worktree, and a thread whose run is preparing a worktree it has no
+        // path for yet. Once the watch closes, the tick doesn't count the run, and the sidebar
+        // is hidden, so only the card could ask for the tick.
+        for (case, worktree, runs) in [
+            ("worktree", true, json!([])),
+            ("preparing", false, json!([setup_run("preparing", false)])),
+        ] {
+            let (mut app, subscriptions) = setup_tui();
+            open_setup_thread(
+                &mut app,
+                "t",
+                worktree_thread("t", worktree, runs, short_answer()),
+            );
+            let listing = |title: &str| listed_setup_thread("t", title, worktree);
+            app.on_shell_event(shell_snapshot(vec![listing("Fix login")]));
+            assert_eq!(subscribed(&subscriptions), ["t"], "{case}");
+            let stages = setup_stages(["done", "running", "pending", "pending", "pending"]);
+            let running = setup_item("t", "running", 1, stages);
+            assert!(
+                deliver(&mut app, &subscriptions, WatchEvent::Item(running.clone())),
+                "{case}"
+            );
+            assert!(
+                shows(&screen(&mut app, 80, 40), "Setting up worktree…"),
+                "{case}"
+            );
+            assert!(app.open.as_ref().unwrap().setup.ticks(), "{case}");
+
+            // The thread's watch fails for good, and its setup subscription closes with it.
+            app.on_thread_event(WatchEvent::Failed("thread closed".into()));
+            assert!(setup_sender(&subscriptions, 0).is_closed(), "{case}");
+
+            // The shell goes on changing the thread and lists it again after a reconnect. The
+            // worktree, or the preparing run as the closed watch last saw it, is still there.
+            for event in [
+                thread_updated(2, listing("Fix the login page")),
+                thread_updated(3, listing("Fix the login form")),
+                shell_snapshot(vec![listing("Fix the login form")]),
+                thread_updated(2, listing("Fix login")),
+            ] {
+                app.on_shell_event(event);
+                assert_eq!(subscribed(&subscriptions), ["t"], "{case}");
+            }
+            // T3 sends the running setup down any subscription that is open.
+            for (_, sender) in subscriptions.lock().unwrap().iter() {
+                let _ = sender.send(WatchEvent::Item(running.clone()));
+            }
+            assert!(!pump(&mut app), "{case}");
+            // The card keeps the setup it had and asks for no tick.
+            assert!(
+                shows(&screen(&mut app, 80, 40), "Setting up worktree…"),
+                "{case}"
+            );
+            assert!(!needs_tick(app.open.as_ref(), &app.sidebar), "{case}");
+            assert!(setup_sender(&subscriptions, 0).is_closed(), "{case}");
+        }
+    }
+
+    #[test]
+    fn a_connecting_or_reconnecting_watch_and_a_new_watch_follow_the_setup() {
+        let (mut app, subscriptions) = setup_tui();
+        let connection = |app: &App| app.open.as_ref().unwrap().connection.clone();
+        open_setup_thread(
+            &mut app,
+            "t",
+            worktree_thread("t", false, json!([]), short_answer()),
+        );
+        assert!(subscribed(&subscriptions).is_empty());
+        // The shell lists the thread's worktree while its watch is still connecting.
+        assert_eq!(connection(&app), "connecting");
+        app.on_shell_event(shell_snapshot(vec![listed_setup_thread("t", "Fix", true)]));
+        assert_eq!(subscribed(&subscriptions), ["t"]);
+        // While the watch reconnects, the worktree going closes the subscription and the
+        // worktree coming back opens another.
+        let reconnecting = WatchEvent::Reconnecting {
+            reason: "T3 connection lost: socket ended".into(),
+            retry_in: Duration::from_millis(250),
+        };
+        app.on_thread_event(reconnecting);
+        assert!(connection(&app).starts_with("reconnecting"));
+        app.on_shell_event(thread_updated(2, listed_setup_thread("t", "Fix", false)));
+        assert!(setup_sender(&subscriptions, 0).is_closed());
+        app.on_shell_event(thread_updated(3, listed_setup_thread("t", "Fix", true)));
+        assert_eq!(subscribed(&subscriptions), ["t", "t"]);
+        assert!(!setup_sender(&subscriptions, 1).is_closed());
+        // The watch closes. Another thread still subscribes, and so does this one when it
+        // opens again with a new watch.
+        app.on_thread_event(WatchEvent::Failed("thread closed".into()));
+        assert!(setup_sender(&subscriptions, 1).is_closed());
+        open_setup_thread(
+            &mut app,
+            "b",
+            worktree_thread("b", true, json!([]), short_answer()),
+        );
+        assert_eq!(subscribed(&subscriptions), ["t", "t", "b"]);
+        open_setup_thread(
+            &mut app,
+            "t",
+            worktree_thread("t", false, json!([]), short_answer()),
+        );
+        assert_eq!(subscribed(&subscriptions), ["t", "t", "b", "t"]);
+        assert!(!setup_sender(&subscriptions, 3).is_closed());
+    }
+
     #[test]
     fn one_subscription_lasts_through_frames_keys_answers_and_config() {
         let runtime = idle_runtime();
