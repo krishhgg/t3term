@@ -182,9 +182,11 @@ impl Facts {
     ///
     /// The workspace follows the desktop's rules. A worktree path makes it a worktree, at that
     /// path. A thread whose worktree path is null works in the local checkout, the project's
-    /// folder. A path that is missing, blank or not a string leaves the workspace unavailable.
-    /// The branch is the one T3 recorded. A null branch reads `None recorded` and is never
-    /// taken for main, and one missing or not a string reads `Unavailable`.
+    /// folder. A worktree path that is missing, blank or not a string leaves the workspace
+    /// unavailable, and a blank project folder leaves the checkout without one. `blank` reads
+    /// only the ends of a long path. The branch is the one T3 recorded. A null branch reads
+    /// `None recorded` and is never taken for main, and one missing or not a string reads
+    /// `Unavailable`.
     pub(super) fn of(open_id: Option<&str>, record: Record, projects: Projects) -> Facts {
         let Some(open_id) = open_id else {
             return Facts::default();
@@ -246,12 +248,12 @@ impl Facts {
         };
 
         let workspace = match thread.get("worktreePath") {
-            Some(Value::String(path)) if !path.trim().is_empty() => folder("Worktree", path),
+            Some(Value::String(path)) if !blank(path) => folder("Worktree", path),
             Some(Value::Null) => {
                 let root = project
                     .and_then(|project| project.get("workspaceRoot"))
                     .and_then(Value::as_str)
-                    .filter(|root| !root.trim().is_empty());
+                    .filter(|root| !blank(root));
                 match root {
                     Some(root) => folder("Local checkout", root),
                     None => vec![
@@ -341,18 +343,36 @@ fn separator(c: char) -> bool {
 /// `PATH_HEAD` and `PATH_TAIL` together keeps its first and last characters with `…` between,
 /// so the folder at its end stays.
 fn path_text(path: &str) -> String {
-    let (whole, longer) = head(path, PATH_HEAD + PATH_TAIL);
-    let kept = if longer {
-        let (start, _) = head(path, PATH_HEAD);
-        let (end, _) = tail(path, PATH_TAIL);
-        format!("{start}…{end}")
-    } else {
-        whole.to_string()
+    let kept = match kept(path) {
+        (whole, None) => whole.to_string(),
+        (start, Some(end)) => format!("{start}…{end}"),
     };
     without_controls(&kept)
         .replace('\n', " ")
         .trim()
         .to_string()
+}
+
+/// Whether `path` has nothing but whitespace in the parts of it that `kept` keeps. A path
+/// with no more characters than `PATH_HEAD` and `PATH_TAIL` together is read whole, so it is
+/// blank when it trims to nothing. A longer one is blank when both its kept ends are, whatever
+/// its middle holds, since the details would show none of that middle. Like a short blank
+/// path, it leaves a worktree unavailable and a local checkout without its folder.
+fn blank(path: &str) -> bool {
+    let (start, end) = kept(path);
+    start.trim().is_empty() && end.is_none_or(|end| end.trim().is_empty())
+}
+
+/// The parts of `path` the details read: all of it when it has no more characters than
+/// `PATH_HEAD` and `PATH_TAIL` together, and otherwise its first `PATH_HEAD` and its last
+/// `PATH_TAIL`. The second part is None for a path read whole.
+fn kept(path: &str) -> (&str, Option<&str>) {
+    let (whole, longer) = head(path, PATH_HEAD + PATH_TAIL);
+    if longer {
+        (head(path, PATH_HEAD).0, Some(tail(path, PATH_TAIL).0))
+    } else {
+        (whole, None)
+    }
 }
 
 /// The start of `text`, at most `max` characters of it in whole pieces as `clusters` finds
@@ -1012,6 +1032,43 @@ mod tests {
         assert!(pieces[2].text.ends_with("aaa/end-folder"));
         assert!(pieces[2].text.contains('…'));
         assert!(shown(&facts, 30).len() <= 3 * 3 + VALUE_ROWS * 3 + PATH_ROWS);
+    }
+
+    #[test]
+    fn a_huge_path_is_blank_or_not_by_the_ends_it_keeps() {
+        let spaces = " ".repeat(3_000_000);
+        let ended = format!("{spaces}/repo/.t3/worktrees/feature-a\t \n");
+        // Text only in the middle, past what either end keeps.
+        let pad = " ".repeat(10_000);
+        let middle = format!("{pad}/repo/never-shown{pad}");
+        // As a worktree's path, and as the project's folder for a thread without one.
+        for worktree in [true, false] {
+            let rows_for = |path: &str| {
+                let (worktree_path, root) = if worktree {
+                    (json!(path), "/r")
+                } else {
+                    (Value::Null, path)
+                };
+                let projects = [project("p", "Demo", root)];
+                shown(&facts_of(&thread(worktree_path, json!("b")), &projects), 40)
+            };
+            let (kind, unusable) = if worktree {
+                ("Worktree", ["Unavailable", ""])
+            } else {
+                (
+                    "Local checkout",
+                    ["Local checkout", "Project folder unavailable"],
+                )
+            };
+            for path in [spaces.as_str(), middle.as_str()] {
+                let rows = rows_for(path);
+                assert_eq!(rows[4..6], unusable, "{worktree}");
+                assert!(!rows.iter().any(|row| row.contains("never")), "{rows:#?}");
+            }
+            let rows = rows_for(ended.as_str());
+            assert_eq!(rows[4], format!("{kind} · feature-a"));
+            assert_eq!(rows[5], "… /repo/.t3/worktrees/feature-a");
+        }
     }
 
     #[test]
