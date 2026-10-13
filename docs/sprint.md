@@ -39,7 +39,7 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 | 17 | https://github.com/krishhgg/t3term/pull/26 | Worktree setup stream foundation: a client watcher for one thread's `subscribeWorktreeSetup`, for the setup card that comes next. Nothing in the TUI or CLI shows a setup yet | `2b5e75f5ff2a1f81da92067442755c496989ffc3` |
 | 18 | https://github.com/krishhgg/t3term/pull/27 | The open thread's worktree setup as a read-only card under its first prompt: stage progress, the setup script's last output and Details. No Cancel, Work locally, terminal or worktree preparation | `194943b5764256bbae6bc9c7a1d34948d33d9ddc` |
 | 19 | https://github.com/krishhgg/t3term/pull/28 | The environment's label, host and port under the sidebar's wordmark, and a dot that follows the sidebar's own feed, not the open thread's watch. The breadcrumb's row shows both while the sidebar is hidden. No environment list or selector | `f210cd8ac137872b95388ac4e11c097d8b0cf159` |
-| 20 | https://github.com/krishhgg/t3term/pull/29 | The open thread's project, workspace, recorded branch and environment, read-only, in a pane beside the conversation or a dialog on a narrow screen, opened with Alt+B or a button in the title row. No Git status, actions, scripts or tabbed right panel | |
+| 20 | https://github.com/krishhgg/t3term/pull/29 | The open thread's project, workspace, recorded branch and environment, read-only, in a pane beside the conversation or a dialog on a narrow screen, opened with Alt+B or a button in the title row. No Git status, actions, scripts or tabbed right panel | `739cead6795dd0a80151d657c48721c109dea86f` |
 
 ## Maintenance review PRs
 
@@ -47,6 +47,7 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 |---|---|---|---|
 | https://github.com/krishhgg/t3term/pull/23 | 1 | A CI concurrency group for each push to master, Greptile rule scopes and context brought up to date, and CLI tests for exit codes 7, 1 and 6 | `cf17b7ac16ccc00272e2c08ce9094e3bf261bc5c` |
 | https://github.com/krishhgg/t3term/pull/24 | 1 | Plain CLI output without control characters from T3 text, ids, names and errors, with `--json` unchanged | `1efb6a3052a5d3448fdd7fbb8dbf2bac694f0b46` |
+| https://github.com/krishhgg/t3term/pull/30 | 2 | Greptile context for the worktree setup stream, the TUI's real wake rules and the verification pages, and tests of one shared connection drop, a crowded thread and control characters across the whole screen | |
 
 ## Audits
 
@@ -68,4 +69,35 @@ An older concern that the TUI's App couldn't be tested offline no longer holds, 
 
 The rest needed no change. The tests reach only fake servers on 127.0.0.1 and temporary homes. The workflow pins each action to a commit SHA, reads the repository with `contents: read` and needs no secrets. Rust stays pinned to 1.95.0. The release smoke test checks that `doctor --json` exits 5 with no server and prints exactly one JSON object. macOS stays the only supported platform, with Linux as an optional build. The existing regression tests for the sidebar, settings, scrolling, the tasks drawer and caches were enough. The audit added no benchmarks, test frameworks, media migration or nightly automation.
 
-19 sprint PRs have merged. The next audit is due when sprint PR 20 merges.
+### Audit 2: sprint PRs 11 to 20
+
+Sprint PR 20, #29, merged at `739cead6795dd0a80151d657c48721c109dea86f`. The audit covered #18 to #22 and #25 to #29, from `19f5db9` to that commit, and took #23 and #24 as shipped. Astra and Claude Fable 5.1 each finished an audit on their own. Neither found a confirmed application bug, and both recommended a small maintenance PR. Sol reconciled them into #30.
+
+Every final PR head in the block passed macOS, the optional Linux job and Greptile Review. Greptile left four inline findings, and the merged source has the fix for each:
+
+| Pull request | Greptile's finding | Fix in the merged source |
+|---|---|---|
+| [#20](https://github.com/krishhgg/t3term/pull/20#discussion_r4233764369) | The CLI built file-change previews it never printed, and described printed edits again on every event | `describe_plain` in transcript.rs, called only for an item that has settled and hasn't printed |
+| [#25](https://github.com/krishhgg/t3term/pull/25#discussion_r4252516592) | A replaced provider notice kept the old notice's scroll keys for one frame | Keys and the wheel check the banner's current expanded state before they scroll it |
+| [#27](https://github.com/krishhgg/t3term/pull/27#discussion_r4253567356) | A shell update could open a setup watch again after the thread's watch closed | `follow_setup` returns early while the thread's watch is closed |
+| [#28](https://github.com/krishhgg/t3term/pull/28#discussion_r4254647770) | A five-digit port lost a digit at 80 columns | The line keeps the whole port or leaves the address out, as `every_width_keeps_the_whole_port` checks |
+
+The other six PRs had no inline findings. Greptile reviewed #18, #19, #21, #22 and #26 only at their final heads, and first checked #29 at `e1df4c0`, which already bounded the blank-path scan Sol caught. The fixes Sol asked for in those PRs came before Greptile saw them, so the audit can't tell whether the rules would have caught them, and it doesn't count them as misses of the config.
+
+| Finding | Found by | Outcome |
+|---|---|---|
+| The instructions and the protocol-fidelity rule didn't describe `subscribeWorktreeSetup`, which #26 added | Astra | Fixed by #30. They now give its `{threadId}` payload, its items of a whole setup or null and its resubscribe with no cursor, and say a setup's sequence can start over after a null or a reconnect. The rule doesn't ask the watcher to drop repeated items |
+| idle-cost said the TUI draws at most 30 times a second and only after input or an event. A layout change draws at once, and a tick or a snooze can wake it. The rule also didn't name the repeated work Sol caught in #21 and #29 | Astra | Fixed by #30. The rule now gives the 33 ms wait, the immediate layout frame and the two timers. It flags building an unchanged banner or the details again on an unrelated update, and width or cleaning work over huge text before it is cut. Its scope is unchanged |
+| measured-claims couldn't see the verification pages, which count requests and output bytes | Astra and Fable | Fixed by #30 with `docs/*-verification.md`. Fable proposed `docs/**`. Sol kept the narrower pattern so the rule doesn't reach other numbers in docs |
+| platform-gating called macOS the only tested platform, though CI runs an optional Linux build and test job | Astra | Fixed by #30. It now calls macOS the only supported platform and names the optional Linux job. The cfg gate and Keychain fallback rules stay |
+| The parity inventory's context reached only src/tui/ and transcript.rs, though the inventory cites fields and transports in client.rs, projection.rs, models.rs and tests/fake_server.rs | Astra | Fixed by #30, which adds those four. It adds no entry for each verification page, as Fable advised |
+| No test dropped the one connection the shell, thread, config and setup watches share | Astra and Fable | Fixed by #30 with `shared_watches_come_back_on_one_new_connection_after_a_drop` in client.rs, through the real `Client::rpc`. A gap in coverage, not a known defect |
+| No App test put a running setup, a provider notice, a thread error, an approval, the tasks drawer, the model menu and the details on one screen | Fable | Fixed by #30 with `a_crowded_thread_stays_on_screen_and_hands_each_key_to_the_right_place`, at 80x24 and 40x12 |
+| The hostile-field test checked only the details' cells, while raw titles reach the sidebar's card and the breadcrumb through `fit` | Astra and Fable | #30 extends `hostile_and_huge_fields_stay_inside_the_details_at_every_size` to every cell, with the sidebar shown and hidden. ratatui-core 0.1.2 drops any grapheme holding a control character before it reaches a cell, so the test guards that filter. It isn't an injection fix. Printable fragments such as `]52;c;` still print. Cleaning in `fit` and `clip`, Fable's optional follow-up, needs its own PR |
+| Row 20 had no merge commit, and this record still said 19 sprint PRs had merged | Astra and Fable | Bookkeeping, fixed by #30 |
+
+CI and the ruleset need no change. The workflow reads the repository with `contents: read`, checks out with `persist-credentials: false`, pins each action to a commit SHA and keeps Rust at 1.95.0. Pull requests only restore the cache, and master pushes save it. The pushes that merged #18, #19 and #20 were cancelled before #23's concurrency fix, as audit 1 records. Every master run from `7ad958f` on finished and passed, the latest being run 38422824491 at `739cead`. [Ruleset 24698953](https://github.com/krishhgg/t3term/rules/24698953) is active on master and requires Greptile Review and macOS. Linux stays optional, a branch need not be up to date, no one can bypass it, and it blocks deletion and force pushes. It doesn't require review threads to be resolved, so that rests on AGENTS.md. All four of this block's finding threads are resolved.
+
+#30's checks await Sol's run, and their results go here once Sol has them.
+
+20 sprint PRs have merged. The next audit is due when sprint PR 30 merges.
