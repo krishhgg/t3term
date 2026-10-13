@@ -10324,7 +10324,6 @@ mod tests {
     fn hostile_and_huge_fields_stay_inside_the_details_at_every_size() {
         let runtime = idle_runtime();
         let _entered = runtime.enter();
-        let mut app = tui(&Settings::default());
         let hostile = format!(
             "\u{1b}]52;c;cHduZWQ=\u{7}\u{1b}[2J{}\r\nevil",
             "👩\u{200d}💻e\u{301}名".repeat(20_000)
@@ -10332,37 +10331,55 @@ mod tests {
         let root = format!("/r/{}", "\u{9b}x".repeat(200_000));
         let project = json!({"id": "p", "title": &hostile, "workspaceRoot": root});
         let worktree = format!("/w/{}\u{1b}[31m/last", "y".repeat(500_000));
-        let thread = bound("t", "p", json!(worktree), json!(&hostile));
+        let mut thread = bound("t", "p", json!(worktree), json!(&hostile));
+        // The title goes to the sidebar's card and the breadcrumb, as the project does.
+        thread["title"] = json!(&hostile);
         let snapshot = json!({"snapshotSequence": 1, "projects": [project],
             "threads": [thread.clone()]});
-        app.on_shell_event(WatchEvent::Item(
-            json!({"kind": "snapshot", "snapshot": snapshot}),
-        ));
-        app.open_thread(open_bound(thread));
-        cells(&mut app, 200, 50);
-        alt(&mut app, 'b');
-        for (width, height) in [(200, 50), (120, 36), (80, 24), (40, 12), (24, 8)] {
-            let buffer = cells(&mut app, width, height);
-            let drawn = app.details.drawn.expect("drawn");
-            assert_eq!(drawn.area.intersection(app.screen), drawn.area);
-            for y in drawn.area.top()..drawn.area.bottom() {
-                for x in drawn.area.left()..drawn.area.right() {
-                    let symbol = buffer[(x, y)].symbol();
-                    assert!(
-                        !symbol.contains(char::is_control),
-                        "{width}x{height} ({x}, {y}) {symbol:?}"
-                    );
+        let shell = json!({"kind": "snapshot", "snapshot": snapshot});
+        for sidebar_hidden in [false, true] {
+            let settings = Settings {
+                sidebar_hidden,
+                ..Settings::default()
+            };
+            let mut app = tui(&settings);
+            app.on_shell_event(WatchEvent::Item(shell.clone()));
+            app.open_thread(open_bound(thread.clone()));
+            cells(&mut app, 200, 50);
+            alt(&mut app, 'b');
+            for (width, height) in [(200, 50), (120, 36), (80, 24), (40, 12), (24, 8)] {
+                let buffer = cells(&mut app, width, height);
+                let drawn = app.details.drawn.expect("drawn");
+                assert_eq!(drawn.area.intersection(app.screen), drawn.area);
+                // No cell on the screen holds a control character: not the sidebar's, the
+                // breadcrumb's or the details'.
+                for y in 0..height {
+                    for x in 0..width {
+                        let symbol = buffer[(x, y)].symbol();
+                        assert!(
+                            !symbol.contains(char::is_control),
+                            "{sidebar_hidden} {width}x{height} ({x}, {y}) {symbol:?}"
+                        );
+                    }
                 }
+                let text = details_text(&app, &buffer);
+                assert!(text.contains("Thread details"), "{width}x{height}: {text}");
+                let whole = text_in(&buffer, buffer.area);
+                assert!(!whole.contains("evil"), "{whole}");
             }
+            // The hostile text reached the breadcrumb, and the sidebar's card when it shows,
+            // by its printable characters.
+            let buffer = cells(&mut app, 200, 50);
+            let title_row = text_in(&buffer, Rect::new(0, 0, 200, 1));
+            assert!(title_row.contains('名'), "{title_row}");
+            let sidebar = text_in(&buffer, app.sidebar.list);
+            assert_eq!(sidebar.contains('名'), !sidebar_hidden, "{sidebar}");
+            // The folder at the end of the long path still names the worktree.
             let text = details_text(&app, &buffer);
-            assert!(text.contains("Thread details"), "{width}x{height}: {text}");
-            assert!(!text.contains("evil"), "{text}");
+            assert!(text.contains("Worktree · last"), "{text}");
+            // The values were worked out once, on the first frame that showed them.
+            assert_eq!(app.details.prepares, 1);
         }
-        // The folder at the end of the long path still names the worktree.
-        let text = details_after(&mut app, 200, 50);
-        assert!(text.contains("Worktree · last"), "{text}");
-        // The values were worked out once, on the first frame that showed them.
-        assert_eq!(app.details.prepares, 1);
         assert_eq!(reads(&runtime), 0);
     }
 
@@ -10404,5 +10421,222 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert_eq!(app.focus, Focus::Composer);
         assert_eq!(app.composer.text(), "draft");
+    }
+
+    // ---- everything at once ----
+
+    /// The TUI with the sidebar listing thread `t` and `t` open, live on Codex in a worktree
+    /// of Demo, with everything that can crowd the conversation but a request: a worktree
+    /// setup still running, Codex's notice and the thread's error, forty lines each, and
+    /// twenty tasks for the running run. A draft waits in the composer.
+    fn crowded() -> App {
+        let mut app = tui(&Settings::default());
+        let subscriptions = Subscriptions::default();
+        let opened = subscriptions.clone();
+        app.watch_setup = Box::new(move |thread_id: &str| {
+            let (sender, events) = mpsc::unbounded_channel();
+            opened.lock().unwrap().push((thread_id.to_string(), sender));
+            events
+        });
+        let mut thread = bound("t", "p", json!("/work/repo-t"), json!("t3code/t"));
+        thread["providerInstanceId"] = json!("codex");
+        thread["activeProviderThreadId"] = json!("pt");
+        thread["modelSelection"] = json!({"instanceId": "codex", "model": "gpt-6"});
+        app.on_shell_event(details_shell(vec![thread.clone()]));
+        let failing = reported("codex", "Codex", "error", "authenticated");
+        let failing = saying(failing, &forty_lines("notice"));
+        app.on_config_event(config_snapshot(vec![failing], json!({})));
+        let steps: Vec<Value> = (1..=20)
+            .map(|n| {
+                json!({"id": format!("s{n}"), "text": format!("Step {n}"),
+                    "status": "pending"})
+            })
+            .collect();
+        let list = json!({"id": "l1", "threadId": "t", "runId": "r1", "nodeId": "n",
+            "kind": "todo_list", "status": "active", "steps": steps});
+        let more = json!({"thread": thread, "runs": [setup_run("running", true)],
+            "plans": [list]});
+        app.open_thread(codex_thread("t", Some(&forty_lines("error")), more));
+        let stages = setup_stages(["done", "done", "skipped", "running", "pending"]);
+        let setup = setup_item("t", "running", 2, stages);
+        assert!(deliver(&mut app, &subscriptions, WatchEvent::Item(setup)));
+        app.composer.insert_str("half a reply");
+        app
+    }
+
+    /// Asserts that each area the last frame noted for the mouse and the keys lies on the
+    /// screen.
+    fn on_screen(app: &App, size: &str) {
+        let mut areas = vec![
+            app.transcript_area,
+            app.panel_area,
+            app.composer_area,
+            app.picker_area,
+            app.sidebar_toggle,
+            app.tasks.area,
+            app.banner.area,
+            app.banner.close,
+            app.provider_banner.area,
+            app.provider_banner.close,
+            app.details.button,
+            app.sidebar.list,
+            app.sidebar.footer,
+            app.sidebar.border,
+        ];
+        areas.extend(app.chips.iter().map(|&(area, _)| area));
+        if let Some(drawn) = app.details.drawn {
+            areas.extend([drawn.area, drawn.close]);
+        }
+        for area in areas {
+            assert_eq!(area.intersection(app.screen), area, "{size}: {area:?}");
+        }
+    }
+
+    /// Draws a frame 80 columns by 24 rows and returns the text of Codex's notice, the
+    /// thread's error and the tasks drawer, each empty when the frame drew none.
+    fn notices_and_tasks(app: &mut App) -> [String; 3] {
+        let buffer = cells(app, 80, 24);
+        let areas = [app.provider_banner.area, app.banner.area, app.tasks.area];
+        areas.map(|area| text_in(&buffer, area))
+    }
+
+    #[test]
+    fn a_crowded_thread_stays_on_screen_and_hands_each_key_to_the_right_place() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let request = json!({"id": "q1", "kind": "command", "status": "pending"});
+        for (width, height) in [(80, 24), (40, 12)] {
+            let mut app = crowded();
+            for waiting in [false, true] {
+                if waiting {
+                    // A command waits for approval, and its panel takes the tasks' place.
+                    app.on_thread_event(live(2, "runtime-request.updated", request.clone()));
+                }
+                let size = format!("{width}x{height} waiting={waiting}");
+                cells(&mut app, width, height);
+                on_screen(&app, &size);
+                if width == 80 {
+                    let card = card_lines(&app);
+                    assert!(shows(&card, "Setting up worktree"), "{card:#?}");
+                    assert!(app.provider_banner.area.height > 0, "{size}");
+                    assert!(app.banner.area.height > 0, "{size}");
+                    assert_eq!(app.tasks.area.height > 0, !waiting, "{size}");
+                    assert_eq!(app.panel_area.height > 0, waiting, "{size}");
+                }
+
+                // The model menu opens. The details open as a dialog, which closes the menu
+                // and takes the keyboard.
+                alt(&mut app, 'm');
+                assert!(app.picker.is_some(), "{size}");
+                cells(&mut app, width, height);
+                assert!(app.picker_area.height > 0, "{size}");
+                on_screen(&app, &size);
+                alt(&mut app, 'b');
+                assert!(app.picker.is_none(), "{size}");
+                assert_eq!(app.focus, Focus::Details, "{size}");
+                cells(&mut app, width, height);
+                let drawn = app.details.drawn.expect("the dialog");
+                assert_eq!(drawn.layout, details::Layout::Dialog, "{size}");
+                on_screen(&app, &size);
+
+                // Under the dialog, no key reaches the composer, a notice, the tasks, a menu
+                // or the request.
+                for code in [KeyCode::Char('x'), KeyCode::Enter, KeyCode::Tab] {
+                    press(&mut app, code);
+                }
+                for c in ['o', 'i', 't', 'm', 'a'] {
+                    alt(&mut app, c);
+                }
+                alt_arrow(&mut app, KeyCode::Down);
+                assert!(app.details.open && app.focus == Focus::Details, "{size}");
+                assert!(!app.provider_banner.expanded(), "{size}");
+                assert!(!app.banner.expanded(), "{size}");
+                assert!(!app.tasks.open && app.picker.is_none(), "{size}");
+                assert_eq!(app.panel_scroll, 0, "{size}");
+                assert_eq!(app.composer.text(), "half a reply", "{size}");
+
+                // Esc closes the dialog and gives the keyboard back to the composer, and the
+                // menu opens again.
+                press(&mut app, KeyCode::Esc);
+                assert!(!app.details.open, "{size}");
+                assert_eq!(app.focus, Focus::Composer, "{size}");
+                alt(&mut app, 'm');
+                cells(&mut app, width, height);
+                assert!(app.picker.is_some(), "{size}");
+                assert!(app.picker_area.height > 0, "{size}");
+                on_screen(&app, &size);
+                press(&mut app, KeyCode::Esc);
+                assert!(app.picker.is_none(), "{size}");
+                assert_eq!(app.focus, Focus::Composer, "{size}");
+                assert_eq!(app.composer.text(), "half a reply", "{size}");
+            }
+        }
+
+        // Codex's notice opens, then the tasks under it. Alt+↓ goes to the open notice ahead
+        // of the tasks, and opening one notice closes the other.
+        let mut app = crowded();
+        cells(&mut app, 80, 24);
+        alt(&mut app, 'o');
+        cells(&mut app, 80, 24);
+        alt(&mut app, 't');
+        let [notice, _, tasks] = notices_and_tasks(&mut app);
+        assert!(notice.contains("Lines 1-"), "{notice}");
+        assert!(tasks.contains("Lines 1-8 of 20"), "{tasks}");
+        alt_arrow(&mut app, KeyCode::Down);
+        let [notice, _, tasks] = notices_and_tasks(&mut app);
+        assert!(notice.contains("Lines 2-"), "{notice}");
+        assert!(tasks.contains("Lines 1-8 of 20"), "{tasks}");
+        // The details open over them as a dialog and take Alt+↓. Esc closes the details
+        // first, and the next Alt+↓ is the notice's again.
+        alt(&mut app, 'b');
+        cells(&mut app, 80, 24);
+        alt_arrow(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.details.open);
+        assert_eq!(app.focus, Focus::Composer);
+        let [notice, _, _] = notices_and_tasks(&mut app);
+        assert!(notice.contains("Lines 2-"), "{notice}");
+        alt_arrow(&mut app, KeyCode::Down);
+        let [notice, _, tasks] = notices_and_tasks(&mut app);
+        assert!(notice.contains("Lines 3-"), "{notice}");
+        assert!(tasks.contains("Lines 1-8 of 20"), "{tasks}");
+        // Alt+I opens the error and closes the notice, and Alt+↓ scrolls the error.
+        alt(&mut app, 'i');
+        assert!(app.banner.expanded() && !app.provider_banner.expanded());
+        notices_and_tasks(&mut app);
+        alt_arrow(&mut app, KeyCode::Down);
+        let [_, error, tasks] = notices_and_tasks(&mut app);
+        assert!(error.contains("Lines 2-"), "{error}");
+        assert!(tasks.contains("Lines 1-8 of 20"), "{tasks}");
+        // With both closed, Alt+↓ scrolls the tasks.
+        alt(&mut app, 'i');
+        alt_arrow(&mut app, KeyCode::Down);
+        let [_, _, tasks] = notices_and_tasks(&mut app);
+        assert!(tasks.contains("Lines 2-9 of 20"), "{tasks}");
+
+        // A command waits for approval. The tasks close and their place goes to its panel,
+        // which Alt+↓ now scrolls.
+        app.on_thread_event(live(2, "runtime-request.updated", request));
+        let [_, _, tasks] = notices_and_tasks(&mut app);
+        assert!(tasks.is_empty() && !app.tasks.open);
+        assert!(app.panel_area.height > 0);
+        let before = app.panel_scroll;
+        alt_arrow(&mut app, KeyCode::Down);
+        assert_eq!(app.panel_scroll, before + 1);
+        // An open notice takes Alt+↓ back from the panel until it closes.
+        alt(&mut app, 'o');
+        notices_and_tasks(&mut app);
+        let before = app.panel_scroll;
+        alt_arrow(&mut app, KeyCode::Down);
+        assert_eq!(app.panel_scroll, before);
+        let [notice, _, _] = notices_and_tasks(&mut app);
+        assert!(notice.contains("Lines 2-"), "{notice}");
+        alt(&mut app, 'o');
+        let before = app.panel_scroll;
+        alt_arrow(&mut app, KeyCode::Down);
+        assert_eq!(app.panel_scroll, before + 1);
+        assert_eq!(app.composer.text(), "half a reply");
+        // None of it asked T3 for anything.
+        assert_eq!(reads(&runtime), 0);
     }
 }
