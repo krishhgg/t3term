@@ -41,6 +41,7 @@ use ratatui::widgets::{Block, Paragraph};
 use serde_json::Value;
 use unicode_width::UnicodeWidthStr;
 
+use super::environment::{Feed, Identity};
 use super::theme::{self, Theme, monogram, parse_iso_ms, relative_time};
 use super::{fit, row, spinner_frame, str_of, with_bg};
 use crate::projection::{ShellState, is_terminal_status, status};
@@ -706,6 +707,9 @@ pub struct Sidebar {
     drew_working: bool,
     /// The screen row the last frame drew the Working shelf's heading on.
     working_heading: Option<u16>,
+    /// Whether the last frame drew the feed's dot by the wordmark, with the environment
+    /// under it. Without it the breadcrumb's row shows them.
+    drew_environment: bool,
 }
 
 impl Sidebar {
@@ -874,6 +878,12 @@ impl Sidebar {
         self.drew_working
     }
 
+    /// Whether the last frame drew the feed's dot and the environment, which a hidden
+    /// sidebar, or one too narrow for the dot, didn't.
+    pub fn drew_environment(&self) -> bool {
+        self.drew_environment
+    }
+
     /// Whether the list has the Working shelf's heading, which `w` and a click open and close.
     pub fn has_working(&self) -> bool {
         self.working_count > 0
@@ -965,6 +975,7 @@ impl Sidebar {
         self.cards.clear();
         self.drew_working = false;
         self.working_heading = None;
+        self.drew_environment = false;
     }
 
     /// Draws the wordmark, the shelves and the Settled footer, keeping the highlight in view.
@@ -985,6 +996,17 @@ impl Sidebar {
         let inner = Rect::new(area.x + 1, area.y, area.width - 3, area.height);
         let width = inner.width as usize;
 
+        // The wordmark, and the dot for the thread feed with its word while it isn't live and
+        // the row has room. A row too narrow for the dot leaves both to the breadcrumb's row.
+        const WORDMARK: usize = "T3 Code".len();
+        let dot = Style::new().fg(view.feed.dot(t));
+        let word = view.feed.word();
+        let mut right = Vec::with_capacity(3);
+        if view.feed != Feed::Live && WORDMARK + word.width() + 3 <= width {
+            right.extend([Span::styled(word, dot), Span::raw(" ")]);
+        }
+        right.push(Span::styled("●", dot));
+        self.drew_environment = WORDMARK < width;
         let wordmark = row(
             vec![
                 Span::styled(
@@ -993,13 +1015,25 @@ impl Sidebar {
                 ),
                 Span::styled(" Code", Style::new().fg(t.sidebar_muted)),
             ],
-            vec![Span::styled("●", Style::new().fg(view.dot))],
+            right,
             width,
         );
         frame.render_widget(
             Paragraph::new(wordmark),
             Rect::new(inner.x, inner.y, inner.width, 1),
         );
+        // The environment's name and address in the row between the wordmark and the list,
+        // with the dot.
+        if self.drew_environment {
+            let label = Style::new().fg(t.sidebar_muted);
+            let identity = view
+                .environment
+                .spans(width, label, Style::new().fg(t.muted));
+            frame.render_widget(
+                Paragraph::new(Line::from(identity)),
+                Rect::new(inner.x, inner.y + 1, inner.width, 1),
+            );
+        }
 
         // The shelf footer sits on the last row, as in the GUI.
         let footer = Rect::new(inner.x, inner.bottom() - 1, inner.width, 1);
@@ -1134,8 +1168,10 @@ pub struct View<'a> {
     pub focused: bool,
     /// Wall-clock time of the frame, in milliseconds.
     pub now: i64,
-    /// The connection dot's color.
-    pub dot: Color,
+    /// Where the thread feed stands, for the dot by the wordmark.
+    pub feed: Feed,
+    /// The environment, for the row under the wordmark.
+    pub environment: &'a Identity,
 }
 
 impl View<'_> {
@@ -2380,7 +2416,8 @@ mod tests {
             open_id: open,
             focused: true,
             now: now(),
-            dot: theme.success,
+            feed: Feed::Live,
+            environment: &Identity::default(),
         };
         let mut terminal = Terminal::new(TestBackend::new(size.0, size.1)).unwrap();
         let frame = terminal
@@ -2722,7 +2759,8 @@ mod tests {
             open_id: None,
             focused: true,
             now: now(),
-            dot: theme.success,
+            feed: Feed::Live,
+            environment: &Identity::default(),
         };
         let spinner = spinner_frame(now());
         let busy = with(thread("t"), running());
