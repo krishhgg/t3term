@@ -690,3 +690,352 @@ fn delivered_sequence(item: &Value) -> Option<u64> {
         .or_else(|| item.get("snapshot").and_then(|s| s.get("snapshotSequence")))
         .and_then(Value::as_u64)
 }
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+
+    use futures_util::{SinkExt, StreamExt};
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+    use tokio::net::{TcpListener, TcpStream};
+    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::Message;
+    use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
+    use tokio_tungstenite::tungstenite::protocol::Role;
+
+    use super::*;
+    use crate::projection::Applied::{Duplicate, Snapshot, Synchronized};
+    use crate::projection::{Applied, apply_config};
+
+    type Socket = WebSocketStream<TcpStream>;
+    type Events = mpsc::UnboundedReceiver<WatchEvent>;
+
+    const SHELL: &str = "orchestration.subscribeShell";
+    const THREAD: &str = "orchestration.subscribeThread";
+    const CONFIG: &str = "subscribeServerConfig";
+    const SETUP: &str = "subscribeWorktreeSetup";
+
+    /// A client of the fake T3 at `origin`. Like `Client::offline`, it holds no token. Its
+    /// ticket requests ignore proxies, so they reach the fake whatever the environment says.
+    fn client_at(origin: &str) -> Arc<Client> {
+        let mut client = Client::offline();
+        client.runtime.origin = origin.into();
+        client.api = Api::without_proxy(origin);
+        Arc::new(client)
+    }
+
+    /// Plays T3's HTTP side until a WebSocket opens, as `serve_sockets` in tests/cli.rs does.
+    /// Each ticket request gets the next ticket, so the path a socket opens on says how many
+    /// tickets came before it. Returns that path and the socket.
+    async fn open(listener: &TcpListener, tickets: &mut usize) -> (String, Socket) {
+        loop {
+            let (mut stream, _) = listener.accept().await.unwrap();
+            // One byte at a time, so the socket gets every byte after the head.
+            let mut head = Vec::new();
+            while !head.ends_with(b"\r\n\r\n") {
+                head.push(stream.read_u8().await.unwrap());
+            }
+            let head = String::from_utf8(head).unwrap();
+            let path = head.split_whitespace().nth(1).unwrap().to_string();
+            let key = head.lines().find_map(|line| {
+                let (name, value) = line.split_once(':')?;
+                let is_key = name.eq_ignore_ascii_case("sec-websocket-key");
+                is_key.then(|| value.trim().to_string())
+            });
+            if let Some(key) = key {
+                let accept = derive_accept_key(key.as_bytes());
+                let reply = format!(
+                    "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
+                );
+                stream.write_all(reply.as_bytes()).await.unwrap();
+                let socket = WebSocketStream::from_raw_socket(stream, Role::Server, None).await;
+                return (path, socket);
+            }
+            let ticket = head.starts_with("POST /api/auth/websocket-ticket ");
+            assert!(ticket, "{head}");
+            *tickets += 1;
+            let body = json!({"ticket": format!("ticket-{tickets}")}).to_string();
+            let reply = format!(
+                "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                body.len()
+            );
+            stream.write_all(reply.as_bytes()).await.unwrap();
+        }
+    }
+
+    /// The next frame from t3term other than a ping. Fails the test after five seconds.
+    async fn recv(socket: &mut Socket) -> Value {
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
+                .await
+                .expect("a frame within five seconds")
+                .expect("an open socket")
+                .unwrap();
+            if let Message::Text(text) = frame {
+                let value: Value = serde_json::from_str(&text).unwrap();
+                if value["_tag"] != "Ping" {
+                    return value;
+                }
+            }
+        }
+    }
+
+    /// The four subscriptions' requests on a new socket, by tag. They can come in any order,
+    /// and each comes once.
+    async fn requests(socket: &mut Socket) -> HashMap<String, Value> {
+        let mut requests = HashMap::new();
+        while requests.len() < 4 {
+            let request = recv(socket).await;
+            assert_eq!(request["_tag"], "Request", "{request}");
+            let tag = request["tag"].as_str().unwrap().to_string();
+            let earlier = requests.insert(tag, request.clone());
+            assert!(earlier.is_none(), "{request} came twice");
+        }
+        requests
+    }
+
+    /// The id of the request for `tag`, once it is checked to ask for exactly `payload`.
+    fn id(requests: &HashMap<String, Value>, tag: &str, payload: Value) -> Value {
+        let id = requests[tag]["id"].clone();
+        let expected = json!({
+            "_tag": "Request", "id": id, "tag": tag, "payload": payload, "headers": []
+        });
+        assert_eq!(requests[tag], expected);
+        id
+    }
+
+    /// Sends `values` on the stream of request `id`, and checks that t3term acks the chunk.
+    async fn chunk(socket: &mut Socket, id: &Value, values: Value) {
+        let chunk = json!({"_tag": "Chunk", "requestId": id, "values": values});
+        let frame = Message::Text(chunk.to_string().into());
+        socket.send(frame).await.unwrap();
+        let ack = json!({"_tag": "Ack", "requestId": id});
+        assert_eq!(recv(socket).await, ack);
+    }
+
+    /// What t3term sends when it drops the stream of request `id`.
+    fn interrupt(id: &Value) -> Value {
+        json!({"_tag": "Interrupt", "requestId": id, "interruptors": []})
+    }
+
+    /// The watch's next event. Fails the test after five seconds, or if the watch stopped.
+    async fn next_event(events: &mut Events) -> WatchEvent {
+        tokio::time::timeout(Duration::from_secs(5), events.recv())
+            .await
+            .expect("a watch event within five seconds")
+            .expect("a watch that goes on")
+    }
+
+    /// The watch's next `count` events, each of them an item.
+    async fn items(events: &mut Events, count: usize) -> Vec<Value> {
+        let mut items = Vec::new();
+        while items.len() < count {
+            match next_event(events).await {
+                WatchEvent::Item(item) => items.push(item),
+                other => panic!("expected an item, got {other:?}"),
+            }
+        }
+        items
+    }
+
+    /// Checks that the watch's next event reports the dropped connection.
+    async fn reconnecting(events: &mut Events) {
+        match next_event(events).await {
+            WatchEvent::Reconnecting { reason, retry_in } => {
+                assert!(reason.starts_with("T3 connection lost"), "{reason}");
+                assert_eq!(retry_in, Duration::from_millis(250));
+            }
+            other => panic!("expected a reconnect, got {other:?}"),
+        }
+    }
+
+    fn renamed(sequence: u64, id: &str, title: &str) -> Value {
+        let thread = json!({"id": id, "title": title});
+        json!({"kind": "thread.updated", "sequence": sequence, "thread": thread})
+    }
+
+    fn reply(sequence: u64, text: &str) -> Value {
+        let item = json!({"id": "a1", "type": "assistant_message", "ordinal": 1, "text": text});
+        let event = json!({"type": "turn-item.updated", "payload": item});
+        json!({"kind": "event", "sequence": sequence, "event": event})
+    }
+
+    /// A config snapshot that lists the providers `ids`.
+    fn config(ids: &[&str]) -> Value {
+        let config = json!({"providers": providers(ids), "settings": {}});
+        json!({"version": 1, "type": "snapshot", "config": config})
+    }
+
+    fn providers(ids: &[&str]) -> Value {
+        ids.iter()
+            .map(|id| json!({"instanceId": id, "status": "ready"}))
+            .collect()
+    }
+
+    /// A setup with the fields the watcher checks. `sequence` counts this setup's changes.
+    fn setup(sequence: u64) -> Value {
+        json!({"threadId": "t1", "phase": "running", "stages": [], "sequence": sequence})
+    }
+
+    /// The ids of the providers in the configuration held.
+    fn provider_ids(held: &Option<Value>) -> Vec<&str> {
+        let config = held.as_ref().unwrap();
+        let providers = config["providers"].as_array().unwrap();
+        providers
+            .iter()
+            .map(|provider| provider["instanceId"].as_str().unwrap())
+            .collect()
+    }
+
+    /// The four watches the TUI runs for an open thread share the connection `Client::rpc`
+    /// holds. When it drops, each watch says so once, and all four come back on one new
+    /// connection with one request each. The shell and thread streams resume after the last
+    /// sequence they delivered, and the config and setup streams ask again with no cursor. The
+    /// watcher passes on whatever T3 sends, and the reducers drop what they already have.
+    #[tokio::test]
+    async fn shared_watches_come_back_on_one_new_connection_after_a_drop() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let client = client_at(&origin);
+        let shell_payload = json!({"requestCompletionMarker": true});
+        let thread_payload = json!({
+            "threadId": "t1", "requestCompletionMarker": true, "acceptBoundedSnapshot": true
+        });
+
+        let server = tokio::spawn(async move {
+            let synchronized = json!({"kind": "synchronized"});
+            let mut tickets = 0;
+            let (path, mut socket) = open(&listener, &mut tickets).await;
+            assert_eq!(path, "/ws?wsTicket=ticket-1&orchestrationProtocol=2");
+            let asked = requests(&mut socket).await;
+            let shell_id = id(&asked, SHELL, shell_payload.clone());
+            let thread_id = id(&asked, THREAD, thread_payload.clone());
+            let config_id = id(&asked, CONFIG, json!({}));
+            let setup_id = id(&asked, SETUP, json!({"threadId": "t1"}));
+            let threads = json!([{"id": "t1", "title": "First"}]);
+            let snapshot = json!({"snapshotSequence": 5, "projects": [], "threads": threads});
+            let snapshot = json!({"kind": "snapshot", "snapshot": snapshot});
+            let values = json!([snapshot, synchronized, renamed(6, "t1", "Renamed")]);
+            chunk(&mut socket, &shell_id, values).await;
+            let user = json!({"id": "u1", "type": "user_message", "ordinal": 0, "text": "hi"});
+            let projection = json!({"thread": {"id": "t1"}, "turnItems": [user]});
+            let snapshot =
+                json!({"kind": "snapshot", "snapshotSequence": 10, "projection": projection});
+            let values = json!([snapshot, reply(11, "Hel"), synchronized]);
+            chunk(&mut socket, &thread_id, values).await;
+            chunk(&mut socket, &config_id, json!([config(&["codex"])])).await;
+            chunk(&mut socket, &setup_id, json!([setup(7)])).await;
+            // T3 goes away without closing the socket.
+            drop(socket);
+
+            // One more ticket, and one new socket carries all four again.
+            let (path, mut socket) = open(&listener, &mut tickets).await;
+            assert_eq!(path, "/ws?wsTicket=ticket-2&orchestrationProtocol=2");
+            let asked = requests(&mut socket).await;
+            let mut resumed = shell_payload;
+            resumed["afterSequence"] = json!(6);
+            let shell_id = id(&asked, SHELL, resumed);
+            let mut resumed = thread_payload;
+            resumed["afterSequence"] = json!(11);
+            let thread_id = id(&asked, THREAD, resumed);
+            let config_id = id(&asked, CONFIG, json!({}));
+            let setup_id = id(&asked, SETUP, json!({"threadId": "t1"}));
+            // Each orchestration stream sends again the last event the client had.
+            let replayed = renamed(6, "t1", "Renamed");
+            let values = json!([replayed, renamed(7, "t2", "Second"), synchronized]);
+            chunk(&mut socket, &shell_id, values).await;
+            let values = json!([reply(11, "Hel"), reply(12, "Hello"), synchronized]);
+            chunk(&mut socket, &thread_id, values).await;
+            let values = json!([config(&["codex", "claude"])]);
+            chunk(&mut socket, &config_id, values).await;
+            // The setup's count goes lower after the drop, and starts over after a null.
+            let values = json!([setup(3), null, setup(0)]);
+            chunk(&mut socket, &setup_id, values).await;
+
+            // The client drops the setup watch, and that interrupts the setup stream alone.
+            assert_eq!(recv(&mut socket).await, interrupt(&setup_id));
+            let values = json!([renamed(8, "t2", "Third")]);
+            chunk(&mut socket, &shell_id, values).await;
+            let values = json!([reply(13, "Hello world")]);
+            chunk(&mut socket, &thread_id, values).await;
+            let payload = json!({"providers": providers(&["claude"])});
+            let statuses = json!({"version": 1, "type": "providerStatuses", "payload": payload});
+            chunk(&mut socket, &config_id, json!([statuses])).await;
+            let mut ended = Vec::new();
+            for _ in 0..3 {
+                ended.push(recv(&mut socket).await);
+            }
+            for request in [&shell_id, &thread_id, &config_id] {
+                assert!(ended.contains(&interrupt(request)), "{ended:?}");
+            }
+        });
+
+        let mut shell_events = client.watch_shell(None);
+        let mut thread_events = client.watch_thread("t1", None);
+        let mut config_events = client.watch_config();
+        let mut setup_events = client.watch_worktree_setup("t1");
+
+        let rename = Applied::Event("thread.updated".into());
+        let mut shell = ShellState::default();
+        let mut apply_shell = |items: Vec<Value>| -> Vec<Applied> {
+            items.iter().map(|item| shell.apply(item)).collect()
+        };
+        let applied = apply_shell(items(&mut shell_events, 3).await);
+        assert_eq!(applied, [Snapshot, Synchronized, rename.clone()]);
+        reconnecting(&mut shell_events).await;
+        let applied = apply_shell(items(&mut shell_events, 3).await);
+        assert_eq!(applied, [Duplicate, rename.clone(), Synchronized]);
+
+        let delta = Applied::Event("turn-item.updated".into());
+        let mut thread = ThreadState::default();
+        let mut apply_thread = |items: Vec<Value>| -> Vec<Applied> {
+            items.iter().map(|item| thread.apply(item)).collect()
+        };
+        let applied = apply_thread(items(&mut thread_events, 3).await);
+        assert_eq!(applied, [Snapshot, delta.clone(), Synchronized]);
+        reconnecting(&mut thread_events).await;
+        let applied = apply_thread(items(&mut thread_events, 3).await);
+        assert_eq!(applied, [Duplicate, delta.clone(), Synchronized]);
+
+        let mut held = None;
+        let first = items(&mut config_events, 1).await;
+        assert_eq!(apply_config(&mut held, &first[0]), Snapshot);
+        reconnecting(&mut config_events).await;
+        let again = items(&mut config_events, 1).await;
+        assert_eq!(apply_config(&mut held, &again[0]), Snapshot);
+        assert_eq!(provider_ids(&held), ["codex", "claude"]);
+
+        assert_eq!(items(&mut setup_events, 1).await, [setup(7)]);
+        reconnecting(&mut setup_events).await;
+        let restarted = items(&mut setup_events, 3).await;
+        assert_eq!(restarted, [setup(3), Value::Null, setup(0)]);
+        drop(setup_events);
+
+        // The other three go on over the same socket, with no reconnect.
+        let next = items(&mut shell_events, 1).await;
+        assert_eq!(shell.apply(&next[0]), rename);
+        let next = items(&mut thread_events, 1).await;
+        assert_eq!(thread.apply(&next[0]), delta);
+        let next = items(&mut config_events, 1).await;
+        let changed = Applied::Event("providerStatuses".into());
+        assert_eq!(apply_config(&mut held, &next[0]), changed);
+
+        // T3 sent some events twice, and none of them changed the state twice.
+        let first = json!({"id": "t1", "title": "Renamed"});
+        let second = json!({"id": "t2", "title": "Third"});
+        assert_eq!(shell.threads, [first, second]);
+        assert_eq!(shell.sequence, 8);
+        let shown = thread.items();
+        assert_eq!(shown.len(), 2);
+        assert_eq!(shown[0]["text"], "hi");
+        assert_eq!(shown[1]["text"], "Hello world");
+        assert_eq!(thread.sequence, 13);
+        assert_eq!(provider_ids(&held), ["claude"]);
+
+        drop((shell_events, thread_events, config_events));
+        tokio::time::timeout(Duration::from_secs(5), server)
+            .await
+            .expect("the server saw every interrupt")
+            .unwrap();
+    }
+}

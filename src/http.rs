@@ -24,6 +24,17 @@ impl Api {
         }
     }
 
+    /// An `Api` with no token for tests that talk to a fake T3 on 127.0.0.1. Its client
+    /// ignores every proxy setting, so a proxy in the test's environment can't take a request.
+    #[cfg(test)]
+    pub(crate) fn without_proxy(origin: &str) -> Self {
+        Self {
+            origin: origin.to_string(),
+            token: String::new(),
+            http: reqwest::Client::builder().no_proxy().build().unwrap(),
+        }
+    }
+
     pub async fn request(
         &self,
         method: reqwest::Method,
