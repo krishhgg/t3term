@@ -333,7 +333,7 @@ fn elapsed(started: Option<i64>, ended: End, now: i64) -> Option<String> {
 /// trimmed, and cut with `…` after `max` characters where `clusters` finds a place, so an
 /// accent stays on its letter and an emoji stays whole. It reads at most four characters for
 /// each it keeps, so a long string costs no more than one at the limit.
-fn bounded(text: &str, max: usize) -> String {
+pub(super) fn bounded(text: &str, max: usize) -> String {
     let (head, longer) = match text.char_indices().nth(max.saturating_mul(4)) {
         Some((at, _)) => (&text[..at], true),
         None => (text, false),
@@ -371,7 +371,7 @@ fn tail_line(line: &str) -> String {
 
 /// `text` cut in the middle with `…` to at most `width` columns, as the desktop's
 /// `MiddleTruncate` shows a branch or a path, so both its start and its end stay.
-fn middle(text: &str, width: usize) -> String {
+pub(super) fn middle(text: &str, width: usize) -> String {
     let pieces = clusters(text);
     if pieces.iter().map(|piece| piece.width()).sum::<usize>() <= width {
         return text.to_string();

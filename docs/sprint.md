@@ -38,6 +38,7 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 | 16 | https://github.com/krishhgg/t3term/pull/25 | A banner over the conversation, above the thread's error, when the provider the composer would send with isn't ready or runs a version T3 marks broken or unsupported | |
 | 17 | https://github.com/krishhgg/t3term/pull/26 | Worktree setup stream foundation: a client watcher for one thread's `subscribeWorktreeSetup`, for the setup card that comes next. Nothing in the TUI or CLI shows a setup yet | |
 | 18 | https://github.com/krishhgg/t3term/pull/27 | The open thread's worktree setup as a read-only card under its first prompt: stage progress, the setup script's last output and Details. No Cancel, Work locally, terminal or worktree preparation | |
+| 19 | https://github.com/krishhgg/t3term/pull/28 | The environment's label, host and port under the sidebar's wordmark, and a dot that follows the sidebar's own feed, not the open thread's watch. The breadcrumb's row shows both while the sidebar is hidden. No environment list or selector | |
 
 ## Maintenance review PRs
 

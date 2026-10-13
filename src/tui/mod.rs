@@ -8,6 +8,7 @@
 
 mod banner;
 mod composer;
+mod environment;
 mod markdown;
 mod picker;
 mod plan;
@@ -44,6 +45,7 @@ use crate::projection::{Applied, ShellState, ThreadState, apply_config, is_activ
 use crate::settings::Settings;
 use crate::transcript::{self, BlockKind, ChangeLine};
 use composer::Composer;
+use environment::{Feed, Identity};
 use markdown::Styles;
 use picker::{Item, Kind, Pick};
 use scroll::{Pin, Scroll};
@@ -71,6 +73,9 @@ const NARROWEST_SIDEBAR: u16 = 20;
 const NARROWEST_MAIN: u16 = 20;
 /// How far `[` and `]` move the sidebar's edge, in columns.
 const SIDEBAR_STEP: u16 = 2;
+/// The columns of the thread's title the breadcrumb keeps before it gives any to the
+/// environment, while the sidebar doesn't show the environment.
+const KEPT_TITLE: usize = 16;
 
 /// Opens T3's worktree setup subscription for a thread: `Client::watch_worktree_setup`, or a
 /// test's stand-in.
@@ -428,7 +433,12 @@ struct App {
     unsent: Unsent,
     picker: Option<Picker>,
     shell: Option<ShellState>,
-    shell_connection: String,
+    /// Where the sidebar's thread feed stands, which the sidebar's dot shows. The open
+    /// thread's watch keeps its own state.
+    feed: Feed,
+    /// The environment's name and address from discovery, cleaned once, for the sidebar's
+    /// header, or the end of the breadcrumb row while the sidebar doesn't show it.
+    environment: Identity,
     sidebar: Sidebar,
     /// Whether the sidebar is hidden, which gives the main column its width. Saved between
     /// runs. Focus never rests on a hidden sidebar.
@@ -718,6 +728,7 @@ impl App {
         actions: mpsc::UnboundedSender<ActionResult>,
     ) -> App {
         let watcher = client.clone();
+        let environment = Identity::new(client.runtime.label.as_deref(), &client.runtime.origin);
         App {
             client,
             theme,
@@ -728,7 +739,8 @@ impl App {
             unsent: Unsent::default(),
             picker: None,
             shell: None,
-            shell_connection: "connecting".into(),
+            feed: Feed::Connecting,
+            environment,
             sidebar: Sidebar::with_working(
                 settings.sidebar_working_shelf_enabled,
                 settings.sidebar_working_shelf_expanded,
@@ -786,7 +798,7 @@ impl App {
                     .get_or_insert_with(ShellState::default)
                     .apply(&item);
                 if item["kind"] == "synchronized" {
-                    self.shell_connection = "live".into();
+                    self.feed = Feed::Live;
                 }
                 self.rebuild_rows();
                 self.settle_draft();
@@ -795,8 +807,14 @@ impl App {
                 // It has the thread's worktree path too.
                 self.follow_setup();
             }
-            WatchEvent::Reconnecting { .. } => self.shell_connection = "reconnecting".into(),
-            WatchEvent::Failed(message) => self.message = Some((message, true)),
+            // The sidebar keeps the rows it has until the new subscription catches up.
+            WatchEvent::Reconnecting { .. } => self.feed = Feed::Reconnecting,
+            // The watcher stopped, so the rows stay as they were until t3term restarts. The
+            // message goes with the next key, and the dot stays.
+            WatchEvent::Failed(message) => {
+                self.feed = Feed::Failed;
+                self.message = Some((message, true));
+            }
         }
     }
 
@@ -2215,11 +2233,13 @@ impl App {
             .or_else(|| open.state.as_ref().map(ThreadState::thread))
     }
 
+    /// The connection the status line names: the open thread's watch, or the sidebar's feed
+    /// while no thread is open. The sidebar's dot is always the feed's.
     fn connection_state(&self) -> (String, Color) {
         let t = &self.theme;
         let connection = match self.open.as_ref() {
             Some(open) => open.connection.clone(),
-            None => self.shell_connection.clone(),
+            None => self.feed.word().to_string(),
         };
         let color = match connection.as_str() {
             "live" => t.success,
@@ -2245,14 +2265,14 @@ impl App {
         if self.sidebar_hidden {
             self.sidebar.forget_drawn();
         } else {
-            let (_, dot) = self.connection_state();
             let view = View {
                 theme: &self.theme,
                 shell: self.shell.as_ref(),
                 open_id: self.open.as_ref().map(|o| o.id.as_str()),
                 focused: self.focus == Focus::Sidebar,
                 now: self.now,
-                dot,
+                feed: self.feed,
+                environment: &self.environment,
             };
             self.sidebar.draw(frame, sidebar, &view);
         }
@@ -2316,8 +2336,11 @@ impl App {
             width: header.width.saturating_sub(self.sidebar_toggle.width + 1),
             ..header
         };
+        // A hidden sidebar, or one too narrow for its dot, leaves the environment to the
+        // breadcrumb's row.
+        let with_environment = !self.sidebar.drew_environment();
         frame.render_widget(
-            Paragraph::new(self.header_line(breadcrumb.width as usize)),
+            Paragraph::new(self.header_line(breadcrumb.width as usize, with_environment)),
             breadcrumb,
         );
         self.transcript_area = body;
@@ -2362,44 +2385,56 @@ impl App {
         );
     }
 
-    /// The GUI's breadcrumb: project, a slash, the thread title.
-    fn header_line(&self, width: usize) -> Line<'static> {
+    /// The GUI's breadcrumb: project, a slash, the thread title, and the open thread's watch at
+    /// the end while it isn't live. With `with_environment`, when the sidebar doesn't show it, the
+    /// row ends with the feed's dot and the environment, as `environment::chip` lays them out,
+    /// in at most a third of the row and what the title leaves after its first `KEPT_TITLE`
+    /// columns.
+    fn header_line(&self, width: usize, with_environment: bool) -> Line<'static> {
         let t = &self.theme;
         let muted = Style::new().fg(t.muted);
-        let Some(open) = self.open.as_ref() else {
-            return Line::styled("Pick a thread in the sidebar", muted);
+        let (mut left, title, title_style, mut right) = match self.open.as_ref() {
+            None => {
+                let hint = String::from("Pick a thread in the sidebar");
+                (Vec::new(), hint, muted, Vec::new())
+            }
+            Some(open) => match self.open_thread_json() {
+                None => (Vec::new(), String::from("Loading…"), muted, Vec::new()),
+                Some(thread) => {
+                    let project = self.project_title(str_of(thread, "projectId"));
+                    let badge = monogram(&project);
+                    let color = t.project_color(&project);
+                    let left = vec![
+                        Span::styled(badge, Style::new().fg(color).add_modifier(Modifier::BOLD)),
+                        Span::styled(format!(" {project}"), muted),
+                        Span::styled("  /  ", Style::new().fg(t.border_strong)),
+                    ];
+                    let right = if open.connection == "live" {
+                        Vec::new()
+                    } else {
+                        vec![Span::styled(
+                            open.connection.clone(),
+                            Style::new().fg(t.warning_fg),
+                        )]
+                    };
+                    let title: String = str_of(thread, "title").into();
+                    (left, title, Style::new().fg(t.fg), right)
+                }
+            },
         };
-        let Some(thread) = self.open_thread_json() else {
-            return Line::styled("Loading…", muted);
-        };
-        let project = self.project_title(str_of(thread, "projectId"));
-        let title = str_of(thread, "title").to_string();
-        let badge = monogram(&project);
-        let right = if open.connection == "live" {
-            Vec::new()
-        } else {
-            vec![Span::styled(
-                open.connection.clone(),
-                Style::new().fg(t.warning_fg),
-            )]
-        };
+        let left_width: usize = left.iter().map(|s| s.content.width()).sum();
+        // `fit` can run a column over after a wide character, so a title leaves one spare.
+        let lead = left_width + usize::from(!left.is_empty());
+        if with_environment {
+            let state: usize = right.iter().map(|s| s.content.width()).sum();
+            let kept = title.width().min(KEPT_TITLE);
+            let room = width.saturating_sub(lead + state + kept).min(width / 3);
+            right.extend(environment::chip(&self.environment, self.feed, room, t));
+        }
         let right_width: usize = right.iter().map(|s| s.content.width()).sum();
-        let room = width.saturating_sub(badge.width() + project.width() + 7 + right_width);
-        row(
-            vec![
-                Span::styled(
-                    badge,
-                    Style::new()
-                        .fg(t.project_color(&project))
-                        .add_modifier(Modifier::BOLD),
-                ),
-                Span::styled(format!(" {project}"), muted),
-                Span::styled("  /  ", Style::new().fg(t.border_strong)),
-                Span::styled(fit(&title, room), Style::new().fg(t.fg)),
-            ],
-            right,
-            width,
-        )
+        let room = width.saturating_sub(lead + right_width);
+        left.push(Span::styled(fit(&title, room), title_style));
+        row(left, right, width)
     }
 
     /// Draws the provider banner over the top rows of `body`, the transcript's, and the thread
@@ -4450,7 +4485,8 @@ mod tests {
                 open_id: None,
                 focused: false,
                 now: now_ms(),
-                dot: theme.success,
+                feed: Feed::Live,
+                environment: &Identity::default(),
             };
             let mut terminal = Terminal::new(TestBackend::new(30, 12)).unwrap();
             terminal
@@ -8880,5 +8916,462 @@ mod tests {
         let prompt = row_showing(&rows, "Fix the login page");
         assert!(row_showing(&rows, "Looking at the login page") < prompt);
         assert!(prompt < row_showing(&rows, "Setting up worktree…"));
+    }
+
+    // ---- the environment and the sidebar's feed ----
+
+    /// The TUI as `tui` starts it with no settings file, connected to `origin`, which
+    /// discovery read with the descriptor's `label`.
+    fn tui_at(label: Option<&str>, origin: &str) -> App {
+        let mut client = Client::offline();
+        client.runtime.label = label.map(str::to_string);
+        client.runtime.origin = origin.to_string();
+        let mut app = App::new(
+            Arc::new(client),
+            Theme::new(Depth::TrueColor),
+            &Settings::default(),
+            mpsc::unbounded_channel().0,
+        );
+        app.watch_setup = Box::new(|_: &str| mpsc::unbounded_channel().1);
+        app
+    }
+
+    /// T3's marker that the sidebar's feed has caught up.
+    fn caught_up() -> WatchEvent {
+        WatchEvent::Item(json!({"kind": "synchronized"}))
+    }
+
+    /// The sidebar's feed dropping, as its watcher says before it subscribes again.
+    fn shell_dropped() -> WatchEvent {
+        WatchEvent::Reconnecting {
+            reason: "T3 connection lost: socket ended".into(),
+            retry_in: Duration::from_millis(250),
+        }
+    }
+
+    /// What one frame draws around the conversation.
+    #[derive(Debug)]
+    struct Chrome {
+        /// The sidebar's top row, with the wordmark and the dot.
+        wordmark: String,
+        /// The sidebar's row under it.
+        environment: String,
+        /// The sidebar's list.
+        list: String,
+        /// The main column's top row, with the toggle and the breadcrumb.
+        header: String,
+        /// The main column's bottom row.
+        status: String,
+        /// The colors of the dots in the sidebar's top row and the main column's.
+        sidebar_dot: Option<Color>,
+        header_dot: Option<Color>,
+    }
+
+    /// Draws one frame `width` columns by `height` rows and reads its chrome.
+    fn chrome(app: &mut App, width: u16, height: u16) -> Chrome {
+        let buffer = cells(app, width, height);
+        // The main column starts after the sidebar's edge, at 0 with the sidebar hidden.
+        let main = app.sidebar.border.right();
+        let dot = |columns: std::ops::Range<u16>| {
+            columns
+                .map(|x| &buffer[(x, 0)])
+                .find(|cell| cell.symbol() == "●")
+                .map(|cell| cell.fg)
+        };
+        Chrome {
+            wordmark: text_in(&buffer, Rect::new(0, 0, main, 1)),
+            environment: text_in(&buffer, Rect::new(0, 1, main, 1)),
+            list: text_in(&buffer, app.sidebar.list),
+            header: text_in(&buffer, Rect::new(main, 0, width - main, 1)),
+            status: text_in(&buffer, Rect::new(main, height - 1, width - main, 1)),
+            sidebar_dot: dot(0..main),
+            header_dot: dot(main..width),
+        }
+    }
+
+    #[test]
+    fn the_sidebar_dot_follows_its_feed_and_not_the_open_thread() {
+        let mut app = tui_at(Some("Studio Mac"), "http://127.0.0.1:3773");
+        let (emerald, warning) = (app.theme.emerald, app.theme.warning);
+        // Until T3 says the feed caught up, the dot is amber and says why, after the
+        // snapshot too. With no thread open, the status line names the feed.
+        let listing = shell_snapshot(vec![listed("t", "Fix the login page", "idle")]);
+        for event in [None, Some(listing)] {
+            if let Some(event) = event {
+                app.on_shell_event(event);
+            }
+            let drawn = chrome(&mut app, 80, 24);
+            assert!(drawn.wordmark.contains("connecting ●"), "{drawn:?}");
+            assert_eq!(drawn.sidebar_dot, Some(warning));
+            assert!(drawn.status.contains("● connecting  ·"), "{drawn:?}");
+        }
+        app.on_shell_event(caught_up());
+        let drawn = chrome(&mut app, 80, 24);
+        assert!(!drawn.wordmark.contains("connecting"), "{drawn:?}");
+        assert_eq!(drawn.sidebar_dot, Some(emerald));
+        assert!(drawn.status.contains("● live  ·"), "{drawn:?}");
+        assert_eq!(drawn.environment.trim(), "Studio Mac");
+
+        // The open thread's watch closes. The status line and the breadcrumb say so, and the
+        // sidebar's dot stays green for the feed that is still live.
+        app.open_thread(long_thread());
+        let drawn = chrome(&mut app, 80, 24);
+        assert!(!drawn.header.contains("closed"), "{drawn:?}");
+        app.on_thread_event(WatchEvent::Failed("thread closed".into()));
+        press(&mut app, KeyCode::End);
+        let drawn = chrome(&mut app, 80, 24);
+        assert!(drawn.status.contains("● closed  ·"), "{drawn:?}");
+        assert!(drawn.header.contains("Fix the login"), "{drawn:?}");
+        assert!(drawn.header.trim_end().ends_with("closed"), "{drawn:?}");
+        assert_eq!(drawn.header_dot, None, "the sidebar shows the environment");
+        assert!(!drawn.wordmark.contains("closed"), "{drawn:?}");
+        assert_eq!(drawn.sidebar_dot, Some(emerald));
+        assert_eq!(drawn.environment.trim(), "Studio Mac");
+    }
+
+    #[test]
+    fn a_dropped_or_closed_feed_shows_beside_a_live_thread() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = tui_at(Some("Studio Mac"), "http://127.0.0.1:3773");
+        let (emerald, warning, error) = (app.theme.emerald, app.theme.warning, app.theme.error);
+        let listing = || shell_snapshot(vec![listed("t", "Fix the login page", "idle")]);
+        app.on_shell_event(listing());
+        app.on_shell_event(caught_up());
+        app.open_thread(long_thread());
+        let started = reads(&runtime);
+
+        // The feed drops while the thread's watch stays live. The sidebar says so and keeps
+        // its rows and the environment. The status line and the breadcrumb are the thread's.
+        app.on_shell_event(shell_dropped());
+        let drawn = chrome(&mut app, 80, 24);
+        assert!(drawn.wordmark.contains("reconnecting ●"), "{drawn:?}");
+        assert_eq!(drawn.sidebar_dot, Some(warning));
+        assert!(drawn.list.contains("Fix the"), "{drawn:?}");
+        assert!(drawn.environment.contains("Studio Mac"), "{drawn:?}");
+        assert!(drawn.status.contains("● live  ·"), "{drawn:?}");
+        assert!(!drawn.header.contains("connecting"), "{drawn:?}");
+        // A snapshot after the reconnect isn't enough. The dot turns green when T3 says the
+        // feed caught up.
+        app.on_shell_event(listing());
+        let drawn = chrome(&mut app, 80, 24);
+        assert!(drawn.wordmark.contains("reconnecting ●"), "{drawn:?}");
+        app.on_shell_event(caught_up());
+        let drawn = chrome(&mut app, 80, 24);
+        assert!(!drawn.wordmark.contains("connecting"), "{drawn:?}");
+        assert_eq!(drawn.sidebar_dot, Some(emerald));
+
+        // T3 refuses the feed for good. The toast says why. Once a key takes it, the sidebar
+        // still says the feed closed, beside the thread that is still live.
+        let refused = "unknown method: orchestration.subscribeShell";
+        app.on_shell_event(WatchEvent::Failed(refused.into()));
+        let drawn = chrome(&mut app, 80, 24);
+        assert!(drawn.status.contains(refused), "{drawn:?}");
+        assert!(drawn.wordmark.contains("closed ●"), "{drawn:?}");
+        press(&mut app, KeyCode::End);
+        let drawn = chrome(&mut app, 80, 24);
+        assert!(drawn.status.contains("● live  ·"), "{drawn:?}");
+        assert!(drawn.wordmark.contains("closed ●"), "{drawn:?}");
+        assert_eq!(drawn.sidebar_dot, Some(error));
+        assert!(drawn.list.contains("Fix the"), "{drawn:?}");
+        assert!(drawn.environment.contains("Studio Mac"), "{drawn:?}");
+
+        // With the sidebar hidden, the breadcrumb's row shows the feed's state instead.
+        ctrl_b(&mut app);
+        let drawn = chrome(&mut app, 120, 24);
+        assert_eq!(drawn.header_dot, Some(error));
+        assert!(drawn.header.contains("● closed · Studio Mac"), "{drawn:?}");
+        assert!(drawn.header.contains("Fix the login page"), "{drawn:?}");
+        assert!(drawn.status.contains("● live  ·"), "{drawn:?}");
+        // None of it asked T3 for anything or needs the tick.
+        assert_eq!(reads(&runtime), started);
+        assert!(!needs_tick(app.open.as_ref(), &app.sidebar));
+    }
+
+    #[test]
+    fn with_no_thread_open_the_status_line_names_the_feed() {
+        let mut app = tui_at(Some("Studio Mac"), "http://127.0.0.1:3773");
+        app.on_shell_event(caught_up());
+        app.on_shell_event(shell_dropped());
+        let drawn = chrome(&mut app, 80, 24);
+        assert!(drawn.status.contains("● reconnecting  ·"), "{drawn:?}");
+        app.on_shell_event(WatchEvent::Failed("T3 refused the subscription".into()));
+        // The feed's watcher has stopped, so the state stays closed through later keys and
+        // frames.
+        for _ in 0..2 {
+            press(&mut app, KeyCode::End);
+            let drawn = chrome(&mut app, 80, 24);
+            assert!(drawn.status.contains("● closed  ·"), "{drawn:?}");
+            assert!(drawn.wordmark.contains("closed ●"), "{drawn:?}");
+            assert_eq!(drawn.sidebar_dot, Some(app.theme.error));
+        }
+    }
+
+    #[test]
+    fn the_environment_shows_without_the_sidebar_and_never_its_credentials() {
+        let origin = "http://alice:hunter2@127.0.0.1:3773/private-path?token=sekrit#frag";
+        let mut app = tui_at(Some("Studio Mac"), origin);
+        app.on_shell_event(caught_up());
+        // With the sidebar, it is under the wordmark, and the breadcrumb's row doesn't
+        // repeat it.
+        let drawn = chrome(&mut app, 120, 24);
+        assert_eq!(drawn.environment.trim(), "Studio Mac · 127.0.0.1:3773");
+        assert_eq!(drawn.header_dot, None);
+        assert!(!drawn.header.contains("Studio"), "{drawn:?}");
+        let drawn = chrome(&mut app, 40, 24);
+        assert_eq!(drawn.environment.trim(), "Studio Mac");
+
+        // Hidden, the breadcrumb's row ends with the dot and as much of the environment as a
+        // third of the row holds, after the first 16 columns of the title.
+        ctrl_b(&mut app);
+        let drawn = chrome(&mut app, 120, 24);
+        let header = drawn.header.trim_end();
+        assert!(
+            header.ends_with("  ● Studio Mac · 127.0.0.1:3773"),
+            "{header:?}"
+        );
+        assert!(
+            header.contains("Pick a thread in the sidebar"),
+            "{header:?}"
+        );
+        assert_eq!(drawn.header_dot, Some(app.theme.emerald));
+        let header = chrome(&mut app, 80, 24).header;
+        assert!(header.trim_end().ends_with("  ● Studio Mac"), "{header:?}");
+        assert!(
+            header.contains("Pick a thread in the sidebar"),
+            "{header:?}"
+        );
+        let header = chrome(&mut app, 40, 24).header;
+        assert!(header.trim_end().ends_with("  ● Studio…"), "{header:?}");
+        assert!(header.contains("Pick a thread in the s…"), "{header:?}");
+        // Too narrow for it beside the title's 16 columns, the row is the title's.
+        let drawn = chrome(&mut app, 24, 24);
+        assert_eq!(drawn.header_dot, None);
+        assert!(drawn.header.contains("Pick a thread in"), "{drawn:?}");
+
+        // At no width, hidden or shown, does any of the origin but its host and port show.
+        for hidden in [true, false] {
+            for width in [24, 40, 80, 120, 200] {
+                let rows = screen(&mut app, width, 24).join("\n");
+                for secret in [
+                    "alice",
+                    "hunter2",
+                    "private-path",
+                    "token",
+                    "sekrit",
+                    "frag",
+                ] {
+                    assert!(
+                        !rows.contains(secret),
+                        "{hidden} {width}: {secret} in {rows}"
+                    );
+                }
+            }
+            if hidden {
+                ctrl_b(&mut app);
+            }
+        }
+        // Shown again, it is back under the wordmark.
+        let drawn = chrome(&mut app, 120, 24);
+        assert_eq!(drawn.environment.trim(), "Studio Mac · 127.0.0.1:3773");
+        assert_eq!(drawn.header_dot, None);
+    }
+
+    #[test]
+    fn without_a_label_the_address_stands_in_and_without_either_the_dot_is_alone() {
+        let mut app = tui_at(None, "http://[::1]:3773");
+        app.on_shell_event(caught_up());
+        assert_eq!(chrome(&mut app, 80, 24).environment.trim(), "[::1]:3773");
+        ctrl_b(&mut app);
+        let header = chrome(&mut app, 80, 24).header;
+        assert!(header.trim_end().ends_with("  ● [::1]:3773"), "{header:?}");
+
+        let mut app = tui_at(Some(" \u{1b}\u{7} "), "not a url");
+        app.on_shell_event(caught_up());
+        assert_eq!(chrome(&mut app, 80, 24).environment.trim(), "");
+        ctrl_b(&mut app);
+        let drawn = chrome(&mut app, 80, 24);
+        let header = drawn
+            .header
+            .trim_end()
+            .strip_suffix("  ●")
+            .expect("the dot at the end");
+        assert!(header.trim_end().ends_with("in the sidebar"), "{header:?}");
+        assert_eq!(drawn.header_dot, Some(app.theme.emerald));
+    }
+
+    /// The text after the last dot in the breadcrumb's row, where `environment::chip` puts the
+    /// environment while the sidebar doesn't show it, or nothing when the row has no dot.
+    fn header_identity(drawn: &Chrome) -> &str {
+        drawn
+            .header
+            .trim_end()
+            .rsplit_once('●')
+            .map_or("", |(_, identity)| identity.trim())
+    }
+
+    #[test]
+    fn the_sidebar_and_the_header_keep_the_whole_port() {
+        let whole = "Studio Mac · 127.0.0.1:51024";
+        let mut app = tui_at(Some("Studio Mac"), "http://127.0.0.1:51024");
+        app.on_shell_event(caught_up());
+        app.focus = Focus::Composer;
+        app.composer.insert_str("half a thought");
+        // At 80 columns the row under the wordmark has ten columns after the label, too few for
+        // the address with its five-digit port, so the label shows alone.
+        let drawn = chrome(&mut app, 80, 24);
+        assert_eq!(drawn.environment.trim(), "Studio Mac");
+        assert_eq!(drawn.header_dot, None);
+        // Dragged wider, the row keeps the label alone until the whole address fits.
+        let edge = app.sidebar.border.x;
+        mouse(&mut app, CLICK, edge, 5);
+        assert!(app.drag.is_some());
+        for to in edge..edge + 8 {
+            mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), to, 5);
+            let drawn = chrome(&mut app, 80, 24);
+            assert_eq!(app.sidebar.border.x, to);
+            let row = usize::from(app.sidebar.list.width);
+            let expected = if whole.width() <= row {
+                whole
+            } else {
+                "Studio Mac"
+            };
+            assert_eq!(drawn.environment.trim(), expected, "a row of {row}");
+        }
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), edge + 7, 5);
+        assert_eq!(chrome(&mut app, 80, 24).environment.trim(), whole);
+        assert_eq!(app.composer.text(), "half a thought");
+
+        // Hidden, the breadcrumb's row shows the whole address or none of it, at every width.
+        ctrl_b(&mut app);
+        for width in 24..=200 {
+            let drawn = chrome(&mut app, width, 24);
+            let shown = header_identity(&drawn);
+            assert!(
+                shown == whole || !shown.contains(|c: char| c == '·' || c.is_ascii_digit()),
+                "{width}: {drawn:?}"
+            );
+        }
+        assert_eq!(header_identity(&chrome(&mut app, 120, 24)), whole);
+        assert_eq!(app.composer.text(), "half a thought");
+    }
+
+    #[test]
+    fn without_a_label_an_ip_address_keeps_its_whole_port() {
+        let whole = "[::1]:51024";
+        let mut app = tui_at(None, "http://[::1]:51024");
+        app.on_shell_event(caught_up());
+        assert_eq!(chrome(&mut app, 80, 24).environment.trim(), whole);
+        // Shown or hidden, at every width, the sidebar's row and the breadcrumb's show the
+        // whole address or none of it, never some of the port alone.
+        for hidden in [false, true] {
+            if hidden {
+                ctrl_b(&mut app);
+            }
+            for width in 20..=200 {
+                let drawn = chrome(&mut app, width, 24);
+                for shown in [drawn.environment.trim(), header_identity(&drawn)] {
+                    assert!(
+                        shown.is_empty() || shown == whole,
+                        "{hidden} {width}: {drawn:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(header_identity(&chrome(&mut app, 120, 24)), whole);
+    }
+
+    #[test]
+    fn a_hostile_label_is_cleaned_once_and_fits_every_width() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let label = format!(
+            "\u{1b}]0;pwned\u{7}\u{1b}[2J名前 {}\r\nevil",
+            "👩\u{200d}💻e\u{301}".repeat(5_000)
+        );
+        let mut app = tui_at(Some(&label), "http://[::1]:3773");
+        let prepared = app.environment.clone();
+        app.on_shell_event(shell_snapshot(vec![listed(
+            "t",
+            "Fix the login page",
+            "idle",
+        )]));
+        app.on_shell_event(caught_up());
+        app.open_thread(long_thread());
+        for hidden in [false, true] {
+            if hidden {
+                ctrl_b(&mut app);
+            }
+            for width in [24, 40, 80, 120, 200] {
+                let buffer = cells(&mut app, width, 24);
+                for (x, y) in (0..24).flat_map(|y| (0..width).map(move |x| (x, y))) {
+                    let symbol = buffer[(x, y)].symbol();
+                    assert!(
+                        !symbol.contains(char::is_control),
+                        "{width} ({x}, {y}) {symbol:?}"
+                    );
+                }
+                let top = text_in(&buffer, Rect::new(0, 0, width, 2));
+                // The label is cut long before its end.
+                assert!(!top.contains("evil"), "{top}");
+                // The title keeps its columns.
+                assert!(
+                    width < 80 || top.contains("Fix the login page"),
+                    "{width}: {top}"
+                );
+            }
+        }
+        // Answers, shell changes, an environment T3's config renames and more frames leave the
+        // identity as it was made.
+        let answer = json!({"id": "a20", "type": "assistant_message", "ordinal": 20,
+            "text": "Done"});
+        app.on_thread_event(live(2, "turn-item.updated", answer));
+        app.on_shell_event(thread_updated(2, listed("t", "Fix the login form", "idle")));
+        let environment = json!({"label": "Renamed", "capabilities": {}});
+        let config = json!({"providers": [], "settings": {}, "environment": environment});
+        app.on_config_event(WatchEvent::Item(
+            json!({"version": 1, "type": "snapshot", "config": config}),
+        ));
+        cells(&mut app, 120, 30);
+        assert_eq!(app.environment, prepared);
+    }
+
+    #[test]
+    fn the_environment_takes_no_clicks_and_moves_nothing() {
+        let mut app = tui_at(Some("Studio Mac"), "http://127.0.0.1:3773");
+        let threads = vec![listed("a", "Alpha", "idle"), listed("b", "Bravo", "idle")];
+        app.on_shell_event(shell_snapshot(threads));
+        app.on_shell_event(caught_up());
+        app.focus = Focus::Composer;
+        app.composer.insert_str("half a thought");
+        chrome(&mut app, 80, 24);
+        // The list starts under the environment's row, where it always has.
+        assert_eq!(app.sidebar.list.y, 2);
+        let (border, list) = (app.sidebar.border, app.sidebar.list);
+        // A click on the dot or the environment does what a click on the wordmark did.
+        for (x, y) in [(border.x - 2, 0), (5, 1)] {
+            mouse(&mut app, CLICK, x, y);
+            assert_eq!(app.focus, Focus::Composer);
+            assert!(app.open.is_none() && app.picker.is_none() && app.drag.is_none());
+            chrome(&mut app, 80, 24);
+            assert_eq!((app.sidebar.border, app.sidebar.list), (border, list));
+        }
+        // The edge still drags.
+        mouse(&mut app, CLICK, border.x, 5);
+        assert!(app.drag.is_some());
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), border.x, 5);
+        assert!(app.drag.is_none());
+
+        // Hidden, a click on the environment at the end of the breadcrumb's row leaves the
+        // sidebar hidden.
+        ctrl_b(&mut app);
+        let header = chrome(&mut app, 120, 24).header;
+        let at = header.find("Studio").expect("the environment");
+        let x = header[..at].width() as u16;
+        mouse(&mut app, CLICK, x, 0);
+        assert!(app.sidebar_hidden);
+        assert!(crate::settings::saved_in_test().sidebar_hidden);
+        assert!(app.open.is_none() && app.picker.is_none() && app.drag.is_none());
+        assert_eq!(app.composer.text(), "half a thought");
     }
 }
