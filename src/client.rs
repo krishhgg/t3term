@@ -715,11 +715,12 @@ mod tests {
     const CONFIG: &str = "subscribeServerConfig";
     const SETUP: &str = "subscribeWorktreeSetup";
 
-    /// A client of the fake T3 at `origin`. Like `Client::offline`, it holds no token.
+    /// A client of the fake T3 at `origin`. Like `Client::offline`, it holds no token. Its
+    /// ticket requests ignore proxies, so they reach the fake whatever the environment says.
     fn client_at(origin: &str) -> Arc<Client> {
         let mut client = Client::offline();
         client.runtime.origin = origin.into();
-        client.api = Api::new(&client.runtime, "");
+        client.api = Api::without_proxy(origin);
         Arc::new(client)
     }
 
