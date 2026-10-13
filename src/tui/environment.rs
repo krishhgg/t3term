@@ -376,4 +376,209 @@ mod tests {
         assert_eq!(dot(Feed::Reconnecting), Some(t.warning));
         assert_eq!(dot(Feed::Failed), Some(t.error));
     }
+
+    #[test]
+    fn the_address_goes_rather_than_lose_its_whole_port() {
+        // At 80 columns the sidebar's row is 23 columns, ten after `Studio Mac · `. The address
+        // needs 15 with a five-digit port, and an IP address shows whole or not at all.
+        let five = Identity::new(Some("Studio Mac"), "http://127.0.0.1:51024");
+        assert_eq!(fitted(&five, 23), "Studio Mac");
+        assert_eq!(fitted(&five, 27), "Studio Mac");
+        assert_eq!(fitted(&five, 28), "Studio Mac · 127.0.0.1:51024");
+        let four = Identity::new(Some("Studio Mac"), "http://127.0.0.1:3773");
+        assert_eq!(fitted(&four, 23), "Studio Mac");
+        assert_eq!(fitted(&four, 27), "Studio Mac · 127.0.0.1:3773");
+        // A host name is cut in the middle in front of its whole port, down to three columns
+        // at each end, and goes when it can't keep that much.
+        let named = Identity::new(Some("Studio Mac"), "http://studio.example.com:51024");
+        assert_eq!(fitted(&named, 37), "Studio Mac · studio.example.com:51024");
+        assert_eq!(fitted(&named, 30), "Studio Mac · studi…e.com:51024");
+        assert_eq!(fitted(&named, 26), "Studio Mac · stu…com:51024");
+        assert_eq!(fitted(&named, 25), "Studio Mac");
+        // Without a label the address takes the row on the same terms.
+        let bare = Identity::new(None, "http://[::1]:51024");
+        assert_eq!(fitted(&bare, 11), "[::1]:51024");
+        assert_eq!(fitted(&bare, 10), "");
+        let bare = Identity::new(None, "http://studio.example.com:51024");
+        assert_eq!(fitted(&bare, 13), "stu…com:51024");
+        assert_eq!(fitted(&bare, 12), "");
+        // So does the breadcrumb's chip, after the dot and the feed's word.
+        let t = Theme::new(Depth::TrueColor);
+        let chip = |feed, room| text(&chip(&five, feed, room, &t));
+        assert_eq!(chip(Feed::Live, 32), "  ● Studio Mac · 127.0.0.1:51024");
+        assert_eq!(chip(Feed::Live, 31), "  ● Studio Mac");
+        assert_eq!(
+            chip(Feed::Reconnecting, 47),
+            "  ● reconnecting · Studio Mac · 127.0.0.1:51024"
+        );
+        assert_eq!(
+            chip(Feed::Reconnecting, 46),
+            "  ● reconnecting · Studio Mac"
+        );
+    }
+
+    /// An identity a test fits to widths: the label and the origin it is made from, and the
+    /// host and the port its address shows.
+    struct Case {
+        label: Option<&'static str>,
+        origin: &'static str,
+        host: &'static str,
+        port: &'static str,
+        /// Whether the host is an IP address, which shows whole or not at all.
+        ip: bool,
+    }
+
+    impl Case {
+        /// The label and the whole address, as the identity shows them with room.
+        fn whole(&self) -> String {
+            let address = format!("{}:{}", self.host, self.port);
+            match self.label {
+                Some(label) => format!("{label}{SEPARATOR}{address}"),
+                None => address,
+            }
+        }
+
+        /// Checks `shown`, this identity in `width` columns: no wider than that, the label whole
+        /// before any address, and an address only with its whole port after a colon. An IP
+        /// address shows whole, and a host name whole or cut once in its middle with both of its
+        /// ends kept, so nothing else of the origin, such as its credentials, can show.
+        fn check(&self, shown: &str, width: usize) {
+            let at = format!("{shown:?} in {width} columns, from {}", self.origin);
+            assert!(shown.width() <= width, "too wide: {at}");
+            let address = match self.label {
+                Some(label) if shown.contains(SEPARATOR) => Some(
+                    shown
+                        .strip_prefix(label)
+                        .and_then(|rest| rest.strip_prefix(SEPARATOR))
+                        .unwrap_or_else(|| panic!("no whole label before the address: {at}")),
+                ),
+                Some(_) => None,
+                None => Some(shown).filter(|shown| !shown.is_empty()),
+            };
+            let Some(address) = address else {
+                return;
+            };
+            let host = address
+                .strip_suffix(&format!(":{}", self.port))
+                .unwrap_or_else(|| panic!("no whole port after a colon: {at}"));
+            if host == self.host {
+                return;
+            }
+            assert!(!self.ip, "a cut IP address: {at}");
+            let (head, tail) = host
+                .split_once('…')
+                .unwrap_or_else(|| panic!("another host: {at}"));
+            assert!(
+                !head.is_empty()
+                    && !tail.is_empty()
+                    && !tail.contains('…')
+                    && self.host.starts_with(head)
+                    && self.host.ends_with(tail),
+                "not both ends of the host: {at}"
+            );
+        }
+    }
+
+    #[test]
+    fn every_width_keeps_the_whole_port() {
+        let t = Theme::new(Depth::TrueColor);
+        let ipv6 = "[2001:db8::8a2e:370:7334]";
+        let cases = [
+            (
+                "Studio Mac",
+                "http://127.0.0.1:51024",
+                "127.0.0.1",
+                "51024",
+                true,
+            ),
+            (
+                "Studio Mac",
+                "http://127.0.0.1:3773",
+                "127.0.0.1",
+                "3773",
+                true,
+            ),
+            ("Studio Mac", "http://127.0.0.1:1", "127.0.0.1", "1", true),
+            ("", "http://127.0.0.1:51024", "127.0.0.1", "51024", true),
+            ("", "http://[::1]:51024", "[::1]", "51024", true),
+            ("", "http://[::1]:3773", "[::1]", "3773", true),
+            ("Studio Mac", "http://[::1]:1", "[::1]", "1", true),
+            (
+                "Studio Mac",
+                "http://[2001:db8::8a2e:370:7334]:51024",
+                ipv6,
+                "51024",
+                true,
+            ),
+            (
+                "",
+                "http://[2001:db8::8a2e:370:7334]:51024",
+                ipv6,
+                "51024",
+                true,
+            ),
+            // Wide and combining characters in the label.
+            (
+                "スタジオ Mac",
+                "http://127.0.0.1:51024",
+                "127.0.0.1",
+                "51024",
+                true,
+            ),
+            (
+                "Stu\u{301}dio 名前",
+                "http://alice:hunter2@studio.example.com:51024/private?token=sekrit#frag",
+                "studio.example.com",
+                "51024",
+                false,
+            ),
+            (
+                "",
+                "http://studio.example.com:3773",
+                "studio.example.com",
+                "3773",
+                false,
+            ),
+            ("Studio Mac", "http://localhost:1", "localhost", "1", false),
+        ];
+        for (label, origin, host, port, ip) in cases {
+            let case = Case {
+                label: Some(label).filter(|label| !label.is_empty()),
+                origin,
+                host,
+                port,
+                ip,
+            };
+            let identity = Identity::new(case.label, origin);
+            let whole = case.whole();
+            for width in 0..=64 {
+                let shown = fitted(&identity, width);
+                case.check(&shown, width);
+                // With room, all of it shows.
+                if whole.width() <= width {
+                    assert_eq!(shown, whole, "{width}");
+                }
+            }
+            // The breadcrumb's chip fits it the same way after the dot and the feed's word.
+            for feed in [
+                Feed::Connecting,
+                Feed::Live,
+                Feed::Reconnecting,
+                Feed::Failed,
+            ] {
+                for room in 0..=72 {
+                    let shown = text(&chip(&identity, feed, room, &t));
+                    assert!(shown.width() <= room, "{feed:?} in {room}: {shown:?}");
+                    let after_dot = shown.strip_prefix("  ●").unwrap_or_default();
+                    let named = match feed {
+                        Feed::Live => after_dot.strip_prefix(' '),
+                        _ => after_dot
+                            .strip_prefix(&format!(" {}", feed.word()))
+                            .and_then(|rest| rest.strip_prefix(SEPARATOR)),
+                    };
+                    case.check(named.unwrap_or_default(), room);
+                }
+            }
+        }
+    }
 }

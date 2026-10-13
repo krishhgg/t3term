@@ -9200,6 +9200,87 @@ mod tests {
         assert_eq!(drawn.header_dot, Some(app.theme.emerald));
     }
 
+    /// The text after the last dot in the breadcrumb's row, where `environment::chip` puts the
+    /// environment while the sidebar doesn't show it, or nothing when the row has no dot.
+    fn header_identity(drawn: &Chrome) -> &str {
+        drawn
+            .header
+            .trim_end()
+            .rsplit_once('●')
+            .map_or("", |(_, identity)| identity.trim())
+    }
+
+    #[test]
+    fn the_sidebar_and_the_header_keep_the_whole_port() {
+        let whole = "Studio Mac · 127.0.0.1:51024";
+        let mut app = tui_at(Some("Studio Mac"), "http://127.0.0.1:51024");
+        app.on_shell_event(caught_up());
+        app.focus = Focus::Composer;
+        app.composer.insert_str("half a thought");
+        // At 80 columns the row under the wordmark has ten columns after the label, too few for
+        // the address with its five-digit port, so the label shows alone.
+        let drawn = chrome(&mut app, 80, 24);
+        assert_eq!(drawn.environment.trim(), "Studio Mac");
+        assert_eq!(drawn.header_dot, None);
+        // Dragged wider, the row keeps the label alone until the whole address fits.
+        let edge = app.sidebar.border.x;
+        mouse(&mut app, CLICK, edge, 5);
+        assert!(app.drag.is_some());
+        for to in edge..edge + 8 {
+            mouse(&mut app, MouseEventKind::Drag(MouseButton::Left), to, 5);
+            let drawn = chrome(&mut app, 80, 24);
+            assert_eq!(app.sidebar.border.x, to);
+            let row = usize::from(app.sidebar.list.width);
+            let expected = if whole.width() <= row {
+                whole
+            } else {
+                "Studio Mac"
+            };
+            assert_eq!(drawn.environment.trim(), expected, "a row of {row}");
+        }
+        mouse(&mut app, MouseEventKind::Up(MouseButton::Left), edge + 7, 5);
+        assert_eq!(chrome(&mut app, 80, 24).environment.trim(), whole);
+        assert_eq!(app.composer.text(), "half a thought");
+
+        // Hidden, the breadcrumb's row shows the whole address or none of it, at every width.
+        ctrl_b(&mut app);
+        for width in 24..=200 {
+            let drawn = chrome(&mut app, width, 24);
+            let shown = header_identity(&drawn);
+            assert!(
+                shown == whole || !shown.contains(|c: char| c == '·' || c.is_ascii_digit()),
+                "{width}: {drawn:?}"
+            );
+        }
+        assert_eq!(header_identity(&chrome(&mut app, 120, 24)), whole);
+        assert_eq!(app.composer.text(), "half a thought");
+    }
+
+    #[test]
+    fn without_a_label_an_ip_address_keeps_its_whole_port() {
+        let whole = "[::1]:51024";
+        let mut app = tui_at(None, "http://[::1]:51024");
+        app.on_shell_event(caught_up());
+        assert_eq!(chrome(&mut app, 80, 24).environment.trim(), whole);
+        // Shown or hidden, at every width, the sidebar's row and the breadcrumb's show the
+        // whole address or none of it, never some of the port alone.
+        for hidden in [false, true] {
+            if hidden {
+                ctrl_b(&mut app);
+            }
+            for width in 20..=200 {
+                let drawn = chrome(&mut app, width, 24);
+                for shown in [drawn.environment.trim(), header_identity(&drawn)] {
+                    assert!(
+                        shown.is_empty() || shown == whole,
+                        "{hidden} {width}: {drawn:?}"
+                    );
+                }
+            }
+        }
+        assert_eq!(header_identity(&chrome(&mut app, 120, 24)), whole);
+    }
+
     #[test]
     fn a_hostile_label_is_cleaned_once_and_fits_every_width() {
         let runtime = idle_runtime();
