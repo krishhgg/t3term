@@ -1,15 +1,17 @@
 //! Text from T3 cut to one row of a frame, such as a project's or a thread's title or a
 //! thread's branch in the breadcrumb and the sidebar's cards. T3 puts no limit on their length,
-//! so a frame reads only as much of each as its row could show: the characters up to the first
-//! column past the row, and never more than `PER_COLUMN` for each column. A frame never copies,
-//! cleans or measures the rest.
+//! so a frame reads only as much of each as its row could show. For a row of `width` columns it
+//! stops at the character after the first cluster past the row, and reads at most
+//! `(width + 2) * PER_COLUMN + 1` characters. A row of no columns reads nothing. A frame never
+//! copies, cleans or measures the rest.
 
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-/// The most characters a frame reads for each column of a row, counting two columns past it.
-/// That is room for several accents on every letter, or a joined emoji in every other column.
-/// Text that packs in more, such as a long run of controls or marks, is cut where the reading
-/// stops.
+/// The characters a frame may keep reading for each column of a row, counting two columns past
+/// it. It reads one character more to learn whether the text goes on, so a row of `width`
+/// columns reads at most `(width + 2) * PER_COLUMN + 1`. That is room for several accents on
+/// every letter, or a joined emoji in every other column. Text that packs in more, such as a
+/// long run of controls or marks, is cut where the reading stops.
 const PER_COLUMN: usize = 16;
 
 /// `text` in at most `width` columns as one row: whole when it fits, and otherwise cut with
@@ -17,7 +19,7 @@ const PER_COLUMN: usize = 16;
 /// joined emoji stays whole, and a wide character that doesn't fit before the `…` is left out.
 /// A line break or a tab reads as a space, `\r\n` as one, and other controls, C0, DEL or C1,
 /// are dropped, as `transcript::without_controls` drops them. What followed an Esc stays as
-/// plain text. No columns leave nothing at all.
+/// plain text. No columns leave nothing at all, even of text that takes none.
 pub(super) fn cut(text: &str, width: usize) -> String {
     let mut head = head(text.chars(), width);
     if !head.whole {
@@ -44,7 +46,8 @@ struct Head {
     /// How many bytes at the start of `text` fit in one column fewer, which leaves the `…` its
     /// column.
     short: usize,
-    /// Whether `text` is all of the text.
+    /// Whether `text` is all of the text. It never is for a row of no columns, which reads none
+    /// of it.
     whole: bool,
 }
 
@@ -65,11 +68,12 @@ impl Head {
     }
 }
 
-/// Reads `chars` until a cluster takes them past `width` columns, or until it has read
-/// `PER_COLUMN` characters for each of `width + 2` columns, whichever comes first. A cluster
-/// starts where `transcript::clusters` starts one: at each character with a width, except a
-/// skin tone and the character after a zero-width joiner. A cluster still open when the
-/// reading stops is left out.
+/// Reads `chars` until a cluster takes them past `width` columns, which it learns at the
+/// character after that cluster, or until it reads character `(width + 2) * PER_COLUMN + 1`,
+/// which it drops, whichever comes first. A row of no columns reads nothing. A cluster starts
+/// where `transcript::clusters` starts one: at each character with a width, except a skin tone
+/// and the character after a zero-width joiner. A cluster still open when the reading stops is
+/// left out.
 fn head(chars: impl Iterator<Item = char>, width: usize) -> Head {
     let limit = width.saturating_add(2).saturating_mul(PER_COLUMN);
     let mut head = Head {
@@ -78,6 +82,10 @@ fn head(chars: impl Iterator<Item = char>, width: usize) -> Head {
         short: 0,
         whole: false,
     };
+    // A mark or a joiner takes no columns, yet a row of none shows nothing, so it reads nothing.
+    if width == 0 {
+        return head;
+    }
     // Where the open cluster starts in `head.text`.
     let mut start = 0;
     let mut joined = false;
@@ -138,7 +146,13 @@ mod tests {
 
     #[test]
     fn ascii_is_cut_as_fit_cuts_it() {
-        let texts = ["Fix the login page", "a", "ab", "feature/sidebar-badges", "  x  "];
+        let texts = [
+            "Fix the login page",
+            "a",
+            "ab",
+            "feature/sidebar-badges",
+            "  x  ",
+        ];
         for text in texts {
             for width in 1..=text.len() + 2 {
                 assert_eq!(cut(text, width), super::super::fit(text, width), "{width}");
@@ -206,9 +220,22 @@ mod tests {
 
     #[test]
     fn no_columns_show_nothing_and_one_shows_the_ellipsis() {
-        assert_eq!(cut("abc", 0), "");
-        assert_eq!(cut("", 0), "");
-        assert_eq!(columns("abc", 0), 0);
+        // No columns show nothing, even of text that takes none, and read none of it.
+        for text in [
+            "abc",
+            "",
+            "\u{301}",
+            "\u{200d}",
+            "\u{1b}",
+            "\u{7}\u{200d}\u{301}",
+        ] {
+            assert_eq!(cut(text, 0), "", "{text:?}");
+            assert_eq!(columns(text, 0), 0, "{text:?}");
+        }
+        for c in ['a', '\u{301}', '\u{200d}', '\u{1b}'] {
+            let (read, head) = reads(repeat(c), 0);
+            assert_eq!((read, head.text.as_str()), (0, ""), "{c:?}");
+        }
         assert_eq!(cut("abc", 1), "…");
         assert_eq!(cut("a", 1), "a");
         assert_eq!(cut("名", 1), "…");
@@ -225,19 +252,24 @@ mod tests {
 
     #[test]
     fn a_row_reads_no_further_than_it_can_show() {
-        // Text with no end stops at the first character past the row.
+        // Text with no end stops at the character after the first cluster past the row.
         let (read, head) = reads(repeat('a'), 10);
-        assert_eq!((read, head.text.as_str(), head.whole), (12, "aaaaaaaaaa", false));
+        assert_eq!(
+            (read, head.text.as_str(), head.whole),
+            (12, "aaaaaaaaaa", false)
+        );
         let (read, head) = reads(repeat('名'), 10);
         assert_eq!((read, head.width), (7, 10));
-        // Text with no end that shows nothing stops too, and a row twice as wide reads no more
-        // than twice as far: a run of controls, a letter under a run of marks, and one long
-        // chain of joined letters.
+        // Text with no end that shows nothing stops too. It reads `PER_COLUMN` characters for
+        // each column and two columns more, then the one that shows the text goes on, and keeps
+        // none of them. The texts are a run of controls, a letter under a run of marks, and one
+        // long chain of joined letters.
         fn endless<I: Iterator<Item = char>>(chars: impl Fn() -> I) {
-            let (narrow, head) = reads(chars(), 10);
-            assert_eq!((head.text.as_str(), head.whole), ("", false));
-            let (wide, _) = reads(chars(), 20);
-            assert!(narrow < wide && wide <= 2 * narrow, "{narrow} {wide}");
+            for width in [1, 10, 20] {
+                let (read, head) = reads(chars(), width);
+                assert_eq!((head.text.as_str(), head.whole), ("", false), "{width}");
+                assert_eq!(read, (width + 2) * PER_COLUMN + 1, "{width}");
+            }
         }
         endless(|| repeat('\u{1b}'));
         endless(|| once('e').chain(repeat('\u{301}')));

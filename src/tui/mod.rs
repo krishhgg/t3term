@@ -2714,7 +2714,12 @@ impl App {
         let muted = Style::new().fg(t.muted);
         // The breadcrumb borrows the titles as T3 sent them and reads only what it has room for.
         let (mut left, title, title_style, mut right) = match self.open.as_ref() {
-            None => (Vec::new(), "Pick a thread in the sidebar", muted, Vec::new()),
+            None => (
+                Vec::new(),
+                "Pick a thread in the sidebar",
+                muted,
+                Vec::new(),
+            ),
             Some(open) => match self.open_thread_json() {
                 None => (Vec::new(), "Loading…", muted, Vec::new()),
                 Some(thread) => {
@@ -10523,7 +10528,9 @@ mod tests {
         assert_eq!(app.badges.get("p"), &theme::Badge::of("Bravo Yankee"));
         let drawn = chrome(&mut app, 120, 36);
         assert!(
-            drawn.header.contains("BY Bravo Yankee  /  Fix the login form"),
+            drawn
+                .header
+                .contains("BY Bravo Yankee  /  Fix the login form"),
             "{drawn:?}"
         );
         let buffer = cells(&mut app, 120, 36);
@@ -10597,6 +10604,8 @@ mod tests {
         let mut plain = titled("Fix the login page", "feature/login");
         let mut huge = titled(&title, &branch);
         let whole = "Studio Mac · 127.0.0.1:51024";
+        // Whether a row shows any of the address.
+        let address = |row: &str| row.contains(|c: char| c == '·' || c.is_ascii_digit());
         // The breadcrumb up to the slash before the title.
         let lead = |drawn: &Chrome| Some(drawn.header.split_once("/  ")?.0.to_string());
         for hidden in [false, true] {
@@ -10608,11 +10617,15 @@ mod tests {
                 let at = format!("{hidden} {width}x{height}");
                 let plain_drawn = chrome(&mut plain, width, height);
                 let huge_drawn = chrome(&mut huge, width, height);
-                // The environment shows as the short title leaves it, whole or not at all, and
-                // the dots, the status line and the sidebar's top rows are as they were.
+                // The environment shows as it does beside the short title. Where a row has no
+                // room for the whole address, `environment::chip` shows the label alone or
+                // nothing, and never part of the port. The dots, the status line and the
+                // sidebar's top rows are as they were.
                 let shown = header_identity(&huge_drawn);
                 assert_eq!(shown, header_identity(&plain_drawn), "{at}");
-                assert!(shown.is_empty() || shown == whole, "{at}: {huge_drawn:?}");
+                for row in [shown, huge_drawn.environment.trim()] {
+                    assert!(row == whole || !address(row), "{at}: {huge_drawn:?}");
+                }
                 assert_eq!(huge_drawn.sidebar_dot, plain_drawn.sidebar_dot, "{at}");
                 assert_eq!(huge_drawn.header_dot, plain_drawn.header_dot, "{at}");
                 assert_eq!(huge_drawn.status, plain_drawn.status, "{at}");
