@@ -6,21 +6,23 @@
 //!
 //! Every call runs `security` as an async child with a timeout, so a stalled Keychain (for
 //! example one waiting on an unlock prompt) cannot block the runtime or the signal handlers.
+//!
+//! With `T3TERM_NO_SAVED_LOGIN` set, nothing here runs `security`: no login is read, saved or
+//! deleted. Unit tests never run it either. `fake` answers for it instead.
 
 use std::fmt;
-use std::process::{Output, Stdio};
-use std::time::Duration;
 
 use anyhow::Result;
 use serde::{Deserialize, Serialize};
-use tokio::io::AsyncWriteExt;
-use tokio::process::Command;
 
 use crate::error::err;
 
+#[cfg(test)]
+use fake::security;
+#[cfg(not(test))]
+use real::security;
+
 const SERVICE: &str = "t3term";
-const SECURITY: &str = "/usr/bin/security";
-const TIMEOUT: Duration = Duration::from_secs(15);
 /// `security` exits with this when no item matches (errSecItemNotFound).
 const NOT_FOUND: i32 = 44;
 
@@ -43,32 +45,107 @@ impl fmt::Debug for SavedLogin {
     }
 }
 
+/// Whether t3term may use the Keychain: on macOS with `security` installed, and with
+/// `T3TERM_NO_SAVED_LOGIN` unset. When it may not, `load`, `save` and `delete` run nothing and
+/// find nothing saved.
+#[cfg(not(test))]
 pub fn available() -> bool {
-    cfg!(target_os = "macos") && std::path::Path::new(SECURITY).exists()
+    std::env::var_os("T3TERM_NO_SAVED_LOGIN").is_none()
+        && cfg!(target_os = "macos")
+        && std::path::Path::new(real::SECURITY).exists()
 }
 
-/// Runs `security` with optional stdin. `None` means it could not start or timed out, in which
-/// case dropping the child kills it.
-async fn security(args: &[&str], input: Option<&str>) -> Option<Output> {
-    let mut child = Command::new(SECURITY)
-        .args(args)
-        .stdin(if input.is_some() {
-            Stdio::piped()
-        } else {
-            Stdio::null()
+/// In a unit test `fake` stands in for the Keychain on every system, and
+/// `fake::NO_SAVED_LOGIN` for `T3TERM_NO_SAVED_LOGIN`.
+#[cfg(test)]
+pub fn available() -> bool {
+    !fake::NO_SAVED_LOGIN.get()
+}
+
+#[cfg(not(test))]
+mod real {
+    use std::process::{Output, Stdio};
+    use std::time::Duration;
+
+    use tokio::io::AsyncWriteExt;
+    use tokio::process::Command;
+
+    pub(super) const SECURITY: &str = "/usr/bin/security";
+    const TIMEOUT: Duration = Duration::from_secs(15);
+
+    /// Runs `security` with optional stdin. `None` means it could not start or timed out, in
+    /// which case dropping the child kills it.
+    pub(super) async fn security(args: &[&str], input: Option<&str>) -> Option<Output> {
+        let mut child = Command::new(SECURITY)
+            .args(args)
+            .stdin(if input.is_some() {
+                Stdio::piped()
+            } else {
+                Stdio::null()
+            })
+            .stdout(Stdio::piped())
+            .stderr(Stdio::null())
+            .kill_on_drop(true)
+            .spawn()
+            .ok()?;
+        let run = async {
+            if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
+                stdin.write_all(input.as_bytes()).await.ok()?;
+            }
+            child.wait_with_output().await.ok()
+        };
+        tokio::time::timeout(TIMEOUT, run).await.ok().flatten()
+    }
+}
+
+/// The Keychain of unit tests. Nothing runs `security`: each call is recorded on the thread
+/// that made it and answered as an empty Keychain answers, so no test reads, saves or deletes
+/// a real login. A test starts with `reset`.
+#[cfg(test)]
+pub(crate) mod fake {
+    use std::cell::{Cell, RefCell};
+    use std::process::Output;
+
+    thread_local! {
+        /// Stands in for `T3TERM_NO_SAVED_LOGIN`, which a test can't set without changing it
+        /// for the tests on other threads.
+        pub(crate) static NO_SAVED_LOGIN: Cell<bool> = const { Cell::new(false) };
+        static CALLS: RefCell<Vec<Vec<String>>> = const { RefCell::new(Vec::new()) };
+    }
+
+    /// Forgets this thread's calls, and sets whether saved logins are off.
+    pub(crate) fn reset(no_saved_login: bool) {
+        NO_SAVED_LOGIN.set(no_saved_login);
+        CALLS.take();
+    }
+
+    /// The arguments of each `security` call this thread made since `reset`.
+    pub(crate) fn calls() -> Vec<Vec<String>> {
+        CALLS.with_borrow(Clone::clone)
+    }
+
+    /// Records `args` and answers that no item matches. What goes to stdin, a login being
+    /// saved, isn't recorded.
+    pub(super) async fn security(args: &[&str], _input: Option<&str>) -> Option<Output> {
+        let call: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
+        CALLS.with_borrow_mut(|calls| calls.push(call));
+        not_found()
+    }
+
+    #[cfg(unix)]
+    fn not_found() -> Option<Output> {
+        use std::os::unix::process::ExitStatusExt;
+        Some(Output {
+            status: std::process::ExitStatus::from_raw(super::NOT_FOUND << 8),
+            stdout: Vec::new(),
+            stderr: Vec::new(),
         })
-        .stdout(Stdio::piped())
-        .stderr(Stdio::null())
-        .kill_on_drop(true)
-        .spawn()
-        .ok()?;
-    let run = async {
-        if let (Some(input), Some(mut stdin)) = (input, child.stdin.take()) {
-            stdin.write_all(input.as_bytes()).await.ok()?;
-        }
-        child.wait_with_output().await.ok()
-    };
-    tokio::time::timeout(TIMEOUT, run).await.ok().flatten()
+    }
+
+    #[cfg(not(unix))]
+    fn not_found() -> Option<Output> {
+        None
+    }
 }
 
 pub async fn load(environment_id: &str) -> Option<SavedLogin> {
@@ -208,5 +285,39 @@ mod tests {
     #[test]
     fn debug_output_hides_the_token() {
         assert!(!format!("{:?}", login()).contains("abc_DEF-123"));
+    }
+
+    /// `args` as `fake::calls` records them.
+    fn call(args: &[&str]) -> Vec<String> {
+        args.iter().map(|arg| arg.to_string()).collect()
+    }
+
+    #[tokio::test]
+    async fn with_saved_logins_off_nothing_reaches_the_keychain() {
+        fake::reset(true);
+        assert!(!available());
+        assert_eq!(load("env-b").await, None);
+        assert!(!save("env-b", &login()).await);
+        assert_eq!(delete(Some("env-b")).await.unwrap(), 0);
+        assert_eq!(delete(None).await.unwrap(), 0);
+        assert_eq!(fake::calls(), Vec::<Vec<String>>::new());
+        fake::reset(false);
+    }
+
+    #[tokio::test]
+    async fn deleting_one_login_names_its_environment_and_deleting_all_names_none() {
+        fake::reset(false);
+        assert_eq!(delete(Some("env-b")).await.unwrap(), 0);
+        assert_eq!(delete(None).await.unwrap(), 0);
+        // An id that isn't a plain word never reaches `security`, so it can't delete them all.
+        assert_eq!(delete(Some("env b")).await.unwrap(), 0);
+        let verb = "delete-generic-password";
+        assert_eq!(
+            fake::calls(),
+            [
+                call(&[verb, "-s", "t3term", "-a", "env-b"]),
+                call(&[verb, "-s", "t3term"]),
+            ]
+        );
     }
 }

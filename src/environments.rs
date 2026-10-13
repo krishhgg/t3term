@@ -24,7 +24,7 @@ use anyhow::Result;
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::discovery::{LocalTarget, OriginError, Target, home_dir, loopback_origin};
+use crate::discovery::{LocalTarget, Target, home_dir, local_origin};
 use crate::error::{err, err_exit, exit};
 
 /// The kind `add` saves. A later t3term may save other kinds, such as a paired remote
@@ -90,9 +90,7 @@ pub fn local_target(name: &str, t3_home: &Path, origin: Option<&str>) -> Result<
                 "--t3-home needs a path in UTF-8, absolute or relative to the current directory.",
             )
         })?;
-    let origin = origin
-        .map(|origin| loopback_origin(origin).map_err(|problem| origin_error(origin, problem)))
-        .transpose()?;
+    let origin = origin.map(local_origin).transpose()?;
     Ok(LocalTarget {
         name: name.to_string(),
         t3_home,
@@ -256,9 +254,7 @@ fn parse_local(name: &str, entry: &Map<String, Value>) -> Result<LocalTarget> {
         .ok_or_else(|| invalid(name, "needs t3Home, an absolute path"))?;
     let origin = match entry.get("origin") {
         None | Some(Value::Null) => None,
-        Some(Value::String(origin)) => {
-            Some(loopback_origin(origin).map_err(|problem| origin_error(origin, problem))?)
-        }
+        Some(Value::String(origin)) => Some(local_origin(origin)?),
         Some(_) => return Err(invalid(name, "has an origin that isn't text")),
     };
     Ok(LocalTarget {
@@ -266,25 +262,6 @@ fn parse_local(name: &str, entry: &Map<String, Value>) -> Result<LocalTarget> {
         t3_home,
         origin,
     })
-}
-
-fn origin_error(origin: &str, problem: OriginError) -> anyhow::Error {
-    match problem {
-        OriginError::Invalid => err_exit(
-            "ENVIRONMENT_ORIGIN_INVALID",
-            exit::USAGE,
-            format!(
-                "{origin:?} is not an origin. Give the scheme, host and port only, such as http://127.0.0.1:3773."
-            ),
-        ),
-        OriginError::NotLoopback => err_exit(
-            "ENVIRONMENT_NOT_LOCAL",
-            exit::REJECTED,
-            format!(
-                "{origin:?} is not on this machine. A saved environment names a server at 127.0.0.1, ::1 or localhost, because t3term logs in to it with that server's own `t3` command. t3term can't pair with a remote environment or sign in to T3 Connect yet."
-            ),
-        ),
-    }
 }
 
 fn invalid(name: &str, problem: &str) -> anyhow::Error {

@@ -17,8 +17,8 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::discovery::Runtime;
-use crate::error::{err, err_exit, exit};
+use crate::discovery::{LocalTarget, Runtime};
+use crate::error::{T3Error, err, err_exit, exit};
 use crate::http::Api;
 use crate::keychain::{self, SavedLogin};
 
@@ -230,7 +230,7 @@ impl Session {
     /// `scopes` and `ttl` apply only to a temporary session. A saved login always carries
     /// read and operate, because the TUI and the write commands share it.
     pub async fn login(runtime: &Runtime, scopes: &[Scope], ttl: &str) -> Result<Session> {
-        if !keychain::available() || std::env::var_os("T3TERM_NO_SAVED_LOGIN").is_some() {
+        if !keychain::available() {
             return Session::issue(runtime, scopes, ttl).await;
         }
         // Concurrent first runs would each issue a login, and all but the last saved would leak.
@@ -375,6 +375,23 @@ pub async fn logout(runtime: &Runtime) -> Result<Option<String>> {
     Ok(Some(saved.session_id))
 }
 
+/// Removes a named environment's saved login without revoking it, after `error` kept t3term
+/// from reaching the environment's server. Returns how many logins it removed.
+///
+/// Only a server that isn't running allows it. The environment's T3 home then holds its id, so
+/// only that environment's login is removed, never another's or every one. Any other failure,
+/// such as another environment's server answering at the origin, a redirect or a target t3term
+/// refuses, removes nothing and is returned as it was.
+pub async fn forget(local: &LocalTarget, error: anyhow::Error) -> Result<usize> {
+    let down = error
+        .downcast_ref::<T3Error>()
+        .is_some_and(|e| e.code == "T3_SERVER_UNAVAILABLE");
+    match local.environment_id().filter(|_| down) {
+        Some(id) => keychain::delete(Some(&id)).await,
+        None => Err(error),
+    }
+}
+
 async fn issue_session(
     runtime: &Runtime,
     scopes: &[Scope],
@@ -501,6 +518,7 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::discovery::{Target, discover};
 
     #[test]
     fn parses_mac_app_server_command_with_spaces() {
@@ -530,6 +548,78 @@ mod tests {
         assert!(fresh_enough(&saved(now + RENEW_WITHIN_SECS + 1), now));
         assert!(!fresh_enough(&saved(now + RENEW_WITHIN_SECS), now));
         assert!(!fresh_enough(&saved(now - 1), now));
+    }
+
+    /// Environment `b`, whose T3 home holds the id `env-b` and records no running server.
+    fn environment_b(home: &Path) -> LocalTarget {
+        let state_dir = home.join("userdata");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join("environment-id"), "env-b\n").unwrap();
+        LocalTarget {
+            name: "b".into(),
+            t3_home: home.to_path_buf(),
+            origin: None,
+        }
+    }
+
+    fn code(error: &anyhow::Error) -> Option<&'static str> {
+        error.downcast_ref::<T3Error>().map(|e| e.code)
+    }
+
+    #[tokio::test]
+    async fn forgetting_a_stopped_environment_deletes_its_login_alone() {
+        keychain::fake::reset(false);
+        let home = tempfile::tempdir().unwrap();
+        let b = environment_b(home.path());
+        let down = discover(&Target::Local(b.clone())).await.unwrap_err();
+        assert_eq!(code(&down), Some("T3_SERVER_UNAVAILABLE"));
+        assert_eq!(forget(&b, down).await.unwrap(), 0);
+        let deleted = ["delete-generic-password", "-s", "t3term", "-a", "env-b"].map(String::from);
+        assert_eq!(keychain::fake::calls(), [deleted.to_vec()]);
+    }
+
+    #[tokio::test]
+    async fn any_other_failure_forgets_nothing() {
+        keychain::fake::reset(false);
+        let home = tempfile::tempdir().unwrap();
+        let b = environment_b(home.path());
+        // Targets t3term refuses before it reads the home or reaches a server.
+        let refused = [
+            ("http://192.0.2.1:3773", "ENVIRONMENT_NOT_LOCAL"),
+            ("http://127.0.0.1:3773/api", "ENVIRONMENT_ORIGIN_INVALID"),
+        ];
+        for (origin, expected) in refused {
+            let target = LocalTarget {
+                origin: Some(origin.into()),
+                ..b.clone()
+            };
+            let error = discover(&Target::Local(target.clone())).await.unwrap_err();
+            let error = forget(&target, error).await.unwrap_err();
+            assert_eq!(code(&error), Some(expected), "{origin}");
+        }
+        // Answers only a running server gives. tests/cli.rs gets both from fake servers.
+        for answered in ["T3_ENVIRONMENT_MISMATCH", "T3_REDIRECTED"] {
+            let error = err_exit(answered, exit::REJECTED, "made up");
+            let error = forget(&b, error).await.unwrap_err();
+            assert_eq!(code(&error), Some(answered));
+        }
+        // A stopped server whose home holds no id names no login.
+        std::fs::remove_file(home.path().join("userdata").join("environment-id")).unwrap();
+        let down = discover(&Target::Local(b.clone())).await.unwrap_err();
+        let error = forget(&b, down).await.unwrap_err();
+        assert_eq!(code(&error), Some("T3_SERVER_UNAVAILABLE"));
+        assert_eq!(keychain::fake::calls(), Vec::<Vec<String>>::new());
+    }
+
+    #[tokio::test]
+    async fn with_saved_logins_off_forgetting_reaches_no_keychain() {
+        keychain::fake::reset(true);
+        let home = tempfile::tempdir().unwrap();
+        let b = environment_b(home.path());
+        let down = discover(&Target::Local(b.clone())).await.unwrap_err();
+        assert_eq!(forget(&b, down).await.unwrap(), 0);
+        assert_eq!(keychain::fake::calls(), Vec::<Vec<String>>::new());
+        keychain::fake::reset(false);
     }
 
     #[test]

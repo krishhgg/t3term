@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use t3term::auth::Scope;
 use t3term::client::{Client, IfBusy, WatchEvent};
-use t3term::discovery::{self, LocalTarget, Target};
+use t3term::discovery::{self, Target};
 use t3term::environments;
 use t3term::error::{T3Error, err, err_exit, exit};
 use t3term::models::{self, Choice, Plan};
@@ -1183,7 +1183,15 @@ async fn logout(environment: Option<&str>, json_mode: bool) -> Result<i32> {
                     "Removed {removed} saved login(s) from the Keychain. T3 is not running, so they could not be revoked; each expires within 30 days of being issued."
                 ),
             },
-            Target::Local(local) => forget_login(local, error).await?,
+            // A named environment's home holds its id, so `forget` removes that environment's
+            // login alone, and only when its server is down.
+            Target::Local(local) => match t3term::auth::forget(local, error).await? {
+                0 => format!("No saved login for environment {}.", local.name),
+                _ => format!(
+                    "Removed environment {}'s saved login from the Keychain. Its server is not running, so the login could not be revoked; it expires within 30 days of being issued.",
+                    local.name
+                ),
+            },
         },
     };
     if json_mode {
@@ -1192,25 +1200,6 @@ async fn logout(environment: Option<&str>, json_mode: bool) -> Result<i32> {
         println!("{}", plain(&message));
     }
     Ok(0)
-}
-
-/// Logs out of a named environment whose server is down. Its T3 home holds its environment
-/// id, so only that environment's saved login is removed. Any other failure, such as another
-/// environment's server at its origin, removes nothing.
-async fn forget_login(local: &LocalTarget, error: anyhow::Error) -> Result<String> {
-    let down = error
-        .downcast_ref::<T3Error>()
-        .is_some_and(|e| e.code == "T3_SERVER_UNAVAILABLE");
-    let Some(id) = local.environment_id().filter(|_| down) else {
-        return Err(error);
-    };
-    let name = &local.name;
-    Ok(match t3term::keychain::delete(Some(&id)).await? {
-        0 => format!("No saved login for environment {name}."),
-        _ => format!(
-            "Removed environment {name}'s saved login from the Keychain. Its server is not running, so the login could not be revoked; it expires within 30 days of being issued."
-        ),
-    })
 }
 
 /// `environment list`, `add`, `rename`, `remove` and `default`. Each reads or changes

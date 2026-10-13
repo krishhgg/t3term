@@ -8,6 +8,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
 use crate::error::{err_exit, exit};
+use crate::http::direct_client;
 
 pub const PROTOCOL_VERSION: u64 = 2;
 pub const PROTOCOL_HEADER: &str = "x-t3-orchestration-protocol";
@@ -129,6 +130,26 @@ pub fn loopback_origin(text: &str) -> Result<String, OriginError> {
     Ok(url.origin().ascii_serialization())
 }
 
+/// `text` as `loopback_origin` writes it, or the error a command reports for it.
+pub fn local_origin(text: &str) -> Result<String> {
+    loopback_origin(text).map_err(|problem| match problem {
+        OriginError::Invalid => err_exit(
+            "ENVIRONMENT_ORIGIN_INVALID",
+            exit::USAGE,
+            format!(
+                "{text:?} is not an origin. Give the scheme, host and port only, such as http://127.0.0.1:3773."
+            ),
+        ),
+        OriginError::NotLoopback => err_exit(
+            "ENVIRONMENT_NOT_LOCAL",
+            exit::REJECTED,
+            format!(
+                "{text:?} is not on this machine. A saved environment names a server at 127.0.0.1, ::1 or localhost, because t3term logs in to it with that server's own `t3` command. t3term can't pair with a remote environment or sign in to T3 Connect yet."
+            ),
+        ),
+    })
+}
+
 #[derive(Deserialize)]
 struct RuntimeState {
     version: u32,
@@ -165,7 +186,20 @@ fn read_runtime_state(path: &Path) -> Option<RuntimeState> {
     (state.version == 1).then_some(state)
 }
 
-async fn fetch_descriptor(http: &reqwest::Client, origin: &str) -> Option<Descriptor> {
+/// Why `fetch_descriptor` has no descriptor.
+enum NoDescriptor {
+    /// The server answered with a redirect, which t3term doesn't follow.
+    Redirected,
+    /// Nothing answered, or the answer wasn't a descriptor.
+    Unanswered,
+}
+
+/// What the server at `origin` reports at `/.well-known/t3/environment`. `http` is a
+/// `direct_client`, so the answer comes from `origin` and no other server.
+async fn fetch_descriptor(
+    http: &reqwest::Client,
+    origin: &str,
+) -> Result<Descriptor, NoDescriptor> {
     let url = format!(
         "{}/.well-known/t3/environment",
         origin.trim_end_matches('/')
@@ -175,11 +209,15 @@ async fn fetch_descriptor(http: &reqwest::Client, origin: &str) -> Option<Descri
         .timeout(Duration::from_millis(2500))
         .send()
         .await
-        .ok()?;
-    if !response.status().is_success() {
-        return None;
+        .map_err(|_| NoDescriptor::Unanswered)?;
+    let status = response.status();
+    if status.is_redirection() {
+        return Err(NoDescriptor::Redirected);
     }
-    response.json().await.ok()
+    if !status.is_success() {
+        return Err(NoDescriptor::Unanswered);
+    }
+    response.json().await.map_err(|_| NoDescriptor::Unanswered)
 }
 
 struct Candidate {
@@ -224,9 +262,9 @@ async fn discover_any() -> Result<Runtime> {
         }
     }
 
-    let http = reqwest::Client::new();
+    let http = direct_client();
     for candidate in candidates {
-        let Some(descriptor) = fetch_descriptor(&http, &candidate.origin).await else {
+        let Ok(descriptor) = fetch_descriptor(&http, &candidate.origin).await else {
             continue;
         };
         return Ok(described(
@@ -252,14 +290,26 @@ async fn discover_any() -> Result<Runtime> {
 ///
 /// The server must answer at the environment's origin, or at the origin its home records, and
 /// its descriptor must report the environment id that home holds. So a server that belongs to
-/// another home, such as one that took over the port, gets no login.
+/// another home, such as one that took over the port, gets no login. A redirect stops it too,
+/// since its answer would come from another server.
+///
+/// `local` is checked here again, however it was made, before t3term reads the home or reaches
+/// a server: the home must be absolute and the origin on this machine.
 async fn discover_local(local: &LocalTarget) -> Result<Runtime> {
     let name = &local.name;
     let home = local.t3_home.display();
+    if !local.t3_home.is_absolute() {
+        return Err(err_exit(
+            "ENVIRONMENT_HOME_INVALID",
+            exit::USAGE,
+            format!("Environment {name}'s T3 home {home} is not an absolute path."),
+        ));
+    }
+    let chosen = local.origin.as_deref().map(local_origin).transpose()?;
     let state_dir = local.state_dir();
     let recorded = read_runtime_state(&state_dir.join("server-runtime.json"));
-    let origin = match (&local.origin, &recorded) {
-        (Some(origin), _) => origin.clone(),
+    let origin = match (chosen, &recorded) {
+        (Some(origin), _) => origin,
         (None, Some(state)) => loopback_origin(&state.origin).map_err(|_| {
             err_exit(
                 "ENVIRONMENT_NOT_LOCAL",
@@ -291,15 +341,26 @@ async fn discover_local(local: &LocalTarget) -> Result<Runtime> {
             ),
         )
     })?;
-    let http = reqwest::Client::new();
-    let Some(descriptor) = fetch_descriptor(&http, &origin).await else {
-        return Err(err_exit(
-            "T3_SERVER_UNAVAILABLE",
-            exit::UNAVAILABLE,
-            format!(
-                "Environment {name}'s server at {origin} did not answer. Start T3 Code with --base-dir {home} and retry. t3term does not try another server."
-            ),
-        ));
+    let descriptor = match fetch_descriptor(&direct_client(), &origin).await {
+        Ok(descriptor) => descriptor,
+        Err(NoDescriptor::Redirected) => {
+            return Err(err_exit(
+                "T3_REDIRECTED",
+                exit::REJECTED,
+                format!(
+                    "Environment {name}'s server at {origin} answered with a redirect. t3term doesn't follow one, since the answer would come from another server, so it stopped before logging in."
+                ),
+            ));
+        }
+        Err(NoDescriptor::Unanswered) => {
+            return Err(err_exit(
+                "T3_SERVER_UNAVAILABLE",
+                exit::UNAVAILABLE,
+                format!(
+                    "Environment {name}'s server at {origin} did not answer. Start T3 Code with --base-dir {home} and retry. t3term does not try another server."
+                ),
+            ));
+        }
     };
     if descriptor.environment_id != expected {
         return Err(err_exit(
@@ -350,6 +411,13 @@ fn described(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::auth::Scope;
+    use crate::client::Client;
+    use crate::error::T3Error;
+
+    fn code(error: &anyhow::Error) -> Option<&'static str> {
+        error.downcast_ref::<T3Error>().map(|e| e.code)
+    }
 
     #[test]
     fn a_loopback_origin_is_saved_in_one_form() {
@@ -374,7 +442,11 @@ mod tests {
             "http://[::2]:3773",
             "http://localhost.example.com:3773",
         ] {
-            assert_eq!(loopback_origin(text), Err(OriginError::NotLoopback), "{text}");
+            assert_eq!(
+                loopback_origin(text),
+                Err(OriginError::NotLoopback),
+                "{text}"
+            );
         }
         for text in [
             "",
@@ -388,5 +460,57 @@ mod tests {
         ] {
             assert_eq!(loopback_origin(text), Err(OriginError::Invalid), "{text}");
         }
+    }
+
+    /// A caller of the library can build a `Target::Local` by hand. `Client::connect` checks it
+    /// as a saved environment is checked, before t3term reads the home or reaches a server.
+    #[tokio::test]
+    async fn a_hand_made_target_is_checked_before_t3term_reaches_anything() {
+        crate::keychain::fake::reset(false);
+        // The server the home records, which must see no connection.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let port = listener.local_addr().unwrap().port();
+        let home = tempfile::tempdir().unwrap();
+        let state_dir = home.path().join("userdata");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join("environment-id"), "env-b\n").unwrap();
+        let origin = format!("http://127.0.0.1:{port}");
+        let recorded = serde_json::json!({"version": 1, "pid": 1, "origin": origin});
+        std::fs::write(state_dir.join("server-runtime.json"), recorded.to_string()).unwrap();
+        let b = LocalTarget {
+            name: "b".into(),
+            t3_home: home.path().to_path_buf(),
+            origin: None,
+        };
+        let refused = [
+            (format!("http://192.0.2.1:{port}"), "ENVIRONMENT_NOT_LOCAL"),
+            ("https://example.com".to_string(), "ENVIRONMENT_NOT_LOCAL"),
+            (format!("{origin}/api"), "ENVIRONMENT_ORIGIN_INVALID"),
+            (format!("http://user:secret@127.0.0.1:{port}"), "ENVIRONMENT_ORIGIN_INVALID"),
+            (format!("ftp://127.0.0.1:{port}"), "ENVIRONMENT_ORIGIN_INVALID"),
+            (format!("127.0.0.1:{port}"), "ENVIRONMENT_ORIGIN_INVALID"),
+        ];
+        for (origin, expected) in refused {
+            let target = Target::Local(LocalTarget {
+                origin: Some(origin.clone()),
+                ..b.clone()
+            });
+            let connected = Client::connect(&target, &[Scope::Read], "1m").await;
+            let error = connected.err().expect("a refused origin");
+            assert_eq!(code(&error), Some(expected), "{origin}");
+        }
+        let relative = Target::Local(LocalTarget {
+            t3_home: PathBuf::from("t3/b"),
+            ..b.clone()
+        });
+        let connected = Client::connect(&relative, &[Scope::Read], "1m").await;
+        let error = connected.err().expect("a relative home");
+        assert_eq!(code(&error), Some("ENVIRONMENT_HOME_INVALID"));
+        // Nothing reached the server the home records, so no descriptor was read, and no login
+        // was looked up, issued or saved.
+        let accepted = listener.accept().map_err(|error| error.kind());
+        assert_eq!(accepted.err(), Some(std::io::ErrorKind::WouldBlock));
+        assert_eq!(crate::keychain::fake::calls(), Vec::<Vec<String>>::new());
     }
 }
