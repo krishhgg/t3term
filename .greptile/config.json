@@ -16,12 +16,12 @@
     {
       "id": "session-lifecycle",
       "rule": "Every session t3term issues must end up either saved in the Keychain or revoked before the process exits, on every exit path: normal return, error, Ctrl+C, SIGHUP from a closed terminal and SIGTERM. A spawned revoke must be waited for, or tracked so exit waits for it, and must not die with the terminal's process group. Concurrent t3term processes must not issue duplicate saved logins. Flag new exit paths (process::exit, panics, early returns from main) that skip revoke_all_sessions.",
-      "scope": ["src/auth.rs", "src/keychain.rs", "src/client.rs", "src/main.rs", "src/tui/**"],
+      "scope": ["src/auth.rs", "src/keychain.rs", "src/client.rs", "src/client/**", "src/main.rs", "src/tui/**"],
       "severity": "high"
     },
     {
       "id": "least-privilege",
-      "rule": "Sessions carry only the orchestration:read and orchestration:operate scopes and last at most 30 days. Flag any new scope, any longer TTL, and any HTTP or RPC call that needs more access than these scopes grant.",
+      "rule": "The saved login and every other session the CLI and TUI log in with carry only the orchestration:read and orchestration:operate scopes and last at most 30 days. The one exception is the terminal session that src/client/terminal_access.rs issues on the first terminal connection. It carries only terminal:read and terminal:operate, lasts at most 12 hours and is never saved. Flag a terminal scope in any other session, any other new scope, any longer TTL, and any HTTP or RPC call that needs more access than the session it uses grants.",
       "scope": ["src/**"],
       "severity": "high"
     },
