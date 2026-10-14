@@ -10,6 +10,7 @@ T3 checks each terminal RPC against `terminal:read` or `terminal:operate`, never
 - T3 lists it as `t3term terminal`, with the subject `t3term`.
 - t3term issues it with the server's own `t3 auth session issue --base-dir`, against the T3 home of the environment the client connected to.
 - It is never saved. Like any session that lasts one run, it is revoked when the client drops and at exit, including after Ctrl+C, `kill` or a closed terminal window.
+- Revoking it doesn't close the socket it opened, which keeps the scopes it opened with (apps/server/src/ws.ts:3155-3213 and apps/server/src/auth/SessionStore.ts:995-1012 at T3 f570bd21). So when the client drops, t3term closes the terminal's socket first and then revokes the session.
 - A login can't carry a terminal scope. `Session::login` and `Session::issue` refuse one with `TERMINAL_SCOPE_NOT_ALLOWED`.
 
 ## When t3term issues it
@@ -19,7 +20,7 @@ Connecting a client issues nothing, and neither does `Client::rpc`, which keeps 
 1. It checks the server at the client's origin again. The server must still report the client's environment id and orchestration protocol 2. A named environment's server must also report the id its T3 home holds, as when the client connected. t3term asks that origin alone, even when the home now records another one. Otherwise the call stops before t3term issues a session or sends a token, with `T3_ENVIRONMENT_MISMATCH`, `T3_ENVIRONMENT_CHANGED`, `T3_SERVER_UNAVAILABLE` or the error discovery reports.
 2. It issues the session.
 3. It asks `/api/auth/session` about the session and reads `permissions`. The older `scopes` field leaves out `terminal:read` (packages/contracts/src/auth.ts:131-149 at T3 f570bd21), so t3term doesn't read it.
-4. It gets a WebSocket ticket with the session's token and opens `/ws` with it.
+4. It gets a WebSocket ticket with the session's token and opens `/ws` with it. The ticket and the WebSocket handshake get 30 seconds together. Past that the call fails with `TERMINAL_CONNECT_TIMED_OUT` and keeps the session for the next call.
 
 What t3term does with the answer in step 3:
 
@@ -35,9 +36,20 @@ What t3term does with the answer in step 3:
 
 - Calls that come at once wait for one connect and share the session and the socket it makes.
 - Once the socket drops, the next call checks the server and the session again and opens a new socket with the same session.
-- A ticket request or socket that fails keeps the session for the next call.
-- A connect runs on a task of its own. A caller that stops waiting can't drop a session between issuing and tracking it, and a client that drops mid-connect revokes the session once the connect ends.
+- A ticket request, handshake or socket that fails or runs out of time keeps the session for the next call.
+- A connect runs on a task of its own. A caller that stops waiting can't drop a session between issuing and tracking it, and a client that drops mid-connect revokes the session once the connect ends. Every step of a connect has a time limit, so it does end.
 - A client starts at most one issue a minute. A call within the minute fails with `TERMINAL_SESSION_LIMITED` and says why the last issue failed, if it did. Nothing retries in the background.
+
+## Closing
+
+When the client drops, t3term closes the terminal's socket and then revokes the session. Closing reaches every copy of the connection a caller still holds:
+
+- A call or stream still waiting on T3 ends with `T3_DISCONNECTED`.
+- A call made after that fails at once and sends nothing.
+- t3term sends T3 no request when it closes, so it doesn't close, kill or restart a terminal. T3 sees a client that went away.
+- The client's other socket, the login's, stays open.
+
+The session lasts 12 hours, and nothing renews it. At T3 f570bd21, a socket's session is checked when the socket opens, and nothing in `ws.ts` ends an open socket when its session expires. So an open terminal socket may outlive its session. Nobody has tried this against a running T3. A call after the socket drops and the session expires finds the session rejected, revokes it and issues one in its place.
 
 ## Errors
 
@@ -47,12 +59,14 @@ What t3term does with the answer in step 3:
 | `TERMINAL_ACCESS_REFUSED` | 4 | T3 lists other permissions for the terminal session. Lasts until t3term starts again. |
 | `TERMINAL_SESSION_REJECTED` | 4 | T3 doesn't accept the terminal session it just issued. |
 | `TERMINAL_SESSION_LIMITED` | 5 | The client tried to issue a terminal session less than a minute ago. |
-| `T3_ENVIRONMENT_CHANGED` | 4 | The server at the client's origin is another environment now. Start t3term again. |
+| `TERMINAL_CONNECT_TIMED_OUT` | 5 | The ticket and WebSocket handshake took more than 30 seconds. The session stays for the next call. |
+| `T3_ENVIRONMENT_CHANGED` | 4 | The server at the client's origin is another environment now. The next call checks again, and connects if the client's environment is back. |
 | `TERMINAL_CONNECT_FAILED` | 1 | The connect task stopped before it opened the socket. |
 
 ## Known limits
 
 - A signal that arrives while `t3 auth session issue` runs kills it. T3 may have made a session t3term never saw, and it expires within 12 hours. The saved login has the same gap.
-- t3term doesn't close a terminal connection a caller still holds when it revokes the session.
-- `TERMINAL_ACCESS_REFUSED` and `T3_ENVIRONMENT_CHANGED` last until t3term starts again.
+- `TERMINAL_ACCESS_REFUSED` lasts until t3term starts again. After any other error, the next call checks the server and the session again.
+- The connection's task does the closing. If T3 stops reading while t3term's writes to it are backed up, the task waits on that write, and the close waits with it, as the ping check already does.
+- An open terminal socket may outlive its 12-hour session, as [Closing](#closing) says.
 - The terminal itself, opening a shell and the TUI's terminal panel aren't built yet.
