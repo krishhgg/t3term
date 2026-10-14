@@ -1,8 +1,9 @@
 //! The pull requests linked to the open thread, in the details' second tab. Each shows its
 //! number, title and state, and the checks, review and line counts the host reported, with
-//! the repository and its branches under them. Enter or a second click opens a link's
-//! details, with its whole URL as plain text. t3term opens no browser and changes nothing:
-//! the list only reads.
+//! the repository and its branches under them. Enter or a second click shows a link's details
+//! in the list's place, its whole URL among them as plain text, and they scroll. ←, Enter or
+//! a click on the row above them goes back to the list. t3term opens no browser and changes
+//! nothing: the list only reads.
 //!
 //! The links come from the thread's record that the details already hold, as the desktop's
 //! `ThreadPullRequestsPanel` (apps/web/src/components/pullRequest/ThreadPullRequestsPanel.tsx
@@ -19,7 +20,7 @@
 //! The links are worked out from the record only after an event that can change it, while
 //! the details are open: a few strings of each, bounded and cleaned once. A frame lays out
 //! only the links it shows, and lays them out again only when the width, the height, the
-//! selection or the minute changes.
+//! selection, the details' scroll or the minute changes.
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
@@ -51,10 +52,8 @@ const KEY: usize = 1024;
 const STAMP: usize = 64;
 /// The rows each link takes in the list.
 const ENTRY_ROWS: usize = 3;
-/// The most rows a selected link's title, its other values and its URL wrap to.
-const TITLE_ROWS: usize = 4;
+/// The most rows each sentence of a list without links wraps to.
 const VALUE_ROWS: usize = 3;
-const URL_ROWS: usize = 8;
 /// What a GitHub stack does, as the desktop's tooltip says it.
 const NATIVE_STACK: &str = "merging a layer lands the ones below it.";
 /// What watching a pull request does, as the desktop's tooltip says it.
@@ -119,15 +118,20 @@ struct Key {
 }
 
 impl Key {
+    /// The identity of link `number` on `host`'s `repository`. None when either is longer
+    /// than `KEY` bytes as T3 sent it, so no longer text is trimmed or lowercased, or when
+    /// either is empty once trimmed.
     fn of(host: &str, repository: &str, number: u64) -> Option<Key> {
-        let readable = |text: &str| !text.is_empty() && text.len() <= KEY;
-        let (host, repository) = (host.trim(), repository.trim());
-        if !readable(host) || !readable(repository) {
-            return None;
-        }
+        let part = |text: &str| {
+            if text.len() > KEY {
+                return None;
+            }
+            let text = text.trim();
+            (!text.is_empty()).then(|| text.to_lowercase())
+        };
         Some(Key {
-            host: host.to_lowercase(),
-            repository: repository.to_lowercase(),
+            host: part(host)?,
+            repository: part(repository)?,
             number,
         })
     }
@@ -182,6 +186,8 @@ struct Entry {
     repository: String,
     number: u64,
     url: String,
+    /// Whether `url` is cut short of the one T3 sent.
+    url_cut: bool,
     source: Source,
     linked_at: Option<String>,
     synced: Synced,
@@ -374,12 +380,14 @@ fn link_of(link: &Value) -> Option<Parsed> {
     };
     let at = updated.or(linked_at.as_deref());
     let activity = at.and_then(parse_iso_ms).unwrap_or(0);
+    let (url, url_cut) = url_of(url);
     let entry = Entry {
         host: bounded(host, NAME),
         repository: bounded(repository, NAME),
         key,
         number,
-        url: bounded(url, URL),
+        url,
+        url_cut,
         source,
         linked_at,
         synced,
@@ -403,11 +411,13 @@ fn legacy_of(linked: &Value) -> Option<Raw> {
     let number = number_of(linked)?;
     let url = linked.get("url")?.as_str()?;
     let key = Key::of(&host_of(url), repository, number)?;
+    let (url, url_cut) = url_of(url);
     let entry = Entry {
         host: bounded(&key.host, NAME),
         repository: bounded(&key.repository, NAME),
         number,
-        url: bounded(url, URL),
+        url,
+        url_cut,
         source: Source::Manual,
         // T3 stamps the link with the epoch, which says nothing worth showing.
         linked_at: None,
@@ -422,6 +432,14 @@ fn legacy_of(linked: &Value) -> Option<Raw> {
         stack: None,
         activity: 0,
     })
+}
+
+/// `url` bounded and cleaned, and whether that cut it short. `bounded` ends what it cuts with
+/// `…`, and cuts only text longer than `URL` characters, so a URL that is both was cut.
+fn url_of(url: &str) -> (String, bool) {
+    let shown = bounded(url, URL);
+    let cut = shown.ends_with('…') && url.char_indices().nth(URL).is_some();
+    (shown, cut)
 }
 
 /// The host of `url`, as `legacyThreadPullRequestKey` reads it with `new URL(url).hostname`
@@ -678,7 +696,7 @@ fn position(entries: &[Entry], key: &Key) -> Option<usize> {
     entries.iter().position(|entry| &entry.key == key)
 }
 
-/// What a frame lays the list out for.
+/// What a frame lays the list or a link's details out for.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Shape {
     width: usize,
@@ -686,26 +704,39 @@ struct Shape {
     /// The first link shown.
     top: usize,
     selected: usize,
-    expanded: Option<usize>,
+    /// Whether the selected link's details show in the list's place.
+    viewing: bool,
+    /// The first row of the details shown.
+    scroll: usize,
     /// The minute the relative times read from.
     minute: i64,
+}
+
+/// What a click on a row of a page reaches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Spot {
+    /// One of a link's rows in the list.
+    Link(usize),
+    /// The row above a link's details, which leads back to the list.
+    Back,
 }
 
 /// The rows a frame shows.
 pub(super) struct Page {
     shape: Shape,
     pub lines: Vec<Line<'static>>,
-    /// For each row, the link whose own rows it is on. None for the rows of a link's details,
-    /// the blank rows and the footer.
-    rows: Vec<Option<usize>>,
-    /// Whether links lie above or below the page.
+    /// For each row, what a click on it reaches. None for the blank rows, the footer and the
+    /// text of a link's details.
+    rows: Vec<Option<Spot>>,
+    /// Whether links, or rows of a link's details, lie above or below the page.
     pub above: bool,
     pub below: bool,
-    /// The links a page holds, which PageUp and PageDown move by.
+    /// The links a page of the list holds, or the rows of details it shows, which PageUp and
+    /// PageDown move by.
     per_page: usize,
 }
 
-/// A selected link's details at one width and minute.
+/// The selected link's details at one width and minute.
 struct Detail {
     index: usize,
     /// The width and the minute these lines are of.
@@ -723,11 +754,17 @@ pub(super) struct PullRequests {
     selected: usize,
     /// The selected link, which stays selected when the list changes around it.
     chosen: Option<Key>,
-    /// The link whose details show.
-    expanded: Option<usize>,
+    /// Whether the selected link's details show in the list's place.
+    viewing: bool,
+    /// The first row of the details shown. A frame keeps it within the details.
+    scroll: usize,
     /// The first link the last frame showed.
     top: usize,
     page: Option<Page>,
+    /// Whether `page` is what the last frame drew. Moving the selection, scrolling the details
+    /// or switching between them and the list clears it, so a click before the next frame
+    /// lands on nothing rather than on a row that moved.
+    current: bool,
     detail: Option<Detail>,
     /// How many times the links were worked out and a page laid out, so the tests can tell
     /// what a frame or an event did.
@@ -748,7 +785,8 @@ impl PullRequests {
         self.stale = true;
         self.selected = 0;
         self.chosen = None;
-        self.expanded = None;
+        self.viewing = false;
+        self.scroll = 0;
         self.top = 0;
         self.page = None;
         self.detail = None;
@@ -763,8 +801,9 @@ impl PullRequests {
         self.stale || list.thread_id.as_deref() != open_id || list.supported != supported
     }
 
-    /// Takes the links a frame worked out. The selection stays on its link, and the details
-    /// that showed stay open, while those links are still listed.
+    /// Takes the links a frame worked out. The selection stays on its link, and that link's
+    /// details stay open at their scroll, while it is still listed. When it goes, the details
+    /// close and the selection stays where it was.
     pub fn set(&mut self, list: List) {
         #[cfg(test)]
         {
@@ -774,21 +813,18 @@ impl PullRequests {
         if self.list.as_ref() == Some(&list) {
             return;
         }
-        let expanded = self
-            .expanded
-            .and_then(|index| entries_of(self.list.as_ref()).get(index))
-            .map(|entry| entry.key.clone());
         self.list = Some(list);
         self.page = None;
         self.detail = None;
         let entries = entries_of(self.list.as_ref());
-        let selected = self
-            .chosen
-            .as_ref()
-            .and_then(|key| position(entries, key))
+        let found = self.chosen.as_ref().and_then(|key| position(entries, key));
+        if found.is_none() {
+            self.viewing = false;
+            self.scroll = 0;
+        }
+        let selected = found
             .unwrap_or(self.selected)
             .min(entries.len().saturating_sub(1));
-        self.expanded = expanded.and_then(|key| position(entries, &key));
         self.chosen = entries.get(selected).map(|entry| entry.key.clone());
         self.selected = selected;
     }
@@ -798,51 +834,92 @@ impl PullRequests {
         self.list.as_ref().and_then(List::count)
     }
 
+    /// Whether the selected link's details show in the list's place.
+    pub fn viewing(&self) -> bool {
+        self.viewing
+    }
+
     /// Moves the selection `delta` links, down for a positive one, and stops at the ends.
+    /// While a link's details show, scrolls them `delta` rows instead.
     pub fn move_by(&mut self, delta: isize) {
+        if self.viewing {
+            self.scroll_to(self.scroll.saturating_add_signed(delta));
+            return;
+        }
         let count = entries_of(self.list.as_ref()).len();
         if count > 0 {
             self.select(self.selected.saturating_add_signed(delta).min(count - 1));
         }
     }
 
-    /// Moves the selection a page down, or up when `down` is false.
+    /// Moves the selection, or scrolls the details, a page down, or up when `down` is false.
     pub fn page_by(&mut self, down: bool) {
-        let step = self.page.as_ref().map_or(1, |page| page.per_page) as isize;
+        let step = self
+            .page
+            .as_ref()
+            .filter(|page| page.shape.viewing == self.viewing)
+            .map_or(1, |page| page.per_page) as isize;
         self.move_by(if down { step } else { -step });
     }
 
     fn select(&mut self, index: usize) {
+        if index != self.selected {
+            self.current = false;
+        }
         self.selected = index;
         self.chosen = entries_of(self.list.as_ref())
             .get(index)
             .map(|entry| entry.key.clone());
     }
 
-    /// Opens the selected link's details, or closes them.
-    pub fn toggle(&mut self) {
-        if entries_of(self.list.as_ref()).is_empty() {
-            return;
+    fn scroll_to(&mut self, scroll: usize) {
+        if scroll != self.scroll {
+            self.current = false;
+            self.scroll = scroll;
         }
-        self.expanded = if self.expanded == Some(self.selected) {
-            None
-        } else {
-            Some(self.selected)
-        };
     }
 
-    /// A click on row `offset` of the last frame's page: on a link's rows it selects the link,
-    /// or opens or closes its details when it is selected already. Says whether it landed on
-    /// a link.
-    pub fn click(&mut self, offset: usize) -> bool {
-        let hit = self.page.as_ref().and_then(|page| page.rows.get(offset));
-        let Some(&Some(index)) = hit else {
+    /// Shows the selected link's details in the list's place, from their top, or the list
+    /// again.
+    pub fn toggle(&mut self) {
+        if self.viewing {
+            self.back();
+        } else if !entries_of(self.list.as_ref()).is_empty() {
+            self.viewing = true;
+            self.scroll = 0;
+            self.current = false;
+        }
+    }
+
+    /// Shows the list again in place of a link's details, with that link still selected. Says
+    /// whether the details showed.
+    pub fn back(&mut self) -> bool {
+        if !self.viewing {
             return false;
-        };
-        if index == self.selected {
-            self.toggle();
-        } else {
-            self.select(index);
+        }
+        self.viewing = false;
+        self.scroll = 0;
+        self.current = false;
+        true
+    }
+
+    /// A click on row `offset` of the page the last frame drew. On a link's rows it selects
+    /// the link, or shows its details when it is selected already, and on the row above the
+    /// details it shows the list again. Says whether it landed on one of those. Once the
+    /// selection or the scroll moved, a click lands on nothing until a frame draws the page.
+    pub fn click(&mut self, offset: usize) -> bool {
+        let hit = self
+            .page
+            .as_ref()
+            .filter(|_| self.current)
+            .and_then(|page| page.rows.get(offset).copied().flatten());
+        match hit {
+            Some(Spot::Link(index)) if index == self.selected => self.toggle(),
+            Some(Spot::Link(index)) => self.select(index),
+            Some(Spot::Back) => {
+                self.back();
+            }
+            None => return false,
         }
         true
     }
@@ -853,17 +930,17 @@ impl PullRequests {
         if count == 0 {
             return message(self.list.as_ref(), width, theme).len();
         }
-        let detail = match self.expanded {
-            Some(index) => self.prepare_detail(index, width, now, theme),
-            None => 0,
-        };
-        count * ENTRY_ROWS + detail + 1
+        if self.viewing {
+            // The row back to the list, then the details.
+            return 1 + self.prepare_detail(width, now, theme);
+        }
+        count * ENTRY_ROWS + 1
     }
 
-    /// The rows of link `index`'s details at `width`, worked out again only for another link,
-    /// width or minute.
-    fn prepare_detail(&mut self, index: usize, width: usize, now: i64, theme: &Theme) -> usize {
-        let at = (width, now.div_euclid(60_000));
+    /// The rows of the selected link's details at `width`, worked out again only for another
+    /// link, width or minute.
+    fn prepare_detail(&mut self, width: usize, now: i64, theme: &Theme) -> usize {
+        let (index, at) = (self.selected, (width, now.div_euclid(60_000)));
         let cached = self.detail.as_ref().map(|detail| (detail.index, detail.at));
         if cached != Some((index, at)) {
             let lines = match entries_of(self.list.as_ref()).get(index) {
@@ -876,14 +953,23 @@ impl PullRequests {
     }
 
     /// The page a frame shows in `height` rows of `width` columns, laid out again only when
-    /// its shape changed. The selected link stays on it.
+    /// its shape changed: the list with the selected link on it, or the selected link's
+    /// details, scrolled no further than their last row shows. Clicks land on it until the
+    /// selection or the scroll moves.
     pub fn page(&mut self, width: usize, height: usize, now: i64, theme: &Theme) -> &Page {
+        if self.viewing {
+            let total = self.prepare_detail(width, now, theme);
+            // The row back to the list comes first.
+            let shown = height.saturating_sub(1);
+            self.scroll = self.scroll.min(total.saturating_sub(shown));
+        }
         let shape = Shape {
             width,
             height,
             top: self.top,
             selected: self.selected,
-            expanded: self.expanded,
+            viewing: self.viewing,
+            scroll: self.scroll,
             minute: now.div_euclid(60_000),
         };
         if self.page.as_ref().map(|page| page.shape) != Some(shape) {
@@ -891,27 +977,23 @@ impl PullRequests {
             {
                 self.pages += 1;
             }
-            if let Some(index) = shape.expanded {
-                self.prepare_detail(index, width, now, theme);
-            }
-            let (list, detail) = (self.list.as_ref(), self.detail.as_ref());
-            let page = lay_out(list, detail, shape, now, theme);
+            let list = self.list.as_ref();
+            let page = if shape.viewing {
+                view(list, self.detail.as_ref(), shape, theme)
+            } else {
+                lay_out(list, shape, now, theme)
+            };
             self.top = page.shape.top;
             self.page = Some(page);
         }
+        self.current = true;
         self.page.as_ref().expect("laid out above")
     }
 }
 
 /// The page of `list` for `shape`: as many links as fit from the first shown, moved so the
 /// selected one shows, and the footer on the last row. A list without links says why.
-fn lay_out(
-    list: Option<&List>,
-    detail: Option<&Detail>,
-    mut shape: Shape,
-    now: i64,
-    theme: &Theme,
-) -> Page {
+fn lay_out(list: Option<&List>, mut shape: Shape, now: i64, theme: &Theme) -> Page {
     let mut page = Page {
         shape,
         lines: Vec::new(),
@@ -938,41 +1020,28 @@ fn lay_out(
     let count = entries.len();
     let footer = height >= 2;
     let room = height - usize::from(footer);
+    // The links whose rows all fit, or the one whose first rows do.
+    let fit = (room / ENTRY_ROWS).max(1);
     let selected = shape.selected.min(count - 1);
-    let expanded = shape.expanded.filter(|&index| index < count);
-    let detail = detail.filter(|detail| Some(detail.index) == expanded);
-    let detail_rows = detail.map_or(0, |detail| detail.lines.len());
-    // The rows of the links from `from` to `to`, both included.
-    let span = |from: usize, to: usize| {
-        let open = expanded.is_some_and(|index| (from..=to).contains(&index));
-        (to + 1 - from) * ENTRY_ROWS + if open { detail_rows } else { 0 }
-    };
-    let mut top = shape.top.min(selected);
-    while top < selected && span(top, selected) > room {
-        top += 1;
-    }
-    // A page that reaches the end of the list starts as early as it can.
-    while top > 0 && span(top - 1, count - 1) <= room {
-        top -= 1;
-    }
+    // The selected link shows, and a page that reaches the end of the list starts as early as
+    // it can.
+    let top = shape
+        .top
+        .min(selected)
+        .max((selected + 1).saturating_sub(fit))
+        .min(count.saturating_sub(fit));
     let mut index = top;
     while index < count && page.lines.len() < room {
         let lines = entry_lines(&entries[index], width, index == selected, now, theme);
         for line in lines.into_iter().take(room - page.lines.len()) {
-            page.rows.push(Some(index));
+            page.rows.push(Some(Spot::Link(index)));
             page.lines.push(line);
-        }
-        if let Some(detail) = detail.filter(|detail| detail.index == index) {
-            for line in detail.lines.iter().take(room - page.lines.len()) {
-                page.rows.push(None);
-                page.lines.push(line.clone());
-            }
         }
         index += 1;
     }
     page.above = top > 0;
-    page.below = span(top, count - 1) > room;
-    page.per_page = (room / ENTRY_ROWS).max(1);
+    page.below = (count - top) * ENTRY_ROWS > room;
+    page.per_page = fit;
     if footer {
         page.lines.resize(room, Line::default());
         page.rows.resize(room, None);
@@ -981,6 +1050,42 @@ fn lay_out(
     }
     shape.top = top;
     page.shape = shape;
+    page
+}
+
+/// The page of the selected link's details for `shape`: the row back to the list, with where
+/// the link is in it, then as many rows of the details as fit from row `shape.scroll`.
+fn view(list: Option<&List>, detail: Option<&Detail>, shape: Shape, theme: &Theme) -> Page {
+    let mut page = Page {
+        shape,
+        lines: Vec::new(),
+        rows: Vec::new(),
+        above: false,
+        below: false,
+        per_page: 1,
+    };
+    let (width, height) = (shape.width, shape.height);
+    if width == 0 || height == 0 {
+        return page;
+    }
+    let lines: &[Line<'static>] = match detail {
+        Some(detail) if detail.index == shape.selected => &detail.lines,
+        _ => &[],
+    };
+    let back = Style::new().fg(theme.primary).add_modifier(Modifier::BOLD);
+    let back = fitted(vec![Span::styled("← List", back)], width);
+    let count = entries_of(list).len();
+    let place = format!("{} of {count}", shape.selected + 1);
+    let place = vec![Span::styled(place, Style::new().fg(theme.muted))];
+    page.lines.push(row(back, place, width));
+    page.rows.push(Some(Spot::Back));
+    let room = height - 1;
+    let shown = lines.iter().skip(shape.scroll).take(room);
+    page.lines.extend(shown.cloned());
+    page.rows.resize(page.lines.len(), None);
+    page.above = shape.scroll > 0;
+    page.below = shape.scroll + room < lines.len();
+    page.per_page = room.max(1);
     page
 }
 
@@ -1087,8 +1192,7 @@ fn fitted(spans: Vec<Span<'static>>, width: usize) -> Vec<Span<'static>> {
     out
 }
 
-/// `text` wrapped at `width` to at most `rows` rows, the last cut with `…`. Each row is one
-/// span in `style`, so a caller can put the spans on rows of its own.
+/// `text` in `style`, wrapped at `width` to at most `rows` rows, the last cut with `…`.
 fn wrapped(text: &str, width: usize, rows: usize, style: Style) -> Vec<Line<'static>> {
     let mut pieces = wrap(text, width);
     if pieces.len() > rows {
@@ -1101,6 +1205,11 @@ fn wrapped(text: &str, width: usize, rows: usize, style: Style) -> Vec<Line<'sta
         .iter()
         .map(|piece| Line::from(Span::styled(clip(piece, width), style)))
         .collect()
+}
+
+/// `text` in `style`, wrapped at `width` to every row it takes.
+fn whole(text: &str, width: usize, style: Style) -> Vec<Line<'static>> {
+    wrapped(text, width, usize::MAX, style)
 }
 
 /// `number` with a comma between each three digits, as the desktop's `toLocaleString` writes
@@ -1141,10 +1250,10 @@ fn state_of(entry: &Entry, theme: &Theme) -> (&'static str, &'static str, Color)
     }
 }
 
-/// What a link's second row says before its time: the stack it heads, its state, then while
-/// it is open whether T3 watches it, whether it conflicts, and its checks and review, each
-/// only when the host reported it.
-fn status_spans(entry: &Entry, theme: &Theme) -> Vec<Span<'static>> {
+/// What a link's second row says before its time, a part each: the stack it heads, its state,
+/// then while it is open whether T3 watches it, whether it conflicts, and its checks and
+/// review, each only when the host reported it.
+fn status_parts(entry: &Entry, theme: &Theme) -> Vec<Span<'static>> {
     let mut parts: Vec<(String, Color)> = Vec::new();
     if let Some(chain) = entry.chain {
         let text = if chain.native {
@@ -1177,14 +1286,57 @@ fn status_spans(entry: &Entry, theme: &Theme) -> Vec<Span<'static>> {
             parts.push((text.to_string(), color));
         }
     }
-    let mut spans = Vec::new();
-    for (text, color) in parts {
+    parts
+        .into_iter()
+        .map(|(text, color)| Span::styled(text, Style::new().fg(color)))
+        .collect()
+}
+
+/// `parts` with `gap` between each two.
+fn joined(parts: Vec<Span<'static>>, gap: Span<'static>) -> Vec<Span<'static>> {
+    let mut spans = Vec::with_capacity(2 * parts.len());
+    for part in parts {
         if !spans.is_empty() {
-            spans.push(Span::styled(" · ", Style::new().fg(theme.muted)));
+            spans.push(gap.clone());
         }
-        spans.push(Span::styled(text, Style::new().fg(color)));
+        spans.push(part);
     }
     spans
+}
+
+/// `parts` on as few rows of `width` as they take, `gap` between two on a row. A part wider
+/// than a row wraps on rows of its own.
+fn flowed(
+    parts: Vec<Span<'static>>,
+    gap: &'static str,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let mut lines = Vec::new();
+    let mut spans: Vec<Span<'static>> = Vec::new();
+    let mut used = 0;
+    for part in parts {
+        let columns = part.content.width();
+        if !spans.is_empty() && used + gap.width() + columns <= width {
+            spans.push(Span::styled(gap, Style::new().fg(theme.muted)));
+            spans.push(part);
+            used += gap.width() + columns;
+            continue;
+        }
+        if !spans.is_empty() {
+            lines.push(Line::from(std::mem::take(&mut spans)));
+        }
+        if columns <= width {
+            used = columns;
+            spans.push(part);
+        } else {
+            lines.extend(whole(&part.content, width, part.style));
+        }
+    }
+    if !spans.is_empty() {
+        lines.push(Line::from(spans));
+    }
+    lines
 }
 
 /// A link's three rows. The first has its state's mark, its number and its title, with the
@@ -1206,7 +1358,7 @@ fn entry_lines(
 
     let (mark, _, color) = state_of(entry, theme);
     let number = format!("#{}", entry.number);
-    let diff = diff_spans(snapshot, theme);
+    let diff = joined(diff_parts(snapshot, theme), Span::raw(" "));
     let diff_width = spans_width(&diff);
     let used = pad.len() + 2 + number.len() + 1;
     // The counts show only beside at least four columns of the title.
@@ -1225,7 +1377,8 @@ fn entry_lines(
     ];
 
     let mut status = vec![Span::raw(lead.clone())];
-    status.extend(status_spans(entry, theme));
+    let parts = joined(status_parts(entry, theme), Span::styled(" · ", muted));
+    status.extend(parts);
     let at = snapshot.and_then(|snapshot| snapshot.updated.as_deref());
     let ago = match time_ago(at, now) {
         Some(ago) if ago.width() + 12 <= width => vec![Span::styled(ago, muted)],
@@ -1257,10 +1410,10 @@ fn entry_lines(
         .collect()
 }
 
-/// The lines a link adds and removes, as the desktop's `PullRequestDiffStat` shows them, or
-/// nothing when the host counted none, so a missing count never reads as an empty change. A
-/// count the host left out shows as nothing rather than as zero.
-fn diff_spans(snapshot: Option<&Snapshot>, theme: &Theme) -> Vec<Span<'static>> {
+/// The lines a link adds and removes, a part each, as the desktop's `PullRequestDiffStat`
+/// shows them, or nothing when the host counted none, so a missing count never reads as an
+/// empty change. A count the host left out shows as nothing rather than as zero.
+fn diff_parts(snapshot: Option<&Snapshot>, theme: &Theme) -> Vec<Span<'static>> {
     let Some(snapshot) = snapshot else {
         return Vec::new();
     };
@@ -1268,19 +1421,16 @@ fn diff_spans(snapshot: Option<&Snapshot>, theme: &Theme) -> Vec<Span<'static>> 
     if additions.unwrap_or(0) == 0 && deletions.unwrap_or(0) == 0 {
         return Vec::new();
     }
-    let mut spans = Vec::new();
+    let mut parts = Vec::new();
     if let Some(additions) = additions {
         let text = format!("+{}", grouped(additions));
-        spans.push(Span::styled(text, Style::new().fg(theme.success)));
+        parts.push(Span::styled(text, Style::new().fg(theme.success)));
     }
     if let Some(deletions) = deletions {
-        if !spans.is_empty() {
-            spans.push(Span::raw(" "));
-        }
         let text = format!("-{}", grouped(deletions));
-        spans.push(Span::styled(text, Style::new().fg(theme.error_fg)));
+        parts.push(Span::styled(text, Style::new().fg(theme.error_fg)));
     }
-    spans
+    parts
 }
 
 /// `repository · head → base` in `room` columns. When it doesn't fit, each is cut in the
@@ -1299,56 +1449,62 @@ fn branches(repository: &str, head: &str, base: &str, room: usize) -> String {
     format!("{repository} · {head} → {base}")
 }
 
-/// A selected link's details under its rows: its whole title and URL, the URL as plain text
-/// to copy, then its status, who linked it and when, its author, when it last changed and
-/// synced, its repository and branches, what watching it does and the stack it heads. The URL
-/// comes early, so a short pane still shows it.
+/// A link's details, which show in the list's place: its number and whole title, its status
+/// and the lines it changes, then each under its label its URL, whole as plain text to copy,
+/// its repository, its branches, its author, and who linked it and when it last changed and
+/// synced, then what watching it does and the stack it heads. Each value wraps to every row it
+/// takes, so the reader can scroll to all of it, and each was bounded when it was read.
 fn detail_lines(entry: &Entry, width: usize, now: i64, theme: &Theme) -> Vec<Line<'static>> {
+    if width == 0 {
+        return Vec::new();
+    }
     let muted = Style::new().fg(theme.muted);
     let value = Style::new().fg(theme.fg);
     let info = Style::new().fg(theme.info);
-    let pad = " ".repeat(indent(entry, width) + 2);
-    let room = width.saturating_sub(pad.len());
-    if room == 0 {
-        return Vec::new();
-    }
     let snapshot = entry.snapshot();
-    let mut parts: Vec<(String, usize, Style)> = Vec::new();
-    if let Some(snapshot) = snapshot.filter(|snapshot| !snapshot.title.is_empty()) {
-        parts.push((snapshot.title.clone(), TITLE_ROWS, value));
+    let heading = format!("#{} {}", entry.number, entry.title());
+    let mut lines = whole(&heading, width, value.add_modifier(Modifier::BOLD));
+    lines.extend(flowed(status_parts(entry, theme), " · ", width, theme));
+    lines.extend(flowed(diff_parts(snapshot, theme), " ", width, theme));
+
+    let mut sections: Vec<(Option<&str>, Vec<(String, Style)>)> = Vec::new();
+    let mut url = vec![(entry.url.clone(), info)];
+    if entry.url_cut {
+        let note = format!(
+            "Cut short: T3 sent a URL longer than the {} characters t3term keeps.",
+            grouped(URL as u64)
+        );
+        url.push((note, muted));
     }
-    parts.push((entry.url.clone(), URL_ROWS, info));
-    let status: String = status_spans(entry, theme)
-        .iter()
-        .map(|span| span.content.as_ref())
-        .collect();
-    parts.push((status, VALUE_ROWS, value));
-    let mut linked = entry.source.label().to_string();
-    if let Some(ago) = time_ago(entry.linked_at.as_deref(), now) {
-        linked.push_str(" · ");
-        linked.push_str(&ago);
-    }
-    parts.push((linked, VALUE_ROWS, muted));
-    if let Some(snapshot) = snapshot {
-        if let Some(author) = snapshot.author.as_deref() {
-            let bot = if snapshot.bot { " (bot)" } else { "" };
-            parts.push((format!("By {author}{bot}"), VALUE_ROWS, muted));
-        }
-        if let Some(ago) = time_ago(snapshot.updated.as_deref(), now) {
-            parts.push((format!("Updated {ago}"), VALUE_ROWS, muted));
-        }
-        if let Some(ago) = time_ago(snapshot.synced.as_deref(), now) {
-            parts.push((format!("Synced {ago}"), VALUE_ROWS, muted));
-        }
-    }
+    sections.push((Some("URL"), url));
     let place = format!("{}/{}", entry.host, entry.repository);
-    parts.push((place, VALUE_ROWS, muted));
+    sections.push((Some("Repository"), vec![(place, value)]));
     if let Some(snapshot) = snapshot {
         let branches = format!("{} → {}", snapshot.head, snapshot.base);
-        parts.push((branches, VALUE_ROWS, muted));
+        sections.push((Some("Branches"), vec![(branches, value)]));
     }
+    if let Some(snapshot) = snapshot
+        && let Some(author) = snapshot.author.as_deref()
+    {
+        let bot = if snapshot.bot { " (bot)" } else { "" };
+        sections.push((Some("Author"), vec![(format!("{author}{bot}"), value)]));
+    }
+    let linked = match time_ago(entry.linked_at.as_deref(), now) {
+        Some(ago) => format!("{} · {ago}", entry.source.label()),
+        None => entry.source.label().to_string(),
+    };
+    let mut activity = vec![(linked, value)];
+    if let Some(snapshot) = snapshot {
+        if let Some(ago) = time_ago(snapshot.updated.as_deref(), now) {
+            activity.push((format!("Updated {ago}"), value));
+        }
+        if let Some(ago) = time_ago(snapshot.synced.as_deref(), now) {
+            activity.push((format!("Synced {ago}"), value));
+        }
+    }
+    sections.push((Some("Activity"), activity));
     if entry.open() && entry.watching {
-        parts.push((WATCHING.to_string(), VALUE_ROWS, info));
+        sections.push((None, vec![(WATCHING.to_string(), info)]));
     }
     if let Some(chain) = entry.chain {
         let size = chain.size;
@@ -1357,14 +1513,15 @@ fn detail_lines(entry: &Entry, width: usize, now: i64, theme: &Theme) -> Vec<Lin
         } else {
             format!("{size} pull requests chained by base branch.")
         };
-        parts.push((text, VALUE_ROWS, muted));
+        sections.push((None, vec![(text, muted)]));
     }
-    let mut lines = Vec::new();
-    for (text, rows, style) in parts {
-        for line in wrapped(&text, room, rows, style) {
-            let mut spans = vec![Span::raw(pad.clone())];
-            spans.extend(line.spans);
-            lines.push(Line::from(spans));
+    for (label, values) in sections {
+        lines.push(Line::default());
+        if let Some(label) = label {
+            lines.push(Line::styled(clip(label, width), muted));
+        }
+        for (text, style) in values {
+            lines.extend(whole(&text, width, style));
         }
     }
     lines
@@ -1458,15 +1615,64 @@ mod tests {
         rows_of(&pulls.page(width, height, now(), &theme()).lines)
     }
 
+    /// The links whose rows `page` shows.
+    fn links_on(page: &Page) -> HashSet<usize> {
+        page.rows
+            .iter()
+            .filter_map(|spot| match spot {
+                Some(Spot::Link(index)) => Some(*index),
+                _ => None,
+            })
+            .collect()
+    }
+
+    /// The rows of the selected link's details at the width the last frame drew them.
+    fn detail_rows(pulls: &PullRequests) -> Vec<String> {
+        pulls
+            .detail
+            .as_ref()
+            .map(|detail| rows_of(&detail.lines))
+            .unwrap_or_default()
+    }
+
     #[test]
     fn a_synced_link_shows_what_the_host_reported() {
         let pull = link("krishhgg/t3term", 31, "feature", "master");
-        let rows = page_rows(list_of(&thread(vec![pull])), 44, 4);
+        let rows = page_rows(list_of(&thread(vec![pull.clone()])), 44, 4);
         let gap = " ".repeat(21);
         assert_eq!(rows[0], format!("● #31 Change 31{gap}+821 -51"));
         assert_eq!(rows[1], "  Open · Checks passing · Approved   46m ago");
         assert_eq!(rows[2], "  krishhgg/t3term · feature → master");
         assert_eq!(rows[3], "1 open · 1 linked · synced 1m ago");
+        // Its details show in the list's place, under the row back to it.
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![pull])));
+        pulls.toggle();
+        let rows = rows_of(&pulls.page(44, 30, now(), &theme()).lines);
+        assert_eq!(rows[0], format!("← List{}1 of 1", " ".repeat(32)));
+        let expected = [
+            "#31 Change 31",
+            "Open · Checks passing · Approved",
+            "+821 -51",
+            "",
+            "URL",
+            "https://github.com/krishhgg/t3term/pull/31",
+            "",
+            "Repository",
+            "github.com/krishhgg/t3term",
+            "",
+            "Branches",
+            "feature → master",
+            "",
+            "Author",
+            "krishhgg",
+            "",
+            "Activity",
+            "Linked by the agent · 2h ago",
+            "Updated 46m ago",
+            "Synced 1m ago",
+        ];
+        assert_eq!(rows[1..], expected);
     }
 
     #[test]
@@ -1755,6 +1961,42 @@ mod tests {
     }
 
     #[test]
+    fn identities_are_bounded_before_they_are_trimmed() {
+        // Millions of spaces round a short host or repository make it too long to read, and
+        // it is never trimmed or lowercased whole.
+        let pad = " ".repeat(5_000_000);
+        let mut host = link("o/r", 1, "h", "b");
+        host["host"] = json!(format!("{pad}github.com{pad}"));
+        let mut repository = link("o/r", 2, "h2", "b");
+        repository["repository"] = json!(format!("{pad}o/r{pad}"));
+        let legacy = json!({"id": "t", "linkedPullRequest": {"projectId": "p",
+            "repository": format!("{pad}o/r"), "number": 3,
+            "url": "https://github.com/o/r/pull/3"}});
+        let list = list_of(&thread(vec![host, repository, link("o/r", 4, "h4", "b")]));
+        assert_eq!(numbers(&list), [(4, 0)]);
+        let rows = page_rows(list, 60, 4);
+        assert_eq!(rows[3], "1 open · 1 linked · synced 1m ago · 2 unreadable");
+        assert_eq!(list_of(&legacy).count(), Some(0));
+        // The bound is on the text as T3 sent it, padding and all.
+        let over = format!("{}github.com", " ".repeat(KEY));
+        assert_eq!(Key::of(&over, "o/r", 1), None);
+        assert_eq!(Key::of("github.com", &over, 1), None);
+        let at = format!("{}GitHub.COM", " ".repeat(KEY - "GitHub.COM".len()));
+        let key = Key::of(&at, " O/R ", 1).expect("at the bound");
+        assert_eq!((key.host.as_str(), key.repository.as_str()), ("github.com", "o/r"));
+        // Ordinary text is trimmed and lowercased as before, and empty text is no identity.
+        let key = Key::of(" GitHub.COM ", " Owner/Repo ", 7).expect("ordinary");
+        let expected = Key {
+            host: "github.com".into(),
+            repository: "owner/repo".into(),
+            number: 7,
+        };
+        assert_eq!(key, expected);
+        assert_eq!(Key::of("   ", "o/r", 1), None);
+        assert_eq!(Key::of("github.com", "", 1), None);
+    }
+
+    #[test]
     fn the_thread_and_the_environment_decide_before_the_links() {
         let record = thread(vec![link("o/r", 1, "h", "b")]);
         let unsupported = "Linked pull requests unavailable";
@@ -1814,30 +2056,47 @@ mod tests {
         // Branches too long to match by chain to nothing.
         assert_eq!(snapshot.head_key, None);
         assert_eq!(snapshot.base_key, None);
+        // The URL was cut, and says so.
+        let url = format!("https://github.com/{}…", "u".repeat(URL - 19));
+        assert_eq!((entry.url.as_str(), entry.url_cut), (url.as_str(), true));
 
         let mut pulls = PullRequests::default();
         pulls.set(list);
-        pulls.toggle();
         let theme = theme();
-        for width in [1, 2, 3, 7, 12, 20, 33, 52] {
-            for height in [1, 2, 5, 40] {
-                let page = pulls.page(width, height, now(), &theme);
-                assert!(page.lines.len() <= height);
-                for line in &page.lines {
-                    let text = line.to_string();
-                    assert!(line.width() <= width, "{text:?} at {width}x{height}");
-                    assert!(!text.contains(char::is_control), "{text:?}");
-                    assert!(!text.contains("evil"), "{text:?}");
-                }
-            }
-        }
         let rows = rows_of(&pulls.page(40, 40, now(), &theme).lines);
         let start = "● #1 ]52;c;cHduZWQ=[2J👩\u{200d}💻e\u{301}名";
         assert!(rows[0].starts_with(start), "{rows:#?}");
-        // The details wrap the URL to eight rows, the last cut with …
-        let urls: Vec<&String> = rows.iter().filter(|row| row.contains("uuuu")).collect();
-        assert_eq!(urls.len(), URL_ROWS, "{rows:#?}");
-        assert!(urls[URL_ROWS - 1].ends_with('…'), "{rows:#?}");
+        // The list and the link's details fit every width and height.
+        for viewing in [false, true] {
+            if viewing {
+                pulls.toggle();
+            }
+            for width in [1, 2, 3, 7, 12, 20, 33, 52] {
+                for height in [1, 2, 5, 40] {
+                    let page = pulls.page(width, height, now(), &theme);
+                    assert!(page.lines.len() <= height);
+                    for line in &page.lines {
+                        let text = line.to_string();
+                        assert!(line.width() <= width, "{text:?} at {width}x{height}");
+                        assert!(!text.contains(char::is_control), "{text:?}");
+                        assert!(!text.contains("evil"), "{text:?}");
+                    }
+                }
+            }
+        }
+        // Tall enough, the details show whole: every character of the URL t3term kept, wrapped
+        // with nothing between, then the note that it was cut.
+        let page = pulls.page(40, 2_000, now(), &theme);
+        assert!(!page.above && !page.below);
+        let rows = rows_of(&page.lines);
+        assert!(rows[0].starts_with("← List") && rows[0].ends_with("1 of 1"));
+        assert!(rows[1..].iter().all(|row| !row.contains("evil")));
+        let from = rows.iter().position(|row| row == "URL").expect("the URL") + 1;
+        let to = rows.iter().position(|row| row.starts_with("Cut short:"));
+        let to = to.expect("the note");
+        assert_eq!(rows[from..to].concat(), url);
+        // The 2,048 characters and the … on rows of 40.
+        assert_eq!(to - from, (URL + 1).div_ceil(40), "{rows:#?}");
     }
 
     #[test]
@@ -1852,7 +2111,7 @@ mod tests {
         let theme = theme();
         let page = pulls.page(36, 31, now(), &theme);
         // Thirty rows of links and the footer: ten links laid out of a thousand.
-        let laid: HashSet<usize> = page.rows.iter().flatten().copied().collect();
+        let laid = links_on(page);
         assert_eq!(laid.len(), 10);
         assert!(page.below && !page.above);
         let footer = page.lines.last().map(Line::to_string);
@@ -1868,7 +2127,7 @@ mod tests {
         assert_eq!(pulls.selected, 10);
         pulls.move_by(isize::MAX);
         let page = pulls.page(36, 31, now(), &theme);
-        let laid: HashSet<usize> = page.rows.iter().flatten().copied().collect();
+        let laid = links_on(page);
         let last: HashSet<usize> = (990..1000).collect();
         assert_eq!(laid, last);
         assert!(page.above && !page.below);
@@ -1898,18 +2157,24 @@ mod tests {
         // Newest first: 3, 2, 1.
         pulls.move_by(1);
         pulls.toggle();
-        assert_eq!((pulls.selected, pulls.expanded), (1, Some(1)));
-        let rows = rows_of(&pulls.page(40, 30, now(), &theme).lines);
+        assert_eq!((pulls.selected, pulls.viewing), (1, true));
+        let rows = rows_of(&pulls.page(40, 10, now(), &theme).lines);
+        assert_eq!(rows[0], format!("← List{}2 of 3", " ".repeat(28)));
         let url = "https://github.com/o/r/pull/2";
-        assert!(rows.iter().any(|row| row.contains(url)), "{rows:#?}");
-        // A newer link comes first, and the selection and the details stay on #2.
+        assert!(rows.iter().any(|row| row == url), "{rows:#?}");
+        // A newer link comes first, and the selection and the details stay on #2, where the
+        // reader scrolled them.
+        pulls.move_by(2);
         let four = vec![dated(1), dated(2), dated(3), dated(4)];
         pulls.set(list_of(&thread(four)));
-        assert_eq!((pulls.selected, pulls.expanded), (2, Some(2)));
-        // #2 goes. The selection stays where it was, and the details close.
+        assert_eq!((pulls.selected, pulls.viewing, pulls.scroll), (2, true, 2));
+        let rows = rows_of(&pulls.page(40, 10, now(), &theme).lines);
+        assert!(rows[0].ends_with("3 of 4"), "{rows:#?}");
+        assert_eq!(rows[4], url, "{rows:#?}");
+        // #2 goes. The selection stays where it was, and the list shows again.
         let without = vec![dated(1), dated(3), dated(4)];
         pulls.set(list_of(&thread(without.clone())));
-        assert_eq!((pulls.selected, pulls.expanded), (2, None));
+        assert_eq!((pulls.selected, pulls.viewing, pulls.scroll), (2, false, 0));
         assert_eq!(pulls.chosen.as_ref().map(|key| key.number), Some(1));
         // The same list again lays nothing out again.
         pulls.page(40, 30, now(), &theme);
@@ -1924,14 +2189,101 @@ mod tests {
         assert!(pulls.wants(None, true));
         pulls.mark();
         assert!(pulls.wants(Some("t"), true));
-        // Another thread starts at its top.
+        // Another thread starts at its top, on its list.
+        pulls.toggle();
+        pulls.move_by(3);
         pulls.follow();
         assert!(pulls.wants(Some("u"), true));
-        assert_eq!((pulls.selected, pulls.expanded, pulls.top), (0, None, 0));
+        let after = (pulls.selected, pulls.viewing, pulls.scroll, pulls.top);
+        assert_eq!(after, (0, false, 0, 0));
     }
 
     #[test]
-    fn clicks_select_a_link_and_a_second_opens_its_details() {
+    fn a_links_details_scroll_to_their_last_row_and_lead_back_to_the_list() {
+        let mut pulls = PullRequests::default();
+        let theme = theme();
+        // Every field the contract has, each long: a title of many words, a URL longer than
+        // t3term keeps, long branches, a bot author, a watch and a GitHub stack of two.
+        let long = |number: u64| {
+            let head = format!("feature/{}{number}", "branch-".repeat(40));
+            let mut pull = link("o/r", number, &head, "main");
+            let query = "q".repeat(3 * URL);
+            pull["url"] = json!(format!("https://github.com/o/r/pull/{number}?{query}"));
+            pull["snapshot"]["title"] = json!("A long title ".repeat(60));
+            pull["snapshot"]["author"] = json!({"login": "renovate[bot]", "isBot": true});
+            pull["watch"] = json!({"startedAt": NOW});
+            pull["stack"] = json!({"kind": "native", "id": "s1",
+                "layers": [{"number": 1}, {"number": 2}]});
+            pull
+        };
+        pulls.set(list_of(&thread(vec![long(2), long(1)])));
+        assert_eq!(pulls.wanted(30, now(), &theme), 2 * ENTRY_ROWS + 1);
+        // Enter on the stack's bottom layer shows its details from their top.
+        pulls.toggle();
+        let page = pulls.page(30, 8, now(), &theme);
+        assert!(!page.above && page.below);
+        let rows = rows_of(&page.lines);
+        assert_eq!(rows[0], format!("← List{}1 of 2", " ".repeat(18)));
+        assert!(rows[1].starts_with("#1 A long title"), "{rows:#?}");
+        let all = detail_rows(&pulls);
+        let total = all.len();
+        assert_eq!(pulls.wanted(30, now(), &theme), 1 + total);
+        for shown in [
+            "Stack of 2 · Open · Watching",
+            "Checks passing · Approved",
+            "Repository",
+            "Branches",
+            "renovate[bot] (bot)",
+            "Linked by the agent · 2h ago",
+            "Updated 46m ago",
+            "Synced 1m ago",
+        ] {
+            assert!(all.iter().any(|row| row == shown), "{shown:?} in {all:#?}");
+        }
+        let text = all.join(" ");
+        assert!(text.contains("Cut short: T3 sent a URL longer than"), "{all:#?}");
+        assert!(text.contains("Watching: the agent wakes"), "{all:#?}");
+        assert!(text.ends_with("merging a layer lands the ones below it."), "{all:#?}");
+
+        // ↓ scrolls a row and PageDown the seven rows a page shows.
+        pulls.move_by(1);
+        pulls.page(30, 8, now(), &theme);
+        pulls.page_by(true);
+        assert_eq!(pulls.scroll, 1 + 7);
+        // End reaches the last row, and no further.
+        pulls.move_by(isize::MAX);
+        let page = pulls.page(30, 8, now(), &theme);
+        assert!(page.above && !page.below);
+        let rows = rows_of(&page.lines);
+        assert!(rows[0].starts_with("← List"), "{rows:#?}");
+        assert_eq!(rows[1..], all[total - 7..]);
+        assert_eq!(pulls.scroll, total - 7);
+        pulls.move_by(1);
+        pulls.page(30, 8, now(), &theme);
+        assert_eq!(pulls.scroll, total - 7);
+        // ↑ and PageUp scroll back, and Home goes to the top.
+        pulls.move_by(-1);
+        pulls.page_by(false);
+        assert_eq!(pulls.scroll, total - 7 - 1 - 7);
+        pulls.move_by(isize::MIN);
+        assert_eq!(pulls.scroll, 0);
+        // Back to the list, with the link still selected. Its details show from their top
+        // again.
+        pulls.move_by(isize::MAX);
+        assert!(pulls.back());
+        assert!(!pulls.back());
+        assert_eq!((pulls.selected, pulls.viewing, pulls.scroll), (0, false, 0));
+        let page = pulls.page(30, 8, now(), &theme);
+        assert_eq!(links_on(page), HashSet::from([0, 1]));
+        assert!(rows_of(&page.lines)[0].starts_with("● #1"));
+        pulls.toggle();
+        assert_eq!((pulls.viewing, pulls.scroll), (true, 0));
+        pulls.toggle();
+        assert!(!pulls.viewing);
+    }
+
+    #[test]
+    fn clicks_select_a_link_open_its_details_and_lead_back() {
         let mut pulls = PullRequests::default();
         let theme = theme();
         let links = vec![link("o/r", 1, "a", "m"), link("o/r", 2, "b", "m")];
@@ -1941,19 +2293,69 @@ mod tests {
         pulls.page(40, 20, now(), &theme);
         // The second link's rows are the page's fourth to sixth.
         assert!(pulls.click(4));
-        assert_eq!((pulls.selected, pulls.expanded), (1, None));
+        assert_eq!((pulls.selected, pulls.viewing), (1, false));
         pulls.page(40, 20, now(), &theme);
-        assert!(pulls.click(3));
-        assert_eq!(pulls.expanded, Some(1));
-        // The details' rows, the blank rows and the footer take no click.
-        pulls.page(40, 20, now(), &theme);
+        // The blank rows and the footer take no click.
         for offset in [6, 7, 18, 19, 20, 200] {
             assert!(!pulls.click(offset), "{offset}");
         }
-        assert_eq!((pulls.selected, pulls.expanded), (1, Some(1)));
-        // A click on the first link selects it, and the second's details stay open.
+        // A second click on the link shows its details.
+        assert!(pulls.click(3));
+        assert!(pulls.viewing);
+        let rows = rows_of(&pulls.page(40, 20, now(), &theme).lines);
+        assert_eq!(rows[1], "#2 Change 2");
+        // Only the row above them takes a click, and it leads back to the list with the link
+        // still selected.
+        for offset in 1..30 {
+            assert!(!pulls.click(offset), "{offset}");
+        }
+        assert!(pulls.viewing);
         assert!(pulls.click(0));
-        assert_eq!((pulls.selected, pulls.expanded), (0, Some(1)));
+        assert_eq!((pulls.selected, pulls.viewing), (1, false));
+    }
+
+    #[test]
+    fn a_click_lands_only_on_the_page_the_last_frame_drew() {
+        let mut pulls = PullRequests::default();
+        let theme = theme();
+        let links = (1..=20)
+            .map(|number| link("o/r", number, &format!("h{number}"), "main"))
+            .collect();
+        pulls.set(list_of(&thread(links)));
+        // Three links fit above the footer.
+        pulls.page(40, 10, now(), &theme);
+        // The keys move the selection past them. Until a frame lays the list out again, a
+        // click on its first row lands on nothing, rather than on the link that showed there.
+        pulls.move_by(5);
+        pulls.page_by(true);
+        assert_eq!(pulls.selected, 8);
+        for offset in 0..10 {
+            assert!(!pulls.click(offset), "{offset}");
+        }
+        assert_eq!((pulls.selected, pulls.viewing), (8, false));
+        // After the frame, the click lands on the link that row shows now.
+        let page = pulls.page(40, 10, now(), &theme);
+        assert_eq!(page.rows[0], Some(Spot::Link(6)));
+        assert!(pulls.click(0));
+        assert_eq!(pulls.selected, 6);
+        // So with the details: until a frame draws them, no click shows the list again, and
+        // after their scroll moves, none does until the next.
+        pulls.page(40, 10, now(), &theme);
+        assert!(pulls.click(0));
+        assert!(pulls.viewing);
+        assert!(!pulls.click(0));
+        pulls.page(40, 10, now(), &theme);
+        pulls.move_by(3);
+        assert!(!pulls.click(0));
+        assert!(pulls.viewing);
+        pulls.page(40, 10, now(), &theme);
+        assert!(pulls.click(0));
+        assert!(!pulls.viewing);
+        // A move that changes nothing keeps the page the reader sees.
+        pulls.page(40, 10, now(), &theme);
+        pulls.move_by(0);
+        assert!(pulls.click(3));
+        assert_eq!(pulls.selected, 7);
     }
 
     #[test]
@@ -1963,9 +2365,11 @@ mod tests {
         let links = vec![link("o/r", 1, "a", "m"), link("o/r", 2, "b", "m")];
         pulls.set(list_of(&thread(links)));
         assert_eq!(pulls.wanted(40, now(), &theme), 2 * ENTRY_ROWS + 1);
+        // The row back to the list and the twenty rows of the details.
         pulls.toggle();
-        assert!(pulls.wanted(40, now(), &theme) > 2 * ENTRY_ROWS + 1);
+        assert_eq!(pulls.wanted(40, now(), &theme), 21);
         pulls.set(list_of(&thread(vec![])));
+        assert!(!pulls.viewing);
         assert_eq!(pulls.wanted(40, now(), &theme), 3);
     }
 

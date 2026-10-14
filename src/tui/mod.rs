@@ -1324,10 +1324,11 @@ impl App {
     }
 
     /// A key for the details while they have the keyboard. Esc closes a dialog. On a pane it
-    /// gives the keyboard back and leaves the pane open. ← and → or `h` and `l` switch between
-    /// the thread's tab and its pull requests'. The up and down arrows, `j` and `k`, the page
-    /// keys, Home, End, `g` and `G` scroll the thread's text, or move along its pull requests,
-    /// where Enter opens or closes the selected one's details.
+    /// gives the keyboard back and leaves the pane open. → or `l` shows the thread's pull
+    /// requests, and ← or `h` goes back: from a pull request's details to the list, and from
+    /// the list to the thread's tab. The up and down arrows, `j` and `k`, the page keys, Home,
+    /// End, `g` and `G` scroll the thread's text, move along its pull requests, or scroll the
+    /// selected one's details, which Enter shows in the list's place and hides again.
     fn on_details_key(&mut self, key: KeyEvent) {
         let plain = !key
             .modifiers
@@ -1337,8 +1338,8 @@ impl App {
                 self.leave_details()
             }
             KeyCode::Esc => self.close_details(),
-            KeyCode::Left => self.details.show(details::Tab::Thread),
-            KeyCode::Char('h') if plain => self.details.show(details::Tab::Thread),
+            KeyCode::Left => self.details.back(),
+            KeyCode::Char('h') if plain => self.details.back(),
             KeyCode::Right => self.details.show(details::Tab::PullRequests),
             KeyCode::Char('l') if plain => self.details.show(details::Tab::PullRequests),
             KeyCode::Enter => self.details.toggle_pull(),
@@ -3631,42 +3632,6 @@ impl App {
             .open
             .as_ref()
             .is_some_and(|o| self.unsent.has_saved(&o.id));
-        let hint;
-        let keys = match (self.focus, self.picker.as_ref().map(|p| p.kind)) {
-            (_, Some(Kind::Model)) => "Type to search · ↑↓ choose · Enter select · Esc close",
-            (_, Some(_)) => "↑↓ choose · Enter select · Esc close",
-            (Focus::Sidebar, None) if self.sidebar.has_working() => {
-                "↑↓ select · Enter open · w working · e settled · [ ] width · Ctrl+B hide · Tab focus · q quit"
-            }
-            (Focus::Sidebar, None) => {
-                "↑↓ select · Enter open · e settled · [ ] width · Ctrl+B hide · Tab focus · q quit"
-            }
-            (Focus::Composer, None) => {
-                "Enter send · Alt+Enter newline · Alt+M model · Alt+E effort · Alt+P mode · Ctrl+X interrupt"
-            }
-            (Focus::Details, None) if self.details.tab() == details::Tab::PullRequests => {
-                if self.details_modal() {
-                    "↑↓ select · Enter details · ← thread · Esc close"
-                } else {
-                    "↑↓ select · Enter details · ← thread · Esc leave · Alt+B close · Tab focus"
-                }
-            }
-            (Focus::Details, None) if self.details_modal() => {
-                "↑↓/PgUp scroll · Esc close · → pull requests"
-            }
-            (Focus::Details, None) => {
-                "↑↓/PgUp scroll · Esc leave · Alt+B close · → pull requests · Tab focus"
-            }
-            (Focus::Transcript, None) => {
-                let plan = self
-                    .drawn_plans
-                    .first()
-                    .map(|card| self.expanded_plans.contains(&card.id));
-                let setup = self.open.as_ref().and_then(|open| open.setup.hint());
-                hint = transcript_keys(self.verbose, plan, setup);
-                hint.as_str()
-            }
-        };
         // Only Ctrl+B and the toggle bring a hidden sidebar back, so the keys lead with it.
         let restore = if self.sidebar_hidden && self.picker.is_none() {
             "Ctrl+B sidebar · "
@@ -3684,6 +3649,34 @@ impl App {
             room -= note.width();
             spans.push(Span::styled(note, Style::new().fg(t.warning_fg)));
         }
+        let hint;
+        let keys = match (self.focus, self.picker.as_ref().map(|p| p.kind)) {
+            (_, Some(Kind::Model)) => "Type to search · ↑↓ choose · Enter select · Esc close",
+            (_, Some(_)) => "↑↓ choose · Enter select · Esc close",
+            (Focus::Sidebar, None) if self.sidebar.has_working() => {
+                "↑↓ select · Enter open · w working · e settled · [ ] width · Ctrl+B hide · Tab focus · q quit"
+            }
+            (Focus::Sidebar, None) => {
+                "↑↓ select · Enter open · e settled · [ ] width · Ctrl+B hide · Tab focus · q quit"
+            }
+            (Focus::Composer, None) => {
+                "Enter send · Alt+Enter newline · Alt+M model · Alt+E effort · Alt+P mode · Ctrl+X interrupt"
+            }
+            // The details' keys shorten to the room there is, so Esc still shows.
+            (Focus::Details, None) => {
+                let keys = self.details.keys(self.details_modal());
+                fitting(keys, room.saturating_sub(restore.width()))
+            }
+            (Focus::Transcript, None) => {
+                let plan = self
+                    .drawn_plans
+                    .first()
+                    .map(|card| self.expanded_plans.contains(&card.id));
+                let setup = self.open.as_ref().and_then(|open| open.setup.hint());
+                hint = transcript_keys(self.verbose, plan, setup);
+                hint.as_str()
+            }
+        };
         if room > 0 {
             let keys = format!("{restore}{keys}");
             spans.push(Span::styled(fit(&keys, room), Style::new().fg(t.muted)));
@@ -3972,6 +3965,12 @@ fn fit(text: &str, width: usize) -> String {
     }
     out.push('…');
     out
+}
+
+/// The first of `choices` that fits in `room` columns, or else the last, which `fit` cuts.
+fn fitting(choices: &[&'static str], room: usize) -> &'static str {
+    let fits = choices.iter().find(|choice| choice.width() <= room);
+    fits.or(choices.last()).copied().unwrap_or_default()
 }
 
 /// `text` cut with `…` to at most `width` columns, at a place `transcript::clusters` finds, so
@@ -10545,6 +10544,49 @@ mod tests {
         app
     }
 
+    /// `linked` with every field the contract has, each long: a title of many words, a URL
+    /// longer than t3term keeps, a long branch, a bot author, the lines it changes, a watch,
+    /// and a GitHub stack of #31 under #32.
+    fn long_linked(number: u64) -> Value {
+        let mut link = linked(number, &"A long title ".repeat(60));
+        let query = "q".repeat(6_000);
+        let url = format!("https://github.com/krishhgg/t3term/pull/{number}?{query}");
+        link["url"] = json!(url);
+        link["snapshot"]["headBranch"] = json!(format!("feature/{}", "branch-".repeat(40)));
+        link["snapshot"]["author"] = json!({"login": "renovate[bot]", "isBot": true});
+        link["snapshot"]["additions"] = json!(1_234);
+        link["snapshot"]["deletions"] = json!(56);
+        link["watch"] = json!({"startedAt": "2026-10-13T10:00:00.000Z"});
+        link["stack"] = json!({"kind": "native", "id": "s1",
+            "layers": [{"number": 31}, {"number": 32}]});
+        link
+    }
+
+    /// Draws a frame `width` columns by `height` rows and returns the rows of the details'
+    /// body, the padding at their ends dropped.
+    fn body_after(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let buffer = cells(app, width, height);
+        let body = app.details.drawn.expect("the details").body;
+        text_in(&buffer, body)
+            .lines()
+            .map(|row| row.trim_end().to_string())
+            .collect()
+    }
+
+    /// Checks the status line at every width from 3 columns, where the dot and the cut
+    /// connection start, to `widest`: it never runs past the width, and `esc` shows whole
+    /// wherever there is room for it after the `restore` columns Ctrl+B takes.
+    fn keys_fit(app: &App, widest: usize, esc: &str, restore: usize) {
+        let least = "● live  ·  ".width() + restore + esc.width();
+        for width in 3..=widest {
+            let text = app.status_line(width).to_string();
+            assert!(text.width() <= width, "{width}: {text:?}");
+            if width >= least {
+                assert!(text.contains(esc), "{width}: {text:?}");
+            }
+        }
+    }
+
     #[test]
     fn the_pane_lists_the_threads_pull_requests_in_a_tab_the_keys_and_the_mouse_reach() {
         let runtime = idle_runtime();
@@ -10578,15 +10620,21 @@ mod tests {
         let hint = "↑↓ select · Enter details · ← thread";
         assert!(status.contains(hint), "{status}");
 
-        // ↓ selects the second link and Enter opens its details, and the composer, the draft
-        // and the transcript stay as they were.
+        // ↓ selects the second link and Enter shows its details in the list's place, under a
+        // row back to the list. The composer, the draft and the transcript stay as they were.
         press(&mut app, KeyCode::Down);
         let text = details_after(&mut app, 200, 50);
         assert!(!text.contains("Linked by the agent"), "{text}");
         press(&mut app, KeyCode::Enter);
-        let text = details_after(&mut app, 200, 50);
-        let below = text.find("Linked by the agent").expect("the details");
-        assert!(text.find("#32").is_some_and(|at| at < below), "{text}");
+        let buffer = cells(&mut app, 200, 50);
+        let text = details_text(&app, &buffer);
+        for shown in ["← List", "2 of 2", "#32 Lineage", "Linked by the agent"] {
+            assert!(text.contains(shown), "{shown:?} in {text}");
+        }
+        assert!(!text.contains("#31"), "{text}");
+        let status = text_in(&buffer, Rect::new(0, 49, 200, 1));
+        let hint = "↑↓/PgUp scroll · ← list · Esc leave";
+        assert!(status.contains(hint), "{status}");
         for code in [KeyCode::Char('x'), KeyCode::Char('q'), KeyCode::Backspace] {
             press(&mut app, code);
         }
@@ -10594,18 +10642,23 @@ mod tests {
         assert_eq!(app.scroll.rows(), scrolled);
         assert!(!app.quit);
 
-        // ← and → switch the tabs, as `h` and `l` do.
-        for (code, tab) in [
-            (KeyCode::Left, details::Tab::Thread),
-            (KeyCode::Right, details::Tab::PullRequests),
-            (KeyCode::Char('h'), details::Tab::Thread),
-            (KeyCode::Char('l'), details::Tab::PullRequests),
+        // ← goes back to the list, and from the list to the thread's tab. → shows the pull
+        // requests again. `h` and `l` do as ← and → do.
+        for (code, tab, viewing) in [
+            (KeyCode::Left, details::Tab::PullRequests, false),
+            (KeyCode::Left, details::Tab::Thread, false),
+            (KeyCode::Right, details::Tab::PullRequests, false),
+            (KeyCode::Enter, details::Tab::PullRequests, true),
+            (KeyCode::Char('h'), details::Tab::PullRequests, false),
+            (KeyCode::Char('h'), details::Tab::Thread, false),
+            (KeyCode::Char('l'), details::Tab::PullRequests, false),
         ] {
             press(&mut app, code);
             assert_eq!(app.details.tab(), tab, "{code:?}");
+            assert_eq!(app.details.pulls.viewing(), viewing, "{code:?}");
         }
 
-        // A click on a link selects it, and a second opens its details. Until a frame draws
+        // A click on a link selects it, and a second shows its details. Until a frame draws
         // the pane again, a click does nothing.
         cells(&mut app, 200, 50);
         let drawn = app.details.drawn.expect("the pane");
@@ -10614,13 +10667,29 @@ mod tests {
         assert!(!mouse(&mut app, CLICK, x, y));
         cells(&mut app, 200, 50);
         assert!(mouse(&mut app, CLICK, x, y));
+        assert!(app.details.pulls.viewing());
         let text = details_after(&mut app, 200, 50);
-        let below = text.find("Linked by the agent").expect("the details");
-        assert!(text.find("#31").is_some_and(|at| at < below), "{text}");
-        assert!(text.find("#32").is_some_and(|at| at > below), "{text}");
-        // The wheel moves the selection.
+        for shown in [
+            "← List",
+            "1 of 2",
+            "#31 Bound titles",
+            "Linked by the agent",
+        ] {
+            assert!(text.contains(shown), "{shown:?} in {text}");
+        }
+        assert!(!text.contains("#32"), "{text}");
+        // The wheel scrolls the details, which all fit here. A click on the row above them
+        // leads back to the list, with the link still selected.
         assert!(mouse(&mut app, MouseEventKind::ScrollDown, x, y));
         assert!(mouse(&mut app, MouseEventKind::ScrollUp, x, y));
+        cells(&mut app, 200, 50);
+        assert!(mouse(&mut app, CLICK, x, y));
+        assert!(!app.details.pulls.viewing());
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("#32 Lineage"), "{text}");
+        press(&mut app, KeyCode::Enter);
+        assert!(details_after(&mut app, 200, 50).contains("1 of 2"));
+        press(&mut app, KeyCode::Left);
 
         // Esc gives the keyboard back, and the pane keeps its tab.
         press(&mut app, KeyCode::Esc);
@@ -10645,22 +10714,46 @@ mod tests {
         let buffer = cells(&mut app, 80, 24);
         let drawn = app.details.drawn.expect("the dialog");
         assert_eq!(drawn.layout, details::Layout::Dialog);
+        // Beside the sidebar the status line has 41 columns for the keys, and the ones that
+        // fit there show whole, Esc with them.
         let status = text_in(&buffer, Rect::new(0, 23, 80, 1));
-        let hint = "↑↓ select · Enter details · ← thread · Esc close";
+        let hint = "↑↓ · Enter details · ← thread · Esc close";
         assert!(status.contains(hint), "{status}");
         // The dialog is as tall as the links and the footer, its title, its tabs and its
         // border.
         assert_eq!(drawn.area.height, 2 * 3 + 1 + 4);
         let url = "https://github.com/krishhgg/t3term/pull/31";
         assert!(!details_text(&app, &buffer).contains(url));
+        // Enter shows the selected link's details in the list's place, and the dialog grows to
+        // hold them.
         press(&mut app, KeyCode::Enter);
-        let text = details_after(&mut app, 80, 24);
-        assert!(text.contains(url), "{text}");
+        let buffer = cells(&mut app, 80, 24);
+        let text = details_text(&app, &buffer);
+        for shown in [
+            "← List",
+            "1 of 2",
+            "#31 Bound titles",
+            url,
+            "Linked by the agent",
+        ] {
+            assert!(text.contains(shown), "{shown:?} in {text}");
+        }
+        assert!(!text.contains("#32"), "{text}");
         let drawn = app.details.drawn.expect("the dialog");
         assert!(drawn.area.height > 2 * 3 + 1 + 4);
-        // A second Enter closes them.
+        let status = text_in(&buffer, Rect::new(0, 23, 80, 1));
+        let hint = "↑↓/PgUp scroll · ← list · Esc close";
+        assert!(status.contains(hint), "{status}");
+        // A second Enter shows the list again, as ← does.
         press(&mut app, KeyCode::Enter);
         assert!(!details_after(&mut app, 80, 24).contains(url));
+        press(&mut app, KeyCode::Enter);
+        assert!(details_after(&mut app, 80, 24).contains(url));
+        press(&mut app, KeyCode::Left);
+        let text = details_after(&mut app, 80, 24);
+        assert!(!text.contains(url), "{text}");
+        assert!(text.contains("#32 Lineage"), "{text}");
+        assert_eq!(app.details.tab(), details::Tab::PullRequests);
 
         // A click on the thread's tab shows it, and the dialog stays open with the keyboard.
         let drawn = app.details.drawn.expect("the dialog");
@@ -10677,6 +10770,239 @@ mod tests {
         press(&mut app, KeyCode::Esc);
         assert!(!app.details.open);
         assert_eq!(app.focus, Focus::Transcript);
+        assert_eq!(app.composer.text(), "draft");
+    }
+
+    #[test]
+    fn the_details_keys_shorten_to_the_room_there_is_and_esc_always_shows() {
+        // After each step, the keys a dialog's status line offers at 80 columns, beside the
+        // sidebar and without it: on the thread's tab, on the list and on a link's details.
+        let steps = [
+            (
+                None,
+                "↑↓/PgUp scroll · Esc close · → PRs",
+                "↑↓/PgUp scroll · Esc close · → pull requests",
+            ),
+            (
+                Some(KeyCode::Right),
+                "↑↓ · Enter details · ← thread · Esc close",
+                "↑↓ select · Enter details · ← thread · Esc close",
+            ),
+            (
+                Some(KeyCode::Enter),
+                "↑↓/PgUp scroll · ← list · Esc close",
+                "↑↓/PgUp scroll · ← list · Esc close",
+            ),
+        ];
+        for sidebar_hidden in [false, true] {
+            let mut app = pulls_tui(vec![linked(31, "Bound titles")], sidebar_hidden);
+            app.focus = Focus::Transcript;
+            cells(&mut app, 80, 24);
+            alt(&mut app, 'b');
+            assert_eq!(app.focus, Focus::Details);
+            // Ctrl+B leads the keys while the sidebar is hidden.
+            let restore = if sidebar_hidden { 17 } else { 0 };
+            for (key, beside, alone) in steps {
+                if let Some(key) = key {
+                    press(&mut app, key);
+                }
+                let buffer = cells(&mut app, 80, 24);
+                let status = text_in(&buffer, Rect::new(0, 23, 80, 1));
+                let keys = if sidebar_hidden { alone } else { beside };
+                assert!(status.contains(keys), "{keys:?} in {status:?}");
+                keys_fit(&app, 120, "Esc close", restore);
+                // At 40 columns Esc shows whole without the sidebar. Beside it, 7 columns are
+                // left, and the keys still start with Esc.
+                let buffer = cells(&mut app, 40, 12);
+                let status = text_in(&buffer, Rect::new(0, 11, 40, 1));
+                let shown = if sidebar_hidden {
+                    "Ctrl+B sidebar · Esc close"
+                } else {
+                    "live  ·  Esc"
+                };
+                assert!(status.contains(shown), "{shown:?} in {status:?}");
+                // A screen 10 columns wide draws too.
+                cells(&mut app, 10, 5);
+            }
+        }
+
+        // A pane's keys say Esc leaves it, and shorten the same way.
+        let mut app = pulls_tui(vec![linked(31, "Bound titles")], false);
+        app.focus = Focus::Transcript;
+        cells(&mut app, 200, 50);
+        alt(&mut app, 'b');
+        cells(&mut app, 200, 50);
+        let drawn = app.details.drawn.expect("the pane");
+        assert!(mouse(&mut app, CLICK, drawn.tabs[0].x, drawn.tabs[0].y));
+        assert_eq!(app.focus, Focus::Details);
+        for key in [None, Some(KeyCode::Right), Some(KeyCode::Enter)] {
+            if let Some(key) = key {
+                press(&mut app, key);
+            }
+            let buffer = cells(&mut app, 200, 50);
+            let status = text_in(&buffer, Rect::new(0, 49, 200, 1));
+            let keys = app.details.keys(false)[0];
+            assert!(status.contains(keys), "{keys:?} in {status:?}");
+            keys_fit(&app, 200, "Esc leave", 0);
+        }
+        assert!(app.details.pulls.viewing());
+    }
+
+    #[test]
+    fn a_click_after_the_keys_or_the_wheel_lands_only_once_a_frame_shows_where_they_went() {
+        let links: Vec<Value> = (1..=20).map(|number| linked(number, "Change")).collect();
+        // The pane, then the dialog.
+        for (width, height) in [(200, 50), (80, 24)] {
+            let mut app = pulls_tui(links.clone(), false);
+            app.focus = Focus::Transcript;
+            cells(&mut app, width, height);
+            alt(&mut app, 'b');
+            cells(&mut app, width, height);
+            let drawn = app.details.drawn.expect("the details");
+            assert!(mouse(&mut app, CLICK, drawn.tabs[1].x, drawn.tabs[1].y));
+            assert_eq!(app.details.tab(), details::Tab::PullRequests);
+            assert_eq!(app.focus, Focus::Details);
+            cells(&mut app, width, height);
+            let drawn = app.details.drawn.expect("the details");
+            let (x, y) = (drawn.body.x + 1, drawn.body.y);
+            // The keys, a page and the wheel move the selection to the last link, past the
+            // ones the frame showed. Until a frame draws the list again, a click on its first
+            // row lands on nothing, rather than on the link that showed there.
+            for code in [KeyCode::Down, KeyCode::PageDown, KeyCode::End] {
+                press(&mut app, code);
+            }
+            assert!(mouse(&mut app, MouseEventKind::ScrollDown, x, y));
+            for _ in 0..2 {
+                mouse(&mut app, CLICK, x, y);
+            }
+            assert!(!app.details.pulls.viewing(), "{width}x{height}");
+            assert_eq!(app.focus, Focus::Details);
+            // So the last link is still selected, and Enter shows its details.
+            cells(&mut app, width, height);
+            press(&mut app, KeyCode::Enter);
+            let text = details_after(&mut app, width, height);
+            assert!(text.contains("20 of 20"), "{width}x{height}: {text}");
+
+            // Back on the list, a click on the first row the frame drew selects the link it
+            // shows, and a second after the next frame shows that link's details.
+            press(&mut app, KeyCode::Left);
+            let first = body_after(&mut app, width, height)[0].clone();
+            let title = first.trim_start_matches("● ").to_string();
+            assert!(title.starts_with('#'), "{first:?}");
+            assert!(mouse(&mut app, CLICK, x, y));
+            cells(&mut app, width, height);
+            assert!(mouse(&mut app, CLICK, x, y));
+            assert!(app.details.pulls.viewing());
+            let rows = body_after(&mut app, width, height);
+            assert_eq!(rows[1], title, "{width}x{height}");
+
+            // A resize may move the details, so no click lands until a frame draws them, on
+            // the row back to the list or on a tab.
+            assert!(app.on_terminal_event(Event::Resize(width, height)));
+            let drawn = app.details.drawn.expect("the details");
+            assert!(!mouse(&mut app, CLICK, x, y));
+            assert!(!mouse(&mut app, CLICK, drawn.tabs[0].x, drawn.tabs[0].y));
+            assert!(app.details.pulls.viewing());
+            assert_eq!(app.details.tab(), details::Tab::PullRequests);
+            cells(&mut app, width, height);
+            assert!(mouse(&mut app, CLICK, x, y));
+            assert!(!app.details.pulls.viewing());
+            assert_eq!(app.focus, Focus::Details);
+            assert_eq!(app.composer.text(), "draft");
+        }
+    }
+
+    #[test]
+    fn long_details_scroll_to_their_last_row_by_key_and_wheel_and_lead_back_to_the_list() {
+        let mut app = pulls_tui(vec![long_linked(32), long_linked(31)], false);
+        app.focus = Focus::Transcript;
+        cells(&mut app, 80, 24);
+        alt(&mut app, 'b');
+        press(&mut app, KeyCode::Right);
+        cells(&mut app, 80, 24);
+        // #31, the stack's bottom layer, comes first.
+        press(&mut app, KeyCode::Enter);
+        let text = details_after(&mut app, 80, 24);
+        for shown in ["← List", "1 of 2", "#31 A long title", " more ↓ "] {
+            assert!(text.contains(shown), "{shown:?} in {text}");
+        }
+        let drawn = app.details.drawn.expect("the dialog");
+        let (x, y) = (drawn.body.x + 1, drawn.body.y);
+        // The details end with the stack's note, which wraps to two rows here.
+        let last = "below it.";
+
+        // End and `G` reach the last row, and ↓ goes no further. The row back to the list
+        // stays on top. Home and `g` go back to the first row.
+        for (end, home) in [
+            (KeyCode::End, KeyCode::Home),
+            (KeyCode::Char('G'), KeyCode::Char('g')),
+        ] {
+            press(&mut app, end);
+            let rows = body_after(&mut app, 80, 24);
+            assert!(rows[0].starts_with("← List"), "{rows:#?}");
+            assert_eq!(rows.last().map(String::as_str), Some(last), "{rows:#?}");
+            press(&mut app, KeyCode::Down);
+            let rows = body_after(&mut app, 80, 24);
+            assert_eq!(rows.last().map(String::as_str), Some(last), "{rows:#?}");
+            press(&mut app, home);
+            let rows = body_after(&mut app, 80, 24);
+            assert!(rows[1].starts_with("#31 A long title"), "{rows:#?}");
+        }
+
+        // PageDown passes every row on the way: the URL as far as t3term keeps it, with a note
+        // that T3 sent more, the bot author and the watch.
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            seen.extend(body_after(&mut app, 80, 24));
+            press(&mut app, KeyCode::PageDown);
+        }
+        seen.extend(body_after(&mut app, 80, 24));
+        assert_eq!(seen.last().map(String::as_str), Some(last));
+        for shown in [
+            "Cut short: T3 sent a URL longer than the 2,048",
+            "renovate[bot] (bot)",
+            "Watching: the agent wakes when checks finish,",
+        ] {
+            let found = seen.iter().any(|row| row == shown);
+            assert!(found, "{shown:?} in {seen:#?}");
+        }
+
+        // The wheel reaches the last row too, from the top.
+        press(&mut app, KeyCode::Home);
+        let mut turns = 0;
+        while body_after(&mut app, 80, 24).last().map(String::as_str) != Some(last) {
+            assert!(mouse(&mut app, MouseEventKind::ScrollDown, x, y));
+            turns += 1;
+            assert!(turns < 200, "the wheel never reached the last row");
+        }
+
+        // The wheel moved the details, so a click on the row back to the list waits for the
+        // frame that draws them. After it, the click leads back to the list, with #31 still
+        // selected.
+        assert!(mouse(&mut app, MouseEventKind::ScrollUp, x, y));
+        assert!(!mouse(&mut app, CLICK, x, y));
+        assert!(app.details.pulls.viewing());
+        cells(&mut app, 80, 24);
+        assert!(mouse(&mut app, CLICK, x, y));
+        assert!(!app.details.pulls.viewing());
+        let rows = body_after(&mut app, 80, 24);
+        assert!(rows[0].starts_with("● #31 A long title"), "{rows:#?}");
+
+        // ↓ selects #32, whose details end with the watch's note. ← leads back to the list
+        // with #32 still selected, so Enter shows its details again.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::End);
+        let rows = body_after(&mut app, 80, 24);
+        assert!(rows[0].ends_with("2 of 2"), "{rows:#?}");
+        let end = "someone comments, or the branch conflicts";
+        assert_eq!(rows.last().map(String::as_str), Some(end), "{rows:#?}");
+        press(&mut app, KeyCode::Left);
+        assert!(!app.details.pulls.viewing());
+        press(&mut app, KeyCode::Enter);
+        let rows = body_after(&mut app, 80, 24);
+        assert!(rows[0].ends_with("2 of 2"), "{rows:#?}");
+        assert!(rows[1].starts_with("#32 A long title"), "{rows:#?}");
         assert_eq!(app.composer.text(), "draft");
     }
 
@@ -10701,7 +11027,8 @@ mod tests {
             cells(&mut app, 200, 50);
             alt(&mut app, 'b');
             app.details.show(details::Tab::PullRequests);
-            for expanded in [false, true] {
+            // The list, then the first link's details in its place.
+            for viewing in [false, true] {
                 for (width, height) in [(200, 50), (120, 36), (80, 24), (40, 12)] {
                     let buffer = cells(&mut app, width, height);
                     let drawn = app.details.drawn.expect("drawn");
@@ -10721,12 +11048,14 @@ mod tests {
                     }
                     let text = details_text(&app, &buffer);
                     assert!(text.contains("#1 "), "{width}x{height}: {text}");
+                    if viewing {
+                        assert!(text.contains("1 of 1000"), "{width}x{height}: {text}");
+                    }
                     let whole = text_in(&buffer, buffer.area);
                     assert!(!whole.contains("evil"), "{whole}");
                 }
-                if !expanded {
-                    app.details.toggle_pull();
-                }
+                app.details.toggle_pull();
+                assert_eq!(app.details.pulls.viewing(), !viewing);
             }
             // The links were read once for every frame at every size, a thousand of them.
             assert_eq!(app.details.pulls.builds, 1);

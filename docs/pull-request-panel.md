@@ -12,7 +12,7 @@ T3 sends a thread's links on the thread itself. The server fills the thread's `p
 | --- | --- | --- |
 | `pullRequests` | `ThreadPullRequestLink[]`, packages/contracts/src/threadPullRequest.ts:127-135 | Reads the first 1,000 and counts the rest as not read. A value that isn't a list reads `Linked pull requests unreadable`. An empty list means no links, even beside a legacy link. |
 | `host`, `repository`, `number` | `ThreadPullRequestKey`, threadPullRequest.ts:89-92 | The identity. Host and repository are trimmed and lowercased to compare, as `normalizeThreadPullRequestKey` and `threadPullRequestKeyOf` do (packages/shared/src/threadPullRequests.ts:19 and 74). A host or repository over 1,024 bytes makes the link unreadable. |
-| `url` | `TrimmedNonEmptyString` | Kept to 2,048 characters and shown as plain text in a link's details. Nothing opens it. |
+| `url` | `TrimmedNonEmptyString` | Kept to 2,048 characters and shown whole as plain text in a link's details. A longer one ends with `…` and a note that T3 sent more. Nothing opens it. |
 | `source` | `ThreadPullRequestLinkSource`, threadPullRequest.ts:32-41 | `stack-dismissed` is a tombstone and is hidden. The other sources are named as the panel's `SOURCE_LABELS` names them (apps/web/src/components/pullRequest/ThreadPullRequestsPanel.tsx:49). A source this version doesn't know reads `Linked`. |
 | `linkedAt` | `IsoDateTime` | Shown after the source in a link's details. |
 | `snapshot` | null or `ThreadPullRequestSnapshot`, threadPullRequest.ts:49-66 | Null until the server syncs the link with its host, which reads `Waiting for host state` as the panel's mark does (ThreadPullRequestsPanel.tsx:140). A snapshot without its required fields reads `Host state unreadable`. |
@@ -43,9 +43,10 @@ The snapshot's `state`, `title`, `headBranch`, `baseBranch` and `isDraft` are re
 ## Bounds
 
 - At most 1,000 links are read from a thread. Each keeps at most 512 characters of its title, 2,048 of its URL and 256 of its host, repository, branches and author, with control characters dropped, before any width is measured.
-- The links are worked out again only after an event that can change the open thread, a thread switch or a change in the capability, and only while the details are open. A frame lays out only the links it shows, and lays them out again only when the width, the height, the selection, the open details or the minute changes.
-- A link's details wrap its title to 4 rows, its URL to 8 and each other value to 3, the last cut with `…`.
-- A click acts on the rows the last frame drew. After a change that the next frame hasn't drawn yet, a click does nothing.
+- The links are worked out again only after an event that can change the open thread, a thread switch or a change in the capability, and only while the details are open. A frame lays out only the links it shows, and lays them out again only when the width, the height, the selection, the details' scroll or the minute changes, or when the details open or close.
+- A link's details show in the list's place and wrap each value to every row it takes, so the reader scrolls to all of it. They are worked out again only for another link, width or minute. A frame scrolls them no further than their last row shows.
+- A click acts on the rows the last frame drew. After a change that the next frame hasn't drawn yet, a click does nothing. That covers a selection or scroll moved by a key or the wheel, a resize, a tab switch and the details opening or closing.
+- The status line shows the longest of the details' hints that fits, and each shorter one keeps Esc, so Esc shows whole wherever there are 9 columns for the keys.
 
 ## Next slices
 
@@ -99,5 +100,6 @@ Linking, unlinking, watching, reviewing, commenting, merging and every other wri
 - The list shows only what the server last synced into the thread. A pull request that changed on its host since then shows the old state until the server syncs it again.
 - Links match on their trimmed, lowercased host, repository and number. The desktop's key also takes the authority from the link's URL, which keeps a Forgejo port, and puts the repository in canonical form (threadPullRequests.ts:19-37). Two links the desktop counts as one can show as two here.
 - The legacy link's host is read from its URL's scheme and authority. The desktop's parser also recovers a Forgejo port or an Azure DevOps path, and this doesn't.
-- There is no key that copies the URL and no opener, so you select the URL in the terminal.
+- There is no key that copies the URL and no opener, so you select the URL in the terminal. A URL longer than a row wraps across rows, so a selection in the terminal can also pick up the line breaks and the text beside the card.
+- While a link's details show, a click on the Pull requests tab's name doesn't go back to the list. `← List`, Enter, ← or `h` do.
 - The desktop's linking from a URL, unlinking, watch toggle, row menu and pull request page aren't here.

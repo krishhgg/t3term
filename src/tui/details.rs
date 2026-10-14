@@ -621,7 +621,8 @@ impl Details {
         self.open && self.pulls.wants(open_id, supported)
     }
 
-    /// Opens or closes the selected pull request's details, while its tab shows.
+    /// Shows the selected pull request's details in the list's place, or the list again, while
+    /// their tab shows.
     pub fn toggle_pull(&mut self) {
         if self.tab == Tab::PullRequests {
             self.pulls.toggle();
@@ -629,9 +630,69 @@ impl Details {
         }
     }
 
+    /// Goes back a step: from a pull request's details to the list, or from the pull requests
+    /// to the thread's tab.
+    pub fn back(&mut self) {
+        if self.tab == Tab::PullRequests && self.pulls.back() {
+            self.moved = true;
+        } else {
+            self.show(Tab::Thread);
+        }
+    }
+
+    /// The keys the status line offers while the details have the keyboard, for the tab and
+    /// what it shows: the fullest first, and each after it shorter. The status line shows the
+    /// first that fits, so Esc shows wherever it has room. `modal` says whether the details
+    /// show as a dialog, which Esc closes, rather than a pane, which Esc leaves.
+    pub fn keys(&self, modal: bool) -> &'static [&'static str] {
+        match (self.tab, self.pulls.viewing(), modal) {
+            (Tab::Thread, _, true) => &[
+                "↑↓/PgUp scroll · Esc close · → pull requests",
+                "↑↓/PgUp scroll · Esc close · → PRs",
+                "↑↓ scroll · Esc close · → PRs",
+                "Esc close · → PRs",
+                "Esc close",
+            ],
+            (Tab::Thread, _, false) => &[
+                "↑↓/PgUp scroll · Esc leave · Alt+B close · → pull requests · Tab focus",
+                "↑↓/PgUp scroll · Esc leave · Alt+B close · → PRs",
+                "↑↓ scroll · Esc leave · → PRs",
+                "Esc leave · → PRs",
+                "Esc leave",
+            ],
+            (Tab::PullRequests, false, true) => &[
+                "↑↓ select · Enter details · ← thread · Esc close",
+                "↑↓ · Enter details · ← thread · Esc close",
+                "↑↓ · Enter · ← thread · Esc close",
+                "Esc close · ← thread",
+                "Esc close",
+            ],
+            (Tab::PullRequests, false, false) => &[
+                "↑↓ select · Enter details · ← thread · Esc leave · Alt+B close · Tab focus",
+                "↑↓ · Enter details · ← thread · Esc leave · Alt+B close",
+                "↑↓ · Enter · ← thread · Esc leave",
+                "Esc leave · ← thread",
+                "Esc leave",
+            ],
+            (Tab::PullRequests, true, true) => &[
+                "↑↓/PgUp scroll · ← list · Esc close",
+                "↑↓ scroll · ← list · Esc close",
+                "Esc close · ← list",
+                "Esc close",
+            ],
+            (Tab::PullRequests, true, false) => &[
+                "↑↓/PgUp scroll · ← list · Esc leave · Alt+B close · Tab focus",
+                "↑↓ scroll · ← list · Esc leave · Alt+B close",
+                "Esc leave · ← list",
+                "Esc leave",
+            ],
+        }
+    }
+
     /// A click at `column`, `row`, inside the card the last frame drew: on a tab's name it shows
-    /// that tab, and on a pull request it selects it or opens its details. Says whether it
-    /// changed what shows.
+    /// that tab, and on a pull request it selects it, or shows its details when it is selected
+    /// already. On the row above those details it shows the list again. Says whether it changed
+    /// what shows.
     pub fn click(&mut self, column: u16, row: u16) -> bool {
         let Some(drawn) = self.drawn else {
             return false;
@@ -654,7 +715,7 @@ impl Details {
     }
 
     /// Scrolls the text `delta` rows, down for a positive one, or moves the selected pull
-    /// request `delta` links.
+    /// request `delta` links, or scrolls its details while they show.
     pub fn scroll_by(&mut self, delta: isize) {
         match self.tab {
             Tab::Thread => self.scroll = self.scroll.saturating_add_signed(delta),
@@ -663,7 +724,7 @@ impl Details {
     }
 
     /// Scrolls the text a page down, or up when `down` is false, or moves the selected pull
-    /// request a page.
+    /// request a page, or scrolls its details a page.
     pub fn page(&mut self, down: bool) {
         match self.tab {
             Tab::Thread => {
