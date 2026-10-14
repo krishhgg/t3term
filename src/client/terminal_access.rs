@@ -537,8 +537,10 @@ mod tests {
 
     /// The error a terminal call ends with. Fails the test if the call connects.
     async fn failed(client: &Client) -> anyhow::Error {
-        let connected = client.terminal_rpc().await;
-        connected.err().expect("the terminal call to fail")
+        match client.terminal_rpc().await {
+            Ok(_) => panic!("the terminal call connected"),
+            Err(error) => error,
+        }
     }
 
     /// Moves the client's last issue an hour back, as if an hour had passed.
