@@ -1,12 +1,23 @@
 # Linked pull requests verification
 
-This page records how GPT-6.1 Sol checked the details' Pull requests tab from [PR #34](https://github.com/krishhgg/t3term/pull/34) on 2026-10-13. Sol first checked source `407566d49626bfb8061cb590ef1f5876c47766cc` with two runs against a fake server, which found two problems. `eac6096a53fdf910d61a0a373fb766596e74208a` fixes both, and Sol checked it with a third run. The README's [Linked pull requests](../README.md#linked-pull-requests) section describes the behavior. Nothing here measures time, CPU or memory.
+This page records how GPT-6.1 Sol checked the details' Pull requests tab from [PR #34](https://github.com/krishhgg/t3term/pull/34) on 2026-10-13. Sol first checked source `407566d49626bfb8061cb590ef1f5876c47766cc` with two runs against a fake server, which found two problems. `eac6096a53fdf910d61a0a373fb766596e74208a` fixes both, and Sol checked it with a third run. Greptile then found two more problems, which `13b7a29` fixes and Sol hasn't checked yet. The README's [Linked pull requests](../README.md#linked-pull-requests) section describes the behavior. Nothing here measures time, CPU or memory.
 
 ## Checks
 
 At `407566d` with Rust 1.95.0, Sol ran `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked` and a build, and all of them passed. The 460 tests were 426 library, 2 main, 18 CLI and 14 fake RPC tests. [CI run 38504684165](https://github.com/krishhgg/t3term/actions/runs/38504684165) passed on macOS and Linux.
 
 At `eac6096`, the same four commands passed. The 461 tests are 427 library, 2 main, 18 CLI and 14 fake RPC tests. Master at `f77df53` has 432, so the pull request adds 29. The one new test, `the_first_frame_at_a_new_size_offers_the_keys_for_how_it_draws_the_details`, checks that the first frame after a resize, an open or a close offers the keys for how that frame draws the details. [CI run 38508217636](https://github.com/krishhgg/t3term/actions/runs/38508217636) passed on macOS and Linux. Greptile hadn't reviewed the pull request, which was still a draft.
+
+## After Greptile's review
+
+Greptile reviewed `87a9d03`, which changed only this page, and found two problems. Sol confirmed both in the source.
+
+- Links that build on a cycle of branches showed as one stack with the cycle, at depths and in an order no branch gives. The desktop's walk does the same (packages/shared/src/threadPullRequests.ts:215-278). The script's #37 and #38 make a cycle, but nothing builds on them, so no run here showed it.
+- When T3 removed the link whose details showed, the first frame without them still offered the details' keys, because `App::draw` took in the new links after it drew the status line. The third run's capture after unlinking #42 shows the list a later frame drew, not the first frame, so it couldn't show this.
+
+`13b7a29` fixes both. A walk down a chain stops where it comes back to a link it passed, and that link and the ones after it stand alone, while the links that build on them stack without them. `App::draw` takes in the details and the links before it draws the status line. Two unit tests are new. `links_that_build_on_a_cycle_stack_apart_from_it_in_any_order` lays out a two-link cycle and a self-cycle, each with links on it, in every order. `the_first_frame_after_t3_changes_the_links_offers_the_keys_for_what_it_shows` sends `thread.pull-request-synced` changes and checks the first frame's keys and what ← does, in a pane and a dialog, including a link removed and the capability turned off. Sol hasn't run the checks, the tests or the script at `13b7a29`, so nothing on this page shows that the fixes work.
+
+The script's derived preset now adds #39 on #37's head, and its model of the stacks stops at a cycle as t3term does. For a set or an unlink, the script sends `thread.metadata-updated` unless told otherwise. The pinned T3 server sends `thread.pull-request-synced` for both (apps/server/src/orchestration-v2/Orchestrator.ts:3188-3194). Each carries the whole thread, and t3term takes the thread from every `thread.` event the same way (src/projection.rs:116).
 
 ## How it ran
 
@@ -64,13 +75,13 @@ In the second capture, the branches row shows `[31mred 2J` and `]52;c;eA==`. Tho
 
 ## Images
 
-Sol took no native Terminal screenshots. Each image is a PNG of the cells tmux captured from t3term's pane, drawn by the private Swift renderer the earlier verification pages describe. It draws each cell at 17x33 pixels, so 200x50 gives 3400x1650, 120x36 gives 2040x1188 and 80x24 gives 1360x792, and adds no text, frame or cursor. No image is a mockup, and none was edited or cropped. Sol approved all three, and they are copied unchanged. This page doesn't record the third one's hash.
+Sol took no native Terminal screenshots. Each image is a PNG of the cells tmux captured from t3term's pane, drawn by the private Swift renderer the earlier verification pages describe. It draws each cell at 17x33 pixels, so 200x50 gives 3400x1650, 120x36 gives 2040x1188 and 80x24 gives 1360x792, and adds no text, frame or cursor. No image is a mockup, and none was edited or cropped. Sol approved all three, and they are copied unchanged. Sol recorded the third one's hash after `87a9d03`.
 
 | File | SHA-256 |
 |---|---|
 | `screenshots/linked-pull-requests-pane.png` | `fff90b0c6e0774f82664e1b104d23afd49ef274fa77157c7823c51860fc054db` |
 | `screenshots/linked-pull-requests-url-cut-256.png` | `5354db7ffcf3cb54ab707f68168b288cffd32162da6edd31ad889c381451488f` |
-| `screenshots/linked-pull-requests-resize-dialog.png` | not recorded |
+| `screenshots/linked-pull-requests-resize-dialog.png` | `f9eef2ca5344941d2fe62e07200e89104d99e5a277ea7426c969977c0a55e62d` |
 
 ## What this doesn't show
 
