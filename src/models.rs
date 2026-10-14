@@ -64,25 +64,32 @@ impl Plan {
         self.runtime_mode.is_some() || self.interaction_mode.is_some()
     }
 
-    /// The message text to send, with the ultrathink prefix when that effort was chosen.
+    /// The message text to send, trimmed, with the ultrathink prefix when that effort was chosen.
     pub fn message_text(&self, text: &str) -> String {
-        let text = text.trim();
+        self.message_text_as_given(text.trim())
+    }
+
+    /// `text` as given, with the ultrathink prefix on a line before it when that effort was
+    /// chosen. The trimmed text decides whether it gets the prefix, as in `message_text`. A
+    /// launch sends a new thread's first message this way, so an indented snippet or the final
+    /// newline from stdin reaches T3 as typed.
+    pub(crate) fn message_text_as_given(&self, text: &str) -> String {
         match self.prompt_effort.as_deref() {
-            Some(ULTRATHINK) => ultrathink_prefix(text),
+            Some(ULTRATHINK) if takes_ultrathink_prefix(text.trim()) => {
+                format!("{ULTRATHINK_PREFIX}\n{text}")
+            }
             _ => text.to_string(),
         }
     }
 }
 
-/// Matches `applyClaudePromptEffortPrefix` in packages/shared/src/model.ts: a leading slash
-/// command stays unprefixed so Claude still runs it.
-fn ultrathink_prefix(text: &str) -> String {
+/// Whether `applyClaudePromptEffortPrefix` in packages/shared/src/model.ts prefixes the trimmed
+/// `text`. Empty text and text that already starts with the prefix get none, and neither does a
+/// leading slash command, so Claude still runs it.
+fn takes_ultrathink_prefix(text: &str) -> bool {
     let first = text.split_whitespace().next().unwrap_or("");
     let slash_command = first.len() > 1 && first.starts_with('/') && !first[1..].contains('/');
-    if text.is_empty() || slash_command || text.starts_with(ULTRATHINK_PREFIX) {
-        return text.to_string();
-    }
-    format!("{ULTRATHINK_PREFIX}\n{text}")
+    !(text.is_empty() || slash_command || text.starts_with(ULTRATHINK_PREFIX))
 }
 
 pub fn providers(config: &Value) -> &[Value] {
@@ -761,6 +768,9 @@ mod tests {
             "Ultrathink:\n/src/a.rs is wrong"
         );
         assert_eq!(plan.message_text("Ultrathink: again"), "Ultrathink: again");
+        // `send` trims its message, with the prefix or without it.
+        assert_eq!(plan.message_text(" /review now\n"), "/review now");
+        assert_eq!(Plan::default().message_text("  fix it\n"), "fix it");
         // The label and `--option` reach the same prefix, never the thread's options.
         for choice in [
             Choice {

@@ -34,7 +34,7 @@ const LAUNCH_ERROR_TAG: &str = "OrchestrationV2ThreadLaunchError";
 const TITLE_UNITS: usize = 50;
 
 /// Where a new thread's agent works.
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Clone, PartialEq, Eq)]
 pub enum Workspace {
     /// The project's own folder. T3 makes no worktree, but runs the project's setup script
     /// there when it has one.
@@ -94,6 +94,26 @@ impl Workspace {
                 }
                 strategy
             }
+        }
+    }
+}
+
+/// Shows the kind of workspace, the lengths of its base ref and branch, and `start_from_origin`,
+/// but not the names.
+impl fmt::Debug for Workspace {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Workspace::Root => f.write_str("Root"),
+            Workspace::Worktree {
+                base_ref,
+                branch,
+                start_from_origin,
+            } => f
+                .debug_struct("Worktree")
+                .field("base_ref_chars", &base_ref.chars().count())
+                .field("branch_chars", &branch.as_ref().map(|b| b.chars().count()))
+                .field("start_from_origin", start_from_origin)
+                .finish(),
         }
     }
 }
@@ -203,8 +223,10 @@ impl LaunchRequest {
             project_id: project_id.to_string(),
             title,
             generate_title,
-            // Trimmed, with the ultrathink prefix when that effort was chosen, as `send` does.
-            text: plan.message_text(prompt),
+            // As typed, with the ultrathink prefix on a line before it when that effort was
+            // chosen. `send` trims its message, but a first message such as an indented snippet
+            // keeps its whitespace.
+            text: plan.message_text_as_given(prompt),
             model_selection: plan.model_selection.clone().ok_or_else(incomplete)?,
             runtime_mode: plan.runtime_mode.clone().ok_or_else(incomplete)?,
             interaction_mode: plan.interaction_mode.clone().ok_or_else(incomplete)?,
@@ -286,7 +308,7 @@ impl LaunchRequest {
 
     /// The error for a launch T3 may have acted on. It carries the ids that find the thread and
     /// `outcome`: "unknown" when t3term can't tell what T3 did, or "rejected" when T3 answered
-    /// with a failure.
+    /// with a failure it named.
     fn failure(
         &self,
         code: &'static str,
@@ -319,11 +341,23 @@ impl LaunchRequest {
                     message.trim_end_matches('.')
                 ),
             ),
-            // Any other failure, such as a missing scope, keeps the code, exit and message every
-            // failed call gets.
-            failed @ RpcError::Failed { .. } => {
-                self.failure("T3_RPC_FAILED", exit::REJECTED, "rejected", failed.to_string())
-            }
+            // Any other failure T3 names with a tag, such as a missing scope, keeps the code, exit
+            // and message every failed call gets.
+            failed @ RpcError::Failed {
+                error_tag: Some(_),
+                ..
+            } => self.failure("T3_RPC_FAILED", exit::REJECTED, "rejected", failed.to_string()),
+            // A failure without a tag, such as a defect, keeps that code and exit. It doesn't say
+            // how far the launch got, so T3 may have created the thread before it.
+            RpcError::Failed { message, .. } => self.failure(
+                "T3_RPC_FAILED",
+                exit::REJECTED,
+                "unknown",
+                format!(
+                    "T3 failed the launch of thread {id} with an unexpected error: {}. T3 may have created the thread before the error, so t3term can't tell whether the launch happened.",
+                    message.trim_end_matches('.')
+                ),
+            ),
             // The socket dropped or went silent, T3 didn't answer in time, or a defect frame
             // failed every call on the socket. T3 may have run the launch in each case.
             unknown => self.failure(
@@ -338,10 +372,13 @@ impl LaunchRequest {
     }
 }
 
-/// Leaves out the message and the title, which can be made from it. The ids, the lengths and
-/// the choices tell requests apart.
+/// Shows ids, lengths, counts and the modes. It leaves out the message, the title, which can be
+/// made from the message, the options' values and any other field of the model selection, and
+/// the workspace's ref and branch names.
 impl fmt::Debug for LaunchRequest {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        let selection = &self.model_selection;
+        let options = selection.get("options").and_then(Value::as_array);
         f.debug_struct("LaunchRequest")
             .field("environment_id", &self.environment_id)
             .field("command_id", &self.command_id)
@@ -351,7 +388,12 @@ impl fmt::Debug for LaunchRequest {
             .field("title_chars", &self.title.chars().count())
             .field("generate_title", &self.generate_title)
             .field("text_bytes", &self.text.len())
-            .field("model_selection", &self.model_selection)
+            .field(
+                "instance_id",
+                &selection.get("instanceId").and_then(Value::as_str),
+            )
+            .field("model", &selection.get("model").and_then(Value::as_str))
+            .field("model_options", &options.map_or(0, Vec::len))
             .field("runtime_mode", &self.runtime_mode)
             .field("interaction_mode", &self.interaction_mode)
             .field("workspace", &self.workspace)
@@ -438,10 +480,15 @@ impl Client {
     ///   launch that waits for the server to finish starting can land after t3term gives up.
     /// - `THREAD_LAUNCH_REJECTED`, exit 4, outcome "rejected": T3 ran the launch and it failed.
     ///   A failure after T3 created the thread leaves the thread behind.
-    /// - `T3_RPC_FAILED`, exit 4, outcome "rejected": any other failure, such as a missing
-    ///   scope.
+    /// - `T3_RPC_FAILED`, exit 4, outcome "rejected": any other failure T3 tags, such as a
+    ///   missing scope.
+    /// - `T3_RPC_FAILED`, exit 4, outcome "unknown": a failure without a tag, such as a defect.
+    ///   It doesn't say how far the launch got, so T3 may have created the thread.
     /// - `T3_INVALID_LAUNCH`, exit 1, outcome "unknown": T3 answered, but not with the thread
     ///   and run the request asked for.
+    ///
+    /// When the outcome is unknown, a thread missing from a read doesn't prove T3 never made it.
+    /// Sending a new request for the same launch could start a second thread.
     pub async fn launch_thread(&self, request: &LaunchRequest) -> Result<LaunchReceipt> {
         self.launch_thread_within(request, DISPATCH_TIMEOUT).await
     }
@@ -555,8 +602,8 @@ mod tests {
         details
     }
 
-    /// A launch into the project's folder sends the trimmed message, a title made from it that
-    /// T3 may replace, and nothing T3 doesn't need.
+    /// A launch into the project's folder sends the message as typed, a title made from it
+    /// trimmed that T3 may replace, and nothing T3 doesn't need.
     #[test]
     fn a_root_launch_sends_exactly_what_t3_takes() {
         let client = Client::offline();
@@ -574,7 +621,7 @@ mod tests {
             "creationSource": "web",
             "initialMessage": {
                 "messageId": request.message_id,
-                "text": "Fix the flaky build",
+                "text": "  Fix the flaky build\n",
                 "attachments": [],
             },
         });
@@ -686,19 +733,85 @@ mod tests {
         assert_eq!(title_from_prompt(&longer), format!("{accents}..."));
     }
 
+    /// The first message goes as typed, whitespace and all. Ultrathink puts its prefix on a line
+    /// before it, unless the trimmed message starts with a slash command or the prefix, and then
+    /// the message goes unchanged.
     #[test]
-    fn debug_leaves_out_the_message_and_title() {
+    fn the_first_message_keeps_its_whitespace_with_or_without_ultrathink() {
         let client = Client::offline();
-        let request = launch_of(
+        let mut ultrathink = plan();
+        ultrathink.prompt_effort = Some(crate::models::ULTRATHINK.into());
+        let snippet = "    let x = 1;\n    assert_eq!(x, 2);\nWhy does this fail?\n";
+        let cases = [
+            (plan(), snippet, snippet.to_string()),
+            (
+                ultrathink.clone(),
+                snippet,
+                format!("Ultrathink:\n{snippet}"),
+            ),
+            (
+                ultrathink.clone(),
+                "  /review src/launch.rs\n",
+                "  /review src/launch.rs\n".into(),
+            ),
+            (
+                ultrathink.clone(),
+                "\nUltrathink:\nAgain.\n",
+                "\nUltrathink:\nAgain.\n".into(),
+            ),
+            (
+                ultrathink,
+                " /src/a.rs is wrong\n",
+                "Ultrathink:\n /src/a.rs is wrong\n".into(),
+            ),
+        ];
+        for (plan, prompt, text) in cases {
+            let request =
+                LaunchRequest::new(&client, "p", prompt, None, &plan, Workspace::Root).unwrap();
+            assert_eq!(request.payload()["initialMessage"]["text"], text);
+        }
+    }
+
+    /// `Debug` prints ids, lengths and counts, but none of the message, the title, the model's
+    /// option values, other fields of its selection, or the worktree's names.
+    #[test]
+    fn debug_shows_ids_and_lengths_but_no_content() {
+        let client = Client::offline();
+        let mut plan = plan();
+        plan.model_selection = Some(json!({
+            "instanceId": "claudeAgent", "model": "claude-opus-5-5",
+            "options": [{"id": "effort", "value": "sentinel-option-value"}],
+            "endpoint": {"token": "sentinel-extra-field"},
+        }));
+        let worktree = Workspace::Worktree {
+            base_ref: "sentinel-base-ref".into(),
+            branch: Some("sentinel-branch".into()),
+            start_from_origin: true,
+        };
+        let request = LaunchRequest::new(
             &client,
-            "secret plans",
-            Some("hidden name"),
-            Workspace::Root,
-        );
+            "project-1",
+            "sentinel message",
+            Some("sentinel title"),
+            &plan,
+            worktree,
+        )
+        .unwrap();
         let debug = format!("{request:?}");
-        assert!(debug.contains(&request.thread_id), "{debug}");
-        assert!(!debug.contains("secret plans"), "{debug}");
-        assert!(!debug.contains("hidden name"), "{debug}");
+        for shown in [
+            request.thread_id.as_str(),
+            "project_id: \"project-1\"",
+            "instance_id: Some(\"claudeAgent\")",
+            "model: Some(\"claude-opus-5-5\")",
+            "model_options: 1",
+            "text_bytes: 16",
+            "base_ref_chars: 17",
+            "branch_chars: Some(15)",
+            "start_from_origin: true",
+        ] {
+            assert!(debug.contains(shown), "{shown} missing from {debug}");
+        }
+        assert!(!debug.contains("sentinel"), "{debug}");
     }
 
     /// Sending a request again sends the same ids and content on the same connection, and T3
@@ -838,8 +951,8 @@ mod tests {
     }
 
     /// T3's own launch error becomes `THREAD_LAUNCH_REJECTED`, matched by its tag. Any other
-    /// failure keeps the code and message every failed call gets. Both carry the ids, since a
-    /// launch that fails partway leaves the thread behind.
+    /// failure T3 tags keeps the code and message every failed call gets. Both carry the ids,
+    /// since a launch that fails partway leaves the thread behind.
     #[tokio::test]
     async fn failures_keep_the_ids_and_only_t3s_launch_error_is_a_rejection() {
         let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
@@ -879,6 +992,62 @@ mod tests {
         assert_eq!((error.code, error.exit_code), ("T3_RPC_FAILED", 4));
         assert_eq!(error.message, "The session can't operate this environment.");
         assert_eq!(error.details, details(&request, "rejected"));
+        server.await.unwrap();
+    }
+
+    /// A failure without a readable tag keeps `T3_RPC_FAILED` and exit 4, but doesn't say how
+    /// far the launch got, so its outcome is unknown. That covers a defect, which is how Effect
+    /// fails a call whose handler died, an interrupted call, and a failure whose tag is missing
+    /// or isn't text.
+    #[tokio::test]
+    async fn failures_without_a_tag_leave_the_outcome_unknown() {
+        let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let client = client_at(&origin);
+        let request = launch_of(&client, "Fix it", None, Workspace::Root);
+        let fallback = "T3 rejected orchestration.launchThread";
+        let cases = [
+            (
+                json!([{"_tag": "Die", "defect": "database is locked"}]),
+                "database is locked",
+            ),
+            (
+                json!([{"_tag": "Die", "defect": {"name": "Error", "message": "boom"}}]),
+                fallback,
+            ),
+            (json!([{"_tag": "Interrupt", "fiberId": 7}]), fallback),
+            (
+                json!([{"_tag": "Fail", "error": {"message": "No tag here."}}]),
+                "No tag here",
+            ),
+            (
+                json!([{"_tag": "Fail", "error": {"_tag": 7, "message": "A numeric tag."}}]),
+                "A numeric tag",
+            ),
+        ];
+        let causes: Vec<Value> = cases.iter().map(|(cause, _)| cause.clone()).collect();
+        let sent = request.clone();
+        let server = tokio::spawn(async move {
+            let mut tickets = 0;
+            let (_, mut socket) = open(&listener, &mut tickets).await;
+            for cause in causes {
+                let id = launch(&mut socket, &sent).await;
+                let exit = json!({"_tag": "Failure", "cause": cause});
+                reply(&mut socket, &id, exit).await;
+            }
+        });
+
+        let thread = &request.thread_id;
+        for (_, shown) in &cases {
+            let error = client.launch_thread(&request).await.unwrap_err();
+            let error = t3(&error);
+            assert_eq!((error.code, error.exit_code), ("T3_RPC_FAILED", 4));
+            let message = format!(
+                "T3 failed the launch of thread {thread} with an unexpected error: {shown}. T3 may have created the thread before the error, so t3term can't tell whether the launch happened."
+            );
+            assert_eq!(error.message, message);
+            assert_eq!(error.details, details(&request, "unknown"));
+        }
         server.await.unwrap();
     }
 

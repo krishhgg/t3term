@@ -2460,6 +2460,8 @@ const LAUNCH: &str = "orchestration.launchThread";
 const PREPARATION_FAILURE: &str = "fatal: invalid reference: no-such-branch";
 /// A made-up launch failure that holds an Esc sequence, BEL, a C1 CSI and DEL.
 const LAUNCH_FAILURE: &str = "Failed to launch thread\u{1b}[2J\u{7}\u{9b}31m\u{7f}";
+/// A made-up defect, as Effect sends when a call's handler dies.
+const LAUNCH_DEFECT: &str = "database is locked";
 
 /// A fake T3 server for `launch`.
 struct LaunchServer {
@@ -2583,8 +2585,8 @@ fn launch_failed(error: Value) -> Option<Value> {
 
 /// Answers a launch by its first message. "reject" fails it with T3's own launch error,
 /// "unauthorized" fails it as T3 does a session without the operate scope (packages/contracts/
-/// src/auth.ts), "garbled" accepts it but names another thread, "drop" closes the socket, and
-/// anything else is accepted.
+/// src/auth.ts), "defect" fails it with a defect, which has no tag, "garbled" accepts it but
+/// names another thread, "drop" closes the socket, and anything else is accepted.
 fn answer_by_message(payload: &Value) -> Option<Value> {
     match text(&payload["initialMessage"]["text"]) {
         "reject" => launch_failed(json!({"_tag": "OrchestrationV2ThreadLaunchError",
@@ -2593,6 +2595,8 @@ fn answer_by_message(payload: &Value) -> Option<Value> {
         "unauthorized" => launch_failed(json!({"_tag": "EnvironmentAuthorizationError",
             "message": "This session can't operate the environment.",
             "requiredScope": "orchestration:operate"})),
+        "defect" => Some(json!({"_tag": "Failure",
+            "cause": [{"_tag": "Die", "defect": LAUNCH_DEFECT}]})),
         "garbled" => {
             let mut exit = launched(payload)?;
             exit["value"]["threadId"] = json!(THREAD_A);
@@ -2673,12 +2677,12 @@ fn launch_goes_to_the_named_environment_and_prints_the_ids_it_sent() {
     assert_ne!(command_id, message_id);
     assert_ne!(thread_id, message_id);
 
-    // T3 gets the trimmed message, a title made from it that it may replace, the model with no
-    // options, B's default mode, and the worktree asked for.
+    // T3 gets the message as typed, a title made from it trimmed that T3 may replace, the model
+    // with no options, B's default mode, and the worktree asked for.
     let selection = json!({"instanceId": "claudeAgent", "model": "claude-opus-5-5", "options": []});
     let worktree = json!({"type": "worktree", "baseRef": "main", "branch": "t3/fix-build",
         "startFromOrigin": true});
-    let message = json!({"messageId": message_id, "text": "Fix the flaky build",
+    let message = json!({"messageId": message_id, "text": "  Fix the flaky build\n",
         "attachments": []});
     let expected = json!({
         "commandId": command_id, "threadId": thread_id, "projectId": PROJECT_B,
@@ -2817,16 +2821,19 @@ fn launch_reads_the_first_message_from_stdin() {
     let mut command = home.command(&args, &t3);
     command.stdin(Stdio::piped()).stdout(Stdio::piped());
     let mut child = command.spawn().expect("run t3term");
+    // An indented snippet keeps its indent and the final newline. The title is trimmed.
+    let message = "    let x = 1;\n    assert_eq!(x, 2);\nWhy?\n";
     let mut stdin = child.stdin.take().unwrap();
-    stdin.write_all(b"Fix it from stdin\n").unwrap();
+    stdin.write_all(message.as_bytes()).unwrap();
     drop(stdin);
     let launch = child.wait_with_output().unwrap();
     assert_eq!(launch.status.code(), Some(0), "{launch:?}");
 
     let launches = server.launches();
     assert_eq!(launches.len(), 1, "{launches:?}");
-    assert_eq!(launches[0]["initialMessage"]["text"], "Fix it from stdin");
-    assert_eq!(launches[0]["title"], "Fix it from stdin");
+    assert_eq!(launches[0]["initialMessage"]["text"], message);
+    let title = "let x = 1;\n    assert_eq!(x, 2);\nWhy?";
+    assert_eq!(launches[0]["title"], title);
     // Settings that name no default mode give T3's own, full access.
     let printed_json = json_stdout(&launch);
     assert_eq!(printed_json["runtimeMode"], "full-access");
@@ -3021,7 +3028,7 @@ fn launch_failures_print_the_ids_and_the_command_that_reads_the_thread() {
     );
     assert_eq!(err, expected);
 
-    // Any other failure keeps the code every failed call gets.
+    // Any other failure T3 tags keeps the code every failed call gets.
     let (thread, message) = failed(
         &launch(true, "unauthorized"),
         4,
@@ -3031,6 +3038,14 @@ fn launch_failures_print_the_ids_and_the_command_that_reads_the_thread() {
     let read = format!("t3term --environment b read {thread}");
     let expected = format!(
         "This session can't operate the environment. Run `{read}` to see whether T3 left the thread behind."
+    );
+    assert_eq!(message, expected);
+
+    // A defect keeps that code too, but T3 may have created the thread before it.
+    let (thread, message) = failed(&launch(true, "defect"), 4, "T3_RPC_FAILED", "unknown");
+    let read = format!("t3term --environment b read {thread}");
+    let expected = format!(
+        "T3 failed the launch of thread {thread} with an unexpected error: {LAUNCH_DEFECT}. T3 may have created the thread before the error, so t3term can't tell whether the launch happened. Run `{read}` {look}"
     );
     assert_eq!(message, expected);
 
@@ -3073,7 +3088,7 @@ fn launch_failures_print_the_ids_and_the_command_that_reads_the_thread() {
     assert!(err.ends_with(" [THREAD_LAUNCH_UNCONFIRMED]\n"), "{err}");
 
     // Each run logged in to B once, to read and operate.
-    assert_eq!(home.t3_log(), session_log(b_dir, OPERATE_SCOPES).repeat(6));
+    assert_eq!(home.t3_log(), session_log(b_dir, OPERATE_SCOPES).repeat(7));
 }
 
 #[test]
