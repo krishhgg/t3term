@@ -88,9 +88,13 @@ T3 sends attach chunks without waiting while fewer than 8 chunks and 64 KiB wait
 
 The caller picks the `StreamLimits` for every stream. This module sets no default.
 
-The byte limit counts each chunk's whole `Chunk` message as compact JSON. That is neither the heap the parsed values take nor what the socket reads first. tungstenite reads a whole WebSocket message, up to 64 MiB in frames of up to 16 MiB, and serde_json parses all of it before the limit sees it. A message past tungstenite's limits fails the socket and every request on it. [bounded-rpc-streams.md](bounded-rpc-streams.md#what-the-limits-dont-bound) has more.
+The byte limit counts each chunk's whole `Chunk` message as compact JSON, the encoded size T3 sends. It caps what a stream holds unaccepted. It doesn't cap the heap, and it can't stop a message from being read. The connection's reader takes in each WebSocket message whole, and serde_json parses all of it, before the limit sees any chunk in it. [bounded-rpc-streams.md](bounded-rpc-streams.md#what-the-limits-dont-bound) has more.
 
-The first chunk of every attach and observe holds the terminal's history. T3 keeps up to 5,000 lines and 8 MiB of it per terminal (`DEFAULT_HISTORY_LINE_LIMIT` and `DEFAULT_HISTORY_BYTE_LIMIT` in `Manager.ts`). JSON writes a control character such as ESC as `\u001b`, six bytes for one, so 8 MiB of history can take up to about 48 MiB as JSON. A byte limit below the history's JSON size stops the stream at the snapshot, and nothing attaches again on its own. t3term doesn't know how large T3's messages get in practice, so no limit here is claimed to cover the largest history.
+The socket has its own limit. t3term reads a message of up to 64 MiB, and T3 sends each message in one frame, so t3term allows a frame of up to 64 MiB too ([One frame per message](bounded-rpc-streams.md#one-frame-per-message)). A message over 64 MiB closes the socket and fails every call and stream on it.
+
+The first chunk of every attach and observe holds the terminal's history. T3 keeps up to 5,000 lines and 8 MiB of it per terminal, counting UTF-8 bytes (`DEFAULT_HISTORY_LINE_LIMIT` and `DEFAULT_HISTORY_BYTE_LIMIT` in `Manager.ts`). JSON writes a control character such as ESC as `\u001b`, six bytes for one, so 8 MiB of history can take up to about 48 MiB as JSON. That fits in one 64 MiB message, and with tungstenite's default 16 MiB frame limit it wouldn't have.
+
+A byte limit below a history's JSON size stops that stream at its snapshot. The socket and its other calls and streams go on, and nothing attaches again on its own. A caller that wants every history T3 keeps needs a byte limit of about 48 MiB plus the rest of the snapshot's message. A smaller limit is a choice to stop on large histories. t3term doesn't know how large T3's messages get in practice.
 
 ## Out of scope
 
