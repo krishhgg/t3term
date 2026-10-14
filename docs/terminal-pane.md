@@ -134,4 +134,5 @@ A hidden drawer holds no stream, no emulator and no timer. The terminal's socket
 - A write the connection drops partway through is lost, and t3term doesn't send it again.
 - The drawer always attaches with `terminal:operate`. A session that held `terminal:read` alone would need `terminal.observe`, which the drawer doesn't use.
 - In a narrow drawer, the reason Start terminal gives wraps onto more rows, and the drawer cuts what doesn't fit.
+- T3 cuts a terminal's title at 128 UTF-16 code units (`Manager.ts:346-349`), which can split an emoji in half. JSON then carries a lone surrogate escape, which serde_json refuses, and the socket's reader skips any frame it can't parse (`src/rpc.rs:221`). The drawer misses that event and never acks its chunk, so T3's window has one slot fewer until the drawer attaches again. The fix belongs in the RPC reader, in its own PR.
 - The screenshots and the run against the fake server are still to come, from the reviewer.
