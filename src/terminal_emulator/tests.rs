@@ -23,7 +23,7 @@ use super::handler::{
 };
 use super::{
     InputModes, MAX_COLUMNS, MAX_ROWS, MIN_COLUMNS, MIN_ROWS, MouseEncoding, MouseTracking,
-    TerminalCursor, TerminalCursorShape, TerminalEmulator, config,
+    ScreenSize, TerminalCursor, TerminalCursorShape, TerminalEmulator, config,
 };
 
 /// A bare `Term` and parser, driven the way alacritty_terminal drives them, with replies kept.
@@ -37,7 +37,7 @@ impl Bare {
     fn new(columns: u16, rows: u16) -> Self {
         let listener = ReplyListener::default();
         listener.queue().accepting = true;
-        let size = (usize::from(rows), usize::from(columns));
+        let size = ScreenSize { columns, rows };
         Self {
             term: Term::new(config(columns), &size, listener.clone()),
             processor: Processor::new(),
@@ -51,7 +51,7 @@ impl Bare {
 
     fn resize(&mut self, columns: u16, rows: u16) {
         self.term.set_options(config(columns));
-        self.term.resize((usize::from(rows), usize::from(columns)));
+        self.term.resize(ScreenSize { columns, rows });
     }
 
     fn flush_sync(&mut self) {
@@ -638,7 +638,10 @@ fn titles_hyperlinks_and_the_clipboard_leave_nothing_behind() {
         osc52: Osc52::CopyPaste,
         ..config(40)
     };
-    let size = (4_usize, 40_usize);
+    let size = ScreenSize {
+        columns: 40,
+        rows: 4,
+    };
     let output = window_effects();
 
     let bare = Recorder::default();

@@ -16,7 +16,7 @@ use std::fmt;
 use std::time::Instant;
 
 use alacritty_terminal::Term;
-use alacritty_terminal::grid::Scroll;
+use alacritty_terminal::grid::{Dimensions, Scroll};
 use alacritty_terminal::term::{Config, Osc52, TermMode};
 use alacritty_terminal::vte::ansi::{Processor, StdSyncHandler};
 use ratatui::buffer::Buffer;
@@ -110,7 +110,7 @@ struct Engine {
 impl Engine {
     fn new(columns: u16, rows: u16) -> Self {
         let listener = ReplyListener::default();
-        let size = (usize::from(rows), usize::from(columns));
+        let size = ScreenSize { columns, rows };
         Self {
             term: Term::new(config(columns), &size, listener.clone()),
             processor: Processor::new(),
@@ -141,6 +141,28 @@ impl Engine {
                 term: &mut self.term,
             });
         }
+    }
+}
+
+/// A size for `Term::new` and `Term::resize`, which take any `Dimensions`. alacritty_terminal
+/// implements the trait for `(usize, usize)` only in its own tests. Like its test `TermSize`,
+/// this counts no scrollback, because both calls read only the columns and screen lines.
+struct ScreenSize {
+    columns: u16,
+    rows: u16,
+}
+
+impl Dimensions for ScreenSize {
+    fn total_lines(&self) -> usize {
+        self.screen_lines()
+    }
+
+    fn screen_lines(&self) -> usize {
+        usize::from(self.rows)
+    }
+
+    fn columns(&self) -> usize {
+        usize::from(self.columns)
     }
 }
 
@@ -187,9 +209,7 @@ impl TerminalEmulator {
         self.rows = rows;
         // Setting the cap first trims old rows before a wider reflow copies them.
         self.engine.term.set_options(config(columns));
-        self.engine
-            .term
-            .resize((usize::from(rows), usize::from(columns)));
+        self.engine.term.resize(ScreenSize { columns, rows });
     }
 
     /// Starts over from `history`, the thread's whole output so far, at the current size. The
