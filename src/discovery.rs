@@ -916,36 +916,73 @@ mod tests {
 
     const PADDED_ID: &str = "6f1c2a8e-3b7d-4e9a-9c41-2d5f8b0a7e13";
 
+    /// The capabilities T3 f570bd21 reports from a desktop Mac, in the order it sends them.
+    const CAPABILITIES: &[&str] = &[
+        "repositoryIdentity",
+        "connectionProbe",
+        "attachmentUploads",
+        "questionAttachments",
+        "fileAttachments",
+        "pullRequests",
+        "pullRequestChecks",
+        "inlineMessageContext",
+        "requiredWorktreeBootstrap",
+        "threadSettlement",
+        "threadAutoSettlement",
+        "storageCleanup",
+        "projectWorktreeCleanup",
+        "worktreesDirectory",
+        "threadRestartContinuation",
+        "projectSettingsOverrides",
+        "threadSnooze",
+        "environmentThemes",
+        "usageLimitSources",
+        "usagePriceOverrides",
+        "usageModelAliases",
+        "threadPinning",
+        "threadPinReorder",
+        "threadActiveReorder",
+        "threadAutoSettleOptOut",
+        "threadTitleRegeneration",
+        "threadVisitedTracking",
+        "threadPullRequests",
+        "threadPullRequestWatch",
+        "pullRequestStackActions",
+        "threadPullRequestLinking",
+        "serverResolvedCommandContext",
+        "environmentIcon",
+        "projectCloneTracking",
+        "serverSelfUpdate",
+        "serverSelfUpdateProgress",
+        "desktopAppUpdate",
+        "serverBrowser",
+        "agentActivityPublishing",
+    ];
+
     /// A descriptor as T3 f570bd21 builds one on a desktop Mac
     /// (apps/server/src/environment/ServerEnvironment.ts:208-275), with `padding`, a key t3term
-    /// ignores, long enough that the JSON is `size` bytes.
+    /// ignores, long enough that the JSON is `size` bytes. The capabilities are built one at a
+    /// time because a single `json!` holding all of them passes the macro recursion limit.
     fn padded_descriptor(size: usize) -> Vec<u8> {
+        let capabilities: serde_json::Map<String, Value> = CAPABILITIES
+            .iter()
+            .map(|&name| {
+                let value = match name {
+                    "fileAttachments" => serde_json::json!({"maxUploadBytes": 52428800}),
+                    "serverSelfUpdate" => Value::from("desktop-managed"),
+                    "agentActivityPublishing" => Value::Bool(false),
+                    _ => Value::Bool(true),
+                };
+                (name.to_owned(), value)
+            })
+            .collect();
         let mut descriptor = serde_json::json!({
             "environmentId": PADDED_ID,
             "label": "Studio Mac",
             "platform": {"os": "darwin", "arch": "arm64", "machine": "mac-studio"},
             "serverVersion": "0.0.46-nightly.20261007.2787",
             "orchestrationProtocolVersion": 2,
-            "capabilities": {
-                "repositoryIdentity": true, "connectionProbe": true, "attachmentUploads": true,
-                "questionAttachments": true, "fileAttachments": {"maxUploadBytes": 52428800},
-                "pullRequests": true, "pullRequestChecks": true, "inlineMessageContext": true,
-                "requiredWorktreeBootstrap": true, "threadSettlement": true,
-                "threadAutoSettlement": true, "storageCleanup": true,
-                "projectWorktreeCleanup": true, "worktreesDirectory": true,
-                "threadRestartContinuation": true, "projectSettingsOverrides": true,
-                "threadSnooze": true, "environmentThemes": true, "usageLimitSources": true,
-                "usagePriceOverrides": true, "usageModelAliases": true, "threadPinning": true,
-                "threadPinReorder": true, "threadActiveReorder": true,
-                "threadAutoSettleOptOut": true, "threadTitleRegeneration": true,
-                "threadVisitedTracking": true, "threadPullRequests": true,
-                "threadPullRequestWatch": true, "pullRequestStackActions": true,
-                "threadPullRequestLinking": true, "serverResolvedCommandContext": true,
-                "environmentIcon": true, "projectCloneTracking": true,
-                "serverSelfUpdate": "desktop-managed", "serverSelfUpdateProgress": true,
-                "desktopAppUpdate": true, "serverBrowser": true,
-                "agentActivityPublishing": false
-            },
+            "capabilities": capabilities,
             "padding": ""
         });
         let unpadded = descriptor.to_string().len();
