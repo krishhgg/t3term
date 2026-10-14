@@ -6,7 +6,8 @@ use t3term::{
 
 #[tokio::main]
 async fn main() -> anyhow::Result<()> {
-    let client = Arc::new(Client::connect(&[Scope::Read], "5m").await?);
+    let target = t3term::environments::target(None).await?;
+    let client = Arc::new(Client::connect(&target, &[Scope::Read], "5m").await?);
     let mut events = client.watch_shell(None);
     for _ in 0..3 {
         if let Some(WatchEvent::Item(item)) = events.recv().await {

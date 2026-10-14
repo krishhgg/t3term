@@ -9640,7 +9640,10 @@ mod tests {
             let answers = answers().into_iter().take(count).collect();
             open_setup_thread(&mut app, "t", worktree_thread("t", true, runs, answers));
             let stages = setup_stages(["done", "done", "skipped", "done", "done"]);
-            let item = setup_item("t", "done", 1, stages);
+            let mut item = setup_item("t", "done", 1, stages);
+            // A done setup with its end, so its elapsed time can't tick over between the
+            // frames compared below.
+            item["endedAt"] = json!("2026-10-07T00:00:12.000Z");
             assert!(deliver(&mut app, &subscriptions, WatchEvent::Item(item)));
             press(&mut app, KeyCode::Esc);
             press(&mut app, key);
