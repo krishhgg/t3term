@@ -744,6 +744,21 @@ struct Detail {
     lines: Vec<Line<'static>>,
 }
 
+/// How far the details are scrolled: a row from their top, or a number of rows up from where
+/// their last row shows. End asks for the bottom before a frame knows how many rows that takes
+/// at the width it draws, so the keys after it count from there and the later one wins.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Offset {
+    Top(usize),
+    End(usize),
+}
+
+impl Default for Offset {
+    fn default() -> Offset {
+        Offset::Top(0)
+    }
+}
+
 /// The pull request list as the reader left it in this window.
 #[derive(Default)]
 pub(super) struct PullRequests {
@@ -756,8 +771,9 @@ pub(super) struct PullRequests {
     chosen: Option<Key>,
     /// Whether the selected link's details show in the list's place.
     viewing: bool,
-    /// The first row of the details shown. A frame keeps it within the details.
-    scroll: usize,
+    /// How far the details are scrolled. A frame turns it into the first row it shows, kept
+    /// within the details.
+    scroll: Offset,
     /// The first link the last frame showed.
     top: usize,
     page: Option<Page>,
@@ -786,7 +802,7 @@ impl PullRequests {
         self.selected = 0;
         self.chosen = None;
         self.viewing = false;
-        self.scroll = 0;
+        self.scroll = Offset::Top(0);
         self.top = 0;
         self.page = None;
         self.detail = None;
@@ -820,7 +836,7 @@ impl PullRequests {
         let found = self.chosen.as_ref().and_then(|key| position(entries, key));
         if found.is_none() {
             self.viewing = false;
-            self.scroll = 0;
+            self.scroll = Offset::Top(0);
         }
         let selected = found
             .unwrap_or(self.selected)
@@ -840,16 +856,60 @@ impl PullRequests {
     }
 
     /// Moves the selection `delta` links, down for a positive one, and stops at the ends.
-    /// While a link's details show, scrolls them `delta` rows instead.
+    /// While a link's details show, scrolls them `delta` rows instead, no further than the
+    /// last frame showed they go, so a scroll back up after one past the end counts.
     pub fn move_by(&mut self, delta: isize) {
         if self.viewing {
-            self.scroll_to(self.scroll.saturating_add_signed(delta));
+            let last = self.last_row();
+            let within = |rows: usize| last.map_or(rows, |last| rows.min(last));
+            let scroll = match self.scroll {
+                Offset::Top(row) => Offset::Top(within(row.saturating_add_signed(delta))),
+                Offset::End(up) => {
+                    // Down leaves fewer rows under the page, and up more.
+                    let up = up.saturating_add_signed(delta.saturating_neg());
+                    Offset::End(within(up))
+                }
+            };
+            self.scroll_to(scroll);
             return;
         }
         let count = entries_of(self.list.as_ref()).len();
         if count > 0 {
             self.select(self.selected.saturating_add_signed(delta).min(count - 1));
         }
+    }
+
+    /// Selects the first link, or scrolls the details to their top.
+    pub fn home(&mut self) {
+        if self.viewing {
+            self.scroll_to(Offset::Top(0));
+        } else {
+            self.move_by(isize::MIN);
+        }
+    }
+
+    /// Selects the last link, or scrolls the details until their last row shows, however many
+    /// rows the next frame finds they take.
+    pub fn end(&mut self) {
+        if self.viewing {
+            self.scroll_to(Offset::End(0));
+        } else {
+            self.move_by(isize::MAX);
+        }
+    }
+
+    /// The furthest the details scroll, as the last frame laid them out: their rows past the
+    /// ones a page shows. None until a frame drew the selected link's details.
+    fn last_row(&self) -> Option<usize> {
+        let shape = self.page.as_ref()?.shape;
+        let detail = self.detail.as_ref()?;
+        let drawn = shape.viewing && shape.selected == self.selected;
+        if !drawn || detail.index != self.selected || detail.at.0 != shape.width {
+            return None;
+        }
+        // The row back to the list comes first.
+        let shown = shape.height.saturating_sub(1);
+        Some(detail.lines.len().saturating_sub(shown))
     }
 
     /// Moves the selection, or scrolls the details, a page down, or up when `down` is false.
@@ -872,7 +932,7 @@ impl PullRequests {
             .map(|entry| entry.key.clone());
     }
 
-    fn scroll_to(&mut self, scroll: usize) {
+    fn scroll_to(&mut self, scroll: Offset) {
         if scroll != self.scroll {
             self.current = false;
             self.scroll = scroll;
@@ -886,7 +946,7 @@ impl PullRequests {
             self.back();
         } else if !entries_of(self.list.as_ref()).is_empty() {
             self.viewing = true;
-            self.scroll = 0;
+            self.scroll = Offset::Top(0);
             self.current = false;
         }
     }
@@ -898,7 +958,7 @@ impl PullRequests {
             return false;
         }
         self.viewing = false;
-        self.scroll = 0;
+        self.scroll = Offset::Top(0);
         self.current = false;
         true
     }
@@ -957,11 +1017,16 @@ impl PullRequests {
     /// details, scrolled no further than their last row shows. Clicks land on it until the
     /// selection or the scroll moves.
     pub fn page(&mut self, width: usize, height: usize, now: i64, theme: &Theme) -> &Page {
+        let mut scroll = 0;
         if self.viewing {
             let total = self.prepare_detail(width, now, theme);
             // The row back to the list comes first.
-            let shown = height.saturating_sub(1);
-            self.scroll = self.scroll.min(total.saturating_sub(shown));
+            let last = total.saturating_sub(height.saturating_sub(1));
+            scroll = match self.scroll {
+                Offset::Top(row) => row.min(last),
+                Offset::End(up) => last - up.min(last),
+            };
+            self.scroll = Offset::Top(scroll);
         }
         let shape = Shape {
             width,
@@ -969,7 +1034,7 @@ impl PullRequests {
             top: self.top,
             selected: self.selected,
             viewing: self.viewing,
-            scroll: self.scroll,
+            scroll,
             minute: now.div_euclid(60_000),
         };
         if self.page.as_ref().map(|page| page.shape) != Some(shape) {
@@ -1467,7 +1532,17 @@ fn detail_lines(entry: &Entry, width: usize, now: i64, theme: &Theme) -> Vec<Lin
     lines.extend(flowed(status_parts(entry, theme), " · ", width, theme));
     lines.extend(flowed(diff_parts(snapshot, theme), " ", width, theme));
 
-    let mut sections: Vec<(Option<&str>, Vec<(String, Style)>)> = Vec::new();
+    // Each section is a blank row, its label when it has one, then each value in its style,
+    // wrapped to every row it takes.
+    let mut section = |label: Option<&str>, values: &[(String, Style)]| {
+        lines.push(Line::default());
+        if let Some(label) = label {
+            lines.push(Line::styled(clip(label, width), muted));
+        }
+        for (text, style) in values {
+            lines.extend(whole(text, width, *style));
+        }
+    };
     let mut url = vec![(entry.url.clone(), info)];
     if entry.url_cut {
         let note = format!(
@@ -1476,18 +1551,18 @@ fn detail_lines(entry: &Entry, width: usize, now: i64, theme: &Theme) -> Vec<Lin
         );
         url.push((note, muted));
     }
-    sections.push((Some("URL"), url));
+    section(Some("URL"), &url);
     let place = format!("{}/{}", entry.host, entry.repository);
-    sections.push((Some("Repository"), vec![(place, value)]));
+    section(Some("Repository"), &[(place, value)]);
     if let Some(snapshot) = snapshot {
         let branches = format!("{} → {}", snapshot.head, snapshot.base);
-        sections.push((Some("Branches"), vec![(branches, value)]));
+        section(Some("Branches"), &[(branches, value)]);
     }
     if let Some(snapshot) = snapshot
         && let Some(author) = snapshot.author.as_deref()
     {
         let bot = if snapshot.bot { " (bot)" } else { "" };
-        sections.push((Some("Author"), vec![(format!("{author}{bot}"), value)]));
+        section(Some("Author"), &[(format!("{author}{bot}"), value)]);
     }
     let linked = match time_ago(entry.linked_at.as_deref(), now) {
         Some(ago) => format!("{} · {ago}", entry.source.label()),
@@ -1502,9 +1577,9 @@ fn detail_lines(entry: &Entry, width: usize, now: i64, theme: &Theme) -> Vec<Lin
             activity.push((format!("Synced {ago}"), value));
         }
     }
-    sections.push((Some("Activity"), activity));
+    section(Some("Activity"), &activity);
     if entry.open() && entry.watching {
-        sections.push((None, vec![(WATCHING.to_string(), info)]));
+        section(None, &[(WATCHING.to_string(), info)]);
     }
     if let Some(chain) = entry.chain {
         let size = chain.size;
@@ -1513,16 +1588,7 @@ fn detail_lines(entry: &Entry, width: usize, now: i64, theme: &Theme) -> Vec<Lin
         } else {
             format!("{size} pull requests chained by base branch.")
         };
-        sections.push((None, vec![(text, muted)]));
-    }
-    for (label, values) in sections {
-        lines.push(Line::default());
-        if let Some(label) = label {
-            lines.push(Line::styled(clip(label, width), muted));
-        }
-        for (text, style) in values {
-            lines.extend(whole(&text, width, style));
-        }
+        section(None, &[(text, muted)]);
     }
     lines
 }
@@ -1983,7 +2049,10 @@ mod tests {
         assert_eq!(Key::of("github.com", &over, 1), None);
         let at = format!("{}GitHub.COM", " ".repeat(KEY - "GitHub.COM".len()));
         let key = Key::of(&at, " O/R ", 1).expect("at the bound");
-        assert_eq!((key.host.as_str(), key.repository.as_str()), ("github.com", "o/r"));
+        assert_eq!(
+            (key.host.as_str(), key.repository.as_str()),
+            ("github.com", "o/r")
+        );
         // Ordinary text is trimmed and lowercased as before, and empty text is no identity.
         let key = Key::of(" GitHub.COM ", " Owner/Repo ", 7).expect("ordinary");
         let expected = Key {
@@ -2125,14 +2194,14 @@ mod tests {
         // The end of the list, a page at a time and then at once.
         pulls.page_by(true);
         assert_eq!(pulls.selected, 10);
-        pulls.move_by(isize::MAX);
+        pulls.end();
         let page = pulls.page(36, 31, now(), &theme);
         let laid = links_on(page);
         let last: HashSet<usize> = (990..1000).collect();
         assert_eq!(laid, last);
         assert!(page.above && !page.below);
         assert_eq!(pulls.pages, 2);
-        pulls.move_by(isize::MIN);
+        pulls.home();
         assert_eq!((pulls.selected, pulls.top), (0, 990));
         pulls.page(36, 31, now(), &theme);
         assert_eq!(pulls.top, 0);
@@ -2167,14 +2236,16 @@ mod tests {
         pulls.move_by(2);
         let four = vec![dated(1), dated(2), dated(3), dated(4)];
         pulls.set(list_of(&thread(four)));
-        assert_eq!((pulls.selected, pulls.viewing, pulls.scroll), (2, true, 2));
+        let after = (pulls.selected, pulls.viewing, pulls.scroll);
+        assert_eq!(after, (2, true, Offset::Top(2)));
         let rows = rows_of(&pulls.page(40, 10, now(), &theme).lines);
         assert!(rows[0].ends_with("3 of 4"), "{rows:#?}");
         assert_eq!(rows[4], url, "{rows:#?}");
         // #2 goes. The selection stays where it was, and the list shows again.
         let without = vec![dated(1), dated(3), dated(4)];
         pulls.set(list_of(&thread(without.clone())));
-        assert_eq!((pulls.selected, pulls.viewing, pulls.scroll), (2, false, 0));
+        let after = (pulls.selected, pulls.viewing, pulls.scroll);
+        assert_eq!(after, (2, false, Offset::Top(0)));
         assert_eq!(pulls.chosen.as_ref().map(|key| key.number), Some(1));
         // The same list again lays nothing out again.
         pulls.page(40, 30, now(), &theme);
@@ -2195,7 +2266,7 @@ mod tests {
         pulls.follow();
         assert!(pulls.wants(Some("u"), true));
         let after = (pulls.selected, pulls.viewing, pulls.scroll, pulls.top);
-        assert_eq!(after, (0, false, 0, 0));
+        assert_eq!(after, (0, false, Offset::Top(0), 0));
     }
 
     #[test]
@@ -2241,45 +2312,130 @@ mod tests {
             assert!(all.iter().any(|row| row == shown), "{shown:?} in {all:#?}");
         }
         let text = all.join(" ");
-        assert!(text.contains("Cut short: T3 sent a URL longer than"), "{all:#?}");
+        assert!(
+            text.contains("Cut short: T3 sent a URL longer than"),
+            "{all:#?}"
+        );
         assert!(text.contains("Watching: the agent wakes"), "{all:#?}");
-        assert!(text.ends_with("merging a layer lands the ones below it."), "{all:#?}");
+        assert!(
+            text.ends_with("merging a layer lands the ones below it."),
+            "{all:#?}"
+        );
 
         // ↓ scrolls a row and PageDown the seven rows a page shows.
         pulls.move_by(1);
         pulls.page(30, 8, now(), &theme);
         pulls.page_by(true);
-        assert_eq!(pulls.scroll, 1 + 7);
+        assert_eq!(pulls.scroll, Offset::Top(1 + 7));
         // End reaches the last row, and no further.
-        pulls.move_by(isize::MAX);
+        pulls.end();
         let page = pulls.page(30, 8, now(), &theme);
         assert!(page.above && !page.below);
         let rows = rows_of(&page.lines);
         assert!(rows[0].starts_with("← List"), "{rows:#?}");
         assert_eq!(rows[1..], all[total - 7..]);
-        assert_eq!(pulls.scroll, total - 7);
+        assert_eq!(pulls.scroll, Offset::Top(total - 7));
         pulls.move_by(1);
         pulls.page(30, 8, now(), &theme);
-        assert_eq!(pulls.scroll, total - 7);
+        assert_eq!(pulls.scroll, Offset::Top(total - 7));
         // ↑ and PageUp scroll back, and Home goes to the top.
         pulls.move_by(-1);
         pulls.page_by(false);
-        assert_eq!(pulls.scroll, total - 7 - 1 - 7);
-        pulls.move_by(isize::MIN);
-        assert_eq!(pulls.scroll, 0);
+        assert_eq!(pulls.scroll, Offset::Top(total - 7 - 1 - 7));
+        pulls.home();
+        assert_eq!(pulls.scroll, Offset::Top(0));
         // Back to the list, with the link still selected. Its details show from their top
         // again.
-        pulls.move_by(isize::MAX);
+        pulls.end();
         assert!(pulls.back());
         assert!(!pulls.back());
-        assert_eq!((pulls.selected, pulls.viewing, pulls.scroll), (0, false, 0));
+        let after = (pulls.selected, pulls.viewing, pulls.scroll);
+        assert_eq!(after, (0, false, Offset::Top(0)));
         let page = pulls.page(30, 8, now(), &theme);
         assert_eq!(links_on(page), HashSet::from([0, 1]));
         assert!(rows_of(&page.lines)[0].starts_with("● #1"));
         pulls.toggle();
-        assert_eq!((pulls.viewing, pulls.scroll), (true, 0));
+        assert_eq!((pulls.viewing, pulls.scroll), (true, Offset::Top(0)));
         pulls.toggle();
         assert!(!pulls.viewing);
+    }
+
+    #[test]
+    fn a_scroll_after_end_or_past_the_end_counts_before_the_next_frame() {
+        let mut pulls = PullRequests::default();
+        let theme = theme();
+        let mut pull = link("o/r", 1, "h", "main");
+        pull["snapshot"]["title"] = json!("A long title ".repeat(60));
+        pulls.set(list_of(&thread(vec![pull])));
+        pulls.toggle();
+        // A page shows the row back to the list and seven rows of the details.
+        pulls.page(30, 8, now(), &theme);
+        let last = detail_rows(&pulls).len() - 7;
+        assert!(last > 3 * 7, "{last}");
+        // Draws a frame and says how far it scrolled the details.
+        let drawn = |pulls: &mut PullRequests| {
+            pulls.page(30, 8, now(), &theme);
+            pulls.scroll
+        };
+
+        // End, then PageUp, ↑ or three turns of the wheel up before a frame: each moves from
+        // the last row, not from past it.
+        pulls.end();
+        pulls.page_by(false);
+        assert_eq!(drawn(&mut pulls), Offset::Top(last - 7));
+        pulls.end();
+        pulls.move_by(-1);
+        assert_eq!(drawn(&mut pulls), Offset::Top(last - 1));
+        pulls.end();
+        for _ in 0..3 {
+            pulls.move_by(-1);
+        }
+        assert_eq!(drawn(&mut pulls), Offset::Top(last - 3));
+        // ↓ after End stays at the end, and ↑ after that moves a row.
+        pulls.end();
+        pulls.move_by(1);
+        pulls.move_by(-1);
+        assert_eq!(drawn(&mut pulls), Offset::Top(last - 1));
+        // Whichever of Home and End comes last wins.
+        pulls.end();
+        pulls.home();
+        assert_eq!(drawn(&mut pulls), Offset::Top(0));
+        pulls.home();
+        pulls.end();
+        assert_eq!(drawn(&mut pulls), Offset::Top(last));
+
+        // ↓ and PageDown past the end stop at the last row the frame showed, so ↑ and PageUp
+        // after them count.
+        pulls.home();
+        drawn(&mut pulls);
+        for _ in 0..last + 5 {
+            pulls.move_by(1);
+        }
+        assert_eq!(pulls.scroll, Offset::Top(last));
+        pulls.move_by(-1);
+        assert_eq!(drawn(&mut pulls), Offset::Top(last - 1));
+        for _ in 0..5 {
+            pulls.page_by(true);
+        }
+        pulls.page_by(false);
+        assert_eq!(drawn(&mut pulls), Offset::Top(last - 7));
+
+        // End and the keys after it count from wherever the last row lands at the size of the
+        // next frame.
+        pulls.end();
+        pulls.move_by(-1);
+        let page = pulls.page(20, 6, now(), &theme);
+        assert!(page.above && page.below);
+        let narrower = detail_rows(&pulls).len() - 5;
+        assert_eq!(pulls.scroll, Offset::Top(narrower - 1));
+        // Before a frame first draws a link's details, nothing knows how many rows they take,
+        // and End and ↑ count from their end all the same.
+        assert!(pulls.back());
+        pulls.page(30, 8, now(), &theme);
+        pulls.toggle();
+        pulls.end();
+        pulls.move_by(-1);
+        assert_eq!(drawn(&mut pulls), Offset::Top(last - 1));
     }
 
     #[test]

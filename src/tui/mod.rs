@@ -11007,6 +11007,109 @@ mod tests {
     }
 
     #[test]
+    fn a_scroll_after_end_or_past_the_end_wins_before_the_next_frame() {
+        // The pane, then the dialog.
+        for (width, height) in [(200, 50), (80, 24)] {
+            let size = format!("{width}x{height}");
+            let mut app = pulls_tui(vec![long_linked(32), long_linked(31)], false);
+            app.focus = Focus::Transcript;
+            cells(&mut app, width, height);
+            alt(&mut app, 'b');
+            cells(&mut app, width, height);
+            let drawn = app.details.drawn.expect("the details");
+            assert!(mouse(&mut app, CLICK, drawn.tabs[1].x, drawn.tabs[1].y));
+            assert_eq!(app.focus, Focus::Details);
+            cells(&mut app, width, height);
+            // ↓ selects #32, the stack's top layer, and Enter shows its details.
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            let top = body_after(&mut app, width, height);
+            assert!(top[0].ends_with("2 of 2"), "{size}: {top:#?}");
+            let drawn = app.details.drawn.expect("the details");
+            let (x, y) = (drawn.body.x + 1, drawn.body.y);
+
+            // What End shows, and what PageUp, ↑ and the wheel up show with a frame between End
+            // and them.
+            press(&mut app, KeyCode::End);
+            let bottom = body_after(&mut app, width, height);
+            press(&mut app, KeyCode::PageUp);
+            let page_up = body_after(&mut app, width, height);
+            press(&mut app, KeyCode::End);
+            cells(&mut app, width, height);
+            press(&mut app, KeyCode::Up);
+            let up = body_after(&mut app, width, height);
+            press(&mut app, KeyCode::End);
+            cells(&mut app, width, height);
+            assert!(mouse(&mut app, MouseEventKind::ScrollUp, x, y));
+            let wheel = body_after(&mut app, width, height);
+            assert_ne!(up, bottom, "{size}");
+            assert_ne!(page_up, up, "{size}");
+            assert_eq!(wheel, up, "{size}");
+
+            // With no frame between them, the key after End still moves from the last row.
+            press(&mut app, KeyCode::Home);
+            cells(&mut app, width, height);
+            press(&mut app, KeyCode::End);
+            press(&mut app, KeyCode::PageUp);
+            assert_eq!(body_after(&mut app, width, height), page_up, "{size}");
+            press(&mut app, KeyCode::Char('G'));
+            press(&mut app, KeyCode::Up);
+            assert_eq!(body_after(&mut app, width, height), up, "{size}");
+            press(&mut app, KeyCode::End);
+            assert!(mouse(&mut app, MouseEventKind::ScrollUp, x, y));
+            assert_eq!(body_after(&mut app, width, height), wheel, "{size}");
+            // Whichever of Home and End comes last wins.
+            press(&mut app, KeyCode::End);
+            press(&mut app, KeyCode::Home);
+            assert_eq!(body_after(&mut app, width, height), top, "{size}");
+            press(&mut app, KeyCode::Char('g'));
+            press(&mut app, KeyCode::End);
+            assert_eq!(body_after(&mut app, width, height), bottom, "{size}");
+
+            // PageDown from the top reaches the last row. ↓, PageDown and the wheel past it stop
+            // there, so ↑ and PageUp after them still move.
+            press(&mut app, KeyCode::Home);
+            let mut turns = 0;
+            while body_after(&mut app, width, height) != bottom {
+                press(&mut app, KeyCode::PageDown);
+                turns += 1;
+                assert!(turns < 50, "{size}: PageDown never reached the last row");
+            }
+            for _ in 0..5 {
+                press(&mut app, KeyCode::Down);
+                press(&mut app, KeyCode::PageDown);
+                assert!(mouse(&mut app, MouseEventKind::ScrollDown, x, y));
+            }
+            press(&mut app, KeyCode::Up);
+            assert_eq!(body_after(&mut app, width, height), up, "{size}");
+            for _ in 0..5 {
+                press(&mut app, KeyCode::PageDown);
+            }
+            press(&mut app, KeyCode::PageUp);
+            assert_eq!(body_after(&mut app, width, height), page_up, "{size}");
+
+            // Enter, End and ↑ before a frame first draws the details count from their last
+            // row too.
+            press(&mut app, KeyCode::Left);
+            assert!(!app.details.pulls.viewing());
+            cells(&mut app, width, height);
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::End);
+            press(&mut app, KeyCode::Up);
+            assert_eq!(body_after(&mut app, width, height), up, "{size}");
+
+            // ← leads back to the list with #32 still selected, so Enter shows its details from
+            // their top.
+            press(&mut app, KeyCode::Left);
+            assert!(!app.details.pulls.viewing());
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(body_after(&mut app, width, height), top, "{size}");
+            assert_eq!(app.focus, Focus::Details);
+            assert_eq!(app.composer.text(), "draft");
+        }
+    }
+
+    #[test]
     fn hostile_and_a_thousand_links_stay_inside_the_details_at_every_size() {
         let runtime = idle_runtime();
         let _entered = runtime.enter();

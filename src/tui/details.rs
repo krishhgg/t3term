@@ -602,7 +602,8 @@ impl Details {
         self.shown.filter(|_| self.open)
     }
 
-    /// The tab that shows.
+    /// The tab that shows, for the tests.
+    #[cfg(test)]
     pub fn tab(&self) -> Tab {
         self.tab
     }
@@ -738,14 +739,14 @@ impl Details {
     pub fn scroll_home(&mut self) {
         match self.tab {
             Tab::Thread => self.scroll = 0,
-            Tab::PullRequests => self.pulls.move_by(isize::MIN),
+            Tab::PullRequests => self.pulls.home(),
         }
     }
 
     pub fn scroll_end(&mut self) {
         match self.tab {
             Tab::Thread => self.scroll = usize::MAX / 2,
-            Tab::PullRequests => self.pulls.move_by(isize::MAX),
+            Tab::PullRequests => self.pulls.end(),
         }
     }
 

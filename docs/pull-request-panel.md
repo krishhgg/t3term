@@ -45,6 +45,7 @@ The snapshot's `state`, `title`, `headBranch`, `baseBranch` and `isDraft` are re
 - At most 1,000 links are read from a thread. Each keeps at most 512 characters of its title, 2,048 of its URL and 256 of its host, repository, branches and author, with control characters dropped, before any width is measured.
 - The links are worked out again only after an event that can change the open thread, a thread switch or a change in the capability, and only while the details are open. A frame lays out only the links it shows, and lays them out again only when the width, the height, the selection, the details' scroll or the minute changes, or when the details open or close.
 - A link's details show in the list's place and wrap each value to every row it takes, so the reader scrolls to all of it. They are worked out again only for another link, width or minute. A frame scrolls them no further than their last row shows.
+- End asks for the details' last row, wherever the next frame finds it, and a key or the wheel after End counts from there before that frame comes. Once a frame has drawn the details, a scroll past their end stops at the last row it showed, so a scroll back up moves at once. Each key does this with numbers the last frame kept, and nothing is wrapped again until the next frame.
 - A click acts on the rows the last frame drew. After a change that the next frame hasn't drawn yet, a click does nothing. That covers a selection or scroll moved by a key or the wheel, a resize, a tab switch and the details opening or closing.
 - The status line shows the longest of the details' hints that fits, and each shorter one keeps Esc, so Esc shows whole wherever there are 9 columns for the keys.
 
@@ -102,4 +103,5 @@ Linking, unlinking, watching, reviewing, commenting, merging and every other wri
 - The legacy link's host is read from its URL's scheme and authority. The desktop's parser also recovers a Forgejo port or an Azure DevOps path, and this doesn't.
 - There is no key that copies the URL and no opener, so you select the URL in the terminal. A URL longer than a row wraps across rows, so a selection in the terminal can also pick up the line breaks and the text beside the card.
 - While a link's details show, a click on the Pull requests tab's name doesn't go back to the list. `← List`, Enter, ← or `h` do.
+- Until a frame has drawn a link's details, as between Enter and the next frame or after T3 changes the links, t3term doesn't know how many rows they take. A ↓ pressed in that moment isn't held at their end, and PgUp or PgDn moves one row. End, Home and ↑ after End work as they do after the frame.
 - The desktop's linking from a URL, unlinking, watch toggle, row menu and pull request page aren't here.
