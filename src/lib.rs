@@ -5,6 +5,7 @@ pub mod environments;
 pub mod error;
 pub mod http;
 pub mod keychain;
+pub mod launch;
 pub mod models;
 pub mod projection;
 pub mod rpc;

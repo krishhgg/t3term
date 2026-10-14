@@ -1,5 +1,7 @@
 use std::fmt;
 
+use serde_json::{Map, Value};
+
 /// Exit codes are part of the CLI contract. Scripts branch on them, so never renumber one.
 pub mod exit {
     pub const FAILURE: i32 = 1;
@@ -17,6 +19,9 @@ pub struct T3Error {
     pub code: &'static str,
     pub message: String,
     pub exit_code: i32,
+    /// Fields `--json` prints beside `error`, such as the ids that find a thread whose launch
+    /// t3term couldn't confirm. Empty for most errors.
+    pub details: Map<String, Value>,
 }
 
 impl T3Error {
@@ -25,11 +30,17 @@ impl T3Error {
             code,
             message: message.into(),
             exit_code: exit::FAILURE,
+            details: Map::new(),
         }
     }
 
     pub fn exit(mut self, exit_code: i32) -> Self {
         self.exit_code = exit_code;
+        self
+    }
+
+    pub fn with_details(mut self, details: Map<String, Value>) -> Self {
+        self.details = details;
         self
     }
 }

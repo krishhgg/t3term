@@ -6,9 +6,9 @@
 //! modelSelection.ts and the mode values in providerPolicy.ts.
 
 use anyhow::Result;
-use serde_json::{Value, json};
+use serde_json::{Map, Value, json};
 
-use crate::error::{err_exit, exit};
+use crate::error::{err, err_exit, exit};
 
 /// Runtime modes with the labels the desktop app shows.
 pub const RUNTIME_MODES: &[(&str, &str)] = &[
@@ -406,20 +406,15 @@ pub fn plan(config: &Value, thread: &Value, choice: &Choice) -> Result<Plan> {
                         .join(", ")
                 ))
             })?;
-        // When a provider lists its modes, T3 runs any other mode as approval-required.
-        if let Some(supported) = provider.and_then(|p| p["supportedRuntimeModes"].as_array())
-            && !supported.iter().any(|m| m.as_str() == Some(mode))
+        if let Some(supported) = provider.and_then(listed_modes)
+            && !supported.contains(&mode)
         {
             return Err(usage(format!(
                 "{} supports only {}.",
                 provider
                     .and_then(|p| p["displayName"].as_str())
                     .unwrap_or("This provider"),
-                supported
-                    .iter()
-                    .filter_map(Value::as_str)
-                    .collect::<Vec<_>>()
-                    .join(", ")
+                supported.join(", ")
             )));
         }
         if thread["runtimeMode"].as_str() != Some(mode) {
@@ -469,6 +464,150 @@ pub fn runtime_mode_label(mode: &str) -> &str {
         .iter()
         .find(|(id, _)| *id == mode)
         .map_or(mode, |(_, label)| label)
+}
+
+/// The runtime modes a provider lists, or `None` when it lists none. When a provider lists its
+/// modes, T3 runs any other mode as approval-required.
+fn listed_modes(provider: &Value) -> Option<Vec<&str>> {
+    let modes = provider["supportedRuntimeModes"].as_array()?;
+    Some(modes.iter().filter_map(Value::as_str).collect())
+}
+
+/// T3's own default runtime mode, for settings that name none (`defaultRuntimeMode` in
+/// `ServerSettings`, packages/contracts/src/settings.ts).
+const DEFAULT_RUNTIME_MODE: &str = "full-access";
+
+/// Where a new thread's runtime mode came from.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ModeSource {
+    /// `--mode`.
+    Chosen,
+    /// The project's override in T3's settings.
+    Project,
+    /// The environment's default in T3's settings, or T3's own default when they name none.
+    Environment,
+}
+
+impl ModeSource {
+    pub fn as_str(self) -> &'static str {
+        match self {
+            ModeSource::Chosen => "chosen",
+            ModeSource::Project => "project",
+            ModeSource::Environment => "environment",
+        }
+    }
+}
+
+/// The runtime mode the desktop app gives a new thread in `project_id`: the project's override,
+/// else the environment's default, else T3's. `resolveProjectSettings` in
+/// packages/shared/src/projectSettings.ts reads them from the same settings, which
+/// `server.getConfig` returns. Settings in another shape are an error, not a reason to fall back
+/// to T3's default, and the error doesn't repeat what they hold.
+pub fn default_runtime_mode(
+    config: &Value,
+    project_id: &str,
+) -> Result<(&'static str, ModeSource)> {
+    let unreadable = |what: &str| {
+        err(
+            "T3_INVALID_CONFIG",
+            format!("t3term can't read {what} in T3's settings. Pass --mode to choose one."),
+        )
+    };
+    let mode_in = |holder: &Map<String, Value>, what: &str| -> Result<Option<&'static str>> {
+        let Some(mode) = holder.get("defaultRuntimeMode") else {
+            return Ok(None);
+        };
+        RUNTIME_MODES
+            .iter()
+            .map(|(id, _)| *id)
+            .find(|id| mode.as_str() == Some(*id))
+            .map(Some)
+            .ok_or_else(|| unreadable(what))
+    };
+    let settings = config
+        .get("settings")
+        .and_then(Value::as_object)
+        .ok_or_else(|| unreadable("the default runtime mode"))?;
+    if let Some(overrides) = settings.get("projectSettingsOverrides") {
+        let overrides = overrides
+            .as_object()
+            .ok_or_else(|| unreadable("the projects' overrides"))?;
+        if let Some(project) = overrides.get(project_id) {
+            let project = project
+                .as_object()
+                .ok_or_else(|| unreadable("this project's overrides"))?;
+            if let Some(mode) = mode_in(project, "this project's default runtime mode")? {
+                return Ok((mode, ModeSource::Project));
+            }
+        }
+    }
+    let mode = mode_in(settings, "the default runtime mode")?.unwrap_or(DEFAULT_RUNTIME_MODE);
+    Ok((mode, ModeSource::Environment))
+}
+
+/// The usage error for a launch without a model. t3term doesn't pick one, since the desktop
+/// app's choice depends on state it keeps in the browser.
+pub fn model_required() -> anyhow::Error {
+    err_exit(
+        "MODEL_REQUIRED",
+        exit::USAGE,
+        "A new thread needs a model. Pass --model; `t3term models` lists them.",
+    )
+}
+
+/// The model and modes for a new thread in `project_id`, and where its runtime mode came from.
+/// `choice` must name a model. Without `--mode`, the runtime mode is the project's or
+/// environment's default, which the model's provider must support. Without `--plan`, the thread
+/// starts in the default interaction mode.
+pub fn plan_new_thread(
+    config: &Value,
+    project_id: &str,
+    choice: &Choice,
+) -> Result<(Plan, ModeSource)> {
+    let query = choice
+        .model
+        .as_deref()
+        .filter(|model| !model.trim().is_empty());
+    let query = query.ok_or_else(model_required)?;
+    let mut choice = choice.clone();
+    let source = match choice.runtime_mode {
+        Some(_) => ModeSource::Chosen,
+        None => {
+            let (mode, source) = default_runtime_mode(config, project_id)?;
+            let (provider, _) = find_model(config, query)?;
+            if let Some(supported) = listed_modes(provider)
+                && !supported.contains(&mode)
+            {
+                let place = match source {
+                    ModeSource::Project => "This project's",
+                    _ => "This environment's",
+                };
+                return Err(usage(format!(
+                    "{place} default runtime mode is {mode}, which {} doesn't support. Pass --mode with one of {}.",
+                    provider["displayName"].as_str().unwrap_or("this provider"),
+                    supported.join(", ")
+                )));
+            }
+            choice.runtime_mode = Some(mode.to_string());
+            source
+        }
+    };
+    let mut plan = plan(config, &json!({}), &choice)?;
+    plan.interaction_mode
+        .get_or_insert_with(|| "default".into());
+    let selection = plan.model_selection.as_ref();
+    let named = |key: &str| {
+        selection
+            .and_then(|s| s[key].as_str())
+            .is_some_and(|value| !value.is_empty())
+    };
+    if !named("instanceId") || !named("model") {
+        return Err(err(
+            "T3_INVALID_CONFIG",
+            "T3 lists that model without an instance id or slug, so t3term can't launch a thread with it.",
+        ));
+    }
+    Ok((plan, source))
 }
 
 /// A thread's model, options and modes as plain values, for display and `--json`.
@@ -887,5 +1026,138 @@ mod tests {
         assert!(settings["options"].get("thinking").is_none());
         assert_eq!(settings["runtimeModeLabel"], "Supervised");
         assert_eq!(settings["interactionMode"], "default");
+    }
+
+    /// `config()` with `settings`, and Pi turned on.
+    fn config_with(settings: Value) -> Value {
+        let mut config = config();
+        config["settings"] = settings;
+        config["providers"][2]["enabled"] = json!(true);
+        config
+    }
+
+    fn opus() -> Choice {
+        Choice {
+            model: Some("claude-opus-5-5".into()),
+            ..choice()
+        }
+    }
+
+    fn t3(error: &anyhow::Error) -> &crate::error::T3Error {
+        error.downcast_ref().expect("a T3Error")
+    }
+
+    #[test]
+    fn a_new_thread_takes_the_projects_mode_then_the_environments_then_t3s() {
+        let overrides = json!({"p1": {"defaultRuntimeMode": "auto"}, "p2": {}});
+        let config = config_with(json!({
+            "defaultRuntimeMode": "approval-required", "projectSettingsOverrides": overrides
+        }));
+        let project = ("auto", ModeSource::Project);
+        let environment = ("approval-required", ModeSource::Environment);
+        assert_eq!(default_runtime_mode(&config, "p1").unwrap(), project);
+        assert_eq!(default_runtime_mode(&config, "p2").unwrap(), environment);
+        assert_eq!(default_runtime_mode(&config, "p3").unwrap(), environment);
+        let t3_default = ("full-access", ModeSource::Environment);
+        assert_eq!(
+            default_runtime_mode(&config_with(json!({})), "p1").unwrap(),
+            t3_default
+        );
+
+        let (plan, source) = plan_new_thread(&config, "p1", &opus()).unwrap();
+        let selection =
+            json!({"instanceId": "claudeAgent", "model": "claude-opus-5-5", "options": []});
+        let expected = Plan {
+            model_selection: Some(selection),
+            runtime_mode: Some("auto".into()),
+            interaction_mode: Some("default".into()),
+            prompt_effort: None,
+        };
+        assert_eq!((plan, source), (expected, ModeSource::Project));
+
+        let chosen = Choice {
+            runtime_mode: Some("Supervised".into()),
+            interaction_mode: Some("plan".into()),
+            ..opus()
+        };
+        let (plan, source) = plan_new_thread(&config, "p1", &chosen).unwrap();
+        assert_eq!(source, ModeSource::Chosen);
+        assert_eq!(plan.runtime_mode.as_deref(), Some("approval-required"));
+        assert_eq!(plan.interaction_mode.as_deref(), Some("plan"));
+    }
+
+    /// Settings t3term can't read stop a launch that needs them, and the error doesn't repeat
+    /// what they hold. A launch with `--mode` doesn't read them.
+    #[test]
+    fn unreadable_settings_are_an_error_unless_a_mode_is_chosen() {
+        for settings in [
+            json!("full-access"),
+            json!({"defaultRuntimeMode": "yolo-mode"}),
+            json!({"defaultRuntimeMode": null}),
+            json!({"projectSettingsOverrides": ["yolo-mode"]}),
+            json!({"projectSettingsOverrides": {"p1": "yolo-mode"}}),
+            json!({"projectSettingsOverrides": {"p1": {"defaultRuntimeMode": "yolo-mode"}}}),
+        ] {
+            let config = config_with(settings.clone());
+            let error = plan_new_thread(&config, "p1", &opus()).unwrap_err();
+            assert_eq!(t3(&error).code, "T3_INVALID_CONFIG", "{settings}");
+            assert!(!t3(&error).message.contains("yolo"), "{error}");
+        }
+        assert!(default_runtime_mode(&config(), "p1").is_err());
+
+        let chosen = Choice {
+            runtime_mode: Some("auto".into()),
+            ..opus()
+        };
+        let (plan, source) = plan_new_thread(&config(), "p1", &chosen).unwrap();
+        assert_eq!(plan.runtime_mode.as_deref(), Some("auto"));
+        assert_eq!(source, ModeSource::Chosen);
+    }
+
+    #[test]
+    fn a_default_mode_the_provider_lacks_is_a_usage_error() {
+        let config = config_with(json!({"defaultRuntimeMode": "auto"}));
+        let pi = Choice {
+            model: Some("pi-1".into()),
+            ..choice()
+        };
+        let error = plan_new_thread(&config, "p1", &pi).unwrap_err();
+        assert_eq!(
+            (t3(&error).code, t3(&error).exit_code),
+            ("INVALID_CHOICE", 2)
+        );
+        assert_eq!(
+            t3(&error).message,
+            "This environment's default runtime mode is auto, which Pi doesn't support. Pass --mode with one of approval-required, full-access."
+        );
+
+        // A mode chosen on the command line is checked as it is for an existing thread.
+        let chosen = Choice {
+            runtime_mode: Some("auto".into()),
+            ..pi.clone()
+        };
+        let error = plan_new_thread(&config, "p1", &chosen).unwrap_err();
+        assert_eq!(
+            t3(&error).message,
+            "Pi supports only approval-required, full-access."
+        );
+        let chosen = Choice {
+            runtime_mode: Some("full-access".into()),
+            ..pi
+        };
+        assert!(plan_new_thread(&config, "p1", &chosen).is_ok());
+    }
+
+    #[test]
+    fn a_new_thread_needs_a_model() {
+        let config = config_with(json!({}));
+        for model in [None, Some("  ".to_string())] {
+            let without_model = Choice { model, ..choice() };
+            let error = plan_new_thread(&config, "p1", &without_model).unwrap_err();
+            assert_eq!(
+                (t3(&error).code, t3(&error).exit_code),
+                ("MODEL_REQUIRED", 2)
+            );
+        }
     }
 }

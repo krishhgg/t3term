@@ -17,7 +17,7 @@ use crate::models::Plan;
 use crate::projection::{ShellState, ThreadState};
 use crate::rpc::{RpcClient, RpcError};
 
-const DISPATCH_TIMEOUT: Duration = Duration::from_secs(60);
+pub(crate) const DISPATCH_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
 
 pub struct Client {
@@ -694,7 +694,7 @@ fn delivered_sequence(item: &Value) -> Option<u64> {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use std::collections::HashMap;
 
     use futures_util::{SinkExt, StreamExt};
@@ -709,7 +709,7 @@ mod tests {
     use crate::projection::Applied::{Duplicate, Snapshot, Synchronized};
     use crate::projection::{Applied, apply_config};
 
-    type Socket = WebSocketStream<TcpStream>;
+    pub(crate) type Socket = WebSocketStream<TcpStream>;
     type Events = mpsc::UnboundedReceiver<WatchEvent>;
 
     const SHELL: &str = "orchestration.subscribeShell";
@@ -719,7 +719,7 @@ mod tests {
 
     /// A client of the fake T3 at `origin`. Like `Client::offline`, it holds no token. Its
     /// ticket requests ignore proxies, so they reach the fake whatever the environment says.
-    fn client_at(origin: &str) -> Arc<Client> {
+    pub(crate) fn client_at(origin: &str) -> Arc<Client> {
         let mut client = Client::offline();
         client.runtime.origin = origin.into();
         client.api = Api::without_proxy(origin);
@@ -729,7 +729,7 @@ mod tests {
     /// Plays T3's HTTP side until a WebSocket opens, as `serve_sockets` in tests/cli.rs does.
     /// Each ticket request gets the next ticket, so the path a socket opens on says how many
     /// tickets came before it. Returns that path and the socket.
-    async fn open(listener: &TcpListener, tickets: &mut usize) -> (String, Socket) {
+    pub(crate) async fn open(listener: &TcpListener, tickets: &mut usize) -> (String, Socket) {
         loop {
             let (mut stream, _) = listener.accept().await.unwrap();
             // One byte at a time, so the socket gets every byte after the head.
@@ -766,7 +766,7 @@ mod tests {
     }
 
     /// The next frame from t3term other than a ping. Fails the test after five seconds.
-    async fn recv(socket: &mut Socket) -> Value {
+    pub(crate) async fn recv(socket: &mut Socket) -> Value {
         loop {
             let frame = tokio::time::timeout(Duration::from_secs(5), socket.next())
                 .await
