@@ -537,6 +537,34 @@ async fn a_starting_shell_takes_no_input_and_its_queries_get_no_reply() {
 }
 
 #[tokio::test]
+async fn the_status_line_says_whether_keys_reach_the_shell() {
+    let lead = |pane: &Pane| pane.keys().split(" · ").next().unwrap().to_string();
+    let fake = Fake::new().await;
+    let mut pane = fake.pane();
+    assert_eq!(lead(&pane), "Takes no input");
+    let (mut socket, id) = running(&fake, &mut pane, "$ ").await;
+    assert_eq!(lead(&pane), "Keys go to the shell");
+
+    // A write T3 refuses stops input while the shell still runs.
+    pane.key(&key(KeyCode::Char('a')));
+    poll_once(&mut pane).await;
+    let write = recv(&mut socket).await;
+    let write = expect_request(&write, WRITE, with(json!({"data": "a"})));
+    let error = json!({"_tag": "TerminalWriteError", "threadId": THREAD, "terminalId": "term-1"});
+    send(&mut socket, refusal(&write, error)).await;
+    assert_eq!(step(&mut pane).await, "wrote");
+    assert!(!pane.writable());
+    let stopped = "Input stopped · F4 twice attaches again · Shift+PgUp/PgDn scroll";
+    assert!(pane.keys().starts_with(stopped), "{}", pane.keys());
+
+    // A shell that exited takes no input either.
+    let exited = event("exited", 2, json!({"exitCode": 0, "exitSignal": null}));
+    send(&mut socket, chunk(&id, json!([exited]))).await;
+    assert_eq!(step(&mut pane).await, "batch");
+    assert_eq!(lead(&pane), "Takes no input");
+}
+
+#[tokio::test]
 async fn a_missing_terminal_waits_for_start_and_a_reconnect_never_sends_the_launch() {
     let fake = Fake::new().await;
     let mut pane = fake.pane();

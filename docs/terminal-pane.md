@@ -8,7 +8,7 @@ Everything here follows T3 Code at commit `f570bd2`, nightly v0.0.46-nightly.202
 
 F4 works from any pane, and with a menu open. While the details show as a dialog, the dialog keeps every key, F4 too. A click on `>_` does the same as F4. The button sits left of ◨ while a thread is open and the title row has room for it beside the breadcrumb. Showing the drawer gives it the keyboard and closes an open menu. Hiding it gives the keyboard back to the composer if the drawer had it. F4 held down shows or hides the drawer once. With no thread open, F4 shows nothing and the status line says to open a thread first.
 
-The drawer takes half of the rows that the title, a one-row composer and the status line leave, up to 17 rows with its header. The transcript always keeps 3 rows. So the drawer takes 7 rows at 80x24, 13 at 120x36, 17 at 200x60, 3 at 80x14 and none at 80x10. A waiting request's panel takes its rows first, and the composer keeps its height as it grows. The drawer spans the whole main column, under the details' pane too.
+The drawer takes half of the rows that the title, a one-row composer and the status line leave, up to 17 rows with its header. The transcript always keeps 3 rows. So the drawer takes 7 rows at 80x24, 13 at 120x36, 17 at 200x60, 3 at 80x14 and none at 80x10. A drawer with no rows can't have the keyboard, so the composer gets it, and keeps it when the screen grows again. A waiting request's panel takes its rows first, and the composer keeps its height as it grows. The drawer spans the whole main column, under the details' pane too.
 
 ## The header
 
@@ -36,7 +36,7 @@ When even `Terminal` and the short state don't fit, the short state shows alone,
 | reconnecting, try N of 8 | reconnecting | The connection dropped, and t3term attaches again soon. |
 | stopped | | t3term stopped attaching, and the screen says why. Enter attaches again. |
 
-Left of `F4 hide`, the header says what the screen can't show: `↑ 1 row` or `↑ N rows` while the view is scrolled into the history, and `no room for the screen` when the drawer has only its header row. The status line names the drawer's keys while it has the keyboard.
+Left of `F4 hide`, the header says what the screen can't show: `↑ 1 row` or `↑ N rows` while the view is scrolled into the history, and `no room for the screen` when the drawer has only its header row. The status line names the drawer's keys while it has the keyboard. It leads with what a key does now: `Keys go to the shell` while the shell takes input, `Input stopped` after a write failed, and `Takes no input` while the drawer attaches or reconnects, while the shell starts and after it ends. A missing terminal leads with `Enter start terminal`, and a stopped drawer with `Enter attach again`.
 
 ## Keys and the mouse
 
@@ -159,9 +159,10 @@ The script needs Python's standard library and tmux, and nothing else. It serves
 
 ## Known limits
 
-- The drawer isn't ready for users until it runs on the RPC reader from [#47](https://github.com/krishhgg/t3term/pull/47). T3 cuts a terminal's title at 128 UTF-16 code units (`Manager.ts:346-349`), which can split an emoji in half. JSON then carries a lone surrogate escape, which serde_json refuses, and the socket's reader on this branch skips any frame it can't parse (`src/rpc.rs:221`). The drawer misses that event and never acks its chunk, so T3's window has one slot fewer until the drawer attaches again. After 8 such chunks T3 sends the drawer nothing more, and its screen stops with no word of why. #47, a draft stacked on #44, reads such a frame with U+FFFD for the half, and closes the connection on any frame t3term can't parse. This branch takes neither, and `src/rpc.rs` is unchanged here.
+- The drawer isn't ready for users until it runs on the RPC reader from [#47](https://github.com/krishhgg/t3term/pull/47). T3 cuts a terminal's title at 128 UTF-16 code units (`Manager.ts:346-349`), which can split an emoji in half. JSON then carries a lone surrogate escape, which serde_json refuses, and the socket's reader on this branch skips any frame it can't parse (`src/rpc.rs:221`). The drawer misses that event and never acks its chunk, so T3's window has one slot fewer until the drawer attaches again. After 8 such chunks T3 sends the drawer nothing more, and its screen stops with no word of why. #47, stacked on #44, reads such a frame with U+FFFD for the half, and closes the connection on any frame t3term can't parse. This branch takes neither, and `src/rpc.rs` is unchanged here.
 - A write the connection drops partway through is lost, and t3term doesn't send it again.
+- The emulator drops a C1 control that comes as UTF-8, such as U+009B for CSI, and draws what follows it as text, so `\u{9b}0m` shows `0m`. Nothing of it reaches the terminal t3term runs in.
 - The drawer always attaches with `terminal:operate`. A session that held `terminal:read` alone would need `terminal.observe`, which the drawer doesn't use.
 - In a narrow drawer, the reason Start terminal gives wraps onto more rows, and the drawer cuts what doesn't fit.
 - The header measures clusters with t3term's own rule, which can differ from ratatui's for a rare sequence. A title that draws wider than measured loses its end, never the state.
-- No screenshot of this code exists yet, and this page shows none. The fake-server run of the current code is still to come, from Sol.
+- This page shows no screenshot. [PR 41](https://github.com/krishhgg/t3term/pull/41) carries the captures from the fixture run, with every step of the walkthrough above.

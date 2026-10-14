@@ -4149,15 +4149,8 @@ impl App {
                 "Enter send · Alt+Enter newline · Alt+M model · Alt+E effort · Alt+P mode · Ctrl+X interrupt · F4 terminal"
             }
             (Focus::Terminal, None) => match self.terminal.as_ref() {
-                Some(pane) if pane.missing() => {
-                    "Enter start terminal · F4 hide · F6 next pane · Ctrl+Q quit"
-                }
-                Some(pane) if pane.stopped() => {
-                    "Enter attach again · F4 hide · F6 next pane · Ctrl+Q quit"
-                }
-                _ => {
-                    "Keys go to the shell · Shift+PgUp/PgDn scroll · F4 hide · F6 next pane · Ctrl+Q quit"
-                }
+                Some(pane) => pane.keys(),
+                None => "F4 terminal · F6 next pane · Ctrl+Q quit",
             },
             // The details' keys shorten to the room there is, so Esc still shows. Esc closes
             // details this frame draws as a dialog and leaves a pane.

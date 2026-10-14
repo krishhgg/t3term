@@ -265,6 +265,24 @@ impl Pane {
         matches!(self.link, Link::Stopped(_))
     }
 
+    /// The drawer's keys for the status line while it has the keyboard. They lead with what a
+    /// key does now, which `send` decides by `writable` too.
+    pub(super) fn keys(&self) -> &'static str {
+        match &self.link {
+            Link::Missing(_) => "Enter start terminal · F4 hide · F6 next pane · Ctrl+Q quit",
+            Link::Stopped(_) => "Enter attach again · F4 hide · F6 next pane · Ctrl+Q quit",
+            _ if self.writable() => {
+                "Keys go to the shell · Shift+PgUp/PgDn scroll · F4 hide · F6 next pane · Ctrl+Q quit"
+            }
+            // The shell runs, but a write failed.
+            _ if self.resizable() => {
+                "Input stopped · F4 twice attaches again · Shift+PgUp/PgDn scroll · F6 next pane · Ctrl+Q quit"
+            }
+            // Attaching, starting, reconnecting, or exited, failed or closed.
+            _ => "Takes no input · Shift+PgUp/PgDn scroll · F4 hide · F6 next pane · Ctrl+Q quit",
+        }
+    }
+
     /// Start terminal: attaches with `launch`, so T3 starts a shell from it. Only while T3 has
     /// no `term-1`, and T3 ignores a launch for a terminal that exists, so this never replaces
     /// a shell. A reconnect after it attaches without the launch.

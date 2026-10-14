@@ -315,8 +315,9 @@ fn the_status_line_names_the_drawers_keys() {
         "{status}"
     );
     press(&mut app, KeyCode::F(4));
-    let keys =
-        "Keys go to the shell · Shift+PgUp/PgDn scroll · F4 hide · F6 next pane · Ctrl+Q quit";
+    // This drawer never attaches, so its keys go nowhere. tui/terminal/tests.rs checks the
+    // keys of each state.
+    let keys = "Takes no input · Shift+PgUp/PgDn scroll · F4 hide · F6 next pane · Ctrl+Q quit";
     let status = chrome(&mut app, 200, 50).status;
     assert!(status.contains(keys), "{status}");
     // With the sidebar hidden, Ctrl+B goes to the shell, so the status line doesn't offer it.
