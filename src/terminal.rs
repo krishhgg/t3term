@@ -357,7 +357,8 @@ impl Terminal {
 
     async fn call(&self, tag: &str, payload: Map<String, Value>) -> Result<(), RpcError> {
         let calling = self.rpc.call(tag, Value::Object(payload), CALL_TIMEOUT);
-        calling.await.map(drop).map_err(explain)
+        calling.await.map_err(explain)?;
+        Ok(())
     }
 }
 
@@ -723,11 +724,13 @@ impl Checked {
 }
 
 fn check_event(value: &Value) -> Result<(), Malformed> {
-    parse_event(value).map(drop)
+    parse_event(value)?;
+    Ok(())
 }
 
 fn check_metadata(value: &Value) -> Result<(), Malformed> {
-    parse_metadata(value).map(drop)
+    parse_metadata(value)?;
+    Ok(())
 }
 
 fn parse_event(value: &Value) -> Result<TerminalEvent<'_>, Malformed> {
@@ -1041,25 +1044,26 @@ fn int(value: &Value) -> Option<i64> {
 /// (terminal.ts), so rpc.rs can only say that T3 rejected the request. The tag stays in
 /// `error_tag`, and any cause rpc.rs found stays after the words.
 fn explain(error: RpcError) -> RpcError {
-    let RpcError::Failed {
-        tag,
-        message,
-        error_tag,
-    } = error
-    else {
-        return error;
-    };
-    let words = error_tag.as_deref().and_then(describe);
-    let fallback = rpc::rejected(&tag);
-    let message = match (words, message.strip_prefix(fallback.as_str())) {
-        (Some(words), Some("")) => format!("{words}."),
-        (Some(words), Some(cause)) => format!("{words}{cause}"),
-        _ => message,
-    };
-    RpcError::Failed {
-        tag,
-        message,
-        error_tag,
+    match error {
+        RpcError::Failed {
+            tag,
+            message,
+            error_tag,
+        } => {
+            let words = error_tag.as_deref().and_then(describe);
+            let fallback = rpc::rejected(&tag);
+            let message = match (words, message.strip_prefix(fallback.as_str())) {
+                (Some(words), Some("")) => format!("{words}."),
+                (Some(words), Some(cause)) => format!("{words}{cause}"),
+                _ => message,
+            };
+            RpcError::Failed {
+                tag,
+                message,
+                error_tag,
+            }
+        }
+        other => other,
     }
 }
 
