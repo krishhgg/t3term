@@ -13,7 +13,7 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use serde_json::{Value, json};
 use tokio::io::{AsyncRead, AsyncWrite};
 use tokio::sync::{Mutex, Notify, mpsc, oneshot};
@@ -106,6 +106,12 @@ type PendingMap = Arc<Mutex<HashMap<String, Pending>>>;
 /// gives all of that one second and then drops the socket, so a write T3 stopped reading
 /// partway through can't hold the socket open. Whether that write reached T3 stays unknown,
 /// and the task never sends it again.
+///
+/// The second starts once the calls and streams have ended, which takes time in proportion
+/// to how many were waiting. The task looks at the clock before each queued frame, so however
+/// many are queued, it goes past the second by one frame's work at most: taking the frame from
+/// the queue and passing over it, or handing it to a sink that takes it at once. It drops the
+/// socket before it frees the frames left in the queue.
 ///
 /// A [`BoundedChunk`] doesn't keep the connection: it acks only while its stream is open, and
 /// an open stream does.
@@ -338,28 +344,15 @@ impl RpcClient {
             for (_, entry) in reader_pending.lock().await.drain() {
                 fail(entry, RpcError::Disconnected(reason.clone()));
             }
-            let leaving = async {
-                // Every handle has dropped, so these are the last frames they queued, in
-                // order, and the one the task held comes first. Only an Ack or an Interrupt
-                // goes out. The sink finishes a frame that had started to go out before any
-                // of them, if T3 reads it.
-                if abandoned {
-                    let mut finished = HashSet::new();
-                    let queued = std::iter::from_fn(|| outgoing_rx.try_recv().ok());
-                    for message in unsent.into_iter().chain(queued) {
-                        if !sent_after_abandon(&message, &mut finished) {
-                            continue;
-                        }
-                        let text = Message::Text(message.to_string().into());
-                        if sink.send(text).await.is_err() {
-                            return;
-                        }
-                    }
-                }
-                let _ = sink.close().await;
-            };
-            // The socket drops when the task ends, whether the frames went or not.
-            let _ = tokio::time::timeout(CLOSE_LIMIT, leaving).await;
+            // `leave` looks at the clock before each frame, and the timeout cuts short a write
+            // T3 doesn't read.
+            let deadline = tokio::time::Instant::now() + CLOSE_LIMIT;
+            let expired = || tokio::time::Instant::now() >= deadline;
+            let leaving = leave(&mut sink, &mut outgoing_rx, unsent, abandoned, expired);
+            let _ = tokio::time::timeout_at(deadline, leaving).await;
+            // The socket drops here, whether the frames went or not, and before the task frees
+            // the frames still queued, which may be many.
+            drop((sink, source));
         });
 
         let rpc = RpcClient {
@@ -501,6 +494,50 @@ async fn forget_bounded(pending: &PendingMap, interrupt: &Value) {
     if matches!(map.get(id), Some(Pending::Bounded { .. })) {
         map.remove(id);
     }
+}
+
+/// What a connection's task sends last, once it has ended every call and stream still
+/// waiting. After a close, or once the socket was lost, that is only the WebSocket Close
+/// frame. After the last handle dropped, the frames those handles queued come first, in
+/// order, starting with `held`, the one the task had taken from the queue. Of those, only the
+/// ones [`sent_after_abandon`] allows go out. The sink finishes a frame that had started to go
+/// out before any of them, if T3 reads it.
+///
+/// `expired` says whether the task's second is up, and `leave` asks before each frame. So a
+/// long run of requests it passes over, which never waits on the sink, can't keep the socket
+/// open past the second. Once it says yes, nothing more goes out, the Close frame included.
+/// The task's timeout cuts short a frame the sink is still waiting to write.
+async fn leave<S>(
+    sink: &mut S,
+    queue: &mut mpsc::UnboundedReceiver<Value>,
+    mut held: Option<Value>,
+    abandoned: bool,
+    expired: impl Fn() -> bool,
+) where
+    S: Sink<Message> + Unpin,
+{
+    if abandoned {
+        let mut finished = HashSet::new();
+        loop {
+            if expired() {
+                return;
+            }
+            let Some(message) = held.take().or_else(|| queue.try_recv().ok()) else {
+                break;
+            };
+            if !sent_after_abandon(&message, &mut finished) {
+                // Passing over a frame never waits, so once the task's budget runs out it
+                // gives the runtime its turn here, as a send would.
+                tokio::task::coop::consume_budget().await;
+                continue;
+            }
+            let text = Message::Text(message.to_string().into());
+            if sink.send(text).await.is_err() {
+                return;
+            }
+        }
+    }
+    let _ = sink.close().await;
 }
 
 /// Whether a frame still queued when the last handle dropped goes out before the Close frame.
@@ -651,6 +688,8 @@ fn failure(tag: &str, exit: &Value) -> RpcError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
     use futures_util::poll;
     use tokio::io::{AsyncReadExt, DuplexStream};
     use tokio::net::{TcpListener, TcpStream};
@@ -1083,5 +1122,49 @@ mod tests {
         let interrupt = json!({"_tag": "Interrupt", "requestId": id, "interruptors": []});
         assert_eq!(before_close(&mut server).await, [ack, interrupt]);
         within(task).await.unwrap();
+    }
+
+    /// After the last handle drops, the task passes over the requests still queued without
+    /// waiting on anything. Its second still runs out partway through a long run of them, and
+    /// then T3 gets nothing more: not the `Interrupt` queued after the run, and not the Close
+    /// frame. The rest of the queue stays where it was. Going through it later sends that
+    /// `Interrupt` and the Close frame, so only the deadline held them back.
+    #[tokio::test]
+    async fn the_close_limit_runs_out_partway_through_requests_the_task_passes_over() {
+        const REQUESTS: usize = 1000;
+        // How many frames the task takes from the queue before its second runs out.
+        const TAKEN: usize = 10;
+        let (client, server) = tokio::io::duplex(PIPE);
+        let socket = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let (mut sink, source) = socket.split();
+        let (outgoing, mut queue) = mpsc::unbounded_channel();
+        for id in 1..=REQUESTS {
+            let write = json!({"threadId": "thread-1", "terminalId": "term-1", "data": "ls\r"});
+            let request = json!({
+                "_tag": "Request",
+                "id": id.to_string(),
+                "tag": "terminal.write",
+                "payload": write,
+                "headers": []
+            });
+            outgoing.send(request).unwrap();
+        }
+        // The Interrupt of a stream whose request T3 got before the run.
+        let interrupt = json!({"_tag": "Interrupt", "requestId": "0", "interruptors": []});
+        outgoing.send(interrupt.clone()).unwrap();
+
+        let looks = Cell::new(0);
+        let expired = || {
+            looks.set(looks.get() + 1);
+            looks.get() > TAKEN
+        };
+        within(leave(&mut sink, &mut queue, None, true, expired)).await;
+        assert_eq!(queue.len(), REQUESTS + 1 - TAKEN);
+
+        within(leave(&mut sink, &mut queue, None, true, || false)).await;
+        assert!(queue.is_empty());
+        drop((sink, source));
+        let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        assert_eq!(before_close(&mut server).await, [interrupt]);
     }
 }
