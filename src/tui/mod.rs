@@ -10908,6 +10908,36 @@ mod tests {
     }
 
     #[test]
+    fn the_parent_still_opens_after_the_shell_drops_the_open_thread() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = lineage_tui();
+        let started = reads(&runtime);
+        // T3 archives `t`, so the shell drops it. Its watch goes on, and its projection still
+        // has it as a fork of `up`, which the shell lists.
+        let removed = json!({"kind": "thread.removed", "sequence": 2, "threadId": "t"});
+        app.on_shell_event(WatchEvent::Item(removed));
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("↑ Thread up"), "{text}");
+        assert!(text.contains("↳ Thread f"), "{text}");
+        // The watch closes too, and the parent stays.
+        app.on_thread_event(WatchEvent::Failed("The thread's watch closed.".into()));
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("↑ Thread up"), "{text}");
+
+        // ↓ chooses the parent, and Enter opens it with a watch of its own. The pane keeps the
+        // keyboard, and the sidebar highlights the parent.
+        press(&mut app, KeyCode::Down);
+        let status = status_after(&mut app);
+        assert!(status.contains("Enter open parent thread"), "{status}");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(open_id(&app), Some("up"));
+        assert_eq!(reads(&runtime), started + 1);
+        assert_eq!(app.focus, Focus::Details);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("up"));
+    }
+
+    #[test]
     fn enter_asks_the_shell_again_before_it_opens_a_related_thread() {
         let runtime = idle_runtime();
         let _entered = runtime.enter();

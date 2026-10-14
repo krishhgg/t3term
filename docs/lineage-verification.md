@@ -4,6 +4,10 @@ This page records how GPT-6.1 Sol checked Lineage from [PR #33](https://github.c
 
 Lineage follows T3 Code nightly `f570bd2` (v0.0.46-nightly.20261007.2787), the source the pull request traced. The fake server sends that source's records and events, with a few values of its own listed under [What this doesn't show](#what-this-doesnt-show). Nothing here says what a later nightly sends. Lineage only reads, so nothing here checks Stop, Merge back, Disconnect or a new fork.
 
+## After these runs
+
+A later commit in the same pull request changes Lineage for two Greptile findings. When the feed drops the open thread, as after someone archives it in the desktop, the thread's watch now names its parent. A frame now looks for click targets only among the Lineage rows in view. The checks, runs, counts and images on this page come from `3d8ee07` and don't cover either change, and none of the runs archived the open thread itself. Sol hasn't checked the later commit yet.
+
 ## Checks
 
 At `3d8ee07` Sol ran the three CI checks with Rust 1.95.0 and built the binary. `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked` and the build passed. The 457 tests are 423 library, 2 main, 18 CLI and 14 fake RPC tests. The pull request adds 25 of them to master's 432: 14 in `src/tui/lineage.rs`, 3 in `src/tui/details.rs` and 8 App tests in `src/tui/mod.rs`. [CI run 38515733627](https://github.com/krishhgg/t3term/actions/runs/38515733627) passed on macOS and on the optional Linux job.

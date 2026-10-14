@@ -25,6 +25,12 @@
 //! fork's id. Where the desktop shows an agent's elapsed time, t3term shows its status word,
 //! and it has no Stop, Merge back or Disconnect controls.
 //!
+//! The desktop finds an archived open thread among the archived threads it fetched, and its
+//! parent through that copy. Once the shell drops the open thread, t3term takes the thread's
+//! link to its parent from the thread's own projection instead. T3 sets that link when it
+//! makes a thread and never changes it, so a watch that closed still has it right. Only that
+//! link comes from the projection's copy, and the parent opens only while the shell lists it.
+//!
 //! The desktop's rules assume a watch that still hears the thread. Once the open thread's
 //! watch closes, its projection is the last t3term heard, while the shell still changes. So
 //! the shell's copy of a thread comes first then, as it does for the facts in details.rs:
@@ -382,6 +388,21 @@ pub(super) fn parent_of(thread: &Value) -> Option<&str> {
     }
 }
 
+/// The edge from the thread `thread` came from to it, by its id `id`, as its lineage says.
+fn from_parent<'a>(id: &'a str, thread: &'a Value) -> Option<Edge<'a>> {
+    let kind = if thread["lineage"]["relationshipToParent"] == "subagent" {
+        Kind::Subagent
+    } else {
+        Kind::Fork
+    };
+    Some(Edge {
+        source: parent_of(thread)?,
+        target: id,
+        kind,
+        status: run_status(thread),
+    })
+}
+
 /// Whether the shell's copy of a thread can open. The active shell drops a thread T3 archives,
 /// so a copy that still says it is archived is stale, and the sidebar doesn't list it either.
 pub(super) fn opens(thread: &Value) -> bool {
@@ -424,7 +445,8 @@ fn newest_first(a: Option<i64>, b: Option<i64>) -> Ordering {
 impl Lineage {
     /// The section for thread `open_id`, from the shell's `threads` and the thread's
     /// `projection`, which counts only while it is the open thread's. `closed` says the
-    /// thread's watch closed, which leaves the shell to speak for the threads it lists.
+    /// thread's watch closed, which leaves the shell to speak for the threads it lists. While
+    /// the shell doesn't list the open thread, the projection's copy names its parent.
     /// `paging` says how many rows of each group get made.
     pub(super) fn of(
         open_id: Option<&str>,
@@ -453,29 +475,27 @@ impl Lineage {
             if !std::ptr::eq(by_id[id], thread) {
                 continue;
             }
-            let Some(parent) = parent_of(thread) else {
+            let Some(edge) = from_parent(id, thread) else {
                 continue;
             };
-            if parent != current && id != current {
+            if edge.source != current && id != current {
                 continue;
             }
-            let kind = if thread["lineage"]["relationshipToParent"] == "subagent" {
-                Kind::Subagent
-            } else {
-                Kind::Fork
-            };
-            edges.add(Edge {
-                source: parent,
-                target: id,
-                kind,
-                status: run_status(thread),
-            });
+            edges.add(edge);
         }
 
         let projection = projection.filter(|projection| {
             let thread = projection.get("thread");
             id_of(thread.and_then(|thread| thread.get("id"))) == Some(current)
         });
+        // The projection's copy of the open thread, which links it to its parent once the
+        // shell no longer lists it, as after T3 archives it.
+        let record = projection.and_then(|projection| projection.get("thread"));
+        if !by_id.contains_key(current)
+            && let Some(edge) = record.and_then(|record| from_parent(current, record))
+        {
+            edges.add(edge);
+        }
         let subagents = list(projection, "subagents");
         // `subagentsByThreadId`: the last record for each child thread.
         let mut agents: HashMap<&str, &Value> = HashMap::new();
@@ -523,7 +543,6 @@ impl Lineage {
 
         // The thread a fork merges back to, by the projection's copy of the open thread, or by
         // the shell's once the watch closed.
-        let record = projection.and_then(|projection| projection.get("thread"));
         let record = match by_id.get(current).copied() {
             Some(thread) if closed => Some(thread),
             _ => record,
@@ -1313,6 +1332,95 @@ mod tests {
         assert!(rows.contains(&failed), "{rows:?}");
         // The open thread's parent still comes first.
         assert_eq!(rows[1], "↑ Plan the release Idle");
+    }
+
+    #[test]
+    fn the_projection_names_the_parent_once_the_shell_drops_the_open_thread() {
+        // T3 archived t, so the shell dropped it, but its watch goes on. Its projection still
+        // has it as a fork of p, which the shell lists.
+        let (mut threads, projection) = family();
+        threads.retain(|thread| thread["id"] != "t");
+        let paging = Paging::default();
+        let open = Lineage::of(Some("t"), &threads, Some(&projection), false, &paging);
+        let previous = format!("› Previous agents (1) {}", rule(18));
+        assert_eq!(
+            shown(&open, 40),
+            [
+                "Lineage · 2 running",
+                "↑ Plan the release Idle",
+                "↳ Try a table Idle",
+                "↳ Try a lexer Done",
+                "◆ Run The Tests Running",
+                previous.as_str(),
+            ]
+        );
+        // The watch closes too, and the parent still shows, by the shell's copy of it.
+        let closed = Lineage::of(Some("t"), &threads, Some(&projection), true, &paging);
+        assert_eq!(shown(&closed, 40)[1], "↑ Plan the release Idle");
+        for lineage in [&open, &closed] {
+            let row = lineage.row("p").unwrap();
+            assert_eq!(row.relation, Relation::ParentThread);
+            assert!(row.available);
+            assert_eq!(lineage.targets()[0], Target::Thread("p".into()));
+        }
+        // The parent's status is the shell's.
+        threads[0]["activityRunStatus"] = json!("running");
+        let closed = Lineage::of(Some("t"), &threads, Some(&projection), true, &paging);
+        assert_eq!(closed.row("p").map(|row| row.word), Some("Running"));
+
+        // An agent's thread the shell dropped shows the thread that delegated to it.
+        let (mut threads, _) = family();
+        let child = threads.remove(5);
+        let projection = projected(child, Vec::new(), Vec::new());
+        let lineage = Lineage::of(Some("a2"), &threads, Some(&projection), false, &paging);
+        let rows = shown(&lineage, 40);
+        assert_eq!(rows, ["Lineage", "↑ Fix the parser Running"]);
+        assert_eq!(lineage.row("t").unwrap().relation, Relation::ParentAgent);
+    }
+
+    #[test]
+    fn the_projection_names_no_parent_the_shell_or_another_thread_speaks_for() {
+        let (mut threads, projection) = family();
+        threads.retain(|thread| thread["id"] != "t");
+        // The shell lists neither t nor its parent, so the parent shows by its id, muted, and
+        // doesn't open.
+        let lineage = first_rows(&threads[1..], &projection);
+        assert_eq!(shown(&lineage, 40)[1], "↑ p Unavailable");
+        assert!(!lineage.row("p").unwrap().available);
+
+        // A projection of another thread, or of one without an id T3 could send, names no
+        // parent of t.
+        threads.push(shell("q", "Elsewhere", "idle", 9));
+        for id in [json!("other"), json!(7)] {
+            let mut other = under(shell("other", "Other", "idle", 1), "q", "fork");
+            other["id"] = id;
+            let projection = projected(other, Vec::new(), Vec::new());
+            let lineage = first_rows(&threads, &projection);
+            assert!(!lineage.relates("p") && !lineage.relates("q"));
+            assert!(lineage.row("f1").is_some());
+        }
+
+        // While the shell lists t, its first copy names t's parent, whatever a later copy or
+        // the projection says.
+        let (mut threads, mut projection) = family();
+        threads.push(under(shell("t", "Later copy", "idle", 2), "z", "fork"));
+        threads.push(shell("z", "Zed", "idle", 9));
+        threads.push(shell("q", "Que", "idle", 9));
+        let stale = under(shell("t", "Fix the parser", "running", 2), "q", "fork");
+        projection.insert("thread".into(), stale);
+        let paging = Paging::default();
+        for closed in [false, true] {
+            let lineage = Lineage::of(Some("t"), &threads, Some(&projection), closed, &paging);
+            let rows = shown(&lineage, 40);
+            assert_eq!(rows[1], "↑ Plan the release Idle", "{closed}");
+            assert!(!lineage.relates("q") && !lineage.relates("z"), "{closed}");
+        }
+        // A first copy without a parent leaves t without one.
+        threads[1]["lineage"]["parentThreadId"] = Value::Null;
+        threads[1]["forkedFrom"] = Value::Null;
+        let lineage = first_rows(&threads, &projection);
+        assert!(lineage.row("p").is_none());
+        assert!(!lineage.relates("q"));
     }
 
     #[test]

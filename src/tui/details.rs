@@ -437,6 +437,15 @@ impl Rows {
     fn first_from(&self, top: usize) -> Option<usize> {
         self.targets.iter().position(|(line, _)| *line >= top)
     }
+
+    /// The Lineage rows among the `visible` rows of text from line `top`. Each row's line is
+    /// below the last one's, so a frame finds them without looking at the rows out of view.
+    fn in_view(&self, top: usize, visible: usize) -> &[(usize, Target)] {
+        let start = self.targets.partition_point(|(line, _)| *line < top);
+        let end = top.saturating_add(visible);
+        let rest = &self.targets[start..];
+        &rest[..rest.partition_point(|(line, _)| *line < end)]
+    }
 }
 
 /// How far the text is scrolled: a row from its top, or a number of rows up from where its
@@ -1026,9 +1035,10 @@ impl Details {
             Offset::Top(row) => row,
             Offset::End(up) => bottom - up.min(bottom),
         };
-        // A row ↑ or ↓ chose, or Show more added rows above, comes into view.
+        // A row ↑ or ↓ chose, or Show more added rows above, comes into view. Only then is the
+        // chosen row looked for among all of them.
         let reveal = std::mem::take(&mut self.reveal);
-        if let Some(line) = self.selected_line().filter(|_| reveal) {
+        if reveal && let Some(line) = self.selected_line() {
             scroll = into_view(scroll, line, visible);
         }
         let scroll = scroll.min(bottom);
@@ -1050,10 +1060,16 @@ impl Details {
                 width,
             ));
         }
-        // The chosen row shows highlighted while the details have the keyboard.
-        let chosen = self.selected_line().filter(|_| focused);
         self.targets.clear();
         if let Some(rows) = self.rows.as_ref() {
+            let in_view = rows.in_view(scroll, visible);
+            // The chosen row shows highlighted while the details have the keyboard.
+            let chosen = self
+                .selected
+                .as_ref()
+                .filter(|_| focused)
+                .and_then(|selected| in_view.iter().find(|(_, target)| target == selected))
+                .map(|(line, _)| *line);
             for (index, line) in rows.lines.iter().enumerate().skip(scroll).take(visible) {
                 if Some(index) == chosen {
                     lines.push(Line::from(with_bg(line.spans.clone(), theme.highlight)));
@@ -1061,12 +1077,10 @@ impl Details {
                     lines.push(line.clone());
                 }
             }
-            for (line, target) in &rows.targets {
-                if (scroll..scroll + visible).contains(line) {
-                    let y = inner.y + 1 + (line - scroll) as u16;
-                    let area = Rect::new(inner.x, y, inner.width, 1);
-                    self.targets.push((area, target.clone()));
-                }
+            for (line, target) in in_view {
+                let y = inner.y + 1 + (line - scroll) as u16;
+                let area = Rect::new(inner.x, y, inner.width, 1);
+                self.targets.push((area, target.clone()));
             }
         }
 
@@ -1761,5 +1775,123 @@ mod tests {
         // All eight show, by id as none has a time, so f7 comes last.
         assert_eq!(details.selected(), Some(&Target::Thread("f7".into())));
         assert_eq!(details.lineage_prepares, 2);
+    }
+
+    /// Draws `details` as a pane with the keyboard at `area` of a screen 40 columns by 30 rows.
+    /// For each row of the pane, returns its text and whether its first column of text shows
+    /// highlighted.
+    fn draw_at(details: &mut Details, area: Rect) -> Vec<(String, bool)> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let theme = Theme::new(Depth::TrueColor);
+        let identity = Identity::default();
+        let mut terminal = Terminal::new(TestBackend::new(40, 30)).unwrap();
+        let frame = terminal
+            .draw(|frame| details.draw_pane(frame, area, true, &identity, &theme))
+            .unwrap();
+        let buffer = frame.buffer.clone();
+        (area.y..area.bottom())
+            .map(|y| {
+                let text = (area.x..area.right())
+                    .map(|x| buffer[(x, y)].symbol())
+                    .collect::<String>();
+                (text, buffer[(area.x + 2, y)].bg == theme.highlight)
+            })
+            .collect()
+    }
+
+    #[test]
+    fn a_frame_maps_the_lineage_rows_in_view_and_no_others() {
+        let theme = Theme::new(Depth::TrueColor);
+        let identity = Identity::default();
+        let mut details = Details {
+            open: true,
+            ..Details::default()
+        };
+        let record = thread(Value::Null, Value::Null);
+        details.set(facts_of(&record, &[]));
+        let mut threads = vec![record];
+        for i in 0..40 {
+            let (id, title) = (format!("f{i:02}"), format!("Fork {i:02}"));
+            let fork = json!({"id": id, "title": title, "lineage": {"parentThreadId": "t"}});
+            threads.push(fork);
+        }
+        // Two pages past the first show 30 of the 40 forks, and a Show more row under them.
+        details.show_more(Group::Related);
+        details.show_more(Group::Related);
+        let lineage = Lineage::of(Some("t"), &threads, None, false, details.paging());
+        details.set_lineage(lineage);
+        // The pane's 18 rows have room for 15 rows of text under the title row.
+        let pane = Rect::new(2, 1, 36, 18);
+        let rows = text(details.lines(32, &identity, &theme));
+        let heading = rows.iter().position(|row| row == "Lineage").unwrap();
+        // The rows come in the order of their lines, which a frame counts on to find them.
+        let targets = &details.rows.as_ref().unwrap().targets;
+        assert_eq!(targets.len(), 31);
+        assert!(targets.windows(2).all(|pair| pair[0].0 < pair[1].0));
+
+        // Each row of the pane that shows a Lineage row has the row's target, and no other row
+        // has one, on the screen or off it.
+        let check = |details: &Details, drawn: &[(String, bool)]| -> Vec<Target> {
+            let mut mapped = Vec::new();
+            for (y, (text, _)) in (pane.y..).zip(drawn) {
+                let shown = text.trim_matches(|c: char| c == '│' || c == ' ');
+                let expected = if let Some(rest) = shown.strip_prefix("↳ Fork ") {
+                    Some(Target::Thread(format!("f{}", &rest[..2])))
+                } else if shown.starts_with("+ Show") {
+                    Some(Target::More(Group::Related))
+                } else {
+                    None
+                };
+                assert_eq!(details.target_at(pane.x + 2, y), expected, "{shown:?}");
+                mapped.extend(expected);
+            }
+            assert_eq!(details.targets.len(), mapped.len());
+            mapped
+        };
+        let forks = |range: std::ops::Range<usize>| -> Vec<Target> {
+            range.map(|i| Target::Thread(format!("f{i:02}"))).collect()
+        };
+
+        // Scrolled to the Lineage heading, which no row acts on, the pane shows it and the 14
+        // forks under it. The fork after them, a row below the pane's last, has no target.
+        details.scroll_by(heading as isize);
+        let drawn = draw_at(&mut details, pane);
+        assert_eq!(check(&details, &drawn), forks(0..14));
+        // A row further, the first fork is the pane's first row of text.
+        details.scroll_by(1);
+        let drawn = draw_at(&mut details, pane);
+        assert_eq!(check(&details, &drawn), forks(0..15));
+        // At the end, Show more is the pane's last row.
+        details.scroll_end();
+        let drawn = draw_at(&mut details, pane);
+        let mut end = forks(16..30);
+        end.push(Target::More(Group::Related));
+        assert_eq!(check(&details, &drawn), end);
+
+        // A chosen row in view shows highlighted. One out of view leaves every row as it was.
+        details.choose(Target::Thread("f20".into()));
+        let drawn = draw_at(&mut details, pane);
+        let lit: Vec<_> = drawn.iter().filter(|row| row.1).collect();
+        assert_eq!(lit.len(), 1, "{drawn:?}");
+        assert!(lit[0].0.contains("↳ Fork 20"), "{lit:?}");
+        details.choose(Target::Thread("f00".into()));
+        let drawn = draw_at(&mut details, pane);
+        assert!(drawn.iter().all(|row| !row.1), "{drawn:?}");
+        assert_eq!(check(&details, &drawn), end);
+
+        // A pane two rows high, without a border, has room for one row of text. One a row
+        // high or none has room for none.
+        for (height, in_view) in [
+            (2, vec![Target::More(Group::Related)]),
+            (1, Vec::new()),
+            (0, Vec::new()),
+        ] {
+            details.scroll_end();
+            let drawn = draw_at(&mut details, Rect { height, ..pane });
+            assert_eq!(drawn.len(), usize::from(height));
+            assert_eq!(check(&details, &drawn), in_view, "{height}");
+        }
     }
 }
