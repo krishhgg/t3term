@@ -1238,8 +1238,10 @@ impl App {
             return;
         }
         let had_keyboard = self.focus == Focus::Details;
+        self.open_by_id(id.clone());
+        // Opening it lays the sidebar out again, and a closed shelf lists the open thread, so
+        // its row is there to highlight only now. A subagent's thread has none.
         self.sidebar.select(&id);
-        self.open_by_id(id);
         if had_keyboard {
             self.focus = Focus::Details;
         }
@@ -11472,6 +11474,102 @@ mod tests {
         assert_eq!(app.sidebar.selected_thread_id(), Some("up"));
     }
 
+    /// The TUI with thread `t` open and highlighted in the sidebar's inbox, and `other`, a
+    /// thread related to `t`, on a server that settles threads. Working, Done and Settled are
+    /// closed, as the saved settings have them. The details are open as a pane with the
+    /// keyboard, and the composer has a draft with its cursor before the last letter.
+    fn closed_shelves_lineage_tui(other: Value) -> App {
+        Settings::update(|saved| *saved = shelves_closed());
+        let mut client = Client::offline();
+        client.runtime.capabilities = json!({"threadSettlement": true});
+        let mut app = App::new(
+            Arc::new(client),
+            Theme::new(Depth::TrueColor),
+            &shelves_closed(),
+            mpsc::unbounded_channel().0,
+        );
+        app.watch_setup = Box::new(|_: &str| mpsc::unbounded_channel().1);
+        // A finished run with no visit keeps `t` in the inbox, which doesn't fold.
+        let mut current = bound("t", "p", Value::Null, Value::Null);
+        current["status"] = json!("completed");
+        app.on_shell_event(details_shell(vec![current.clone(), other]));
+        app.on_shell_event(caught_up());
+        app.open_thread(open_bound(current));
+        assert!(app.sidebar.select("t"));
+        app.composer.insert_str("draft");
+        press(&mut app, KeyCode::Left);
+        cells(&mut app, 200, 50);
+        alt(&mut app, 'b');
+        cells(&mut app, 200, 50);
+        let order = focus_after(&mut app, &[KeyCode::Tab; 2]);
+        assert_eq!(order, [Focus::Transcript, Focus::Details]);
+        app
+    }
+
+    #[test]
+    fn a_related_thread_on_a_closed_shelf_opens_listed_there_and_highlighted() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut working = related("w", "t", "fork");
+        working["status"] = json!("running");
+        let mut done = related("d", "t", "fork");
+        done["status"] = json!("completed");
+        done["latestRunCompletedAt"] = json!("2026-10-08T11:00:00.000Z");
+        done["lastVisitedAt"] = json!("2026-10-08T10:00:00.000Z");
+        let mut settled = related("s", "t", "fork");
+        settled["settledOverride"] = json!("settled");
+        for (shelf, fork) in [("Working", working), ("Done", done), ("Settled", settled)] {
+            let id = str_of(&fork, "id").to_string();
+            let mut app = closed_shelves_lineage_tui(fork);
+            let started = reads(&runtime);
+            // The fork's shelf is closed, so the sidebar lists only its heading.
+            let heading = format!("{shelf} (1) ─");
+            let rows = screen(&mut app, 200, 50);
+            let at = row_showing(&rows, &heading) as usize;
+            assert!(rows[at].contains("─ ›"), "{shelf}: {rows:#?}");
+            assert!(!clickable(&app).contains(&id), "{shelf}: {rows:#?}");
+
+            // ↓ chooses the fork, and Enter opens it with a watch of its own. The shelf lists
+            // it as the open thread, and the sidebar highlights it at once.
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(open_id(&app), Some(id.as_str()), "{shelf}");
+            assert_eq!(app.sidebar.selected_thread_id(), Some(id.as_str()), "{shelf}");
+            assert_eq!(reads(&runtime), started + 1, "{shelf}");
+            assert_eq!(app.focus, Focus::Details, "{shelf}");
+
+            // The first frame draws its row under the heading, which stays closed.
+            let rows = screen(&mut app, 200, 50);
+            let at = row_showing(&rows, &heading) as usize;
+            assert!(rows[at].contains("─ ›"), "{shelf}: {rows:#?}");
+            assert!(clickable(&app).contains(&id), "{shelf}: {rows:#?}");
+            assert_eq!(app.sidebar.selected_thread_id(), Some(id.as_str()), "{shelf}");
+            let saved = crate::settings::saved_in_test();
+            assert!(!saved.sidebar_working_shelf_expanded, "{shelf}");
+            assert!(!saved.sidebar_done_shelf_expanded, "{shelf}");
+            assert!(!saved.sidebar_settled_shelf_expanded, "{shelf}");
+            assert_eq!(reads(&runtime), started + 1, "{shelf}");
+            app.focus = Focus::Composer;
+            press(&mut app, KeyCode::Char('x'));
+            assert_eq!(app.composer.text(), "drafxt", "{shelf}");
+        }
+
+        // The sidebar has no row for an agent's thread, so the highlight stays on `t`.
+        let mut agent = related("a", "t", "subagent");
+        agent["activityRunStatus"] = json!("running");
+        let mut app = closed_shelves_lineage_tui(agent);
+        let started = reads(&runtime);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(open_id(&app), Some("a"));
+        assert_eq!(reads(&runtime), started + 1);
+        assert_eq!(app.focus, Focus::Details);
+        screen(&mut app, 200, 50);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("t"));
+        assert!(!clickable(&app).iter().any(|row| row == "a"));
+        assert_eq!(app.composer.text(), "draft");
+    }
+
     #[test]
     fn enter_asks_the_shell_again_before_it_opens_a_related_thread() {
         let runtime = idle_runtime();
@@ -11563,8 +11661,6 @@ mod tests {
         screen: (u16, u16),
         /// What comes before the frame that draws the row clicked.
         prepare: fn(&mut App),
-        /// The row clicked.
-        row: &'static str,
         act: fn(&mut App),
         /// The screen of the frame after the move.
         after: (u16, u16),
@@ -11582,17 +11678,49 @@ mod tests {
         cells(app, 80, 24);
     }
 
-    /// Makes `step`'s move on `app` and clicks where its row was before a frame draws the
-    /// details again. The click acts on nothing. The next frame draws another thread's row
-    /// there, and a click on it opens that thread.
-    fn click_after(runtime: &tokio::runtime::Runtime, mut app: App, step: &Move) {
+    /// Makes `step`'s move on a `long_lineage_tui` and clicks before a frame draws the details
+    /// again. The click acts on nothing. The next frame draws another thread's row there, and a
+    /// click on it opens that thread.
+    ///
+    /// The row clicked comes from the layout, not from a count of the rows the details show. A
+    /// second TUI makes the same move with a frame after it, and the row is the first one that
+    /// had a target before the move and has another thread's row after it. The TUI clicked on
+    /// gets no frame between the move and the click.
+    fn click_after(runtime: &tokio::runtime::Runtime, step: &Move) {
         let name = step.name;
+        let (width, height) = step.screen;
+        let (after_width, after_height) = step.after;
+        let (x, y, was, id) = {
+            let mut framed = long_lineage_tui();
+            (step.prepare)(&mut framed);
+            cells(&mut framed, width, height);
+            let area = framed.details.drawn.expect("the details").area;
+            let x = area.x + area.width / 2;
+            let before: Vec<_> = (area.y..area.bottom())
+                .map(|y| (y, framed.details.target_at(x, y)))
+                .collect();
+            (step.act)(&mut framed);
+            cells(&mut framed, after_width, after_height);
+            before
+                .into_iter()
+                .find_map(|(y, was)| match framed.details.target_at(x, y) {
+                    Some(lineage::Target::Thread(id))
+                        if was.is_some() && was != Some(lineage::Target::Thread(id.clone())) =>
+                    {
+                        Some((x, y, was, id))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{name}: no row has another thread's row after it"))
+        };
+
+        let mut app = long_lineage_tui();
         let started = reads(runtime);
         (step.prepare)(&mut app);
-        let (width, height) = step.screen;
-        let (x, y) = details_row(&mut app, width, height, step.row);
+        cells(&mut app, width, height);
         let before = app.details.target_at(x, y);
         assert!(before.is_some(), "{name}");
+        assert_eq!(before, was, "{name}");
         (step.act)(&mut app);
         let paging = app.details.paging().clone();
         mouse(&mut app, CLICK, x, y);
@@ -11601,12 +11729,9 @@ mod tests {
         assert_eq!(app.details.paging(), &paging, "{name}");
         assert!(app.message.is_none(), "{name}");
 
-        let (width, height) = step.after;
-        let buffer = cells(&mut app, width, height);
-        let Some(lineage::Target::Thread(id)) = app.details.target_at(x, y) else {
-            panic!("{name}: no thread's row at ({x}, {y})");
-        };
-        let now = Some(lineage::Target::Thread(id.clone()));
+        let buffer = cells(&mut app, after_width, after_height);
+        let now = app.details.target_at(x, y);
+        assert_eq!(now, Some(lineage::Target::Thread(id.clone())), "{name}");
         assert_ne!(now, before, "{name}");
         let area = app.details.drawn.expect("the details").area;
         let row = text_in(&buffer, Rect::new(area.x, y, area.width, 1));
@@ -11620,7 +11745,6 @@ mod tests {
     fn a_click_before_the_frame_after_the_details_move_acts_on_no_row() {
         let runtime = idle_runtime();
         let _entered = runtime.enter();
-        // The pane shows 18 rows of the text, and the dialog 19.
         let pane = (200, 24);
         let dialog = (80, 24);
         let moves = [
@@ -11628,7 +11752,6 @@ mod tests {
                 name: "the wheel",
                 screen: pane,
                 prepare: |_| {},
-                row: "↳ Thread f",
                 act: wheel_down,
                 after: pane,
             },
@@ -11636,7 +11759,6 @@ mod tests {
                 name: "Page Down",
                 screen: pane,
                 prepare: |_| {},
-                row: "↑ Thread up",
                 act: |app| press(app, KeyCode::PageDown),
                 after: pane,
             },
@@ -11644,7 +11766,6 @@ mod tests {
                 name: "End",
                 screen: pane,
                 prepare: |_| {},
-                row: "↳ Thread g0",
                 act: |app| press(app, KeyCode::End),
                 after: pane,
             },
@@ -11652,7 +11773,6 @@ mod tests {
                 name: "Home",
                 screen: pane,
                 prepare: |app| press(app, KeyCode::End),
-                row: "↳ Thread g3",
                 act: |app| press(app, KeyCode::Home),
                 after: pane,
             },
@@ -11661,7 +11781,6 @@ mod tests {
                 name: "↓",
                 screen: pane,
                 prepare: |app| presses(app, KeyCode::Down, 4),
-                row: "↳ Thread f",
                 act: |app| press(app, KeyCode::Down),
                 after: pane,
             },
@@ -11670,7 +11789,6 @@ mod tests {
                 name: "Show more",
                 screen: pane,
                 prepare: |app| presses(app, KeyCode::Down, 7),
-                row: "+ Show 1 more",
                 act: |app| press(app, KeyCode::Enter),
                 after: pane,
             },
@@ -11686,7 +11804,6 @@ mod tests {
                     cells(app, 200, 24);
                     press(app, KeyCode::Up);
                 },
-                row: "↳ Thread g3",
                 act: |app| press(app, KeyCode::Enter),
                 after: pane,
             },
@@ -11695,7 +11812,6 @@ mod tests {
                 name: "a resize",
                 screen: pane,
                 prepare: |app| press(app, KeyCode::End),
-                row: "↳ Thread g3",
                 act: |app| {
                     app.on_terminal_event(Event::Resize(200, 30));
                 },
@@ -11705,7 +11821,6 @@ mod tests {
                 name: "the wheel on the dialog",
                 screen: dialog,
                 prepare: as_dialog,
-                row: "↳ Thread f",
                 act: wheel_down,
                 after: dialog,
             },
@@ -11713,7 +11828,6 @@ mod tests {
                 name: "End on the dialog",
                 screen: dialog,
                 prepare: as_dialog,
-                row: "↑ Thread up",
                 act: |app| press(app, KeyCode::End),
                 after: dialog,
             },
@@ -11724,13 +11838,12 @@ mod tests {
                     as_dialog(app);
                     presses(app, KeyCode::Down, 5);
                 },
-                row: "↳ Thread f",
                 act: |app| press(app, KeyCode::Down),
                 after: dialog,
             },
         ];
         for step in &moves {
-            click_after(&runtime, long_lineage_tui(), step);
+            click_after(&runtime, step);
         }
     }
 
