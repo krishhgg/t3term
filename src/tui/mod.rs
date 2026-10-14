@@ -11534,7 +11534,11 @@ mod tests {
             press(&mut app, KeyCode::Down);
             press(&mut app, KeyCode::Enter);
             assert_eq!(open_id(&app), Some(id.as_str()), "{shelf}");
-            assert_eq!(app.sidebar.selected_thread_id(), Some(id.as_str()), "{shelf}");
+            assert_eq!(
+                app.sidebar.selected_thread_id(),
+                Some(id.as_str()),
+                "{shelf}"
+            );
             assert_eq!(reads(&runtime), started + 1, "{shelf}");
             assert_eq!(app.focus, Focus::Details, "{shelf}");
 
@@ -11543,7 +11547,11 @@ mod tests {
             let at = row_showing(&rows, &heading) as usize;
             assert!(rows[at].contains("─ ›"), "{shelf}: {rows:#?}");
             assert!(clickable(&app).contains(&id), "{shelf}: {rows:#?}");
-            assert_eq!(app.sidebar.selected_thread_id(), Some(id.as_str()), "{shelf}");
+            assert_eq!(
+                app.sidebar.selected_thread_id(),
+                Some(id.as_str()),
+                "{shelf}"
+            );
             let saved = crate::settings::saved_in_test();
             assert!(!saved.sidebar_working_shelf_expanded, "{shelf}");
             assert!(!saved.sidebar_done_shelf_expanded, "{shelf}");

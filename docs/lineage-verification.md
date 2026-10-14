@@ -1,6 +1,6 @@
 # Lineage verification
 
-This page records how GPT-6.1 Sol checked Lineage from [PR #33](https://github.com/krishhgg/t3term/pull/33) in the t3term binary, on 2026-10-13, in two rounds. The [first round](#first-round-at-3d8ee07), at source `3d8ee0748f5f4af5f176a6d651bc6d7682e4ee60`, covered the feature in two fake-server runs. The [second round](#second-round-at-a29134c), at `a29134ccd4db20b2088494398e746b3fd2ae3f03`, covered the fixes for Greptile's two findings in a third run. The README's [Lineage](../README.md#lineage) section describes the behavior. Nothing here measures speed, CPU, memory or latency.
+This page records how GPT-6.1 Sol checked Lineage from [PR #33](https://github.com/krishhgg/t3term/pull/33) in the t3term binary, in three rounds. On 2026-10-13, the [first round](#first-round-at-3d8ee07), at source `3d8ee0748f5f4af5f176a6d651bc6d7682e4ee60`, covered the feature in two fake-server runs. The [second round](#second-round-at-a29134c), at `a29134ccd4db20b2088494398e746b3fd2ae3f03`, covered the fixes for Greptile's two findings in a third run. On 2026-10-14, the [third round](#third-round-at-0c3ec54), at `0c3ec5404baff3f26722d213c2a7b5111209dc13`, checked the branch after it merged master, in a fourth run. The README's [Lineage](../README.md#lineage) section describes the behavior. Nothing here measures speed, CPU, memory or latency.
 
 Lineage follows T3 Code nightly `f570bd2` (v0.0.46-nightly.20261007.2787), the source the pull request traced. The fake server sends that source's records and events, with a few values of its own listed under [What this doesn't show](#what-this-doesnt-show). Nothing here says what a later nightly sends. Lineage only reads, so nothing here checks Stop, Merge back, Disconnect or a new fork.
 
@@ -181,6 +181,75 @@ Sol recorded these SHA-256 sums for the two files:
 - Sol took no timing, CPU or memory sample, so nothing here says how much work drawing only the rows in view saves.
 - There's no native Terminal screenshot or video.
 
+## Third round, at `0c3ec54`
+
+`4da19a1` merges master at `0b86d4f` into this branch, which brings in pull requests #32, #35, #36 and #37. #35 adds the sidebar's Working, Done and Settled shelves, and a blank row at the top of any screen 20 rows or taller. The merge left two faults. `open_related` chose the sidebar row before the open laid the sidebar out again, so opening a related thread hidden on a closed shelf left the highlight where it was. And the test `a_click_before_the_frame_after_the_details_move_acts_on_no_row` counted 18 pane rows and 19 dialog rows, which the blank row cut by one each, so it failed. `0c3ec54` moves the highlight after the open, adds the App test `a_related_thread_on_a_closed_shelf_opens_listed_there_and_highlighted`, and takes the stale-click test's rows from a second TUI that draws a frame after the same move. The TUI that takes the stale click still gets no frame before it.
+
+### Checks
+
+At `0c3ec54` Sol ran strict Clippy and the tests with Rust 1.95.0 and built a debug binary. Clippy, the build and all 529 tests passed: 479 library, 2 main, 26 CLI and 22 fake RPC tests, with no doctests. `cargo fmt --all -- --check` failed on the layout of two `assert_eq!` calls in the new App test. The commit that adds this section and its image lays out those two calls the way `cargo fmt` asks, and changes no other source or test. This page records no check at that commit.
+
+### How it ran
+
+Sol built t3term from `0c3ec54` and ran it once with the first round's script, unchanged, and the isolation [How it ran](#how-it-ran) describes. The run was truecolor. It started at 200x50, went to 80x24 and came back to 200x50. t3term started once, with no restart and no reconnect. The fake server issued one session and revoked it, and opened and closed one socket. The server and the private tmux session stopped.
+
+### What the run covered
+
+Sol drove these cases and inspected the captures.
+
+**The merged layout.** At 200x50, Main's Lineage showed in the details pane beside #35's sidebar, with its top row and shelves.
+
+**Fork B on a closed Working shelf.** Sol closed Working and Done with the mouse. Settled starts closed, so all three shelves were closed. With the details holding the keyboard, Sol opened Fork B from Main's Lineage. The sidebar listed Fork B under the still-closed Working heading, as the open thread, and highlighted it. The details kept the keyboard, and the composer kept its draft.
+
+**Fork A on a closed Done shelf.** The script completed Fork A's run, which put Fork A on the closed Done shelf. Sol went back to Main and opened Fork A from its Lineage. The sidebar listed Fork A under the still-closed Done heading and highlighted it, and the draft stayed. That's the image below.
+
+**A dialog and back.** At 80x24 the details became a dialog. Back at 200x50 the pane came back, with the draft `folded-shelf draft` and the open thread still highlighted. At the end, the settings file held all three shelves closed.
+
+### Server counters
+
+| | Truecolor |
+|---|---|
+| t3term starts | 1 |
+| `subscribeServerConfig` | 1 |
+| `orchestration.subscribeShell` | 1 |
+| `orchestration.subscribeThread` | 4 |
+| `subscribeWorktreeSetup` | 0 |
+| `server.getConfig` reads | 0 |
+| Orchestration commands | 0 |
+| RPC interrupts in all | 6 |
+| Sockets opened and closed | 1 and 1 |
+| Sessions issued and revoked | 1 and 1 |
+| Reconnects and restarts | 0 |
+| Resizes | 2 |
+| Captures | 7 |
+
+The thread watches were 2 on `thr-main` and one each on `thr-fork-b` and `thr-fork-a`. No other RPC request reached the server, so closing shelves, choosing rows and resizing started no request. The script completed Fork A's run once. It changed no title, agent or context transfer, and made no fork.
+
+The script searched the run's 99,812 bytes of terminal output for the first round's markers, and every count was 0. This run sent no hostile title, so those zeros say nothing about how t3term handles one.
+
+### Images
+
+The image renders one `tmux capture-pane -p -e` capture with the first round's renderer, at 17x33 pixels a cell, with no text, frame or cursor added. Nobody edited or cropped it. The 200x50 capture is 3400x1650 pixels. Unlike the earlier rounds' images, it shows this branch with master's sidebar shelves.
+
+| Fork A opened on a closed Done shelf, truecolor 200x50 |
+|---|
+| ![Fork A: try another parser, opened from Main's Lineage. At the bottom of the sidebar, the headings Working (1), Done (1) and Settled (0) each end in a closed › chevron, and under Done the open thread's card, Lineage Desk, Fork A: try another parser, Done, is highlighted. The details pane at the right reads Lineage over ↑ Main: open me first (Done). The composer holds folded-shelf draft, and the status line reads live · ↑↓ choose · PgUp scroll · Esc leave · Alt+B close · Tab focus](screenshots/lineage-folded-shelf.png) |
+
+Sol recorded this SHA-256 sum for the file:
+
+| File | Cells | SHA-256 |
+|---|---|---|
+| `screenshots/lineage-folded-shelf.png` | 200x50, truecolor | `cde48e425afdae4adfccd8fc9829598322815c71cd25654b47cb9e7db4faeb0e` |
+
+### What the third round doesn't show
+
+- The image shows Fork A on Done. Sol checked Fork B on Working from a capture that isn't committed.
+- No thread sat on the Settled shelf in the run. The App test opens a fork from a closed Settled shelf.
+- The run made no click between a move and the next frame. The stale-click test makes that click after 11 moves, 8 in a pane and 3 in a dialog.
+- The run didn't repeat the 124 agents, the archived parent, the 256-color run or the hostile titles. That evidence comes from the earlier rounds, which ran this branch without #35.
+- Each capture shows the screen once a step had settled, not the first frame after an event. The App test draws that frame.
+- There's no native Terminal screenshot or video.
+
 ## Where the evidence is
 
-The captures, the raw terminal output and the script's logs stay on the machine that ran the checks: `/private/tmp/t3term-pr33-fixture-hmmblccs` and `/private/tmp/t3term-pr33-fixture-qbww5blw` for the first round, and `/private/tmp/t3term-pr33-fixture-raxj38mb` for the second. They aren't committed or published, and neither are the script, the renderer or the raw asciicast recordings. The images on this page render t3term's captured terminal output, and everything in them comes from the fake server.
+The captures, the raw terminal output and the script's logs stay on the machine that ran the checks: `/private/tmp/t3term-pr33-fixture-hmmblccs` and `/private/tmp/t3term-pr33-fixture-qbww5blw` for the first round, `/private/tmp/t3term-pr33-fixture-raxj38mb` for the second, and `/private/tmp/t3term-pr33-fixture-egrb5xh2` for the third. They aren't committed or published, and neither are the script, the renderer or the raw asciicast recordings. The images on this page render t3term's captured terminal output, and everything in them comes from the fake server.
