@@ -21,7 +21,7 @@ A chunk's size, `BoundedChunk::bytes`, is the length of its whole `Chunk` messag
 ## What the limits don't bound
 
 - Memory. A parsed `serde_json::Value` takes more room than its JSON, so the byte limit isn't a limit on the heap or the process.
-- Reading. The connection's reader decodes each WebSocket message whole before it routes the chunks in it. t3term keeps tungstenite 0.28's defaults, which allow a message of up to 64 MiB in frames of up to 16 MiB. A chunk over the byte limit still costs its full decode before t3term refuses it. A frame serde_json refuses for half a surrogate pair costs one copy of the frame, and a second parse of it.
+- Reading. The connection's reader decodes each WebSocket message whole before it routes the chunks in it. t3term keeps tungstenite 0.28's defaults, which allow a message of up to 64 MiB in frames of up to 16 MiB. A chunk over the byte limit still costs its full decode before t3term refuses it. The reader parses a text frame, or a binary frame of UTF-8, where it lies. A frame with a syntax error costs one copy of it, exactly as long as the message and so 64 MiB at most, and a scan of the copy for halves of surrogate pairs. Only a copy with a half replaced is parsed again. A binary frame that isn't UTF-8 ends the connection without a copy.
 - Accepted values. Once the caller accepts a chunk, bounding its values is up to the caller.
 
 ## Accepting a chunk
@@ -44,7 +44,7 @@ An end never needs room in the stream, so it reaches a full one. However a strea
 | The connection closes or goes silent | `RpcError::Disconnected` |
 | A `Chunk` without a `values` array | `RpcError::Protocol` |
 | A chunk over a limit, or a chunk dropped unaccepted | `RpcError::Stopped` with the reason |
-| A frame t3term can't parse, which also ends the connection | `RpcError::Protocol` |
+| A frame t3term can't parse, a binary one that isn't UTF-8 included, which also ends the connection | `RpcError::Protocol` |
 
 t3term forgets a request as soon as its stream ends, however it ends, so the requests it tracks don't build up over a long session.
 
@@ -72,7 +72,7 @@ On any other stream, Effect's server waits for an Ack after each chunk, so one c
 
 T3 keeps the first 128 UTF-16 code units of a terminal's label, in `truncateTerminalWireLabel` in `apps/server/src/terminal/Manager.ts`, so a label can end with the high half of an emoji's pair. The label goes out in the snapshot a terminal stream starts with and in each `activity` event, and JSON.stringify writes the half as an escape such as `\ud83d`. A Rust string can't hold half a pair, so serde_json refuses the whole frame. Before this change, t3term passed over the frame, so a chunk in it was never acked and kept one of T3's 8 slots for good.
 
-Now t3term parses such a frame again with U+FFFD in place of each half in a string value, and the chunk arrives and is acked as any other. The half itself is lost. A half in an object's key stays refused, since two keys could become one. A frame t3term still can't parse ends the connection, and every call and stream on it ends with `RpcError::Protocol`. Nothing in that frame is acked. `src/rpc/json.rs` has the details.
+Now t3term parses such a frame again with U+FFFD in place of each half in a string value, and the chunk arrives and is acked as any other. The half itself is lost. A half in an object's key stays refused, since two keys could become one. A frame t3term still can't parse ends the connection, and every call and stream on it ends with `RpcError::Protocol`. So does a binary frame that isn't UTF-8, since JSON is UTF-8. Nothing in that frame is acked. `src/rpc/json.rs` has the details.
 
 ## Out of scope
 

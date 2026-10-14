@@ -4,8 +4,9 @@
 //! stream's chunk), `Interrupt`, `Ping`. Server frames: `Chunk`, `Exit`, `Defect`,
 //! `ClientProtocolError`, `Pong`. A frame may hold one message or an array of them. One
 //! connection multiplexes any number of calls and streams. A frame t3term can't parse ends
-//! the connection, since t3term can't tell which call or stream it was for. json.rs says how a
-//! frame with half a UTF-16 surrogate pair in it still parses.
+//! the connection, since t3term can't tell which call or stream it was for. JSON is UTF-8, so
+//! a binary frame that isn't UTF-8 is one of those. json.rs says how a frame with half a
+//! UTF-16 surrogate pair in it still parses.
 
 mod bounded;
 mod json;
@@ -53,8 +54,9 @@ pub enum RpcError {
         error_tag: Option<String>,
     },
     /// T3 sent what t3term can't follow: a `Defect`, a `ClientProtocolError`, a bounded
-    /// stream's `Chunk` without a `values` array, or a frame t3term can't parse. A frame it
-    /// can't parse also closes the connection, and [`RpcClient::is_closed`] says so.
+    /// stream's `Chunk` without a `values` array, or a frame t3term can't parse, a binary one
+    /// that isn't UTF-8 among them. A frame it can't parse also closes the connection, and
+    /// [`RpcClient::is_closed`] says so.
     Protocol(String),
     /// t3term stopped a bounded stream on its own side and interrupted it on the server. A
     /// chunk would have taken the stream over its limits, and that chunk and everything after
@@ -277,7 +279,14 @@ impl RpcClient {
                         last_frame = Instant::now();
                         let decoded = match frame {
                             Some(Ok(Message::Text(text))) => json::decode(&text),
-                            Some(Ok(Message::Binary(bytes))) => json::decode(&String::from_utf8_lossy(&bytes)),
+                            // A binary frame is read in place too, once it checks as UTF-8.
+                            // One that isn't ends the connection here, where a lossy copy
+                            // could have taken three times the frame's size. The reason is
+                            // where the UTF-8 stopped, never what the frame held.
+                            Some(Ok(Message::Binary(bytes))) => match std::str::from_utf8(&bytes) {
+                                Ok(text) => json::decode(text),
+                                Err(e) => break Stop::Malformed(format!("t3term couldn't read a binary frame as UTF-8 ({e})")),
+                            },
                             Some(Ok(Message::Close(frame))) => break Stop::Lost(format!("server closed the socket ({frame:?})")),
                             Some(Ok(_)) => continue,
                             Some(Err(e)) => break Stop::Lost(e.to_string()),

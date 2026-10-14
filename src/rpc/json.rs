@@ -7,22 +7,28 @@
 //! that half as an escape such as `\ud83d`. A Rust string holds Unicode scalar values, which
 //! leave surrogates out, so serde_json refuses the whole frame.
 //!
-//! [`decode`] parses a frame as it is first, so a frame serde_json takes costs nothing more.
-//! Only if serde_json refuses it does `decode` copy it, write `\ufffd` over each escape of a
-//! surrogate without its pair in a string value, and parse the copy once. U+FFFD REPLACEMENT
-//! CHARACTER takes the half's place, and the half itself is lost, since no Rust string can
-//! hold it. An object's key keeps its escape, so serde_json still refuses the frame: two keys
-//! that differ only in such a half would both become U+FFFD and collide.
+//! rpc.rs hands [`decode`] each frame's text where it lies, without a copy: a text frame's, or
+//! a binary frame's bytes once they check as UTF-8. A binary frame that isn't UTF-8 ends the
+//! connection before it gets here. `decode` parses the text as it is first, so a frame
+//! serde_json takes costs nothing more. Only after a syntax error does `decode` copy the text
+//! and write `\ufffd` over each escape of a surrogate without its pair in a string value. It
+//! parses the copy once if it wrote any, and otherwise returns serde_json's first error.
+//! U+FFFD REPLACEMENT CHARACTER takes the half's place, and the half itself is lost, since no
+//! Rust string can hold it. An object's key keeps its escape, so serde_json still refuses the
+//! frame: two keys that differ only in such a half would both become U+FFFD and collide.
 //!
-//! `\ufffd` is as long as the escape it replaces, so the copy is exactly the frame's length,
-//! and the socket's limit on a message bounds it too. Finding the escapes reads the copy once,
-//! and a string that has one twice. Only the four hex digits of each such escape change. The
-//! copy must still parse, so a frame that is wrong in any other way stays refused.
+//! `\ufffd` is as long as the escape it replaces, so the copy is exactly as long as the frame
+//! t3term received, and the socket's limit on a message bounds it too. Every frame with a
+//! syntax error costs that copy and a scan of it, whether or not the scan finds a half. The
+//! scan reads the copy once, and a string with a half in it twice. Only the four hex digits of
+//! each such escape change. The copy must still parse, so a frame that is wrong in any other
+//! way stays refused.
 
 use serde_json::Value;
 
-/// Parses `text`, one frame from T3. A frame serde_json refuses gets one more try, with each
-/// surrogate without its pair in a string value replaced by U+FFFD.
+/// Parses `text`, one frame from T3. A frame serde_json refuses with a syntax error gets one
+/// more try if a string value in it holds a surrogate without its pair, with U+FFFD in place
+/// of each.
 pub(super) fn decode(text: &str) -> serde_json::Result<Value> {
     let refused = match serde_json::from_str::<Value>(text) {
         Ok(value) => return Ok(value),
