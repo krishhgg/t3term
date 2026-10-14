@@ -1581,10 +1581,9 @@ async fn a_frame_t3term_cannot_parse_ends_every_call_and_stream_with_a_protocol_
     }
 }
 
-/// T3 sends text messages, but a binary message of UTF-8 reads as a text one does. Raw
-/// multi-byte text and a pair's escapes stay as they are, and each half becomes U+FFFD. A
-/// legacy stream acks its chunk on arrival, and a bounded stream acks its chunk once the
-/// caller accepts it.
+/// A binary message of UTF-8 reads as a text one does. Raw multi-byte text and a pair's
+/// escapes stay as they are, and each half becomes U+FFFD. A legacy stream acks its chunk on
+/// arrival, and a bounded stream acks its chunk once the caller accepts it.
 #[tokio::test]
 async fn a_binary_frame_of_utf8_reads_and_is_acked_as_a_text_frame_is() {
     let (rpc, mut socket) = connected().await;
