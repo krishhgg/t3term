@@ -18,7 +18,7 @@ t3term environment remove scratch
 ```
 
 - `--t3-home` is the directory the server was started with as `--base-dir` or `T3CODE_HOME`, such as `~/.t3`. A relative path is saved from the current directory. t3term reads `userdata/environment-id` and `userdata/server-runtime.json` there.
-- `--origin` is where the server listens, such as `http://127.0.0.1:3773`. Leave it out and t3term reads the origin from `server-runtime.json` each time it connects, so a server that restarts on a new port is still found. Give it when you start the server on a fixed port.
+- `--origin` is where the server listens, such as `http://127.0.0.1:3773`. Leave it out and t3term reads the origin from `server-runtime.json` each time it connects, so a server that restarts on a new port is still found. Give it when you start the server on a fixed port. It must be http, which is how a local T3 server listens. t3term is built without TLS, so it refuses an https origin with `ENVIRONMENT_TLS_UNSUPPORTED`.
 - A name is 1 to 32 lowercase letters, digits, hyphens and underscores, and starts with a letter or digit.
 - `--default` on `add`, or `environment default NAME`, makes an environment the default for commands that name none. `environment default --clear` goes back to discovery.
 - `remove` refuses the default. Choose another default or clear it first.
@@ -37,24 +37,31 @@ t3term chooses once per command, before it reaches any server:
 
 A saved environment, from the flag or the default, is the only server t3term tries. When it fails a check below, the command stops with an error and t3term doesn't try `T3TERM_ORIGIN`, `T3CODE_HOME` or another environment instead.
 
-A default that names an environment no longer saved stops every command that names none, with `ENVIRONMENT_NOT_FOUND`. So does an `environments.json` that doesn't parse, with `ENVIRONMENTS_UNREADABLE`. In both cases t3term can't tell which server you chose, so it doesn't guess. Setting `T3TERM_ORIGIN` or passing `--environment` gets past either one.
+Two problems with `environments.json` stop a command, because t3term can't tell which server you chose and doesn't guess. They don't have the same way past:
+
+| Problem | A command that names no environment | With `--environment NAME` | With `T3TERM_ORIGIN` and no `--environment` | To fix it |
+| --- | --- | --- | --- | --- |
+| The default names an environment that isn't saved. | Stops with `ENVIRONMENT_NOT_FOUND`, exit 3. | Runs, since the file still reads. | Runs, and the file isn't read. | `t3term environment default --clear`, or `environment default` with a saved name. |
+| `environments.json` doesn't parse or can't be read. | Stops with `ENVIRONMENTS_UNREADABLE`, exit 1. | Stops the same way, since t3term looks the name up in the file. `T3TERM_ORIGIN` doesn't help, because the flag comes first. | Runs, and the file isn't read. | Repair the file, or move it away to start over. The `environment` commands can't change it until then. |
 
 ## What t3term checks before it logs in
 
 For a saved environment, in this order:
 
-1. The T3 home is an absolute path, and the origin, saved or recorded, is on this machine: 127.0.0.0/8, `::1` or `localhost`. t3term logs in by running the server's own `t3` against the T3 home, and it never sends that login off the machine. A program that builds a target with the t3term library gets the same check when it connects, before t3term reads the home.
+1. The T3 home is an absolute path, and the origin, saved or recorded, is an http origin on this machine: 127.0.0.0/8, `::1` or `localhost`. t3term logs in by running the server's own `t3` against the T3 home, and it never sends that login off the machine. An https origin on this machine stops the command with `ENVIRONMENT_TLS_UNSUPPORTED`. A program that builds a target with the t3term library gets the same check when it connects, before t3term reads the home.
 2. The T3 home holds `userdata/environment-id`. t3term reaches no server until it has read it.
-3. The server answers `/.well-known/t3/environment` at the origin itself. An answer that redirects stops the command with `T3_REDIRECTED`.
+3. The server answers `/.well-known/t3/environment` at the origin itself. An answer that redirects stops the command with `T3_REDIRECTED`. An error status, or a body that isn't a whole descriptor, stops it with `T3_DESCRIPTOR_INVALID`. Nothing listening, or no answer within 2.5 seconds, stops it with `T3_SERVER_UNAVAILABLE`.
 4. The `environmentId` the server reports is the id the T3 home holds. A server that belongs to another home, such as one that took over the port, gets no login.
 5. The server speaks orchestration protocol 2.
 6. t3term runs `t3 auth session issue --base-dir <T3 home>`. It finds `t3` from the pid in `server-runtime.json`, and uses that pid only when the record names the same origin t3term connected to. `T3TERM_T3_COMMAND` replaces the program, and t3term still passes the environment's T3 home as `--base-dir`.
 
 T3 writes `environment-id` in the state directory and reports the same id in its descriptor (apps/server/src/environment/ServerEnvironment.ts:89-177 at T3 f570bd21). A server started with `--base-dir` or `T3CODE_HOME` keeps its state in `userdata` under that home, even as a dev server (apps/server/src/cli/config.ts:319-332 and apps/server/src/config.ts:139-142).
 
+t3term reads `environment-id` and `server-runtime.json` once per command, on a blocking thread, so Ctrl-C still works while a slow disk holds the read up. It reads each only as a regular file of at most 16 KiB. A directory, a FIFO or a larger file counts as unreadable, so t3term never waits on a pipe or fills memory. Waiting can't cancel a read that never finishes. That read keeps its thread, and t3term exits without it.
+
 ## Redirects and proxies
 
-t3term sends each HTTP request straight to the server it chose. It follows no redirect. When a server answers the descriptor, or any request after login, with a redirect, the command stops with `T3_REDIRECTED`, and the request, its token and its body never reach the server the redirect names. At T3 f570bd21 no route t3term calls redirects. t3term uses no proxy either, so `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` don't apply, and a request for a server on this machine stays on it. The WebSocket already worked this way.
+t3term sends each HTTP request straight to the server it chose. It follows no redirect. When a server answers the descriptor or any later request with a redirect, the saved login check included, the command stops with `T3_REDIRECTED`, and the request, its token and its body never reach the server the redirect names. At T3 f570bd21 no route t3term calls redirects. t3term uses no proxy either, so `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` don't apply, and a request for a server on this machine stays on it. The WebSocket already worked this way.
 
 Discovery without a saved environment follows the same rule. A server that `T3TERM_ORIGIN` names or `T3CODE_HOME` records and that answers with a redirect is passed over, as one that doesn't answer is, and t3term tries the next one.
 
@@ -66,18 +73,20 @@ Every error uses an existing exit code. With `--json` it prints `{"ok": false, "
 | --- | --- | --- |
 | `ENVIRONMENT_NAME_INVALID` | 2 | A name breaks the naming rule. |
 | `ENVIRONMENT_HOME_INVALID` | 2 | `--t3-home` is empty or isn't UTF-8, or a target a program built has a relative T3 home. |
-| `ENVIRONMENT_ORIGIN_INVALID` | 2 | An origin isn't http or https, or has a user, a path, a query or a fragment. |
+| `ENVIRONMENT_ORIGIN_INVALID` | 2 | An origin isn't an http or https URL, or has a user, a path, a query or a fragment. |
 | `ENVIRONMENT_INVALID` | 2 | A saved environment has no kind, a relative `t3Home` or an origin that isn't text. |
 | `ENVIRONMENT_NOT_FOUND` | 3 | No environment of that name is saved, or the default names one that isn't. |
 | `ENVIRONMENT_EXISTS` | 4 | `add` or `rename` to a name already saved. |
 | `ENVIRONMENT_IS_DEFAULT` | 4 | `remove` of the default. |
-| `ENVIRONMENT_NOT_LOCAL` | 4 | The saved or recorded origin is off this machine. |
+| `ENVIRONMENT_NOT_LOCAL` | 4 | The saved or recorded origin is off this machine, or the recorded one isn't an origin. |
+| `ENVIRONMENT_TLS_UNSUPPORTED` | 4 | The origin, given to `add`, saved or recorded, is on this machine but uses https. |
 | `ENVIRONMENT_UNSUPPORTED` | 4 | A saved environment's kind isn't `local`. |
 | `T3_ENVIRONMENT_UNVERIFIED` | 4 | The T3 home holds no `userdata/environment-id`. |
 | `T3_ENVIRONMENT_MISMATCH` | 4 | The server reports another environment id. |
-| `T3_REDIRECTED` | 4 | A saved environment's server answered the descriptor with a redirect, or a server answered a request after login with one. |
+| `T3_DESCRIPTOR_INVALID` | 4 | A saved environment's server answered the descriptor with an error status, or with a body that isn't a whole descriptor: one that doesn't parse, lacks a field or stops partway. |
+| `T3_REDIRECTED` | 4 | A saved environment's server answered the descriptor with a redirect, or a server answered a later request with one, the saved login check included. |
 | `T3_PROTOCOL_UNSUPPORTED` | 4 | The server isn't on orchestration protocol 2. |
-| `T3_SERVER_UNAVAILABLE` | 5 | No origin is saved or recorded, or the server didn't answer. |
+| `T3_SERVER_UNAVAILABLE` | 5 | Nothing listens at the origin, the server closed the connection without an answer or didn't answer within 2.5 seconds, no origin is saved or recorded, or `server-runtime.json` can't be read. |
 | `T3_AUTH_UNAVAILABLE` | 5 | No recorded pid to find `t3` from, and no `T3TERM_T3_COMMAND`. |
 | `ENVIRONMENTS_UNREADABLE` | 1 | `environments.json` doesn't read or parse. |
 | `ENVIRONMENTS_NOT_SAVED` | 1 | A change couldn't be written. |
@@ -88,7 +97,18 @@ Every error uses an existing exit code. With `--json` it prints `{"ok": false, "
 
 The saved login in the Keychain is keyed by the environment id the server reports, as before. A saved environment and discovery share one login when they reach the same server, and renaming or removing an environment leaves its login alone.
 
-`t3term --environment NAME logout` revokes that environment's saved login and removes it from the Keychain. When the environment's server isn't running, t3term removes that environment's login only, using the id its T3 home holds, and can't revoke it. When the check fails any other way, such as a server that reports another environment id or answers with a redirect, logout removes nothing and reports the error. With a saved default, `t3term logout` acts on the default the same way. Without either, it works as before: with no server running, it removes every t3term login.
+Before it reuses a saved login, t3term asks the server at `/api/auth/session` whether it still accepts it. Only an answer of `authenticated: false`, which T3 gives for an expired or revoked login, makes t3term issue a new login and revoke the old one. T3's own client renews on that answer alone (apps/server/src/auth/EnvironmentAuth.ts:770-789 and packages/client-runtime/src/state/session.ts:65-66 at T3 f570bd21). Any other result stops the command with its error before t3term issues, saves, deletes or revokes a login: a redirect, an error status, an answer without `authenticated`, or no answer. The saved login stays as it was.
+
+`t3term --environment NAME logout` revokes that environment's saved login and removes it from the Keychain. When the environment's server is stopped, t3term can't revoke the login, so it removes that environment's login alone, found by the id its T3 home holds. Stopped means one of these:
+
+- The system refused the connection at the environment's origin. A record left behind by a server that crashed still counts when it names that origin.
+- No origin is saved and the home records no server. T3 removes `server-runtime.json` when its server stops (apps/server/src/serverRuntimeState.ts:72-113).
+
+Anything else keeps the login and reports the error: a server that answers with an error status, a body that isn't a descriptor, a redirect or another environment's id; a server that took the connection and didn't answer, which may be busy rather than stopped; a home whose record can't be read or names another origin; and a target t3term refuses.
+
+The removal holds the lock a login holds while it checks, issues and saves this environment's login. When another t3term holds it, logout removes nothing and fails with `T3_AUTH_FAILED`, since that process may be saving a login for a server that started after logout checked. Logout doesn't wait for the lock. Run it again once the other command finishes, and it checks the server again. The lock can't catch a login that starts and finishes between logout's check and its lock. When t3term can't open or lock the lock file, logout also fails and keeps the login.
+
+With a saved default, `t3term logout` acts on the default the same way. Without either, it works as before: with no server running, it removes every t3term login.
 
 With `T3TERM_NO_SAVED_LOGIN=1`, t3term keeps no login. It reads, saves and deletes nothing in the Keychain, so `logout` finds no saved login. Each command uses a session that lasts one run, revoked against the same T3 home it was issued from.
 
@@ -115,6 +135,7 @@ It holds names, paths and origins, and never a login or a token. A change follow
 
 ## Not supported yet
 
+- https. A local T3 server listens on plain http, and t3term is built without TLS, so it refuses an https origin on this machine when you add it, when a saved one loads and when a T3 home records one, all before it reaches a server. `T3TERM_ORIGIN` isn't checked this way: discovery passes an https origin over as one that didn't answer.
 - Remote environments. t3term refuses an origin off this machine, and a saved kind other than `local`, before it reaches any server. T3 pairs a remote client by exchanging a one-time `t3 pair` credential at the server's `/oauth/token` for a bearer token. t3term's HTTP client is built without TLS, and its saved logins don't hold a remote token yet.
 - T3 Connect. The next section says what T3's clients do and what t3term lacks.
 - A picker in the TUI. The TUI opens on the environment the command chose, and the sidebar names it as before.
