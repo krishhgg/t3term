@@ -24,9 +24,13 @@
 //! lineage.rs works out as the desktop's `ThreadRelationshipsPanel` does. ↑ and ↓ choose
 //! among its rows, and Enter or a click opens the chosen thread the way the sidebar opens one.
 //! It is worked out again only after an event that can change it, as the facts are.
+//!
+//! A second tab lists the pull requests linked to the thread, as the desktop's panel beside
+//! its details does. `pull_requests` reads and lays them out. The facts and Lineage show on
+//! the first tab, and each tab keeps its own scroll and choice while the other shows.
 
 use ratatui::Frame;
-use ratatui::layout::Rect;
+use ratatui::layout::{Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
@@ -35,6 +39,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::environment::Identity;
 use super::lineage::{self, Group, Lineage, Paging, Target};
+use super::pull_requests::PullRequests;
 use super::setup::bounded;
 use super::tasks::wrap;
 use super::theme::Theme;
@@ -75,6 +80,19 @@ const PATH_ROWS: usize = 8;
 /// The longest project id kept to match project events against. With a longer one, every
 /// project event counts.
 const ID: usize = 512;
+
+/// What the card shows under its tabs.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum Tab {
+    /// The thread's project, workspace, branch and environment.
+    #[default]
+    Thread,
+    /// The pull requests linked to the thread.
+    PullRequests,
+}
+
+const TABS: [Tab; 2] = [Tab::Thread, Tab::PullRequests];
+const THREAD_TAB: &str = "Thread";
 
 /// How the details draw.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -483,6 +501,10 @@ pub(super) struct Drawn {
     pub area: Rect,
     /// The × at the right of its title row.
     pub close: Rect,
+    /// The name of each tab, in the order of `TABS`.
+    pub tabs: [Rect; 2],
+    /// The rows under the tabs.
+    pub body: Rect,
 }
 
 /// The details as the reader left them in this window.
@@ -532,6 +554,12 @@ pub(super) struct Details {
     /// Where the last frame drew each Lineage row it showed, for the mouse. Anything that
     /// moves the text clears them, so a click acts on no row until the next frame draws them.
     targets: Vec<(Rect, Target)>,
+    /// The tab that shows.
+    tab: Tab,
+    /// The thread's linked pull requests, for the second tab.
+    pub pulls: PullRequests,
+    /// The time the last frame drew at, for the pull requests' relative times.
+    now: i64,
     /// How many times the facts were worked out and wrapped, so the tests can tell what a
     /// frame or an event did.
     #[cfg(test)]
@@ -568,16 +596,20 @@ impl Details {
         self.targets.clear();
     }
 
-    /// Notes that the facts and Lineage may have changed, as a thread's watch reconnecting or
-    /// closing can.
+    /// Notes that the facts, Lineage and the pull requests may have changed, as a thread's
+    /// watch reconnecting or closing can.
     pub fn mark(&mut self) {
         self.note(true, true);
     }
 
-    /// Notes that the facts, Lineage or both may have changed.
+    /// Notes that the facts, Lineage or both may have changed. The pull requests come from the
+    /// thread's record, as the facts do, so whatever can change the facts can change them too.
     fn note(&mut self, facts: bool, links: bool) {
         self.stale |= facts;
         self.lineage_stale |= links;
+        if facts {
+            self.pulls.mark();
+        }
         if facts || links {
             self.moved = true;
             self.shift();
@@ -650,13 +682,14 @@ impl Details {
 
     /// Follows another thread that opened. Its facts are worked out before a frame draws the
     /// details again, so the last thread's never show for it. Lineage starts over with its
-    /// first rows and nothing chosen.
+    /// first rows and nothing chosen, and the pull requests at the top of their list.
     pub fn follow(&mut self) {
         self.mark();
         self.scroll = Offset::Top(0);
         self.bottom = None;
         self.paging = Paging::default();
         self.selected = None;
+        self.pulls.follow();
     }
 
     /// Whether this frame has to work the facts out for thread `open_id`: the details are
@@ -751,7 +784,8 @@ impl Details {
         &self.paging
     }
 
-    /// The Lineage row ↑ and ↓ chose.
+    /// The Lineage row ↑ and ↓ chose, for the tests. Enter takes it through `enter`.
+    #[cfg(test)]
     pub fn selected(&self) -> Option<&Target> {
         self.selected.as_ref()
     }
@@ -791,8 +825,13 @@ impl Details {
     }
 
     /// Chooses the next Lineage row, or with none chosen the first at or below the top of the
-    /// text. Past the last one, or without Lineage rows, it scrolls the text down a row.
+    /// text. Past the last one, or without Lineage rows, it scrolls the text down a row. On the
+    /// pull requests' tab it selects the next one, or scrolls the selected one's details.
     pub fn down(&mut self) {
+        if self.tab == Tab::PullRequests {
+            self.pulls.move_by(1);
+            return;
+        }
         let targets = self.lineage_targets();
         let next = match (self.chosen(&targets), self.rows.as_ref()) {
             (Some(at), _) => Some(at + 1),
@@ -806,8 +845,13 @@ impl Details {
     }
 
     /// Chooses the Lineage row before the chosen one. From the first one, or with none chosen,
-    /// it leaves none chosen and scrolls the text up a row.
+    /// it leaves none chosen and scrolls the text up a row. On the pull requests' tab it
+    /// selects the one before, or scrolls the selected one's details.
     pub fn up(&mut self) {
+        if self.tab == Tab::PullRequests {
+            self.pulls.move_by(-1);
+            return;
+        }
         let targets = self.lineage_targets();
         match self.chosen(&targets) {
             Some(at) if at > 0 => self.step_to(targets[at - 1].clone()),
@@ -871,8 +915,14 @@ impl Details {
         self.shown.filter(|_| self.open)
     }
 
-    /// Scrolls the text `delta` rows, down for a positive one, no further than the last frame
-    /// let it.
+    /// The tab that shows, for the tests.
+    #[cfg(test)]
+    pub fn tab(&self) -> Tab {
+        self.tab
+    }
+
+    /// Scrolls the thread's text `delta` rows, down for a positive one, no further than the
+    /// last frame let it.
     pub fn scroll_by(&mut self, delta: isize) {
         let bottom = self.bottom;
         let within = |rows: usize| bottom.map_or(rows, |bottom| rows.min(bottom));
@@ -887,31 +937,218 @@ impl Details {
         self.shift();
     }
 
-    /// Scrolls the text `delta` rows for the wheel, which leaves no Lineage row chosen.
+    /// Shows `tab`. Each tab keeps its own scroll and choice while the other shows. Until a
+    /// frame draws the tab, a click acts on none of what the last frame drew.
+    pub fn show(&mut self, tab: Tab) {
+        if self.tab != tab {
+            self.tab = tab;
+            self.moved = true;
+            self.shift();
+        }
+    }
+
+    /// Whether this frame has to work the pull requests out for thread `open_id`, on an
+    /// environment that links them to threads when `supported` is true.
+    pub fn wants_pulls(&self, open_id: Option<&str>, supported: bool) -> bool {
+        self.open && self.pulls.wants(open_id, supported)
+    }
+
+    /// Shows the selected pull request's details in the list's place, or the list again, while
+    /// their tab shows.
+    pub fn toggle_pull(&mut self) {
+        if self.tab == Tab::PullRequests {
+            self.pulls.toggle();
+            self.moved = true;
+        }
+    }
+
+    /// Enter on the thread's tab hands back the Lineage row ↑ and ↓ chose, for the caller to
+    /// act on. On the pull requests' tab it shows the selected one's details in the list's
+    /// place, or the list again.
+    pub fn enter(&mut self) -> Option<Target> {
+        match self.tab {
+            Tab::Thread => self.selected.clone(),
+            Tab::PullRequests => {
+                self.toggle_pull();
+                None
+            }
+        }
+    }
+
+    /// Goes back a step: from a pull request's details to the list, or from the pull requests
+    /// to the thread's tab.
+    pub fn back(&mut self) {
+        if self.tab == Tab::PullRequests && self.pulls.back() {
+            self.moved = true;
+        } else {
+            self.show(Tab::Thread);
+        }
+    }
+
+    /// The keys the status line offers while the details have the keyboard, for the tab and
+    /// what it shows: the fullest first, and each after it shorter. The status line shows the
+    /// first that fits, so Esc shows wherever it has room. `modal` says whether the details
+    /// show as a dialog, which Esc closes, rather than a pane, which Esc leaves. With Lineage
+    /// rows to choose on the thread's tab, ↑ and ↓ choose among them, and what Enter does with
+    /// the chosen row leads.
+    pub fn keys(&self, modal: bool) -> Vec<String> {
+        let lineage = match self.tab {
+            Tab::Thread => self.lineage_keys(),
+            Tab::PullRequests => None,
+        };
+        let Some(action) = lineage else {
+            let plain = self.plain_keys(modal);
+            return plain.iter().map(|keys| keys.to_string()).collect();
+        };
+        let shapes = if modal {
+            [
+                "↑↓ choose · PgUp scroll · Esc close · → pull requests",
+                "↑↓ choose · PgUp scroll · Esc close · → PRs",
+                "↑↓ choose · Esc close · → PRs",
+                "Esc close · → PRs",
+                "Esc close",
+            ]
+        } else {
+            [
+                "↑↓ choose · PgUp scroll · Esc leave · Alt+B close · → pull requests · Tab focus",
+                "↑↓ choose · PgUp scroll · Esc leave · Alt+B close · → PRs",
+                "↑↓ choose · Esc leave · → PRs",
+                "Esc leave · → PRs",
+                "Esc leave",
+            ]
+        };
+        if action.is_empty() {
+            return shapes.iter().map(|keys| keys.to_string()).collect();
+        }
+        let mut keys: Vec<String> = shapes
+            .iter()
+            .map(|keys| format!("{action} · {keys}"))
+            .collect();
+        // Esc still shows where what Enter does has no room.
+        keys.push(shapes[4].to_string());
+        keys
+    }
+
+    /// The keys of `keys` for a tab with no Lineage rows to choose.
+    fn plain_keys(&self, modal: bool) -> &'static [&'static str] {
+        match (self.tab, self.pulls.viewing(), modal) {
+            (Tab::Thread, _, true) => &[
+                "↑↓/PgUp scroll · Esc close · → pull requests",
+                "↑↓/PgUp scroll · Esc close · → PRs",
+                "↑↓ scroll · Esc close · → PRs",
+                "Esc close · → PRs",
+                "Esc close",
+            ],
+            (Tab::Thread, _, false) => &[
+                "↑↓/PgUp scroll · Esc leave · Alt+B close · → pull requests · Tab focus",
+                "↑↓/PgUp scroll · Esc leave · Alt+B close · → PRs",
+                "↑↓ scroll · Esc leave · → PRs",
+                "Esc leave · → PRs",
+                "Esc leave",
+            ],
+            (Tab::PullRequests, false, true) => &[
+                "↑↓ select · Enter details · ← thread · Esc close",
+                "↑↓ · Enter details · ← thread · Esc close",
+                "↑↓ · Enter · ← thread · Esc close",
+                "Esc close · ← thread",
+                "Esc close",
+            ],
+            (Tab::PullRequests, false, false) => &[
+                "↑↓ select · Enter details · ← thread · Esc leave · Alt+B close · Tab focus",
+                "↑↓ · Enter details · ← thread · Esc leave · Alt+B close",
+                "↑↓ · Enter · ← thread · Esc leave",
+                "Esc leave · ← thread",
+                "Esc leave",
+            ],
+            (Tab::PullRequests, true, true) => &[
+                "↑↓/PgUp scroll · ← list · Esc close",
+                "↑↓ scroll · ← list · Esc close",
+                "Esc close · ← list",
+                "Esc close",
+            ],
+            (Tab::PullRequests, true, false) => &[
+                "↑↓/PgUp scroll · ← list · Esc leave · Alt+B close · Tab focus",
+                "↑↓ scroll · ← list · Esc leave · Alt+B close",
+                "Esc leave · ← list",
+                "Esc leave",
+            ],
+        }
+    }
+
+    /// A click at `column`, `row`, inside the card the last frame drew: on a tab's name it shows
+    /// that tab, and on a pull request it selects it, or shows its details when it is selected
+    /// already. On the row above those details it shows the list again. Says whether it changed
+    /// what shows. A click on a Lineage row is the caller's, by `target_at`.
+    pub fn click(&mut self, column: u16, row: u16) -> bool {
+        let Some(drawn) = self.drawn else {
+            return false;
+        };
+        let at = Position::new(column, row);
+        if let Some(index) = drawn.tabs.iter().position(|tab| tab.contains(at)) {
+            let tab = TABS[index];
+            let changed = self.tab != tab;
+            self.show(tab);
+            return changed;
+        }
+        if self.tab != Tab::PullRequests || !drawn.body.contains(at) {
+            return false;
+        }
+        let changed = self.pulls.click(usize::from(row - drawn.body.y));
+        if changed {
+            self.moved = true;
+        }
+        changed
+    }
+
+    /// Scrolls the text `delta` rows for the wheel, which leaves no Lineage row chosen. On the
+    /// pull requests' tab it moves the selection `delta` links, or scrolls the selected one's
+    /// details while they show.
     pub fn wheel(&mut self, delta: isize) {
-        self.selected = None;
-        self.scroll_by(delta);
+        match self.tab {
+            Tab::Thread => {
+                self.selected = None;
+                self.scroll_by(delta);
+            }
+            Tab::PullRequests => self.pulls.move_by(delta),
+        }
     }
 
     /// Scrolls the text a page down, or up when `down` is false. Like the other keys that
-    /// scroll the text, it leaves no Lineage row chosen.
+    /// scroll the text, it leaves no Lineage row chosen. On the pull requests' tab it moves the
+    /// selection a page, or scrolls the selected one's details a page.
     pub fn page(&mut self, down: bool) {
-        let page = self.page.max(1) as isize;
-        self.wheel(if down { page } else { -page });
+        match self.tab {
+            Tab::Thread => {
+                let page = self.page.max(1) as isize;
+                self.wheel(if down { page } else { -page });
+            }
+            Tab::PullRequests => self.pulls.page_by(down),
+        }
     }
 
     pub fn scroll_home(&mut self) {
-        self.selected = None;
-        self.scroll = Offset::Top(0);
-        self.shift();
+        match self.tab {
+            Tab::Thread => {
+                self.selected = None;
+                self.scroll = Offset::Top(0);
+                self.shift();
+            }
+            Tab::PullRequests => self.pulls.home(),
+        }
     }
 
     /// Scrolls the text until its last row shows, however many rows the next frame finds it
-    /// takes.
+    /// takes. On the pull requests' tab it selects the last one, or scrolls the selected one's
+    /// details to their end.
     pub fn scroll_end(&mut self) {
-        self.selected = None;
-        self.scroll = Offset::End(0);
-        self.shift();
+        match self.tab {
+            Tab::Thread => {
+                self.selected = None;
+                self.scroll = Offset::End(0);
+                self.shift();
+            }
+            Tab::PullRequests => self.pulls.end(),
+        }
     }
 
     /// Forgets where the last frame drew the details, for a frame that doesn't draw them.
@@ -923,16 +1160,18 @@ impl Details {
         self.targets.clear();
     }
 
-    /// Draws the details as the pane at `area`. `focused` says whether they have the keyboard,
-    /// which brightens the border.
+    /// Draws the details as the pane at `area`, at time `now`. `focused` says whether they have
+    /// the keyboard, which brightens the border.
     pub fn draw_pane(
         &mut self,
         frame: &mut Frame,
         area: Rect,
         focused: bool,
+        now: i64,
         environment: &Identity,
         theme: &Theme,
     ) {
+        self.now = now;
         self.draw_card(frame, area, Layout::Pane, focused, environment, theme);
     }
 
@@ -944,9 +1183,11 @@ impl Details {
         &mut self,
         frame: &mut Frame,
         screen: Rect,
+        now: i64,
         environment: &Identity,
         theme: &Theme,
     ) {
+        self.now = now;
         let width = if screen.width >= BORDER_MIN_WIDTH + 2 {
             (screen.width - 2).min(DIALOG_WIDTH)
         } else {
@@ -956,14 +1197,19 @@ impl Details {
         let (top, bottom) = if screen.height >= 6 { (1, 1) } else { (0, 0) };
         let room = screen.height - top - bottom;
         let bordered = width >= BORDER_MIN_WIDTH && room >= 3;
-        let frame_rows = if bordered { 3 } else { 1 };
-        let text_width = if bordered { width - 4 } else { width };
-        let wanted = self.lines(text_width as usize, environment, theme).len() as u16 + frame_rows;
+        // The border's rows, the title row and the tabs' row.
+        let frame_rows = if bordered { 4 } else { 2 };
+        let text_width = usize::from(if bordered { width - 4 } else { width });
+        let text_rows = match self.tab {
+            Tab::Thread => self.lines(text_width, environment, theme).len(),
+            Tab::PullRequests => self.pulls.wanted(text_width, now, theme),
+        };
+        let wanted = (text_rows + frame_rows).min(usize::from(room));
         let area = Rect {
             x: screen.right() - width - margin,
             y: screen.y + top,
             width,
-            height: wanted.min(room),
+            height: wanted as u16,
         };
         self.draw_card(frame, area, Layout::Dialog, true, environment, theme);
     }
@@ -1001,9 +1247,9 @@ impl Details {
             .map(|(line, _)| *line)
     }
 
-    /// Draws the card at `area`: a title row with × at its end, and the text under it, which
-    /// scrolls when it doesn't fit. With room for one, a border goes round it and names where
-    /// more text is.
+    /// Draws the card at `area`: a title row with × at its end, the tabs' row, and the tab's
+    /// text under them, which scrolls when it doesn't fit. With room for one, a border goes
+    /// round it and names where more text is.
     fn draw_card(
         &mut self,
         frame: &mut Frame,
@@ -1028,26 +1274,11 @@ impl Details {
             area
         };
         let width = inner.width as usize;
-        let visible = (inner.height as usize).saturating_sub(1);
-        let total = self.lines(width, environment, theme).len();
-        let bottom = total.saturating_sub(visible);
-        let mut scroll = match self.scroll {
-            Offset::Top(row) => row,
-            Offset::End(up) => bottom - up.min(bottom),
-        };
-        // A row ↑ or ↓ chose, or Show more added rows above, comes into view. Only then is the
-        // chosen row looked for among all of them.
-        let reveal = std::mem::take(&mut self.reveal);
-        if reveal && let Some(line) = self.selected_line() {
-            scroll = into_view(scroll, line, visible);
-        }
-        let scroll = scroll.min(bottom);
-        self.scroll = Offset::Top(scroll);
-        self.bottom = Some(bottom);
-        self.page = visible;
+        // The title row and the tabs' row come first.
+        let visible = (inner.height as usize).saturating_sub(2);
         let muted = Style::new().fg(theme.muted);
 
-        let mut lines = Vec::with_capacity(visible + 1);
+        let mut lines = Vec::with_capacity(visible + 2);
         if inner.height > 0 && width > 0 {
             let close = if width >= 4 { " ×" } else { "" };
             let title = clip("Thread details", width.saturating_sub(close.width()));
@@ -1060,29 +1291,66 @@ impl Details {
                 width,
             ));
         }
-        self.targets.clear();
-        if let Some(rows) = self.rows.as_ref() {
-            let in_view = rows.in_view(scroll, visible);
-            // The chosen row shows highlighted while the details have the keyboard.
-            let chosen = self
-                .selected
-                .as_ref()
-                .filter(|_| focused)
-                .and_then(|selected| in_view.iter().find(|(_, target)| target == selected))
-                .map(|(line, _)| *line);
-            for (index, line) in rows.lines.iter().enumerate().skip(scroll).take(visible) {
-                if Some(index) == chosen {
-                    lines.push(Line::from(with_bg(line.spans.clone(), theme.highlight)));
-                } else {
-                    lines.push(line.clone());
-                }
-            }
-            for (line, target) in in_view {
-                let y = inner.y + 1 + (line - scroll) as u16;
-                let area = Rect::new(inner.x, y, inner.width, 1);
-                self.targets.push((area, target.clone()));
+        let mut tabs = [Rect::default(); 2];
+        if inner.height > 1 && width > 0 {
+            let (line, places) = tabs_row(self.tab, self.pulls.count(), width, theme);
+            lines.push(line);
+            for (rect, (start, columns)) in tabs.iter_mut().zip(places) {
+                let tab = Rect::new(inner.x + start as u16, inner.y + 1, columns as u16, 1);
+                *rect = tab.intersection(inner);
             }
         }
+        // Only the thread's tab draws Lineage rows for the mouse.
+        self.targets.clear();
+        let (above, below) = match self.tab {
+            Tab::Thread => {
+                let total = self.lines(width, environment, theme).len();
+                let bottom = total.saturating_sub(visible);
+                let mut scroll = match self.scroll {
+                    Offset::Top(row) => row,
+                    Offset::End(up) => bottom - up.min(bottom),
+                };
+                // A row ↑ or ↓ chose, or Show more added rows above, comes into view. Only then
+                // is the chosen row looked for among all of them.
+                let reveal = std::mem::take(&mut self.reveal);
+                if reveal && let Some(line) = self.selected_line() {
+                    scroll = into_view(scroll, line, visible);
+                }
+                let scroll = scroll.min(bottom);
+                self.scroll = Offset::Top(scroll);
+                self.bottom = Some(bottom);
+                self.page = visible;
+                if let Some(rows) = self.rows.as_ref() {
+                    let in_view = rows.in_view(scroll, visible);
+                    // The chosen row shows highlighted while the details have the keyboard.
+                    let chosen = self
+                        .selected
+                        .as_ref()
+                        .filter(|_| focused)
+                        .and_then(|selected| in_view.iter().find(|(_, target)| target == selected))
+                        .map(|(line, _)| *line);
+                    for (index, line) in rows.lines.iter().enumerate().skip(scroll).take(visible) {
+                        if Some(index) == chosen {
+                            lines.push(Line::from(with_bg(line.spans.clone(), theme.highlight)));
+                        } else {
+                            lines.push(line.clone());
+                        }
+                    }
+                    // Under the title row and the tabs' row.
+                    for (line, target) in in_view {
+                        let y = inner.y + 2 + (line - scroll) as u16;
+                        let area = Rect::new(inner.x, y, inner.width, 1);
+                        self.targets.push((area, target.clone()));
+                    }
+                }
+                (scroll > 0, scroll + visible < total)
+            }
+            Tab::PullRequests => {
+                let page = self.pulls.page(width, visible, self.now, theme);
+                lines.extend(page.lines.iter().cloned());
+                (page.above, page.below)
+            }
+        };
 
         frame.render_widget(Clear, area);
         let style = Style::new().fg(theme.fg).bg(theme.popover);
@@ -1097,7 +1365,7 @@ impl Details {
                 .border_type(BorderType::Rounded)
                 .border_style(Style::new().fg(border))
                 .style(style);
-            let more = match (scroll > 0, scroll + visible < total) {
+            let more = match (above, below) {
                 (true, true) => Some(" more ↑↓ "),
                 (true, false) => Some(" more ↑ "),
                 (false, true) => Some(" more ↓ "),
@@ -1117,12 +1385,65 @@ impl Details {
         } else {
             Rect::default()
         };
+        let body = if visible > 0 {
+            Rect::new(inner.x, inner.y + 2, inner.width, visible as u16)
+        } else {
+            Rect::default()
+        };
         self.drawn = Some(Drawn {
             layout,
             area,
             close,
+            tabs,
+            body,
         });
     }
+}
+
+/// The tabs' row in `width` columns: each tab's name, the one that shows `tab` in the accent
+/// color and underlined, with the number of linked pull requests once they are known and
+/// there are some. Says where each name starts and how many columns it takes.
+fn tabs_row(
+    tab: Tab,
+    count: Option<usize>,
+    width: usize,
+    theme: &Theme,
+) -> (Line<'static>, [(usize, usize); 2]) {
+    let count = count.filter(|&count| count > 0);
+    let long = match count {
+        Some(count) => format!("Pull requests {count}"),
+        None => "Pull requests".to_string(),
+    };
+    let pulls = if THREAD_TAB.len() + 2 + long.width() <= width {
+        long
+    } else {
+        match count {
+            Some(count) => format!("PRs {count}"),
+            None => "PRs".to_string(),
+        }
+    };
+    let active = Style::new()
+        .fg(theme.primary)
+        .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
+    let muted = Style::new().fg(theme.muted);
+    let names = [THREAD_TAB.to_string(), pulls];
+    let mut spans = Vec::new();
+    let mut places = [(0, 0); 2];
+    let mut used = 0;
+    for (index, (shown, name)) in TABS.into_iter().zip(names).enumerate() {
+        let gap = if index > 0 { 2 } else { 0 };
+        if used + gap >= width {
+            break;
+        }
+        let name = clip(&name, width - used - gap);
+        let columns = name.width();
+        let style = if shown == tab { active } else { muted };
+        spans.push(Span::raw(" ".repeat(gap)));
+        spans.push(Span::styled(name, style));
+        places[index] = (used + gap, columns);
+        used += gap + columns;
+    }
+    (Line::from(spans), places)
 }
 
 /// The rows of `facts` at `width`: each label in muted text, its values under it, and a blank
@@ -1788,7 +2109,7 @@ mod tests {
         let identity = Identity::default();
         let mut terminal = Terminal::new(TestBackend::new(40, 30)).unwrap();
         let frame = terminal
-            .draw(|frame| details.draw_pane(frame, area, true, &identity, &theme))
+            .draw(|frame| details.draw_pane(frame, area, true, 0, &identity, &theme))
             .unwrap();
         let buffer = frame.buffer.clone();
         (area.y..area.bottom())
@@ -1822,7 +2143,8 @@ mod tests {
         details.show_more(Group::Related);
         let lineage = Lineage::of(Some("t"), &threads, None, false, details.paging());
         details.set_lineage(lineage);
-        // The pane's 18 rows have room for 15 rows of text under the title row.
+        // The pane's 18 rows have room for 14 rows of text under the title row and the tabs'
+        // row.
         let pane = Rect::new(2, 1, 36, 18);
         let rows = text(details.lines(32, &identity, &theme));
         let heading = rows.iter().position(|row| row == "Lineage").unwrap();
@@ -1854,19 +2176,19 @@ mod tests {
             range.map(|i| Target::Thread(format!("f{i:02}"))).collect()
         };
 
-        // Scrolled to the Lineage heading, which no row acts on, the pane shows it and the 14
+        // Scrolled to the Lineage heading, which no row acts on, the pane shows it and the 13
         // forks under it. The fork after them, a row below the pane's last, has no target.
         details.scroll_by(heading as isize);
         let drawn = draw_at(&mut details, pane);
-        assert_eq!(check(&details, &drawn), forks(0..14));
+        assert_eq!(check(&details, &drawn), forks(0..13));
         // A row further, the first fork is the pane's first row of text.
         details.scroll_by(1);
         let drawn = draw_at(&mut details, pane);
-        assert_eq!(check(&details, &drawn), forks(0..15));
+        assert_eq!(check(&details, &drawn), forks(0..14));
         // At the end, Show more is the pane's last row.
         details.scroll_end();
         let drawn = draw_at(&mut details, pane);
-        let mut end = forks(16..30);
+        let mut end = forks(17..30);
         end.push(Target::More(Group::Related));
         assert_eq!(check(&details, &drawn), end);
 
@@ -1881,10 +2203,12 @@ mod tests {
         assert!(drawn.iter().all(|row| !row.1), "{drawn:?}");
         assert_eq!(check(&details, &drawn), end);
 
-        // A pane two rows high, without a border, has room for one row of text. One a row
-        // high or none has room for none.
+        // A pane five rows high has room inside its border for one row of text under the title
+        // row and the tabs' row. One two rows high has no border and room for those two rows
+        // only, and one a row high or none has room for less.
         for (height, in_view) in [
-            (2, vec![Target::More(Group::Related)]),
+            (5, vec![Target::More(Group::Related)]),
+            (2, Vec::new()),
             (1, Vec::new()),
             (0, Vec::new()),
         ] {

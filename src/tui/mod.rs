@@ -16,6 +16,7 @@ mod markdown;
 mod picker;
 mod plan;
 mod provider;
+mod pull_requests;
 mod scroll;
 mod setup;
 mod sidebar;
@@ -1067,6 +1068,16 @@ impl App {
         })
     }
 
+    /// Whether the environment links pull requests to threads, as its capabilities'
+    /// `threadPullRequests` says, from the same descriptor as `capabilities`.
+    fn links_supported(&self) -> bool {
+        let capabilities = match self.config.as_ref() {
+            Some(config) => &config["environment"]["capabilities"],
+            None => &self.client.runtime.capabilities,
+        };
+        capabilities["threadPullRequests"] == Value::Bool(true)
+    }
+
     /// Hides or shows the sidebar and remembers it, as Ctrl+B and the desktop's Mod+B do. Focus
     /// on a sidebar being hidden moves to the transcript when a thread is open, or else to the
     /// composer. The rows, the highlight, the open thread and the composer stay as they are.
@@ -1369,9 +1380,13 @@ impl App {
     }
 
     /// A key for the details while they have the keyboard. Esc closes a dialog. On a pane it
-    /// gives the keyboard back and leaves the pane open. The arrows, `j` and `k` choose among
-    /// Lineage's rows, and scroll the text past them or without them. Enter acts on the chosen
-    /// row. The page keys, Home, End, `g` and `G` scroll the text.
+    /// gives the keyboard back and leaves the pane open. → or `l` shows the thread's pull
+    /// requests, and ← or `h` goes back: from a pull request's details to the list, and from
+    /// the list to the thread's tab. On the thread's tab the up and down arrows, `j` and `k`
+    /// choose among Lineage's rows, and scroll the text past them or without them, and Enter
+    /// acts on the chosen row. On the pull requests' tab they move along the pull requests, or
+    /// scroll the selected one's details, which Enter shows in the list's place and hides
+    /// again. The page keys, Home, End, `g` and `G` scroll the text, the list or the details.
     fn on_details_key(&mut self, key: KeyEvent) {
         let plain = !key
             .modifiers
@@ -1381,8 +1396,12 @@ impl App {
                 self.leave_details()
             }
             KeyCode::Esc => self.close_details(),
+            KeyCode::Left => self.details.back(),
+            KeyCode::Char('h') if plain => self.details.back(),
+            KeyCode::Right => self.details.show(details::Tab::PullRequests),
+            KeyCode::Char('l') if plain => self.details.show(details::Tab::PullRequests),
             KeyCode::Enter => {
-                if let Some(target) = self.details.selected().cloned() {
+                if let Some(target) = self.details.enter() {
                     self.act_on_lineage(target);
                 }
             }
@@ -1512,10 +1531,10 @@ impl App {
                     }
                 }
                 // A dialog of the thread's details takes the mouse. A click on its × closes it,
-                // as does a click outside it, on the button too. A click on a Lineage row acts
-                // on it, and the wheel over the dialog scrolls it. Nothing reaches what it
-                // covers. Until a frame draws it after a change, it takes events and does
-                // nothing with them.
+                // as does a click outside it, on the button too. A click on a tab, a pull
+                // request or a Lineage row acts on it, and the wheel over the dialog scrolls it.
+                // Nothing reaches what it covers. Until a frame draws it after a change, it
+                // takes events and does nothing with them.
                 if self.details_modal() {
                     let fresh = !self.details.moved && !self.layout_changed;
                     let Some(drawn) = self.details.drawn.filter(|_| fresh) else {
@@ -1526,7 +1545,7 @@ impl App {
                         _ if click && inside(drawn.close) => self.close_details(),
                         _ if click && inside(drawn.area) => {
                             let Some(target) = lineage_row else {
-                                return false;
+                                return self.details.click(mouse.column, mouse.row);
                             };
                             self.details.choose(target.clone());
                             self.act_on_lineage(target);
@@ -1587,10 +1606,10 @@ impl App {
                     return true;
                 }
                 // The details' button opens and closes them. Their pane takes what lands on
-                // it: a click on × closes it, a click elsewhere on it gives it the keyboard
-                // and acts on the Lineage row under it, and the wheel scrolls it. Until a
-                // frame draws them after a change, the button and the pane take events and do
-                // nothing with them.
+                // it: a click on × closes it, and a click elsewhere on it gives it the keyboard
+                // and acts on the tab, the pull request or the Lineage row under it. The wheel
+                // scrolls it. Until a frame draws them after a change, the button and the pane
+                // take events and do nothing with them.
                 let moved = self.details.moved || self.layout_changed;
                 if click && inside(self.details.button) {
                     if moved {
@@ -1615,6 +1634,8 @@ impl App {
                             if let Some(target) = lineage_row {
                                 self.details.choose(target.clone());
                                 self.act_on_lineage(target);
+                            } else {
+                                self.details.click(mouse.column, mouse.row);
                             }
                         }
                         MouseEventKind::ScrollUp => self.details.wheel(-1),
@@ -2612,9 +2633,11 @@ impl App {
             Some(details::Layout::Pane) => {}
             None => self.leave_details(),
         }
-        // The details are worked out again only after an event that can change them, or for
-        // another thread, and wrapped again only at another width. That comes before the
-        // status line, which says what Enter does with the Lineage row they keep chosen.
+        // The details and the pull requests linked to the thread are worked out again only
+        // after an event that can change them, or for another thread, and wrapped again only at
+        // another width. That comes before the status line, which says what Enter does with the
+        // Lineage row they keep chosen. When T3 removes the link whose details show, the first
+        // frame without them offers the list's keys.
         let open_id = self.open.as_ref().map(|open| open.id.as_str());
         if self.details.wants(open_id) {
             let facts = details::Facts::of(open_id, self.details_record(), self.details_projects());
@@ -2623,6 +2646,11 @@ impl App {
         if self.details.wants_lineage(open_id) {
             let lineage = self.details_lineage();
             self.details.set_lineage(lineage);
+        }
+        let supported = self.links_supported();
+        if self.details.wants_pulls(open_id, supported) {
+            let list = pull_requests::List::of(open_id, self.details_record(), supported);
+            self.details.pulls.set(list);
         }
         // The wake timer usually moves a woken thread first, but it runs on a clock that
         // stops while the machine sleeps. A hidden sidebar keeps its rows current too, so it
@@ -2795,15 +2823,16 @@ impl App {
             self.draw_picker(frame, above);
         }
         frame.render_widget(
-            Paragraph::new(self.status_line(status_area.width as usize)),
+            Paragraph::new(self.status_line(status_area.width as usize, shown)),
             status_area,
         );
+        let now = self.now;
         match shown {
             Some(details::Layout::Pane) => {
                 let pane = details::pane_area(main, body.y, composer_area.bottom());
                 let focused = self.focus == Focus::Details;
                 self.details
-                    .draw_pane(frame, pane, focused, &self.environment, &self.theme);
+                    .draw_pane(frame, pane, focused, now, &self.environment, &self.theme);
             }
             Some(details::Layout::Dialog) => {
                 // Under the title row, wherever the inset puts it.
@@ -2813,7 +2842,7 @@ impl App {
                     ..area
                 };
                 self.details
-                    .draw_dialog(frame, below, &self.environment, &self.theme)
+                    .draw_dialog(frame, below, now, &self.environment, &self.theme)
             }
             None => self.details.forget_drawn(),
         }
@@ -3703,22 +3732,9 @@ impl App {
         frame.render_widget(Paragraph::new(lines), list);
     }
 
-    /// The keys the status line names while the details have the keyboard. With Lineage rows
-    /// to choose, ↑ and ↓ choose among them, and the chosen row says what Enter does.
-    fn details_keys(&self) -> String {
-        let close = if self.details_modal() {
-            "Esc close"
-        } else {
-            "Esc leave · Alt+B close · Tab focus"
-        };
-        match self.details.lineage_keys() {
-            None => format!("↑↓/PgUp scroll · {close}"),
-            Some(action) if action.is_empty() => format!("↑↓ choose · PgUp scroll · {close}"),
-            Some(action) => format!("{action} · ↑↓ choose · PgUp scroll · {close}"),
-        }
-    }
-
-    fn status_line(&self, width: usize) -> Line<'static> {
+    /// The status line, `width` columns wide, for a frame that draws the details as `shown`.
+    /// The details draw after it, so the last frame's layout may be another one after a resize.
+    fn status_line(&self, width: usize, shown: Option<details::Layout>) -> Line<'static> {
         let t = &self.theme;
         if let Some((text, error)) = &self.message {
             let color = if *error { t.error_fg } else { t.success };
@@ -3729,6 +3745,23 @@ impl App {
             .open
             .as_ref()
             .is_some_and(|o| self.unsent.has_saved(&o.id));
+        // Only Ctrl+B and the toggle bring a hidden sidebar back, so the keys lead with it.
+        let restore = if self.sidebar_hidden && self.picker.is_none() {
+            "Ctrl+B sidebar · "
+        } else {
+            ""
+        };
+        let head = fit(&format!("{connection}  ·  "), width.saturating_sub(2));
+        let mut room = width.saturating_sub(2 + head.width());
+        let mut spans = vec![
+            Span::styled("● ", Style::new().fg(color)),
+            Span::styled(head, Style::new().fg(t.muted)),
+        ];
+        if unsent && self.picker.is_none() && room > 0 {
+            let note = fit("Unsent message: Ctrl+R  ·  ", room);
+            room -= note.width();
+            spans.push(Span::styled(note, Style::new().fg(t.warning_fg)));
+        }
         let hint;
         let keys = match (self.focus, self.picker.as_ref().map(|p| p.kind)) {
             (_, Some(Kind::Model)) => "Type to search · ↑↓ choose · Enter select · Esc close",
@@ -3752,8 +3785,12 @@ impl App {
             (Focus::Composer, None) => {
                 "Enter send · Alt+Enter newline · Alt+M model · Alt+E effort · Alt+P mode · Ctrl+X interrupt"
             }
+            // The details' keys shorten to the room there is, so Esc still shows. Esc closes
+            // details this frame draws as a dialog and leaves a pane.
             (Focus::Details, None) => {
-                hint = self.details_keys();
+                let modal = shown != Some(details::Layout::Pane);
+                let choices = self.details.keys(modal);
+                hint = fitting(&choices, room.saturating_sub(restore.width())).to_string();
                 hint.as_str()
             }
             (Focus::Transcript, None) => {
@@ -3766,23 +3803,6 @@ impl App {
                 hint.as_str()
             }
         };
-        // Only Ctrl+B and the toggle bring a hidden sidebar back, so the keys lead with it.
-        let restore = if self.sidebar_hidden && self.picker.is_none() {
-            "Ctrl+B sidebar · "
-        } else {
-            ""
-        };
-        let head = fit(&format!("{connection}  ·  "), width.saturating_sub(2));
-        let mut room = width.saturating_sub(2 + head.width());
-        let mut spans = vec![
-            Span::styled("● ", Style::new().fg(color)),
-            Span::styled(head, Style::new().fg(t.muted)),
-        ];
-        if unsent && self.picker.is_none() && room > 0 {
-            let note = fit("Unsent message: Ctrl+R  ·  ", room);
-            room -= note.width();
-            spans.push(Span::styled(note, Style::new().fg(t.warning_fg)));
-        }
         if room > 0 {
             let keys = format!("{restore}{keys}");
             spans.push(Span::styled(fit(&keys, room), Style::new().fg(t.muted)));
@@ -4071,6 +4091,12 @@ fn fit(text: &str, width: usize) -> String {
     }
     out.push('…');
     out
+}
+
+/// The first of `choices` that fits in `room` columns, or else the last, which `fit` cuts.
+fn fitting(choices: &[String], room: usize) -> &str {
+    let fits = choices.iter().find(|choice| choice.width() <= room);
+    fits.or(choices.last()).map_or("", String::as_str)
 }
 
 /// `text` cut with `…` to at most `width` columns, at a place `transcript::clusters` finds, so
@@ -11080,6 +11106,976 @@ mod tests {
         assert_eq!(app.composer.text(), "draft");
     }
 
+    // ---- linked pull requests ----
+
+    /// Pull request `number` of krishhgg/t3term as T3 links it to a thread, open and synced,
+    /// its checks passing and approved.
+    fn linked(number: u64, title: &str) -> Value {
+        json!({
+            "host": "github.com",
+            "repository": "krishhgg/t3term",
+            "number": number,
+            "url": format!("https://github.com/krishhgg/t3term/pull/{number}"),
+            "source": "agent",
+            "linkedAt": "2026-10-13T10:00:00.000Z",
+            "snapshot": {
+                "state": "open",
+                "title": title,
+                "headBranch": format!("feature-{number}"),
+                "baseBranch": "master",
+                "isDraft": false,
+                "updatedAt": "2026-10-13T11:00:00.000Z",
+                "syncedAt": "2026-10-13T11:59:00.000Z",
+                "checksState": "passing",
+                "reviewDecision": "approved"
+            },
+            "stack": null
+        })
+    }
+
+    /// The feature thread `t` linked to `links`, as the shell lists it and its projection has
+    /// it.
+    fn linked_thread(links: Vec<Value>) -> Value {
+        let mut thread = feature_thread();
+        thread["pullRequests"] = json!(links);
+        thread
+    }
+
+    /// `details_tui` on an environment that links pull requests to threads, with thread `t`
+    /// linked to `links`.
+    fn pulls_tui(links: Vec<Value>, sidebar_hidden: bool) -> App {
+        let mut client = Client::offline();
+        client.runtime.capabilities = json!({"threadPullRequests": true});
+        let settings = Settings {
+            sidebar_hidden,
+            ..Settings::default()
+        };
+        let mut app = App::new(
+            Arc::new(client),
+            Theme::new(Depth::TrueColor),
+            &settings,
+            mpsc::unbounded_channel().0,
+        );
+        app.watch_setup = Box::new(|_: &str| mpsc::unbounded_channel().1);
+        let other = bound("u", "q", Value::Null, Value::Null);
+        let thread = linked_thread(links);
+        app.on_shell_event(details_shell(vec![thread.clone(), other]));
+        app.on_shell_event(caught_up());
+        app.open_thread(open_bound(thread));
+        app.composer.insert_str("draft");
+        press(&mut app, KeyCode::Left);
+        app
+    }
+
+    /// `linked` with every field the contract has, each long: a title of many words, a URL
+    /// longer than t3term keeps, a long branch, a bot author, the lines it changes, a watch,
+    /// and a GitHub stack of #31 under #32.
+    fn long_linked(number: u64) -> Value {
+        let mut link = linked(number, &"A long title ".repeat(60));
+        let query = "q".repeat(6_000);
+        let url = format!("https://github.com/krishhgg/t3term/pull/{number}?{query}");
+        link["url"] = json!(url);
+        link["snapshot"]["headBranch"] = json!(format!("feature/{}", "branch-".repeat(40)));
+        link["snapshot"]["author"] = json!({"login": "renovate[bot]", "isBot": true});
+        link["snapshot"]["additions"] = json!(1_234);
+        link["snapshot"]["deletions"] = json!(56);
+        link["watch"] = json!({"startedAt": "2026-10-13T10:00:00.000Z"});
+        link["stack"] = json!({"kind": "native", "id": "s1",
+            "layers": [{"number": 31}, {"number": 32}]});
+        link
+    }
+
+    /// Draws a frame `width` columns by `height` rows and returns the rows of the details'
+    /// body, the padding at their ends dropped.
+    fn body_after(app: &mut App, width: u16, height: u16) -> Vec<String> {
+        let buffer = cells(app, width, height);
+        let body = app.details.drawn.expect("the details").body;
+        text_in(&buffer, body)
+            .lines()
+            .map(|row| row.trim_end().to_string())
+            .collect()
+    }
+
+    /// Checks the status line at every width from 3 columns, where the dot and the cut
+    /// connection start, to `widest`: it never runs past the width, and `esc` shows whole
+    /// wherever there is room for it after the `restore` columns Ctrl+B takes.
+    fn keys_fit(app: &App, widest: usize, esc: &str, restore: usize) {
+        let least = "● live  ·  ".width() + restore + esc.width();
+        for width in 3..=widest {
+            let text = app.status_line(width, app.details.shown()).to_string();
+            assert!(text.width() <= width, "{width}: {text:?}");
+            if width >= least {
+                assert!(text.contains(esc), "{width}: {text:?}");
+            }
+        }
+    }
+
+    /// Draws two frames `width` columns by `height` rows, checks the status line and returns
+    /// the first frame's. The first frame draws it as the second does, so its keys follow how
+    /// that frame draws the details and what they show, not what the frame before it drew.
+    /// With `esc`, the details' keys show it. Without, the line offers no keys of theirs.
+    fn first_status(app: &mut App, width: u16, height: u16, esc: Option<&str>) -> String {
+        let row = Rect::new(0, height - 1, width, 1);
+        let first = text_in(&cells(app, width, height), row);
+        let layout = app.details.shown();
+        let second = text_in(&cells(app, width, height), row);
+        assert_eq!(first, second, "{width}x{height}, {layout:?}");
+        match esc {
+            Some(esc) => assert!(first.contains(esc), "{width}x{height}: {first:?}"),
+            None => {
+                for keys in ["Esc close", "Esc leave"] {
+                    assert!(!first.contains(keys), "{width}x{height}: {first:?}");
+                }
+            }
+        }
+        first
+    }
+
+    #[test]
+    fn the_pane_lists_the_threads_pull_requests_in_a_tab_the_keys_and_the_mouse_reach() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let links = vec![linked(31, "Bound titles"), linked(32, "Lineage")];
+        let mut app = pulls_tui(links, false);
+        app.focus = Focus::Transcript;
+        cells(&mut app, 200, 50);
+        alt(&mut app, 'b');
+        let started = reads(&runtime);
+        // The thread's tab shows first, and the other counts the links.
+        let text = details_after(&mut app, 200, 50);
+        let scrolled = app.scroll.rows();
+        assert!(text.contains("Thread  Pull requests 2"), "{text}");
+        assert!(text.contains("Recorded branch"), "{text}");
+        assert!(!text.contains("#31"), "{text}");
+
+        // A click on the tab shows the links and gives the pane the keyboard.
+        let drawn = app.details.drawn.expect("the pane");
+        let tab = drawn.tabs[1];
+        assert!(mouse(&mut app, CLICK, tab.x, tab.y));
+        assert_eq!(app.details.tab(), details::Tab::PullRequests);
+        assert_eq!(app.focus, Focus::Details);
+        let buffer = cells(&mut app, 200, 50);
+        let text = details_text(&app, &buffer);
+        for shown in ["● #31 Bound titles", "● #32 Lineage", "2 open · 2 linked"] {
+            assert!(text.contains(shown), "{shown:?} in {text}");
+        }
+        assert!(!text.contains("Recorded branch"), "{text}");
+        let status = text_in(&buffer, Rect::new(0, 49, 200, 1));
+        let hint = "↑↓ select · Enter details · ← thread";
+        assert!(status.contains(hint), "{status}");
+
+        // ↓ selects the second link and Enter shows its details in the list's place, under a
+        // row back to the list. The composer, the draft and the transcript stay as they were.
+        press(&mut app, KeyCode::Down);
+        let text = details_after(&mut app, 200, 50);
+        assert!(!text.contains("Linked by the agent"), "{text}");
+        press(&mut app, KeyCode::Enter);
+        let buffer = cells(&mut app, 200, 50);
+        let text = details_text(&app, &buffer);
+        for shown in ["← List", "2 of 2", "#32 Lineage", "Linked by the agent"] {
+            assert!(text.contains(shown), "{shown:?} in {text}");
+        }
+        assert!(!text.contains("#31"), "{text}");
+        let status = text_in(&buffer, Rect::new(0, 49, 200, 1));
+        let hint = "↑↓/PgUp scroll · ← list · Esc leave";
+        assert!(status.contains(hint), "{status}");
+        for code in [KeyCode::Char('x'), KeyCode::Char('q'), KeyCode::Backspace] {
+            press(&mut app, code);
+        }
+        assert_eq!(app.composer.text(), "draft");
+        assert_eq!(app.scroll.rows(), scrolled);
+        assert!(!app.quit);
+
+        // ← goes back to the list, and from the list to the thread's tab. → shows the pull
+        // requests again. `h` and `l` do as ← and → do.
+        for (code, tab, viewing) in [
+            (KeyCode::Left, details::Tab::PullRequests, false),
+            (KeyCode::Left, details::Tab::Thread, false),
+            (KeyCode::Right, details::Tab::PullRequests, false),
+            (KeyCode::Enter, details::Tab::PullRequests, true),
+            (KeyCode::Char('h'), details::Tab::PullRequests, false),
+            (KeyCode::Char('h'), details::Tab::Thread, false),
+            (KeyCode::Char('l'), details::Tab::PullRequests, false),
+        ] {
+            press(&mut app, code);
+            assert_eq!(app.details.tab(), tab, "{code:?}");
+            assert_eq!(app.details.pulls.viewing(), viewing, "{code:?}");
+        }
+
+        // A click on a link selects it, and a second shows its details. Until a frame draws
+        // the pane again, a click does nothing.
+        cells(&mut app, 200, 50);
+        let drawn = app.details.drawn.expect("the pane");
+        let (x, y) = (drawn.body.x + 1, drawn.body.y);
+        assert!(mouse(&mut app, CLICK, x, y));
+        assert!(!mouse(&mut app, CLICK, x, y));
+        cells(&mut app, 200, 50);
+        assert!(mouse(&mut app, CLICK, x, y));
+        assert!(app.details.pulls.viewing());
+        let text = details_after(&mut app, 200, 50);
+        for shown in [
+            "← List",
+            "1 of 2",
+            "#31 Bound titles",
+            "Linked by the agent",
+        ] {
+            assert!(text.contains(shown), "{shown:?} in {text}");
+        }
+        assert!(!text.contains("#32"), "{text}");
+        // The wheel scrolls the details, which all fit here. A click on the row above them
+        // leads back to the list, with the link still selected.
+        assert!(mouse(&mut app, MouseEventKind::ScrollDown, x, y));
+        assert!(mouse(&mut app, MouseEventKind::ScrollUp, x, y));
+        cells(&mut app, 200, 50);
+        assert!(mouse(&mut app, CLICK, x, y));
+        assert!(!app.details.pulls.viewing());
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("#32 Lineage"), "{text}");
+        press(&mut app, KeyCode::Enter);
+        assert!(details_after(&mut app, 200, 50).contains("1 of 2"));
+        press(&mut app, KeyCode::Left);
+
+        // Esc gives the keyboard back, and the pane keeps its tab.
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus, Focus::Transcript);
+        assert!(app.details.open);
+        assert_eq!(app.details.tab(), details::Tab::PullRequests);
+        assert_eq!(app.composer.text(), "draft");
+        // None of it asked T3 for anything or needs the tick.
+        assert_eq!(reads(&runtime), started);
+        assert!(!needs_tick(app.open.as_ref(), &app.sidebar));
+    }
+
+    #[test]
+    fn a_dialog_shows_a_links_url_as_plain_text_and_its_tabs_take_clicks() {
+        let links = vec![linked(31, "Bound titles"), linked(32, "Lineage")];
+        let mut app = pulls_tui(links, false);
+        app.focus = Focus::Transcript;
+        cells(&mut app, 80, 24);
+        alt(&mut app, 'b');
+        assert_eq!(app.focus, Focus::Details);
+        press(&mut app, KeyCode::Right);
+        let buffer = cells(&mut app, 80, 24);
+        let drawn = app.details.drawn.expect("the dialog");
+        assert_eq!(drawn.layout, details::Layout::Dialog);
+        // Beside the sidebar the status line has 41 columns for the keys, and the ones that
+        // fit there show whole, Esc with them.
+        let status = text_in(&buffer, Rect::new(0, 23, 80, 1));
+        let hint = "↑↓ · Enter details · ← thread · Esc close";
+        assert!(status.contains(hint), "{status}");
+        // The dialog is as tall as the links and the footer, its title, its tabs and its
+        // border.
+        assert_eq!(drawn.area.height, 2 * 3 + 1 + 4);
+        let url = "https://github.com/krishhgg/t3term/pull/31";
+        assert!(!details_text(&app, &buffer).contains(url));
+        // Enter shows the selected link's details in the list's place, and the dialog grows to
+        // hold them.
+        press(&mut app, KeyCode::Enter);
+        let buffer = cells(&mut app, 80, 24);
+        let text = details_text(&app, &buffer);
+        for shown in [
+            "← List",
+            "1 of 2",
+            "#31 Bound titles",
+            url,
+            "Linked by the agent",
+        ] {
+            assert!(text.contains(shown), "{shown:?} in {text}");
+        }
+        assert!(!text.contains("#32"), "{text}");
+        let drawn = app.details.drawn.expect("the dialog");
+        assert!(drawn.area.height > 2 * 3 + 1 + 4);
+        let status = text_in(&buffer, Rect::new(0, 23, 80, 1));
+        let hint = "↑↓/PgUp scroll · ← list · Esc close";
+        assert!(status.contains(hint), "{status}");
+        // A second Enter shows the list again, as ← does.
+        press(&mut app, KeyCode::Enter);
+        assert!(!details_after(&mut app, 80, 24).contains(url));
+        press(&mut app, KeyCode::Enter);
+        assert!(details_after(&mut app, 80, 24).contains(url));
+        press(&mut app, KeyCode::Left);
+        let text = details_after(&mut app, 80, 24);
+        assert!(!text.contains(url), "{text}");
+        assert!(text.contains("#32 Lineage"), "{text}");
+        assert_eq!(app.details.tab(), details::Tab::PullRequests);
+
+        // A click on the thread's tab shows it, and the dialog stays open with the keyboard.
+        let drawn = app.details.drawn.expect("the dialog");
+        let tab = drawn.tabs[0];
+        assert!(mouse(&mut app, CLICK, tab.x, tab.y));
+        assert_eq!(app.details.tab(), details::Tab::Thread);
+        assert!(app.details.open);
+        assert_eq!(app.focus, Focus::Details);
+        let text = details_after(&mut app, 80, 24);
+        assert!(text.contains("Recorded branch"), "{text}");
+        // A click on the tab that shows changes nothing.
+        let drawn = app.details.drawn.expect("the dialog");
+        assert!(!mouse(&mut app, CLICK, drawn.tabs[0].x, drawn.tabs[0].y));
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.details.open);
+        assert_eq!(app.focus, Focus::Transcript);
+        assert_eq!(app.composer.text(), "draft");
+    }
+
+    #[test]
+    fn the_details_keys_shorten_to_the_room_there_is_and_esc_always_shows() {
+        // After each step, the keys a dialog's status line offers at 80 columns, beside the
+        // sidebar and without it: on the thread's tab, on the list and on a link's details.
+        let steps = [
+            (
+                None,
+                "↑↓/PgUp scroll · Esc close · → PRs",
+                "↑↓/PgUp scroll · Esc close · → pull requests",
+            ),
+            (
+                Some(KeyCode::Right),
+                "↑↓ · Enter details · ← thread · Esc close",
+                "↑↓ select · Enter details · ← thread · Esc close",
+            ),
+            (
+                Some(KeyCode::Enter),
+                "↑↓/PgUp scroll · ← list · Esc close",
+                "↑↓/PgUp scroll · ← list · Esc close",
+            ),
+        ];
+        for sidebar_hidden in [false, true] {
+            let mut app = pulls_tui(vec![linked(31, "Bound titles")], sidebar_hidden);
+            app.focus = Focus::Transcript;
+            cells(&mut app, 80, 24);
+            alt(&mut app, 'b');
+            assert_eq!(app.focus, Focus::Details);
+            // Ctrl+B leads the keys while the sidebar is hidden.
+            let restore = if sidebar_hidden { 17 } else { 0 };
+            for (key, beside, alone) in steps {
+                if let Some(key) = key {
+                    press(&mut app, key);
+                }
+                let buffer = cells(&mut app, 80, 24);
+                let status = text_in(&buffer, Rect::new(0, 23, 80, 1));
+                let keys = if sidebar_hidden { alone } else { beside };
+                assert!(status.contains(keys), "{keys:?} in {status:?}");
+                keys_fit(&app, 120, "Esc close", restore);
+                // At 40 columns Esc shows whole without the sidebar. Beside it, 7 columns are
+                // left, and the keys still start with Esc.
+                let buffer = cells(&mut app, 40, 12);
+                let status = text_in(&buffer, Rect::new(0, 11, 40, 1));
+                let shown = if sidebar_hidden {
+                    "Ctrl+B sidebar · Esc close"
+                } else {
+                    "live  ·  Esc"
+                };
+                assert!(status.contains(shown), "{shown:?} in {status:?}");
+                // A screen 10 columns wide draws too.
+                cells(&mut app, 10, 5);
+            }
+        }
+
+        // A pane's keys say Esc leaves it, and shorten the same way.
+        let mut app = pulls_tui(vec![linked(31, "Bound titles")], false);
+        app.focus = Focus::Transcript;
+        cells(&mut app, 200, 50);
+        alt(&mut app, 'b');
+        cells(&mut app, 200, 50);
+        let drawn = app.details.drawn.expect("the pane");
+        assert!(mouse(&mut app, CLICK, drawn.tabs[0].x, drawn.tabs[0].y));
+        assert_eq!(app.focus, Focus::Details);
+        for key in [None, Some(KeyCode::Right), Some(KeyCode::Enter)] {
+            if let Some(key) = key {
+                press(&mut app, key);
+            }
+            let buffer = cells(&mut app, 200, 50);
+            let status = text_in(&buffer, Rect::new(0, 49, 200, 1));
+            let keys = app.details.keys(false).remove(0);
+            assert!(status.contains(&keys), "{keys:?} in {status:?}");
+            keys_fit(&app, 200, "Esc leave", 0);
+        }
+        assert!(app.details.pulls.viewing());
+    }
+
+    #[test]
+    fn the_first_frame_at_a_new_size_offers_the_keys_for_how_it_draws_the_details() {
+        for sidebar_hidden in [false, true] {
+            // Beside the sidebar at 40 columns, the keys are cut a little after Esc.
+            let narrow = if sidebar_hidden { "Esc close" } else { "Esc" };
+            // On the thread's tab, on the list and on a link's details.
+            for view in 0..3 {
+                let mut app = pulls_tui(vec![linked(31, "Bound titles")], sidebar_hidden);
+                app.focus = Focus::Transcript;
+                cells(&mut app, 200, 50);
+                // Alt+B opens a pane, which leaves the keyboard where it was.
+                alt(&mut app, 'b');
+                first_status(&mut app, 200, 50, None);
+                // A click on the pane gives it the keyboard, and its keys say Esc leaves it.
+                let drawn = app.details.drawn.expect("the pane");
+                assert!(mouse(&mut app, CLICK, drawn.tabs[0].x, drawn.tabs[0].y));
+                for code in [KeyCode::Right, KeyCode::Enter].into_iter().take(view) {
+                    press(&mut app, code);
+                }
+                first_status(&mut app, 200, 50, Some("Esc leave"));
+                assert_eq!(app.details.pulls.viewing(), view == 2);
+
+                // The pane turns into a dialog at 80 and 40 columns, and into a pane again at
+                // 200, with the keyboard all along. The first frame at each size offers the
+                // keys for what it draws.
+                for (width, height, esc) in [
+                    (80, 24, "Esc close"),
+                    (200, 50, "Esc leave"),
+                    (40, 12, narrow),
+                    (200, 50, "Esc leave"),
+                    (80, 24, "Esc close"),
+                ] {
+                    assert!(app.on_terminal_event(Event::Resize(width, height)));
+                    first_status(&mut app, width, height, Some(esc));
+                    assert_eq!(app.focus, Focus::Details, "{width}x{height}");
+                }
+                // Esc closes the dialog and gives the keyboard back to the transcript, which had
+                // it before the click.
+                press(&mut app, KeyCode::Esc);
+                assert!(!app.details.open);
+                assert_eq!(app.focus, Focus::Transcript);
+                first_status(&mut app, 80, 24, None);
+
+                // Alt+B opens a dialog that takes the keyboard. A pane it turns into gives it
+                // back on its first frame, and a dialog takes it again.
+                alt(&mut app, 'b');
+                assert_eq!(app.focus, Focus::Details);
+                first_status(&mut app, 80, 24, Some("Esc close"));
+                assert!(app.on_terminal_event(Event::Resize(200, 50)));
+                first_status(&mut app, 200, 50, None);
+                assert_eq!(app.focus, Focus::Transcript);
+                assert!(app.on_terminal_event(Event::Resize(40, 12)));
+                first_status(&mut app, 40, 12, Some(narrow));
+                assert_eq!(app.focus, Focus::Details);
+                // Alt+B closes it, and the first frame after offers the transcript's keys.
+                alt(&mut app, 'b');
+                assert_eq!(app.focus, Focus::Transcript);
+                first_status(&mut app, 40, 12, None);
+                assert_eq!(app.composer.text(), "draft");
+            }
+        }
+    }
+
+    #[test]
+    fn the_first_frame_after_t3_changes_the_links_offers_the_keys_for_what_it_shows() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        // The pane, which a click gives the keyboard, then the dialog.
+        for (width, height, esc) in [(200, 50, "Esc leave"), (80, 24, "Esc close")] {
+            let size = format!("{width}x{height}");
+            let both = vec![linked(31, "Bound titles"), linked(32, "Lineage")];
+            let mut app = pulls_tui(both, false);
+            app.focus = Focus::Transcript;
+            cells(&mut app, width, height);
+            alt(&mut app, 'b');
+            cells(&mut app, width, height);
+            let drawn = app.details.drawn.expect("the details");
+            assert!(mouse(&mut app, CLICK, drawn.tabs[1].x, drawn.tabs[1].y));
+            assert_eq!(app.focus, Focus::Details);
+            let started = reads(&runtime);
+            // #32's details show, and the keys lead back to the list.
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            let status = first_status(&mut app, width, height, Some(esc));
+            assert!(status.contains("← list"), "{size}: {status:?}");
+            let mut builds = app.details.pulls.builds;
+
+            // The host syncs #32 as merged. A sync, a link and an unlink each reach the thread's
+            // watch as `thread.pull-request-synced` (apps/server/src/orchestration-v2/
+            // Orchestrator.ts:3188-3194 in the nightly), which carries the whole thread
+            // (packages/contracts/src/orchestrationV2.ts:1665-1672). #32's details still show,
+            // so the first frame after still offers the list.
+            let mut merged = linked(32, "Lineage");
+            merged["snapshot"]["state"] = json!("merged");
+            let synced = linked_thread(vec![linked(31, "Bound titles"), merged.clone()]);
+            app.on_thread_event(live(2, "thread.pull-request-synced", synced));
+            let status = first_status(&mut app, width, height, Some(esc));
+            assert!(status.contains("← list"), "{size}: {status:?}");
+            let text = details_after(&mut app, width, height);
+            assert!(text.contains("2 of 2"), "{size}: {text}");
+            assert!(text.contains("Merged"), "{size}: {text}");
+            // T3 unlinks #31, and the first frame still offers the list, where ← leads.
+            let unlinked = linked_thread(vec![merged]);
+            app.on_thread_event(live(3, "thread.pull-request-synced", unlinked));
+            let status = first_status(&mut app, width, height, Some(esc));
+            assert!(status.contains("← list"), "{size}: {status:?}");
+            let text = details_after(&mut app, width, height);
+            assert!(text.contains("1 of 1"), "{size}: {text}");
+            builds += 2;
+            assert_eq!(app.details.pulls.builds, builds, "{size}");
+            press(&mut app, KeyCode::Left);
+            assert!(!app.details.pulls.viewing(), "{size}");
+            assert_eq!(app.details.tab(), details::Tab::PullRequests, "{size}");
+
+            // T3 unlinks #32 while its details show, and links #31 again. The first frame after
+            // shows the list, and its keys say ← goes to the thread's tab, as it then does.
+            press(&mut app, KeyCode::Enter);
+            cells(&mut app, width, height);
+            let back = linked_thread(vec![linked(31, "Bound titles")]);
+            app.on_thread_event(live(4, "thread.pull-request-synced", back));
+            let status = first_status(&mut app, width, height, Some(esc));
+            assert!(status.contains("← thread"), "{size}: {status:?}");
+            assert!(!status.contains("← list"), "{size}: {status:?}");
+            assert!(!app.details.pulls.viewing(), "{size}");
+            let text = details_after(&mut app, width, height);
+            assert!(text.contains("#31 Bound titles"), "{size}: {text}");
+            assert!(!text.contains("← List"), "{size}: {text}");
+            builds += 1;
+            assert_eq!(app.details.pulls.builds, builds, "{size}");
+            press(&mut app, KeyCode::Left);
+            assert_eq!(app.details.tab(), details::Tab::Thread, "{size}");
+
+            // The environment stops linking pull requests to threads while #31's details show.
+            // The first frame after says so and offers the list's keys too.
+            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Enter);
+            let text = details_after(&mut app, width, height);
+            assert!(text.contains("1 of 1"), "{size}: {text}");
+            let off = json!({"threadPullRequests": false});
+            app.on_config_event(config_snapshot(Vec::new(), off));
+            let status = first_status(&mut app, width, height, Some(esc));
+            assert!(status.contains("← thread"), "{size}: {status:?}");
+            let text = details_after(&mut app, width, height);
+            assert!(text.contains("Linked pull requests unavailable"), "{text}");
+            assert!(!app.details.pulls.viewing(), "{size}");
+
+            // A ← that comes before the frame does what the last frame offered. With #31's
+            // details showing again, T3 unlinks it, and ← then leads to the list.
+            let on = json!({"threadPullRequests": true});
+            app.on_config_event(config_snapshot(Vec::new(), on));
+            cells(&mut app, width, height);
+            press(&mut app, KeyCode::Enter);
+            let text = details_after(&mut app, width, height);
+            assert!(text.contains("1 of 1"), "{size}: {text}");
+            let none = linked_thread(Vec::new());
+            app.on_thread_event(live(5, "thread.pull-request-synced", none));
+            press(&mut app, KeyCode::Left);
+            assert_eq!(app.details.tab(), details::Tab::PullRequests, "{size}");
+            let status = first_status(&mut app, width, height, Some(esc));
+            assert!(status.contains("← thread"), "{size}: {status:?}");
+            let text = details_after(&mut app, width, height);
+            assert!(text.contains("No linked pull requests"), "{size}: {text}");
+            builds += 3;
+            assert_eq!(app.details.pulls.builds, builds, "{size}");
+
+            // None of it moved the keyboard, touched the draft or asked T3 for anything.
+            assert_eq!(app.focus, Focus::Details, "{size}");
+            assert_eq!(app.composer.text(), "draft");
+            assert_eq!(reads(&runtime), started, "{size}");
+        }
+    }
+
+    #[test]
+    fn a_click_after_the_keys_or_the_wheel_lands_only_once_a_frame_shows_where_they_went() {
+        let links: Vec<Value> = (1..=20).map(|number| linked(number, "Change")).collect();
+        // The pane, then the dialog.
+        for (width, height) in [(200, 50), (80, 24)] {
+            let mut app = pulls_tui(links.clone(), false);
+            app.focus = Focus::Transcript;
+            cells(&mut app, width, height);
+            alt(&mut app, 'b');
+            cells(&mut app, width, height);
+            let drawn = app.details.drawn.expect("the details");
+            assert!(mouse(&mut app, CLICK, drawn.tabs[1].x, drawn.tabs[1].y));
+            assert_eq!(app.details.tab(), details::Tab::PullRequests);
+            assert_eq!(app.focus, Focus::Details);
+            cells(&mut app, width, height);
+            let drawn = app.details.drawn.expect("the details");
+            let (x, y) = (drawn.body.x + 1, drawn.body.y);
+            // The keys, a page and the wheel move the selection to the last link, past the
+            // ones the frame showed. Until a frame draws the list again, a click on its first
+            // row lands on nothing, rather than on the link that showed there.
+            for code in [KeyCode::Down, KeyCode::PageDown, KeyCode::End] {
+                press(&mut app, code);
+            }
+            assert!(mouse(&mut app, MouseEventKind::ScrollDown, x, y));
+            for _ in 0..2 {
+                mouse(&mut app, CLICK, x, y);
+            }
+            assert!(!app.details.pulls.viewing(), "{width}x{height}");
+            assert_eq!(app.focus, Focus::Details);
+            // So the last link is still selected, and Enter shows its details.
+            cells(&mut app, width, height);
+            press(&mut app, KeyCode::Enter);
+            let text = details_after(&mut app, width, height);
+            assert!(text.contains("20 of 20"), "{width}x{height}: {text}");
+
+            // Back on the list, a click on the first row the frame drew selects the link it
+            // shows, and a second after the next frame shows that link's details.
+            press(&mut app, KeyCode::Left);
+            let first = body_after(&mut app, width, height)[0].clone();
+            let title = first.trim_start_matches("● ").to_string();
+            assert!(title.starts_with('#'), "{first:?}");
+            assert!(mouse(&mut app, CLICK, x, y));
+            cells(&mut app, width, height);
+            assert!(mouse(&mut app, CLICK, x, y));
+            assert!(app.details.pulls.viewing());
+            let rows = body_after(&mut app, width, height);
+            assert_eq!(rows[1], title, "{width}x{height}");
+
+            // A resize may move the details, so no click lands until a frame draws them, on
+            // the row back to the list or on a tab.
+            assert!(app.on_terminal_event(Event::Resize(width, height)));
+            let drawn = app.details.drawn.expect("the details");
+            assert!(!mouse(&mut app, CLICK, x, y));
+            assert!(!mouse(&mut app, CLICK, drawn.tabs[0].x, drawn.tabs[0].y));
+            assert!(app.details.pulls.viewing());
+            assert_eq!(app.details.tab(), details::Tab::PullRequests);
+            cells(&mut app, width, height);
+            assert!(mouse(&mut app, CLICK, x, y));
+            assert!(!app.details.pulls.viewing());
+            assert_eq!(app.focus, Focus::Details);
+            assert_eq!(app.composer.text(), "draft");
+        }
+    }
+
+    #[test]
+    fn long_details_scroll_to_their_last_row_by_key_and_wheel_and_lead_back_to_the_list() {
+        let mut app = pulls_tui(vec![long_linked(32), long_linked(31)], false);
+        app.focus = Focus::Transcript;
+        cells(&mut app, 80, 24);
+        alt(&mut app, 'b');
+        press(&mut app, KeyCode::Right);
+        cells(&mut app, 80, 24);
+        // #31, the stack's bottom layer, comes first.
+        press(&mut app, KeyCode::Enter);
+        let text = details_after(&mut app, 80, 24);
+        for shown in ["← List", "1 of 2", "#31 A long title", " more ↓ "] {
+            assert!(text.contains(shown), "{shown:?} in {text}");
+        }
+        let drawn = app.details.drawn.expect("the dialog");
+        let (x, y) = (drawn.body.x + 1, drawn.body.y);
+        // The details end with the stack's note, which wraps to two rows here.
+        let last = "below it.";
+
+        // End and `G` reach the last row, and ↓ goes no further. The row back to the list
+        // stays on top. Home and `g` go back to the first row.
+        for (end, home) in [
+            (KeyCode::End, KeyCode::Home),
+            (KeyCode::Char('G'), KeyCode::Char('g')),
+        ] {
+            press(&mut app, end);
+            let rows = body_after(&mut app, 80, 24);
+            assert!(rows[0].starts_with("← List"), "{rows:#?}");
+            assert_eq!(rows.last().map(String::as_str), Some(last), "{rows:#?}");
+            press(&mut app, KeyCode::Down);
+            let rows = body_after(&mut app, 80, 24);
+            assert_eq!(rows.last().map(String::as_str), Some(last), "{rows:#?}");
+            press(&mut app, home);
+            let rows = body_after(&mut app, 80, 24);
+            assert!(rows[1].starts_with("#31 A long title"), "{rows:#?}");
+        }
+
+        // PageDown passes every row on the way: the URL as far as t3term keeps it, with a note
+        // that T3 sent more, the bot author and the watch.
+        let mut seen = Vec::new();
+        for _ in 0..10 {
+            seen.extend(body_after(&mut app, 80, 24));
+            press(&mut app, KeyCode::PageDown);
+        }
+        seen.extend(body_after(&mut app, 80, 24));
+        assert_eq!(seen.last().map(String::as_str), Some(last));
+        for shown in [
+            "Cut short: T3 sent a URL longer than the 2,048",
+            "renovate[bot] (bot)",
+            "Watching: the agent wakes when checks finish,",
+        ] {
+            let found = seen.iter().any(|row| row == shown);
+            assert!(found, "{shown:?} in {seen:#?}");
+        }
+
+        // The wheel reaches the last row too, from the top.
+        press(&mut app, KeyCode::Home);
+        let mut turns = 0;
+        while body_after(&mut app, 80, 24).last().map(String::as_str) != Some(last) {
+            assert!(mouse(&mut app, MouseEventKind::ScrollDown, x, y));
+            turns += 1;
+            assert!(turns < 200, "the wheel never reached the last row");
+        }
+
+        // The wheel moved the details, so a click on the row back to the list waits for the
+        // frame that draws them. After it, the click leads back to the list, with #31 still
+        // selected.
+        assert!(mouse(&mut app, MouseEventKind::ScrollUp, x, y));
+        assert!(!mouse(&mut app, CLICK, x, y));
+        assert!(app.details.pulls.viewing());
+        cells(&mut app, 80, 24);
+        assert!(mouse(&mut app, CLICK, x, y));
+        assert!(!app.details.pulls.viewing());
+        let rows = body_after(&mut app, 80, 24);
+        assert!(rows[0].starts_with("● #31 A long title"), "{rows:#?}");
+
+        // ↓ selects #32, whose details end with the watch's note. ← leads back to the list
+        // with #32 still selected, so Enter shows its details again.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::End);
+        let rows = body_after(&mut app, 80, 24);
+        assert!(rows[0].ends_with("2 of 2"), "{rows:#?}");
+        let end = "someone comments, or the branch conflicts";
+        assert_eq!(rows.last().map(String::as_str), Some(end), "{rows:#?}");
+        press(&mut app, KeyCode::Left);
+        assert!(!app.details.pulls.viewing());
+        press(&mut app, KeyCode::Enter);
+        let rows = body_after(&mut app, 80, 24);
+        assert!(rows[0].ends_with("2 of 2"), "{rows:#?}");
+        assert!(rows[1].starts_with("#32 A long title"), "{rows:#?}");
+        assert_eq!(app.composer.text(), "draft");
+    }
+
+    #[test]
+    fn a_scroll_after_end_or_past_the_end_wins_before_the_next_frame() {
+        // The pane, then the dialog.
+        for (width, height) in [(200, 50), (80, 24)] {
+            let size = format!("{width}x{height}");
+            let mut app = pulls_tui(vec![long_linked(32), long_linked(31)], false);
+            app.focus = Focus::Transcript;
+            cells(&mut app, width, height);
+            alt(&mut app, 'b');
+            cells(&mut app, width, height);
+            let drawn = app.details.drawn.expect("the details");
+            assert!(mouse(&mut app, CLICK, drawn.tabs[1].x, drawn.tabs[1].y));
+            assert_eq!(app.focus, Focus::Details);
+            cells(&mut app, width, height);
+            // ↓ selects #32, the stack's top layer, and Enter shows its details.
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            let top = body_after(&mut app, width, height);
+            assert!(top[0].ends_with("2 of 2"), "{size}: {top:#?}");
+            let drawn = app.details.drawn.expect("the details");
+            let (x, y) = (drawn.body.x + 1, drawn.body.y);
+
+            // What End shows, and what PageUp, ↑ and the wheel up show with a frame between End
+            // and them.
+            press(&mut app, KeyCode::End);
+            let bottom = body_after(&mut app, width, height);
+            press(&mut app, KeyCode::PageUp);
+            let page_up = body_after(&mut app, width, height);
+            press(&mut app, KeyCode::End);
+            cells(&mut app, width, height);
+            press(&mut app, KeyCode::Up);
+            let up = body_after(&mut app, width, height);
+            press(&mut app, KeyCode::End);
+            cells(&mut app, width, height);
+            assert!(mouse(&mut app, MouseEventKind::ScrollUp, x, y));
+            let wheel = body_after(&mut app, width, height);
+            assert_ne!(up, bottom, "{size}");
+            assert_ne!(page_up, up, "{size}");
+            assert_eq!(wheel, up, "{size}");
+
+            // With no frame between them, the key after End still moves from the last row.
+            press(&mut app, KeyCode::Home);
+            cells(&mut app, width, height);
+            press(&mut app, KeyCode::End);
+            press(&mut app, KeyCode::PageUp);
+            assert_eq!(body_after(&mut app, width, height), page_up, "{size}");
+            press(&mut app, KeyCode::Char('G'));
+            press(&mut app, KeyCode::Up);
+            assert_eq!(body_after(&mut app, width, height), up, "{size}");
+            press(&mut app, KeyCode::End);
+            assert!(mouse(&mut app, MouseEventKind::ScrollUp, x, y));
+            assert_eq!(body_after(&mut app, width, height), wheel, "{size}");
+            // Whichever of Home and End comes last wins.
+            press(&mut app, KeyCode::End);
+            press(&mut app, KeyCode::Home);
+            assert_eq!(body_after(&mut app, width, height), top, "{size}");
+            press(&mut app, KeyCode::Char('g'));
+            press(&mut app, KeyCode::End);
+            assert_eq!(body_after(&mut app, width, height), bottom, "{size}");
+
+            // PageDown from the top reaches the last row. ↓, PageDown and the wheel past it stop
+            // there, so ↑ and PageUp after them still move.
+            press(&mut app, KeyCode::Home);
+            let mut turns = 0;
+            while body_after(&mut app, width, height) != bottom {
+                press(&mut app, KeyCode::PageDown);
+                turns += 1;
+                assert!(turns < 50, "{size}: PageDown never reached the last row");
+            }
+            for _ in 0..5 {
+                press(&mut app, KeyCode::Down);
+                press(&mut app, KeyCode::PageDown);
+                assert!(mouse(&mut app, MouseEventKind::ScrollDown, x, y));
+            }
+            press(&mut app, KeyCode::Up);
+            assert_eq!(body_after(&mut app, width, height), up, "{size}");
+            for _ in 0..5 {
+                press(&mut app, KeyCode::PageDown);
+            }
+            press(&mut app, KeyCode::PageUp);
+            assert_eq!(body_after(&mut app, width, height), page_up, "{size}");
+
+            // Enter, End and ↑ before a frame first draws the details count from their last
+            // row too.
+            press(&mut app, KeyCode::Left);
+            assert!(!app.details.pulls.viewing());
+            cells(&mut app, width, height);
+            press(&mut app, KeyCode::Enter);
+            press(&mut app, KeyCode::End);
+            press(&mut app, KeyCode::Up);
+            assert_eq!(body_after(&mut app, width, height), up, "{size}");
+
+            // ← leads back to the list with #32 still selected, so Enter shows its details from
+            // their top.
+            press(&mut app, KeyCode::Left);
+            assert!(!app.details.pulls.viewing());
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(body_after(&mut app, width, height), top, "{size}");
+            assert_eq!(app.focus, Focus::Details);
+            assert_eq!(app.composer.text(), "draft");
+        }
+    }
+
+    #[test]
+    fn hostile_and_a_thousand_links_stay_inside_the_details_at_every_size() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let hostile = format!(
+            "\u{1b}]52;c;cHduZWQ=\u{7}\u{1b}[2J{}\r\nevil",
+            "👩\u{200d}💻e\u{301}名".repeat(20_000)
+        );
+        // Short enough in bytes to be read, and longer in characters than a row keeps.
+        let mut first = linked(1, &hostile);
+        first["repository"] = json!(format!("o/{}\u{9b}x", "漢".repeat(300)));
+        let url = format!("https://github.com/{}", "\u{1b}u".repeat(100_000));
+        first["url"] = json!(url);
+        first["snapshot"]["headBranch"] = json!(&hostile);
+        let mut links = vec![first];
+        links.extend((2..=1_200).map(|number| linked(number, "A change")));
+        for sidebar_hidden in [false, true] {
+            let mut app = pulls_tui(links.clone(), sidebar_hidden);
+            cells(&mut app, 200, 50);
+            alt(&mut app, 'b');
+            app.details.show(details::Tab::PullRequests);
+            // The list, then the first link's details in its place.
+            for viewing in [false, true] {
+                for (width, height) in [(200, 50), (120, 36), (80, 24), (40, 12)] {
+                    let buffer = cells(&mut app, width, height);
+                    let drawn = app.details.drawn.expect("drawn");
+                    assert_eq!(drawn.area.intersection(app.screen), drawn.area);
+                    for part in [drawn.close, drawn.tabs[0], drawn.tabs[1], drawn.body] {
+                        assert_eq!(part.intersection(drawn.area), part, "{width}x{height}");
+                    }
+                    // No cell on the screen holds a control character.
+                    for y in 0..height {
+                        for x in 0..width {
+                            let symbol = buffer[(x, y)].symbol();
+                            assert!(
+                                !symbol.contains(char::is_control),
+                                "{sidebar_hidden} {width}x{height} ({x}, {y}) {symbol:?}"
+                            );
+                        }
+                    }
+                    let text = details_text(&app, &buffer);
+                    assert!(text.contains("#1 "), "{width}x{height}: {text}");
+                    if viewing {
+                        assert!(text.contains("1 of 1000"), "{width}x{height}: {text}");
+                    }
+                    let whole = text_in(&buffer, buffer.area);
+                    assert!(!whole.contains("evil"), "{whole}");
+                }
+                app.details.toggle_pull();
+                assert_eq!(app.details.pulls.viewing(), !viewing);
+            }
+            // The links were read once for every frame at every size, a thousand of them.
+            assert_eq!(app.details.pulls.builds, 1);
+            assert_eq!(app.details.pulls.count(), Some(1_000));
+            assert_eq!(app.composer.text(), "draft");
+        }
+        assert_eq!(reads(&runtime), 0);
+    }
+
+    #[test]
+    fn only_news_of_the_thread_works_its_links_out_and_another_thread_starts_fresh() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = pulls_tui(vec![linked(31, "Bound titles")], false);
+        // Closed, the details read no links, whatever comes.
+        cells(&mut app, 200, 50);
+        let more = linked_thread(vec![linked(31, "Bound titles"), linked(33, "Later")]);
+        app.on_thread_event(live(2, "thread.meta-updated", more));
+        cells(&mut app, 200, 50);
+        assert_eq!(app.details.pulls.builds, 0);
+        let started = reads(&runtime);
+
+        alt(&mut app, 'b');
+        app.details.show(details::Tab::PullRequests);
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("#33 Later"), "{text}");
+        assert!(text.contains("Pull requests 2"), "{text}");
+        assert_eq!(app.details.pulls.builds, 1);
+        // Frames, an answer streaming in and news of another thread read nothing again.
+        for _ in 0..3 {
+            cells(&mut app, 200, 50);
+        }
+        let answer = json!({"id": "a20", "type": "assistant_message", "ordinal": 20,
+            "text": "Done"});
+        app.on_thread_event(live(3, "turn-item.updated", answer));
+        let other = bound("u", "q", json!("/repo/other-wt"), Value::Null);
+        app.on_shell_event(thread_updated(3, other));
+        cells(&mut app, 200, 50);
+        assert_eq!(app.details.pulls.builds, 1);
+
+        // The thread's watch drops a link, and the list follows.
+        app.focus = Focus::Details;
+        press(&mut app, KeyCode::Down);
+        let fewer = linked_thread(vec![linked(31, "Bound titles")]);
+        app.on_thread_event(live(4, "thread.meta-updated", fewer));
+        let text = details_after(&mut app, 200, 50);
+        assert!(!text.contains("#33"), "{text}");
+        assert!(text.contains("#31"), "{text}");
+        assert!(text.contains("Pull requests 1"), "{text}");
+        assert_eq!(app.details.pulls.builds, 2);
+
+        // Another thread starts at its own list, and late news of `t` never brings its links
+        // back.
+        app.open_thread(OpenThread::new("u".into(), mpsc::unbounded_channel().1));
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("No linked pull requests"), "{text}");
+        assert!(!text.contains("#31"), "{text}");
+        assert!(!text.contains("Pull requests 1"), "{text}");
+        let late = linked_thread(vec![linked(34, "Stale")]);
+        app.on_shell_event(thread_updated(4, late.clone()));
+        let stale = json!({"kind": "snapshot", "snapshotSequence": 3,
+            "projection": {"thread": late, "turnItems": []}});
+        app.on_thread_event(WatchEvent::Item(stale));
+        let after = details_after(&mut app, 200, 50);
+        assert_eq!(after, text);
+        assert_eq!(app.composer.text(), "draft");
+        assert_eq!(reads(&runtime), started);
+        assert!(!needs_tick(app.open.as_ref(), &app.sidebar));
+    }
+
+    #[test]
+    fn the_links_wait_for_the_thread_and_need_an_environment_that_links_them() {
+        // The environment's capabilities lack `threadPullRequests`, so the list is unavailable
+        // and counts nothing, whatever the thread holds.
+        let mut app = details_tui();
+        let thread = linked_thread(vec![linked(31, "Bound titles")]);
+        app.on_shell_event(thread_updated(2, thread.clone()));
+        app.open_thread(open_bound(thread));
+        cells(&mut app, 200, 50);
+        alt(&mut app, 'b');
+        app.details.show(details::Tab::PullRequests);
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Linked pull requests unavailable"), "{text}");
+        assert!(!text.contains("Pull requests 1"), "{text}");
+        assert!(!text.contains("#31"), "{text}");
+
+        // A thread neither the shell nor its watch has sent is loading until its watch closes.
+        let mut app = pulls_tui(Vec::new(), false);
+        cells(&mut app, 200, 50);
+        alt(&mut app, 'b');
+        app.details.show(details::Tab::PullRequests);
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("No linked pull requests"), "{text}");
+        app.open_thread(OpenThread::new("v".into(), mpsc::unbounded_channel().1));
+        assert!(details_after(&mut app, 200, 50).contains("Loading…"));
+        app.on_thread_event(WatchEvent::Failed("thread closed".into()));
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Unavailable"), "{text}");
+        assert!(!text.contains("Loading"), "{text}");
+    }
+
     // ---- lineage ----
 
     /// Thread `id` in Demo, a fork or a subagent of thread `parent` by `relationship`.
@@ -11101,8 +12097,17 @@ mod tests {
     /// projection has agent `s1` on `a`, and `s2`, done, on a thread the shell doesn't list.
     /// The composer has a draft with its cursor before the last letter.
     fn lineage_tui() -> App {
+        lineage_on(tui(&Settings::default()), None)
+    }
+
+    /// `lineage_tui` built on `app`, with `t` linked to the pull requests `links` when there
+    /// are any.
+    fn lineage_on(mut app: App, links: Option<Vec<Value>>) -> App {
         let mut current = feature_thread();
         current["lineage"] = json!({"parentThreadId": "up", "relationshipToParent": "fork"});
+        if let Some(links) = links {
+            current["pullRequests"] = json!(links);
+        }
         let mut agent = related("a", "t", "subagent");
         agent["activityRunStatus"] = json!("running");
         let threads = vec![
@@ -11111,7 +12116,6 @@ mod tests {
             related("f", "t", "fork"),
             agent,
         ];
-        let mut app = tui(&Settings::default());
         app.on_shell_event(details_shell(threads));
         app.on_shell_event(caught_up());
         app.open_thread(open_bound(current));
@@ -11927,6 +12931,169 @@ mod tests {
                 assert_eq!(open_id(&batched), Some("t"), "{dialog} {name}");
                 assert_eq!(batched.composer.text(), "draft", "{dialog} {name}");
             }
+        }
+    }
+
+    // ---- Lineage beside the linked pull requests ----
+
+    /// `lineage_tui` on an environment that links pull requests to threads, with `t` linked to
+    /// #31 and #32 and five more forks of `t`, `g0` to `g4`, so its text scrolls on a screen 24
+    /// rows tall.
+    fn lineage_pulls_tui() -> App {
+        let mut client = Client::offline();
+        client.runtime.capabilities = json!({"threadPullRequests": true});
+        let mut app = App::new(
+            Arc::new(client),
+            Theme::new(Depth::TrueColor),
+            &Settings::default(),
+            mpsc::unbounded_channel().0,
+        );
+        // A thread with a worktree subscribes to its setup, which here sends nothing.
+        app.watch_setup = Box::new(|_: &str| mpsc::unbounded_channel().1);
+        let links = vec![linked(31, "Bound titles"), linked(32, "Lineage")];
+        let mut app = lineage_on(app, Some(links));
+        for i in 0..5_u64 {
+            let fork = related(&format!("g{i}"), "t", "fork");
+            app.on_shell_event(thread_updated(2 + i, fork));
+        }
+        app
+    }
+
+    #[test]
+    fn lineage_and_the_linked_pull_requests_keep_their_place_on_their_own_tabs() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        // The work a frame or an event can do for the details.
+        let counts = |app: &App| {
+            let details = &app.details;
+            let builds = details.pulls.builds;
+            (
+                details.prepares,
+                details.wraps,
+                details.lineage_prepares,
+                builds,
+            )
+        };
+        for dialog in [false, true] {
+            let (width, height) = if dialog { (80, 24) } else { (200, 24) };
+            let esc = if dialog { "Esc close" } else { "Esc leave" };
+            let mut app = lineage_pulls_tui();
+            if dialog {
+                as_dialog(&mut app);
+            }
+            let started = reads(&runtime);
+            let scrolled = app.scroll.rows();
+
+            // ↓ chooses Lineage's rows until one under the first screen of text scrolls into
+            // view.
+            let top = details_after(&mut app, width, height);
+            assert!(top.contains("Lineage · 1 running"), "{dialog}: {top}");
+            let mut presses = 0;
+            let (id, reading) = loop {
+                press(&mut app, KeyCode::Down);
+                presses += 1;
+                let text = details_after(&mut app, width, height);
+                if text != top {
+                    let Some(lineage::Target::Thread(id)) = app.details.selected().cloned() else {
+                        panic!("{dialog}: no thread chosen after {presses} presses");
+                    };
+                    break (id, text);
+                }
+                assert!(presses < 8, "{dialog}: the text never scrolled");
+            };
+            assert!(
+                id == "f" || id.starts_with('g'),
+                "{dialog}: {id} is no fork"
+            );
+            let chosen = Some(lineage::Target::Thread(id.clone()));
+            let area = app.details.drawn.expect("the details").area;
+            let x = area.x + area.width / 2;
+            let y = (area.y..area.bottom())
+                .find(|&y| app.details.target_at(x, y) == chosen)
+                .expect("the chosen row in view");
+            let status = first_status(&mut app, width, height, Some(esc));
+            assert!(status.contains("Enter open fork"), "{dialog}: {status}");
+            let before = counts(&app);
+
+            // → shows the pull requests. Until a frame draws them, the chosen row's cell takes
+            // no click, and the first frame offers the list's keys.
+            press(&mut app, KeyCode::Right);
+            assert_eq!(app.details.tab(), details::Tab::PullRequests, "{dialog}");
+            assert_eq!(app.details.target_at(x, y), None, "{dialog}");
+            assert!(!mouse(&mut app, CLICK, x, y), "{dialog}");
+            assert_eq!(open_id(&app), Some("t"), "{dialog}");
+            let status = first_status(&mut app, width, height, Some(esc));
+            assert!(status.contains("← thread"), "{dialog}: {status}");
+            let text = details_after(&mut app, width, height);
+            for shown in ["#31 Bound titles", "#32 Lineage"] {
+                assert!(text.contains(shown), "{dialog}: {shown:?} in {text}");
+            }
+            assert!(!text.contains(&format!("Thread {id}")), "{dialog}: {text}");
+            assert_eq!(app.details.target_at(x, y), None, "{dialog}");
+
+            // ↓ and Enter show #32's details, and Enter acts on no Lineage row.
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            assert!(app.details.pulls.viewing(), "{dialog}");
+            assert_eq!(open_id(&app), Some("t"), "{dialog}");
+            let status = first_status(&mut app, width, height, Some(esc));
+            assert!(status.contains("← list"), "{dialog}: {status}");
+            let text = details_after(&mut app, width, height);
+            for shown in ["← List", "2 of 2", "#32 Lineage"] {
+                assert!(text.contains(shown), "{dialog}: {shown:?} in {text}");
+            }
+
+            // ← goes back to the list, and `h` to the Thread tab. Until a frame draws it, a
+            // click on the chosen row does nothing. Then the text, the choice and the row's
+            // cell are where they were, and the first frame says what Enter does.
+            press(&mut app, KeyCode::Left);
+            press(&mut app, KeyCode::Char('h'));
+            assert_eq!(app.details.tab(), details::Tab::Thread, "{dialog}");
+            assert_eq!(app.details.target_at(x, y), None, "{dialog}");
+            assert!(!mouse(&mut app, CLICK, x, y), "{dialog}");
+            assert_eq!(open_id(&app), Some("t"), "{dialog}");
+            let status = first_status(&mut app, width, height, Some(esc));
+            assert!(status.contains("Enter open fork"), "{dialog}: {status}");
+            assert_eq!(details_after(&mut app, width, height), reading, "{dialog}");
+            assert_eq!(app.details.selected(), chosen.as_ref(), "{dialog}");
+            assert_eq!(app.details.target_at(x, y), chosen, "{dialog}");
+
+            // The pull requests kept their place too, with #32 selected.
+            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Enter);
+            let text = details_after(&mut app, width, height);
+            assert!(text.contains("2 of 2"), "{dialog}: {text}");
+            press(&mut app, KeyCode::Left);
+            press(&mut app, KeyCode::Left);
+            assert_eq!(details_after(&mut app, width, height), reading, "{dialog}");
+            // None of it worked the facts, Lineage or the links out again, wrapped the text,
+            // moved the transcript, touched the draft or asked T3 for anything.
+            assert_eq!(counts(&app), before, "{dialog}");
+            assert_eq!(app.scroll.rows(), scrolled, "{dialog}");
+            assert_eq!(app.composer.text(), "draft", "{dialog}");
+            assert_eq!(reads(&runtime), started, "{dialog}");
+
+            // Enter on the pane, or a click on the dialog, opens the chosen fork with one
+            // watch. The details keep the keyboard and the Thread tab, the sidebar highlights
+            // the fork, and the draft keeps its cursor.
+            if dialog {
+                assert!(mouse(&mut app, CLICK, x, y), "{dialog}");
+            } else {
+                press(&mut app, KeyCode::Enter);
+            }
+            assert_eq!(open_id(&app), Some(id.as_str()), "{dialog}");
+            assert_eq!(reads(&runtime), started + 1, "{dialog}");
+            assert_eq!(app.focus, Focus::Details, "{dialog}");
+            assert_eq!(app.details.tab(), details::Tab::Thread, "{dialog}");
+            assert_eq!(
+                app.sidebar.selected_thread_id(),
+                Some(id.as_str()),
+                "{dialog}"
+            );
+            press(&mut app, KeyCode::Esc);
+            app.focus = Focus::Composer;
+            press(&mut app, KeyCode::Char('x'));
+            assert_eq!(app.composer.text(), "drafxt", "{dialog}");
         }
     }
 
