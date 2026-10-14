@@ -187,8 +187,8 @@ mod tests {
     fn a_key_with_an_unpaired_half_is_refused_rather_than_renamed() {
         let frames = [
             r#"{"\ud83d":1}"#,
-            // Both would become U+FFFD, and so would collide with each other or a key that
-            // already is.
+            // Each would become U+FFFD and collide, with the other or with a key that already
+            // is U+FFFD.
             r#"{"\ud83d":1,"\udbff":2}"#,
             r#"{"\ufffd":1,"\ude42":2}"#,
             // A value t3term would repair before a key with whitespace before its colon.

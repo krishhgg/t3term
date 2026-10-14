@@ -16,12 +16,12 @@ while let Some(chunk) = stream.next().await {
 
 `StreamLimits::new(chunks, bytes)` caps what the stream holds that the caller hasn't accepted. A chunk counts from the moment the reader queues it until the caller accepts or drops it, whether it waits in the stream or the caller holds it. `new` returns `None` if either limit is zero. A sum too big for `usize` counts as over the limit.
 
-A chunk's size, `BoundedChunk::bytes`, is the length of its whole `Chunk` message, `{"_tag":"Chunk","requestId":"7","values":[...]}`, as compact UTF-8 JSON. T3's terminal output window measures a chunk the same way, as `Buffer.byteLength(JSON.stringify(response))` in `apps/server/src/terminal/OutputProtocol.ts`. t3term has serde_json write the message into a counter that keeps nothing and stops at the byte limit, so sizing a chunk takes no second copy of it. serde_json writes strings and integers as JSON.stringify does, but can write a float with an exponent differently, such as `1e21` for `1e+21`.
+A chunk's size, `BoundedChunk::bytes`, is the length of its whole `Chunk` message, `{"_tag":"Chunk","requestId":"7","values":[...]}`, as compact UTF-8 JSON. T3's terminal output window measures a chunk the same way, as `Buffer.byteLength(JSON.stringify(response))` in `apps/server/src/terminal/OutputProtocol.ts`. t3term has serde_json write the message into a counter that keeps nothing and stops at the byte limit, so sizing a chunk takes no second copy of it. serde_json writes strings and integers as JSON.stringify does, but can write a float with an exponent differently, such as `1e21` for `1e+21`. Half a surrogate pair counts differently too: T3 counts its 6-byte escape, such as `\ud83d`, and t3term counts the 3 bytes of the U+FFFD it reads in its place.
 
 ## What the limits don't bound
 
 - Memory. A parsed `serde_json::Value` takes more room than its JSON, so the byte limit isn't a limit on the heap or the process.
-- Reading. The connection's reader decodes each WebSocket message whole before it routes the chunks in it. t3term keeps tungstenite 0.28's defaults, which allow a message of up to 64 MiB in frames of up to 16 MiB. A chunk over the byte limit still costs its full decode before t3term refuses it.
+- Reading. The connection's reader decodes each WebSocket message whole before it routes the chunks in it. t3term keeps tungstenite 0.28's defaults, which allow a message of up to 64 MiB in frames of up to 16 MiB. A chunk over the byte limit still costs its full decode before t3term refuses it. A frame serde_json refuses for half a surrogate pair costs one copy of the frame, and a second parse of it.
 - Accepted values. Once the caller accepts a chunk, bounding its values is up to the caller.
 
 ## Accepting a chunk
@@ -44,6 +44,7 @@ An end never needs room in the stream, so it reaches a full one. However a strea
 | The connection closes or goes silent | `RpcError::Disconnected` |
 | A `Chunk` without a `values` array | `RpcError::Protocol` |
 | A chunk over a limit, or a chunk dropped unaccepted | `RpcError::Stopped` with the reason |
+| A frame t3term can't parse, which also ends the connection | `RpcError::Protocol` |
 
 t3term forgets a request as soon as its stream ends, however it ends, so the requests it tracks don't build up over a long session.
 
@@ -66,6 +67,12 @@ These notes are from T3 Code at commit `f570bd2`, nightly v0.0.46-nightly.202610
 `withTerminalOutputWindow` in `OutputProtocol.ts` covers `terminal.attach` and `subscribeTerminalEvents`. It doesn't cover `terminal.observe`. For those two, T3 acks its own server for each chunk while the client has fewer than 8 chunks and fewer than 64 KiB unacked. Once either is reached, T3 waits for the client's Ack. So T3 leaves at most 8 chunks unacked, and under 64 KiB plus the size of the last one. Limits of at least 8 chunks, and 64 KiB plus the largest chunk the caller expects, won't stop a stream T3 sends normally. T3 doesn't cap the size of a single chunk.
 
 On any other stream, Effect's server waits for an Ack after each chunk, so one chunk at most is unacked.
+
+## Half a surrogate pair
+
+T3 keeps the first 128 UTF-16 code units of a terminal's label, in `truncateTerminalWireLabel` in `apps/server/src/terminal/Manager.ts`, so a label can end with the high half of an emoji's pair. The label goes out in the snapshot a terminal stream starts with and in each `activity` event, and JSON.stringify writes the half as an escape such as `\ud83d`. A Rust string can't hold half a pair, so serde_json refuses the whole frame. Before this change, t3term passed over the frame, so a chunk in it was never acked and kept one of T3's 8 slots for good.
+
+Now t3term parses such a frame again with U+FFFD in place of each half in a string value, and the chunk arrives and is acked as any other. The half itself is lost. A half in an object's key stays refused, since two keys could become one. A frame t3term still can't parse ends the connection, and every call and stream on it ends with `RpcError::Protocol`. Nothing in that frame is acked. `src/rpc/json.rs` has the details.
 
 ## Out of scope
 

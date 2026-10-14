@@ -1386,3 +1386,175 @@ async fn a_bounded_stream_keeps_its_socket_open_and_a_chunk_it_returned_does_not
     assert_eq!(before_close(&mut socket).await, [interrupt(&id)]);
     assert_eq!(b.accept(), [json!("b")]);
 }
+
+// ---- frames with half a surrogate pair, and frames t3term can't parse ----
+
+/// Stands for the high half of 🙂 on its own in a value the test builds with `json!`, which
+/// can't write one. [`as_t3_writes`] puts in the escape JSON.stringify writes for it.
+const HALF: &str = "<half>";
+/// Stands for 🙂 written as the escapes of both its halves.
+const PAIR: &str = "<pair>";
+
+/// `value` as text, with each `HALF` and `PAIR` written as escapes.
+fn as_t3_writes(value: Value) -> String {
+    let text = value.to_string();
+    text.replace(HALF, r"\ud83d").replace(PAIR, r"\ud83d\ude42")
+}
+
+/// The label T3 sends for a terminal running a command of 127 x's and 🙂. Its
+/// `truncateTerminalWireLabel` keeps the first 128 UTF-16 code units, which end with 🙂's
+/// high half.
+fn cut_label() -> String {
+    format!("{}{HALF}", "x".repeat(127))
+}
+
+/// That label as t3term reads it.
+fn read_label() -> String {
+    format!("{}\u{fffd}", "x".repeat(127))
+}
+
+/// An event of `kind` on terminal term-1, with the fields of `rest`.
+fn terminal_event(kind: &str, sequence: u64, rest: Value) -> Value {
+    let mut event = json!({"type": kind, "threadId": "t1", "terminalId": "term-1",
+        "sequence": sequence});
+    event
+        .as_object_mut()
+        .unwrap()
+        .extend(rest.as_object().unwrap().clone());
+    event
+}
+
+/// T3 cuts a terminal's label inside a surrogate pair, both in the snapshot a terminal stream
+/// starts with and in each activity event. t3term reads the half left over as U+FFFD, and
+/// each chunk arrives and is acked once its caller accepts it, as any other is. T3 sends up
+/// to 8 chunks before it waits for an Ack, and a full window of them all arrive.
+#[tokio::test]
+async fn a_terminal_label_cut_inside_a_pair_arrives_and_each_chunk_is_acked_when_accepted() {
+    let (rpc, mut socket) = connected().await;
+    let (mut stream, id) = open(&rpc, &mut socket, limits(8, 64 * 1024)).await;
+    let session = json!({"threadId": "t1", "terminalId": "term-1", "cwd": "/tmp",
+        "status": "running", "history": "$ ", "label": cut_label(), "sequence": 1});
+    let snapshot = json!({"type": "snapshot", "snapshot": session});
+    let output = terminal_event("output", 2, json!({"data": format!("{PAIR} ok")}));
+    send_text(
+        &mut socket,
+        as_t3_writes(chunk(&id, json!([snapshot, output]))),
+    )
+    .await;
+    let first = next_chunk(&mut stream).await;
+    nothing_sent(&rpc, &mut socket).await;
+    let values = first.accept();
+    assert_eq!(values[0]["snapshot"]["label"], read_label());
+    assert_eq!(values[1]["data"], "🙂 ok");
+    assert_eq!(sent(&rpc, &mut socket).await, [ack(&id)]);
+
+    for sequence in 3..11 {
+        let activity = json!({"hasRunningSubprocess": true, "label": cut_label()});
+        let activity = terminal_event("activity", sequence, activity);
+        send_text(&mut socket, as_t3_writes(chunk(&id, json!([activity])))).await;
+    }
+    for sequence in 3..11 {
+        let values = accept_next(&mut stream).await;
+        assert_eq!(values[0]["sequence"], sequence);
+        assert_eq!(values[0]["label"], read_label());
+    }
+    assert_eq!(sent(&rpc, &mut socket).await, vec![ack(&id); 8]);
+
+    // With every Ack in, T3 sends more output, and it arrives too.
+    let output = terminal_event("output", 11, json!({"data": "done"}));
+    send(&mut socket, chunk(&id, json!([output.clone()]))).await;
+    assert_eq!(accept_next(&mut stream).await, [output]);
+    assert_eq!(sent(&rpc, &mut socket).await, [ack(&id)]);
+}
+
+/// One frame can batch messages for several requests, and a half can sit in any string value
+/// in them. t3term reads every message in the frame: a legacy stream gets its item and acks
+/// it on arrival, and a call gets its answer. Each half becomes U+FFFD, while a pair, and a
+/// backslash written before `ud83d`, stay as they were.
+#[tokio::test]
+async fn every_message_in_a_frame_with_half_a_pair_reaches_its_request() {
+    let (rpc, mut socket) = connected().await;
+    let mut legacy = rpc.stream(LEGACY, json!({})).await.unwrap();
+    let legacy_id = within(recv(&mut socket)).await["id"].clone();
+    let held = rpc.clone();
+    let calling =
+        tokio::spawn(async move { held.call(CALL, json!({}), Duration::from_secs(5)).await });
+    let call_id = within(recv(&mut socket)).await["id"].clone();
+
+    let value = json!({"title": format!("{PAIR}{HALF}"), "path": r"C:\ud83d",
+        "items": [HALF, {"nested": [1, format!("a{HALF}b"), true, null]}]});
+    let exit = json!({"_tag": "Success", "value": value.clone()});
+    let answer = json!({"_tag": "Exit", "requestId": call_id, "exit": exit});
+    let frame = json!([chunk(&legacy_id, json!([value])), answer]);
+    send_text(&mut socket, as_t3_writes(frame)).await;
+
+    let read = json!({"title": "🙂\u{fffd}", "path": r"C:\ud83d",
+        "items": ["\u{fffd}", {"nested": [1, "a\u{fffd}b", true, null]}]});
+    assert_eq!(within(recv(&mut socket)).await, ack(&legacy_id));
+    assert_eq!(within(legacy.next()).await.unwrap().unwrap(), read);
+    assert_eq!(within(calling).await.unwrap().unwrap(), read);
+}
+
+/// t3term can't tell which request a frame it can't parse was for, or what the frame held,
+/// so the frame ends the connection. A call, a legacy stream and a bounded stream waiting on
+/// it end with `RpcError::Protocol` at once, rather than when T3 or a timeout ends them, and
+/// the reason says where serde_json stopped, not what the frame held. t3term acks nothing,
+/// and T3 reads nothing more from it but the Close frame. That holds for bad hex in an
+/// escape, for a half t3term could replace in a frame with more after its end, and for a
+/// half in an object's key, which t3term refuses rather than rename.
+#[tokio::test]
+async fn a_frame_t3term_cannot_parse_ends_every_call_and_stream_with_a_protocol_error() {
+    let frames = [
+        r#"{"_tag":"Chunk","requestId":<id>,"values":["secret \uZZZZ"]}"#,
+        r#"{"_tag":"Chunk","requestId":<id>,"values":["secret \ud83d"]} x"#,
+        r#"{"_tag":"Chunk","requestId":<id>,"values":[{"secret \ud83d":1}]}"#,
+    ];
+    for frame in frames {
+        let (rpc, mut socket) = connected().await;
+        let (mut bounded, bounded_id) = open(&rpc, &mut socket, limits(4, 4096)).await;
+        let mut legacy = rpc.stream(LEGACY, json!({})).await.unwrap();
+        let legacy_id = within(recv(&mut socket)).await["id"].clone();
+        let held = rpc.clone();
+        let calling =
+            tokio::spawn(async move { held.call(CALL, json!({}), Duration::from_secs(60)).await });
+        assert_eq!(within(recv(&mut socket)).await["tag"], CALL);
+        send(&mut socket, chunk(&bounded_id, json!(["queued"]))).await;
+        // A chunk for the legacy stream, which acks each chunk it reads.
+        let frame = frame.replace("<id>", &legacy_id.to_string());
+        send_text(&mut socket, frame.clone()).await;
+
+        let reason = match within(calling).await.unwrap() {
+            Err(RpcError::Protocol(reason)) => reason,
+            other => panic!("{frame}: expected a protocol error, got {other:?}"),
+        };
+        assert!(
+            reason.starts_with("t3term couldn't parse a frame as JSON ("),
+            "{reason}"
+        );
+        assert!(!reason.contains("secret"), "{reason}");
+        let ended = within(legacy.next()).await;
+        assert!(
+            matches!(ended, Some(Err(RpcError::Protocol(_)))),
+            "{ended:?}"
+        );
+        assert!(within(legacy.next()).await.is_none());
+        // The bounded stream returns the chunk queued before the frame, then the error.
+        let queued = next_chunk(&mut bounded).await;
+        assert!(matches!(
+            ended_with(&mut bounded).await,
+            RpcError::Protocol(_)
+        ));
+        assert!(end(&mut bounded).await.is_none());
+
+        // The connection is gone, so a later call fails at once, and accepting the chunk
+        // after the end sends nothing.
+        assert!(rpc.is_closed());
+        let later = rpc.call(CALL, json!({}), Duration::from_secs(60));
+        assert!(matches!(
+            within(later).await,
+            Err(RpcError::Disconnected(_))
+        ));
+        assert_eq!(queued.accept(), [json!("queued")]);
+        assert_eq!(before_close(&mut socket).await, Vec::<Value>::new());
+    }
+}
