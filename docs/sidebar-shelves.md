@@ -1,6 +1,6 @@
 # Sidebar shelves
 
-This page records how t3term lays out the sidebar's shelves and where it differs from the desktop app. The desktop source it follows is T3 nightly f570bd2, mostly `apps/web/src/components/Sidebar.tsx`.
+This page records how t3term lays out the sidebar's shelves and where it differs from the desktop app. The desktop source it follows is T3 nightly f570bd2, mostly `apps/web/src/components/Sidebar.tsx`. [Sidebar shelves verification](sidebar-shelves-verification.md) records how GPT-6.1 Sol checked the shelves against a fake server, and [this capture](screenshots/sidebar-shelves.png) shows them at 120x36 in 256 colors.
 
 ## The shelves
 
