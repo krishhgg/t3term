@@ -2450,3 +2450,674 @@ fn environments_are_saved_listed_renamed_and_removed_without_a_server() {
     let text = std::fs::read_to_string(home.environments_path()).unwrap();
     assert_eq!(text, r#"{"default": "#);
 }
+
+/// Projects on the fake servers `launch` reaches. B and C share the prefix b8f4.
+const PROJECT_A: &str = "a7e3c1f9-5b2d-4e6a-8c0f-1d9b3e7a5c42";
+const PROJECT_B: &str = "b8f4d2a0-6c3e-4f7b-9d1a-2e0c4f8b6d53";
+const PROJECT_C: &str = "b8f4e9c1-7d4f-4a8c-8e2b-3f1d5a9c7e64";
+const LAUNCH: &str = "orchestration.launchThread";
+/// Why the fake's worktrees fail to prepare.
+const PREPARATION_FAILURE: &str = "fatal: invalid reference: no-such-branch";
+/// A made-up launch failure that holds an Esc sequence, BEL, a C1 CSI and DEL.
+const LAUNCH_FAILURE: &str = "Failed to launch thread\u{1b}[2J\u{7}\u{9b}31m\u{7f}";
+
+/// A fake T3 server for `launch`.
+struct LaunchServer {
+    origin: String,
+    /// Every path requested, the WebSocket's included.
+    paths: Arc<Mutex<Vec<String>>>,
+    /// Every Effect RPC request sent on its WebSockets.
+    requests: Arc<Mutex<Vec<Value>>>,
+}
+
+impl LaunchServer {
+    /// The payloads of the launches t3term sent, in order.
+    fn launches(&self) -> Vec<Value> {
+        let requests = self.requests.lock().unwrap();
+        let launches = requests.iter().filter(|request| request["tag"] == LAUNCH);
+        launches.map(|request| request["payload"].clone()).collect()
+    }
+
+    /// How many WebSockets t3term opened.
+    fn sockets(&self) -> usize {
+        let paths = self.paths.lock().unwrap();
+        paths.iter().filter(|path| path.starts_with("/ws?")).count()
+    }
+}
+
+/// One project titled `title`.
+fn launch_projects(id: &str, title: &str) -> Value {
+    json!([{"id": id, "title": title, "workspaceRoot": "/work/project"}])
+}
+
+/// Serves environment `environment_id` to `launch` on protocol 2: a shell that lists
+/// `projects`, a WebSocket ticket, and `server.getConfig` with one Claude model and `settings`.
+/// It answers `orchestration.launchThread` with the exit `answer` gives for the request's
+/// payload, or closes the socket unanswered when that is None. A thread whose launch it accepted
+/// is then served to `read` and `wait` with its workspace failed to prepare.
+fn serve_launch_environment(
+    environment_id: &str,
+    projects: Value,
+    settings: Value,
+    answer: impl Fn(&Value) -> Option<Value> + Send + Sync + 'static,
+) -> LaunchServer {
+    let mut descriptor = protocol_2_descriptor();
+    descriptor["environmentId"] = json!(environment_id);
+    let shell = json!({"projects": projects, "threads": []});
+    let model = json!({"slug": "claude-opus-5-5", "name": "Opus 5.5",
+        "capabilities": {"optionDescriptors": []}});
+    let claude = json!({"instanceId": "claudeAgent", "displayName": "Claude", "enabled": true,
+        "status": "ready", "models": [model]});
+    let config = json!({"providers": [claude], "settings": settings});
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let kept = requests.clone();
+    // The snapshots of the threads launched, by the paths `read` and `wait` ask for them on.
+    let threads: Arc<Mutex<std::collections::HashMap<String, Value>>> = Arc::default();
+    let launched_threads = threads.clone();
+    let on_socket = move |mut socket: Socket| {
+        while let Some(request) = next_request(&mut socket) {
+            kept.lock().unwrap().push(request.clone());
+            let exit = if request["tag"] == "server.getConfig" {
+                json!({"_tag": "Success", "value": config.clone()})
+            } else if request["tag"] == LAUNCH {
+                let payload = &request["payload"];
+                let Some(exit) = answer(payload) else {
+                    return;
+                };
+                if exit["_tag"] == "Success" {
+                    let path = format!("/api/orchestration/threads/{}", text(&payload["threadId"]));
+                    let snapshot = preparation_failed(payload);
+                    let mut threads = launched_threads.lock().unwrap();
+                    threads.insert(format!("{path}/bounded"), snapshot.clone());
+                    threads.insert(path, snapshot);
+                }
+                exit
+            } else {
+                continue;
+            };
+            let id = request["id"].clone();
+            reply(
+                &mut socket,
+                json!({"_tag": "Exit", "requestId": id, "exit": exit}),
+            );
+        }
+    };
+    let (origin, paths) = serve_sockets(
+        move |path| match path {
+            "/.well-known/t3/environment" => Some(descriptor.clone()),
+            "/api/orchestration/shell" => Some(shell.clone()),
+            "/api/auth/websocket-ticket" => Some(json!({"ticket": "ticket-test"})),
+            _ => threads.lock().unwrap().get(path).cloned(),
+        },
+        on_socket,
+    );
+    LaunchServer {
+        origin,
+        paths,
+        requests,
+    }
+}
+
+fn text(value: &Value) -> &str {
+    value.as_str().unwrap_or_default()
+}
+
+/// T3's answer to a launch it accepted, in the shape of `OrchestrationV2ThreadLaunchResult` in
+/// packages/contracts/src/orchestrationV2.ts: the new thread, and the run for its first message
+/// preparing the workspace.
+fn launched(payload: &Value) -> Option<Value> {
+    let run = json!({"id": "run-1", "ordinal": 1, "status": "preparing",
+        "userMessageId": payload["initialMessage"]["messageId"]});
+    let thread = json!({"id": payload["threadId"], "title": payload["title"]});
+    let projection = json!({"thread": thread, "runs": [run], "runtimeRequests": [],
+        "turnItems": []});
+    let result = json!({"threadId": payload["threadId"], "projection": projection,
+        "resumed": false});
+    Some(json!({"_tag": "Success", "value": result}))
+}
+
+/// A failed exit with `error`, as Effect RPC encodes it.
+fn launch_failed(error: Value) -> Option<Value> {
+    Some(json!({"_tag": "Failure", "cause": [{"_tag": "Fail", "error": error}]}))
+}
+
+/// Answers a launch by its first message. "reject" fails it with T3's own launch error,
+/// "unauthorized" fails it as T3 does a session without the operate scope (packages/contracts/
+/// src/auth.ts), "garbled" accepts it but names another thread, "drop" closes the socket, and
+/// anything else is accepted.
+fn answer_by_message(payload: &Value) -> Option<Value> {
+    match text(&payload["initialMessage"]["text"]) {
+        "reject" => launch_failed(json!({"_tag": "OrchestrationV2ThreadLaunchError",
+            "commandId": payload["commandId"], "projectId": payload["projectId"],
+            "message": LAUNCH_FAILURE})),
+        "unauthorized" => launch_failed(json!({"_tag": "EnvironmentAuthorizationError",
+            "message": "This session can't operate the environment.",
+            "requiredScope": "orchestration:operate"})),
+        "garbled" => {
+            let mut exit = launched(payload)?;
+            exit["value"]["threadId"] = json!(THREAD_A);
+            Some(exit)
+        }
+        "drop" => None,
+        _ => launched(payload),
+    }
+}
+
+/// Thread `payload` launched, as T3 holds it once its workspace failed to prepare: the run
+/// failed, with an error item whose code says why (apps/server/src/orchestration-v2/
+/// Orchestrator.ts).
+fn preparation_failed(payload: &Value) -> Value {
+    let run = json!({"id": "run-1", "ordinal": 1, "status": "failed",
+        "userMessageId": payload["initialMessage"]["messageId"]});
+    let failure = json!({"code": "workspace_preparation_failed", "message": PREPARATION_FAILURE});
+    let item = json!({"id": "item-1", "runId": "run-1", "ordinal": 1, "type": "error",
+        "status": "failed", "title": "Workspace preparation failed", "failure": failure});
+    let thread = json!({"id": payload["threadId"], "title": payload["title"]});
+    json!({"snapshotSequence": 5, "projection": {"thread": thread, "runs": [run],
+        "runtimeRequests": [], "turnItems": [item]}})
+}
+
+#[test]
+fn launch_goes_to_the_named_environment_and_prints_the_ids_it_sent() {
+    // A is the saved default, the server T3CODE_HOME records and the one T3TERM_ORIGIN names,
+    // as in `a_named_environment_gets_every_request_and_every_login`. Both have a project
+    // titled t3term.
+    let home = Home::new();
+    let t3 = home.logging_t3();
+    let a_projects = launch_projects(PROJECT_A, "t3term");
+    let a = serve_launch_environment("env-a", a_projects, json!({}), launched);
+    let b_projects = launch_projects(PROJECT_B, "t3term");
+    let b_settings = json!({"defaultRuntimeMode": "auto-accept-edits"});
+    let b = serve_launch_environment("env-b", b_projects, b_settings, launched);
+    home.record_server(&a.origin);
+    let a_home = home.t3_home("env a/.t3", Some("env-a"), Some(&a.origin));
+    let b_home = home.t3_home("env b/.t3", Some("env-b"), Some(&b.origin));
+    let b_dir = b_home.to_str().unwrap();
+    for (name, dir) in [("a", a_home.to_str().unwrap()), ("b", b_dir)] {
+        home.run_ok(&["environment", "add", name, "--t3-home", dir]);
+    }
+    home.run_ok(&["environment", "default", "a"]);
+    let near_a = |args: &[&str]| {
+        let mut command = home.command(args, &t3);
+        command.env("T3TERM_ORIGIN", &a.origin);
+        command.output().expect("run t3term")
+    };
+
+    // A launch into a new worktree, with the message padded as a script might leave it.
+    let launch = near_a(&[
+        "--json",
+        "--environment",
+        "b",
+        "launch",
+        "t3term",
+        "  Fix the flaky build\n",
+        "--model",
+        "claude-opus-5-5",
+        "--worktree",
+        "main",
+        "--branch",
+        "t3/fix-build",
+        "--from-origin",
+    ]);
+    assert_eq!(launch.status.code(), Some(0), "{launch:?}");
+    let launches = b.launches();
+    assert_eq!(launches.len(), 1, "{launches:?}");
+    let sent = &launches[0];
+    let command_id = &sent["commandId"];
+    let thread_id = &sent["threadId"];
+    let message_id = &sent["initialMessage"]["messageId"];
+    for id in [command_id, thread_id, message_id] {
+        assert!(uuid::Uuid::parse_str(text(id)).is_ok(), "{id}");
+    }
+    assert_ne!(command_id, thread_id);
+    assert_ne!(command_id, message_id);
+    assert_ne!(thread_id, message_id);
+
+    // T3 gets the trimmed message, a title made from it that it may replace, the model with no
+    // options, B's default mode, and the worktree asked for.
+    let selection = json!({"instanceId": "claudeAgent", "model": "claude-opus-5-5", "options": []});
+    let worktree = json!({"type": "worktree", "baseRef": "main", "branch": "t3/fix-build",
+        "startFromOrigin": true});
+    let message = json!({"messageId": message_id, "text": "Fix the flaky build",
+        "attachments": []});
+    let expected = json!({
+        "commandId": command_id, "threadId": thread_id, "projectId": PROJECT_B,
+        "title": "Fix the flaky build", "generateTitle": true, "modelSelection": selection,
+        "runtimeMode": "auto-accept-edits", "interactionMode": "default",
+        "workspaceStrategy": worktree, "creationSource": "web", "initialMessage": message,
+    });
+    assert_eq!(sent, &expected);
+
+    // stdout holds one object with the same ids and B's environment id.
+    let printed_json = json!({
+        "ok": true, "environmentId": "env-b", "projectId": PROJECT_B, "threadId": thread_id,
+        "commandId": command_id, "messageId": message_id, "runId": "run-1",
+        "runStatus": "preparing", "resumed": false, "projectTitle": "t3term",
+        "title": "Fix the flaky build", "generateTitle": true, "modelSelection": selection,
+        "runtimeMode": "auto-accept-edits", "runtimeModeSource": "environment",
+        "interactionMode": "default", "workspaceStrategy": worktree,
+    });
+    assert_eq!(json_stdout(&launch), printed_json);
+    assert_eq!(printed(&launch).1, "");
+
+    // Without `--json`, it says what it asked for and how to follow the thread on B. A
+    // project's id prefix and a qualified model work too, and a title given is kept.
+    let launch = near_a(&[
+        "--environment",
+        "b",
+        "launch",
+        &PROJECT_B[..8],
+        "Second",
+        "--model",
+        "claudeAgent/claude-opus-5-5",
+        "--title",
+        "  Night shift ",
+        "--mode",
+        "full-access",
+    ]);
+    assert_eq!(launch.status.code(), Some(0), "{launch:?}");
+    let launches = b.launches();
+    assert_eq!(launches.len(), 2, "{launches:?}");
+    assert_eq!(launches[1]["title"], "Night shift");
+    assert_eq!(launches[1]["generateTitle"], false);
+    assert_eq!(launches[1]["workspaceStrategy"], json!({"type": "root"}));
+    let thread = text(&launches[1]["threadId"]);
+    let expected = [
+        format!("launched {}  Night shift", &thread[..8]),
+        "  environment  b (env-b)".into(),
+        format!("  project      {}  t3term", &PROJECT_B[..8]),
+        "  model        claudeAgent/claude-opus-5-5".into(),
+        "  mode         Full access (chosen), plan mode off".into(),
+        "  workspace    the project's folder".into(),
+        "T3 accepted the launch and is preparing the workspace. The agent starts when it's ready."
+            .into(),
+        format!("Follow it with `t3term --environment b wait {thread}`."),
+    ];
+    let expected = expected.join("\n") + "\n";
+    assert_eq!(printed(&launch), (expected.as_str(), ""));
+
+    // A got nothing. Each launch logged in to B once, to read and operate.
+    let reached = a.paths.lock().unwrap().clone();
+    assert!(reached.is_empty(), "A was asked for {reached:?}");
+    assert_eq!(home.t3_log(), session_log(b_dir, OPERATE_SCOPES).repeat(2));
+}
+
+#[test]
+fn launch_checks_its_arguments_before_any_server_or_login() {
+    let home = Home::new();
+    let t3 = home.logging_t3();
+    let projects = launch_projects(PROJECT_B, "t3term");
+    let server = serve_launch_environment("env-test", projects, json!({}), launched);
+    home.record_server(&server.origin);
+    let model = "claude-opus-5-5";
+    let cases: [(&[&str], &str); 10] = [
+        (&["t3term", "Fix it"], "MODEL_REQUIRED"),
+        (&["t3term", "Fix it", "--model", " "], "MODEL_REQUIRED"),
+        // Without a model, t3term doesn't wait for a message on stdin.
+        (&["t3term"], "MODEL_REQUIRED"),
+        // stdin is empty here.
+        (&["t3term", "--model", model], "PROMPT_REQUIRED"),
+        (&["t3term", " \n\t", "--model", model], "PROMPT_REQUIRED"),
+        (&[" ", "Fix it", "--model", model], "PROJECT_REQUIRED"),
+        (
+            &["t3term", "Fix it", "--model", model, "--title", " "],
+            "INVALID_TITLE",
+        ),
+        (
+            &["t3term", "Fix it", "--model", model, "--worktree", " "],
+            "INVALID_WORKSPACE",
+        ),
+        (
+            &[
+                "t3term",
+                "Fix it",
+                "--model",
+                model,
+                "--worktree",
+                "main",
+                "--branch",
+                "",
+            ],
+            "INVALID_WORKSPACE",
+        ),
+        (
+            &["t3term", "Fix it", "--model", model, "--option", "fastMode"],
+            "INVALID_CHOICE",
+        ),
+    ];
+    for (args, code) in cases {
+        let mut all = vec!["--json", "launch"];
+        all.extend(args);
+        assert_error(&home.run_with(&all, &t3), 2, code);
+    }
+
+    // --branch and --from-origin only go with --worktree.
+    for flag in [&["--branch", "t3/fix"][..], &["--from-origin"][..]] {
+        let mut all = vec!["launch", "t3term", "Fix it", "--model", model];
+        all.extend(flag);
+        let refused = home.run_with(&all, &t3);
+        assert_eq!(refused.status.code(), Some(2), "{refused:?}");
+        let (_, err) = printed(&refused);
+        assert!(err.contains("--worktree"), "{err}");
+    }
+
+    let reached = server.paths.lock().unwrap().clone();
+    assert!(reached.is_empty(), "the server was asked for {reached:?}");
+    assert_eq!(home.t3_log(), "");
+}
+
+#[test]
+fn launch_reads_the_first_message_from_stdin() {
+    let home = Home::new();
+    let t3 = home.fake_t3();
+    let projects = launch_projects(PROJECT_B, "t3term");
+    let server = serve_launch_environment("env-test", projects, json!({}), launched);
+    home.record_server(&server.origin);
+    let args = ["--json", "launch", "t3term", "--model", "claude-opus-5-5"];
+    let mut command = home.command(&args, &t3);
+    command.stdin(Stdio::piped()).stdout(Stdio::piped());
+    let mut child = command.spawn().expect("run t3term");
+    let mut stdin = child.stdin.take().unwrap();
+    stdin.write_all(b"Fix it from stdin\n").unwrap();
+    drop(stdin);
+    let launch = child.wait_with_output().unwrap();
+    assert_eq!(launch.status.code(), Some(0), "{launch:?}");
+
+    let launches = server.launches();
+    assert_eq!(launches.len(), 1, "{launches:?}");
+    assert_eq!(launches[0]["initialMessage"]["text"], "Fix it from stdin");
+    assert_eq!(launches[0]["title"], "Fix it from stdin");
+    // Settings that name no default mode give T3's own, full access.
+    let printed_json = json_stdout(&launch);
+    assert_eq!(printed_json["runtimeMode"], "full-access");
+    assert_eq!(printed_json["runtimeModeSource"], "environment");
+}
+
+#[test]
+fn launch_finds_a_project_by_id_prefix_or_title_and_names_those_that_clash() {
+    let home = Home::new();
+    let t3 = home.fake_t3();
+    let deleted = "2026-10-13T10:00:00.000Z";
+    let projects = json!([
+        {"id": PROJECT_B, "title": "api", "workspaceRoot": "/work/api"},
+        {"id": PROJECT_C, "title": PLATFORM, "workspaceRoot": "/work/platform"},
+        {"id": PROJECT_A, "title": "gone", "workspaceRoot": "/work/gone", "deletedAt": deleted},
+    ]);
+    let server = serve_launch_environment("env-test", projects, json!({}), launched);
+    home.record_server(&server.origin);
+    let launch = |json_mode: bool, project: &str| {
+        let mut args = vec!["launch", project, "Fix it", "--model", "claude-opus-5-5"];
+        if json_mode {
+            args.insert(0, "--json");
+        }
+        home.run_with(&args, &t3)
+    };
+
+    // A full id, a unique prefix and an exact title each find one project.
+    for (query, id) in [
+        (PROJECT_C, PROJECT_C),
+        (&PROJECT_B[..6], PROJECT_B),
+        ("api", PROJECT_B),
+    ] {
+        let found = launch(true, query);
+        assert_eq!(found.status.code(), Some(0), "{found:?}");
+        assert_eq!(json_stdout(&found)["projectId"], id);
+    }
+
+    // A deleted project isn't found, nor is a name no project has. A prefix two projects
+    // share is ambiguous, and the error names both without their control characters.
+    for query in ["gone", "nope"] {
+        assert_error(&launch(true, query), 3, "PROJECT_NOT_FOUND");
+    }
+    let ambiguous = launch(true, "b8f4");
+    assert_error(&ambiguous, 2, "AMBIGUOUS_PROJECT");
+    let message = "2 projects match b8f4: b8f4d2a0 api, b8f4e9c1 Platform31m[1m operations. Use more of the id.";
+    assert_eq!(json_stdout(&ambiguous)["error"]["message"], message);
+    let ambiguous = launch(false, "b8f4");
+    assert_eq!(ambiguous.status.code(), Some(2), "{ambiguous:?}");
+    let expected = format!("t3term: {message} [AMBIGUOUS_PROJECT]\n");
+    assert_eq!(printed(&ambiguous), ("", expected.as_str()));
+
+    // A launch into the project whose title holds control characters prints it without them.
+    let found = launch(false, PROJECT_C);
+    assert_eq!(found.status.code(), Some(0), "{found:?}");
+    let (out, err) = printed(&found);
+    assert_printable(out);
+    let project = "  project      b8f4e9c1  Platform31m[1m operations\n";
+    assert!(out.contains(project), "{out}");
+    assert_eq!(err, "");
+
+    // Only the launches that found a project reached T3.
+    assert_eq!(server.launches().len(), 4);
+}
+
+#[test]
+fn launch_takes_the_projects_mode_then_the_environments_and_says_which() {
+    let home = Home::new();
+    let t3 = home.fake_t3();
+    let projects = json!([
+        {"id": PROJECT_B, "title": "api", "workspaceRoot": "/work/api"},
+        {"id": PROJECT_C, "title": "web", "workspaceRoot": "/work/web"},
+    ]);
+    // The api project overrides the mode, and web overrides something else.
+    let mut overrides = json!({});
+    overrides[PROJECT_B] = json!({"defaultRuntimeMode": "auto"});
+    overrides[PROJECT_C] = json!({"defaultAutoPull": true});
+    let settings = json!({"defaultRuntimeMode": "approval-required",
+        "projectSettingsOverrides": overrides});
+    let server = serve_launch_environment("env-test", projects, settings, launched);
+    home.record_server(&server.origin);
+    let launch = |extra: &[&str]| {
+        let mut args = vec!["launch"];
+        args.extend(extra);
+        args.extend(["--model", "claude-opus-5-5"]);
+        home.run_with(&args, &t3)
+    };
+    let modes = |launch: &Output| {
+        assert_eq!(launch.status.code(), Some(0), "{launch:?}");
+        let printed = json_stdout(launch);
+        let sent = server.launches().last().cloned().unwrap();
+        assert_eq!(sent["runtimeMode"], printed["runtimeMode"]);
+        assert_eq!(sent["interactionMode"], printed["interactionMode"]);
+        json!([
+            printed["runtimeMode"],
+            printed["runtimeModeSource"],
+            printed["interactionMode"]
+        ])
+    };
+
+    let api = launch(&["--json", "api", "Fix it"]);
+    assert_eq!(modes(&api), json!(["auto", "project", "default"]));
+    let web = launch(&["--json", "web", "Fix it"]);
+    assert_eq!(
+        modes(&web),
+        json!(["approval-required", "environment", "default"])
+    );
+    let chosen = launch(&["--json", "api", "Fix it", "--mode", "full-access", "--plan"]);
+    assert_eq!(modes(&chosen), json!(["full-access", "chosen", "plan"]));
+    let alias = launch(&[
+        "--json",
+        "web",
+        "Fix it",
+        "--mode",
+        "supervised",
+        "--no-plan",
+    ]);
+    assert_eq!(
+        modes(&alias),
+        json!(["approval-required", "chosen", "default"])
+    );
+
+    // Without `--json`, the mode line says where the mode came from.
+    let api = launch(&["api", "Fix it"]);
+    assert_eq!(api.status.code(), Some(0), "{api:?}");
+    let (out, _) = printed(&api);
+    let mode = "  mode         Auto (project default), plan mode off\n";
+    assert!(out.contains(mode), "{out}");
+}
+
+#[test]
+fn launch_failures_print_the_ids_and_the_command_that_reads_the_thread() {
+    let home = Home::new();
+    let t3 = home.logging_t3();
+    let projects = launch_projects(PROJECT_B, "t3term");
+    let b = serve_launch_environment("env-b", projects, json!({}), answer_by_message);
+    let b_home = home.t3_home("env b/.t3", Some("env-b"), Some(&b.origin));
+    let b_dir = b_home.to_str().unwrap();
+    home.run_ok(&["environment", "add", "b", "--t3-home", b_dir]);
+    let launch = |json_mode: bool, message: &str| {
+        let mut args = vec!["--environment", "b", "launch", "t3term", message];
+        args.extend(["--model", "claude-opus-5-5"]);
+        if json_mode {
+            args.insert(0, "--json");
+        }
+        home.run_with(&args, &t3)
+    };
+    // Checks that `--json` printed one object: the error, with the last launch's ids, the
+    // outcome and the command that reads the thread beside it. Returns the thread id and the
+    // error's message.
+    let failed = |output: &Output, exit_code: i32, code: &str, outcome: &str| {
+        assert_eq!(output.status.code(), Some(exit_code), "{output:?}");
+        let (out, err) = printed(output);
+        assert_printable(out);
+        assert_eq!(err, "");
+        let sent = b.launches().last().cloned().unwrap();
+        let thread = text(&sent["threadId"]).to_string();
+        let printed_json = json_stdout(output);
+        let message = text(&printed_json["error"]["message"]).to_string();
+        let expected = json!({
+            "ok": false, "error": {"code": code, "message": message},
+            "environmentId": "env-b", "projectId": PROJECT_B, "threadId": thread,
+            "commandId": sent["commandId"], "messageId": sent["initialMessage"]["messageId"],
+            "outcome": outcome, "read": format!("t3term --environment b read {thread}"),
+        });
+        assert_eq!(printed_json, expected);
+        (thread, message)
+    };
+    let look = "to look for it. If it isn't there, T3 may still create it, so launching again could start a second thread.";
+
+    // T3's own launch error is a rejection. `--json` keeps its control characters as escapes,
+    // and stderr drops them.
+    let (thread, message) = failed(
+        &launch(true, "reject"),
+        4,
+        "THREAD_LAUNCH_REJECTED",
+        "rejected",
+    );
+    let read = format!("t3term --environment b read {thread}");
+    let expected = format!(
+        "T3 didn't launch thread {thread}: {LAUNCH_FAILURE}. A launch that fails after T3 creates the thread leaves the thread behind under that id, possibly without its first message. Run `{read}` to see whether T3 left the thread behind."
+    );
+    assert_eq!(message, expected);
+    let rejected = launch(false, "reject");
+    assert_eq!(rejected.status.code(), Some(4), "{rejected:?}");
+    let (out, err) = printed(&rejected);
+    assert_eq!(out, "");
+    assert_printable(err);
+    let thread = text(&b.launches().last().unwrap()["threadId"]).to_string();
+    let read = format!("t3term --environment b read {thread}");
+    let expected = format!(
+        "t3term: T3 didn't launch thread {thread}: Failed to launch thread[2J31m. A launch that fails after T3 creates the thread leaves the thread behind under that id, possibly without its first message. Run `{read}` to see whether T3 left the thread behind. [THREAD_LAUNCH_REJECTED]\n"
+    );
+    assert_eq!(err, expected);
+
+    // Any other failure keeps the code every failed call gets.
+    let (thread, message) = failed(
+        &launch(true, "unauthorized"),
+        4,
+        "T3_RPC_FAILED",
+        "rejected",
+    );
+    let read = format!("t3term --environment b read {thread}");
+    let expected = format!(
+        "This session can't operate the environment. Run `{read}` to see whether T3 left the thread behind."
+    );
+    assert_eq!(message, expected);
+
+    // An answer about another thread confirms nothing.
+    let (thread, message) = failed(&launch(true, "garbled"), 1, "T3_INVALID_LAUNCH", "unknown");
+    let read = format!("t3term --environment b read {thread}");
+    let expected = format!(
+        "T3 answered the launch of thread {thread}, but it names another thread or none, so t3term can't confirm what it launched. Run `{read}` {look}"
+    );
+    assert_eq!(message, expected);
+
+    // A connection that drops after the launch goes out leaves it unconfirmed. t3term sent it
+    // once, on one socket, and doesn't reconnect to send it again.
+    let sockets = b.sockets();
+    let (thread, message) = failed(
+        &launch(true, "drop"),
+        5,
+        "THREAD_LAUNCH_UNCONFIRMED",
+        "unknown",
+    );
+    assert_eq!(b.sockets(), sockets + 1);
+    let dropped = b.launches();
+    let dropped = dropped
+        .iter()
+        .filter(|sent| sent["initialMessage"]["text"] == "drop");
+    assert_eq!(dropped.count(), 1);
+    let start = format!(
+        "t3term sent the launch of thread {thread}, but can't tell whether T3 launched it (T3 connection lost: "
+    );
+    assert!(message.starts_with(&start), "{message}");
+    let read = format!("t3term --environment b read {thread}");
+    let end = format!(
+        "T3 may have launched it or may still, so t3term won't send it again. Run `{read}` {look}"
+    );
+    assert!(message.ends_with(&end), "{message}");
+    let unconfirmed = launch(false, "drop");
+    assert_eq!(unconfirmed.status.code(), Some(5), "{unconfirmed:?}");
+    let (_, err) = printed(&unconfirmed);
+    assert_printable(err);
+    assert!(err.ends_with(" [THREAD_LAUNCH_UNCONFIRMED]\n"), "{err}");
+
+    // Each run logged in to B once, to read and operate.
+    assert_eq!(home.t3_log(), session_log(b_dir, OPERATE_SCOPES).repeat(6));
+}
+
+#[test]
+fn a_workspace_that_fails_to_prepare_shows_in_wait_and_read() {
+    let home = Home::new();
+    let t3 = home.fake_t3();
+    let projects = launch_projects(PROJECT_B, "t3term");
+    let server = serve_launch_environment("env-test", projects, json!({}), launched);
+    home.record_server(&server.origin);
+    let args = [
+        "--json",
+        "launch",
+        "t3term",
+        "Fix it",
+        "--model",
+        "claude-opus-5-5",
+    ];
+    let launch = home.run_with(
+        &[&args[..], &["--worktree", "no-such-branch"][..]].concat(),
+        &t3,
+    );
+    assert_eq!(launch.status.code(), Some(0), "{launch:?}");
+    let launched = json_stdout(&launch);
+    assert_eq!(launched["runStatus"], "preparing");
+    let thread = text(&launched["threadId"]);
+
+    // `wait` reports the run failed, as it does any failed turn.
+    let waited = home.run_with(&["--json", "wait", thread, "--timeout", "30"], &t3);
+    assert_eq!(waited.status.code(), Some(1), "{waited:?}");
+    let outcome = json!({"ok": true, "threadId": thread, "messageId": launched["messageId"],
+        "runId": "run-1", "outcome": "failed", "reply": ""});
+    assert_eq!(json_stdout(&waited), outcome);
+    let waited = home.run_with(&["wait", thread, "--timeout", "30"], &t3);
+    assert_eq!(waited.status.code(), Some(1), "{waited:?}");
+    let (_, err) = printed(&waited);
+    assert!(err.ends_with("The turn ended: failed\n"), "{err}");
+
+    // `read` shows why, and `--json` keeps T3's failure code.
+    let read = home.run_with(&["read", thread], &t3);
+    assert_eq!(read.status.code(), Some(0), "{read:?}");
+    let (out, _) = printed(&read);
+    assert!(out.contains(PREPARATION_FAILURE), "{out}");
+    let read = home.run_with(&["--json", "read", thread], &t3);
+    assert_eq!(read.status.code(), Some(0), "{read:?}");
+    let item = &json_stdout(&read)["projection"]["turnItems"][0];
+    assert_eq!(item["failure"]["code"], "workspace_preparation_failed");
+}
