@@ -425,6 +425,7 @@ t3term projects
 t3term threads [--project P] [--all] [--limit N]
 t3term read <thread> [--last N] [--reasoning]
 t3term watch <thread>               live events; --json prints one item per line
+t3term launch <project> [prompt] --model M [--title T] [--worktree REF [--branch B] [--from-origin]] [choices]
 t3term send <thread> [prompt] [--wait] [--timeout S] [--if-busy refuse|queue|steer] [choices]
 t3term wait <thread>                stream the current turn until it ends
 t3term requests <thread>            pending approvals and questions
@@ -442,16 +443,20 @@ t3term environment default <name> | --clear
 
 Add `--environment NAME` to any command to send it to one saved environment's server and no other. An environment is a T3 home on this machine and, optionally, its server's loopback origin. The `environment` commands need no server. [Environment connections](docs/environment-connections.md) covers the order t3term chooses a server in, the checks before it logs in and each error.
 
-`<thread>` takes a full id, the 8-character prefix `threads` prints, or an exact title. `send` reads stdin when you leave the prompt out. Add `--json` to any command for machine-readable output. Inside its strings, every control character, DEL and the C1 codes included, is a JSON escape such as `\n` or `\u009b`.
+`launch` starts a new thread in a project with its first message, in the project's folder or a new worktree, and returns once T3 accepts it, before the agent starts. It sends the launch once and never again on its own. When it can't tell whether T3 launched the thread, it prints the thread's id and the `read` command that finds it. [Launching a thread](docs/thread-launch.md) covers its flags, output and errors.
+
+`<thread>` takes a full id, the 8-character prefix `threads` prints, or an exact title, and `<project>` does the same with `projects`. `send` and `launch` read stdin when you leave the prompt out. Add `--json` to any command for machine-readable output. Inside its strings, every control character, DEL and the C1 codes included, is a JSON escape such as `\n` or `\u009b`.
 
 Without `--json`, t3term drops control characters from what it prints on stdout and stderr: text from T3, the ids and names you pass and its error messages. A carriage return or `\r\n` prints as one line break, and a tab or another control that spaces text prints as a space. It drops every other control, C0, DEL or C1, so a thread title or a reply can't clear the screen, move the cursor or set the clipboard. What followed an Esc, such as `[2J`, stays as plain text, and accents, joined emoji and no-break spaces print as T3 sent them. `doctor` prints each check's details as JSON, escaped as `--json` escapes them. A usage error is the exception, because the argument parser quotes the command line as you typed it. `--json` keeps every value as T3 sent it.
 
-Exit codes: 0 success, 1 failure or a turn that ended without completing, 2 usage, 3 not found, 4 rejected or unsupported protocol, 5 server unavailable, 6 timeout, 7 the turn is waiting for an approval or answer.
+Exit codes: 0 success, 1 failure or a turn that ended without completing, 2 usage, 3 not found, 4 rejected or unsupported protocol, 5 server unavailable or a launch t3term can't confirm, 6 timeout, 7 the turn is waiting for an approval or answer.
 
 <details>
 <summary><strong>Choosing a model, effort and mode from the command line</strong></summary>
 
 The choices on `send` and `settings` are `--model`, `--effort`, `--option ID=VALUE`, `--mode` and `--plan` or `--no-plan`. Anything you leave out keeps the thread's current value.
+
+`launch` takes the same choices and needs `--model`. Without `--mode`, a new thread gets the project's default runtime mode, then the environment's, then `full-access`, as in the desktop app. Plan mode starts off unless you pass `--plan`.
 
 - `--model` takes `provider/model` (for example `claudeAgent/claude-opus-5-5`), a model id, or a model name. A model id that two providers share needs the `provider/` part.
 - `--effort` sets whichever reasoning option the model has: `effort` on Claude, `reasoningEffort` on Codex and Grok, `reasoning` on Cursor. `--effort ultrathink` adds `Ultrathink:` to the start of the message, as the desktop app does, and leaves the thread's effort alone.
@@ -494,7 +499,8 @@ The unit tests cover the reducers, Markdown wrapping, the composer, the model me
 
 - Answering a question from the CLI. `requests` lists one and the TUI can answer it, but there is no `answer` subcommand yet, so a script that hits a question has to hand over to a person.
 - Loading older history for long threads. The TUI opens a bounded recent window.
-- New threads, diffs and checkpoints, worktrees, attachments, embedded terminals and queue management. The TUI shows a worktree setup's progress, but can't cancel or retry it, work locally instead or open the setup script's terminal.
+- New threads in the TUI. `t3term launch` starts one from the CLI in the project's folder or a new worktree, but can't launch into an existing worktree or attach files. The TUI shows a worktree setup's progress, but can't cancel or retry it, work locally instead or open the setup script's terminal.
+- Diffs and checkpoints, attachments, embedded terminals and queue management.
 - A check of the reducer's output against T3's TypeScript reducer on recorded event streams.
 - Linux and Windows. The code has Linux pid lookup, but only macOS has been tested, and the saved login needs the macOS Keychain, so other systems would issue a new session every run.
 - Syntax highlighting in code blocks and the project and git panel.
