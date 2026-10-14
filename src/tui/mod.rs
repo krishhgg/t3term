@@ -12097,8 +12097,17 @@ mod tests {
     /// projection has agent `s1` on `a`, and `s2`, done, on a thread the shell doesn't list.
     /// The composer has a draft with its cursor before the last letter.
     fn lineage_tui() -> App {
+        lineage_on(tui(&Settings::default()), None)
+    }
+
+    /// `lineage_tui` built on `app`, with `t` linked to the pull requests `links` when there
+    /// are any.
+    fn lineage_on(mut app: App, links: Option<Vec<Value>>) -> App {
         let mut current = feature_thread();
         current["lineage"] = json!({"parentThreadId": "up", "relationshipToParent": "fork"});
+        if let Some(links) = links {
+            current["pullRequests"] = json!(links);
+        }
         let mut agent = related("a", "t", "subagent");
         agent["activityRunStatus"] = json!("running");
         let threads = vec![
@@ -12107,7 +12116,6 @@ mod tests {
             related("f", "t", "fork"),
             agent,
         ];
-        let mut app = tui(&Settings::default());
         app.on_shell_event(details_shell(threads));
         app.on_shell_event(caught_up());
         app.open_thread(open_bound(current));
@@ -12923,6 +12931,157 @@ mod tests {
                 assert_eq!(open_id(&batched), Some("t"), "{dialog} {name}");
                 assert_eq!(batched.composer.text(), "draft", "{dialog} {name}");
             }
+        }
+    }
+
+    // ---- Lineage beside the linked pull requests ----
+
+    /// `lineage_tui` on an environment that links pull requests to threads, with `t` linked to
+    /// #31 and #32 and five more forks of `t`, `g0` to `g4`, so its text scrolls on a screen 24
+    /// rows tall.
+    fn lineage_pulls_tui() -> App {
+        let mut client = Client::offline();
+        client.runtime.capabilities = json!({"threadPullRequests": true});
+        let mut app = App::new(
+            Arc::new(client),
+            Theme::new(Depth::TrueColor),
+            &Settings::default(),
+            mpsc::unbounded_channel().0,
+        );
+        // A thread with a worktree subscribes to its setup, which here sends nothing.
+        app.watch_setup = Box::new(|_: &str| mpsc::unbounded_channel().1);
+        let links = vec![linked(31, "Bound titles"), linked(32, "Lineage")];
+        let mut app = lineage_on(app, Some(links));
+        for i in 0..5_u64 {
+            let fork = related(&format!("g{i}"), "t", "fork");
+            app.on_shell_event(thread_updated(2 + i, fork));
+        }
+        app
+    }
+
+    #[test]
+    fn lineage_and_the_linked_pull_requests_keep_their_place_on_their_own_tabs() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        // The work a frame or an event can do for the details.
+        let counts = |app: &App| {
+            let details = &app.details;
+            let builds = details.pulls.builds;
+            (details.prepares, details.wraps, details.lineage_prepares, builds)
+        };
+        for dialog in [false, true] {
+            let (width, height) = if dialog { (80, 24) } else { (200, 24) };
+            let esc = if dialog { "Esc close" } else { "Esc leave" };
+            let mut app = lineage_pulls_tui();
+            if dialog {
+                as_dialog(&mut app);
+            }
+            let started = reads(&runtime);
+            let scrolled = app.scroll.rows();
+
+            // ↓ chooses Lineage's rows until one under the first screen of text scrolls into
+            // view.
+            let top = details_after(&mut app, width, height);
+            assert!(top.contains("Lineage · 1 running"), "{dialog}: {top}");
+            let mut presses = 0;
+            let (id, reading) = loop {
+                press(&mut app, KeyCode::Down);
+                presses += 1;
+                let text = details_after(&mut app, width, height);
+                if text != top {
+                    let Some(lineage::Target::Thread(id)) = app.details.selected().cloned() else {
+                        panic!("{dialog}: no thread chosen after {presses} presses");
+                    };
+                    break (id, text);
+                }
+                assert!(presses < 8, "{dialog}: the text never scrolled");
+            };
+            assert!(id == "f" || id.starts_with('g'), "{dialog}: {id} is no fork");
+            let chosen = Some(lineage::Target::Thread(id.clone()));
+            let area = app.details.drawn.expect("the details").area;
+            let x = area.x + area.width / 2;
+            let y = (area.y..area.bottom())
+                .find(|&y| app.details.target_at(x, y) == chosen)
+                .expect("the chosen row in view");
+            let status = first_status(&mut app, width, height, Some(esc));
+            assert!(status.contains("Enter open fork"), "{dialog}: {status}");
+            let before = counts(&app);
+
+            // → shows the pull requests. Until a frame draws them, the chosen row's cell takes
+            // no click, and the first frame offers the list's keys.
+            press(&mut app, KeyCode::Right);
+            assert_eq!(app.details.tab(), details::Tab::PullRequests, "{dialog}");
+            assert_eq!(app.details.target_at(x, y), None, "{dialog}");
+            assert!(!mouse(&mut app, CLICK, x, y), "{dialog}");
+            assert_eq!(open_id(&app), Some("t"), "{dialog}");
+            let status = first_status(&mut app, width, height, Some(esc));
+            assert!(status.contains("← thread"), "{dialog}: {status}");
+            let text = details_after(&mut app, width, height);
+            for shown in ["#31 Bound titles", "#32 Lineage"] {
+                assert!(text.contains(shown), "{dialog}: {shown:?} in {text}");
+            }
+            assert!(!text.contains(&format!("Thread {id}")), "{dialog}: {text}");
+            assert_eq!(app.details.target_at(x, y), None, "{dialog}");
+
+            // ↓ and Enter show #32's details, and Enter acts on no Lineage row.
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            assert!(app.details.pulls.viewing(), "{dialog}");
+            assert_eq!(open_id(&app), Some("t"), "{dialog}");
+            let status = first_status(&mut app, width, height, Some(esc));
+            assert!(status.contains("← list"), "{dialog}: {status}");
+            let text = details_after(&mut app, width, height);
+            for shown in ["← List", "2 of 2", "#32 Lineage"] {
+                assert!(text.contains(shown), "{dialog}: {shown:?} in {text}");
+            }
+
+            // ← goes back to the list, and `h` to the Thread tab. Until a frame draws it, a
+            // click on the chosen row does nothing. Then the text, the choice and the row's
+            // cell are where they were, and the first frame says what Enter does.
+            press(&mut app, KeyCode::Left);
+            press(&mut app, KeyCode::Char('h'));
+            assert_eq!(app.details.tab(), details::Tab::Thread, "{dialog}");
+            assert_eq!(app.details.target_at(x, y), None, "{dialog}");
+            assert!(!mouse(&mut app, CLICK, x, y), "{dialog}");
+            assert_eq!(open_id(&app), Some("t"), "{dialog}");
+            let status = first_status(&mut app, width, height, Some(esc));
+            assert!(status.contains("Enter open fork"), "{dialog}: {status}");
+            assert_eq!(details_after(&mut app, width, height), reading, "{dialog}");
+            assert_eq!(app.details.selected(), chosen.as_ref(), "{dialog}");
+            assert_eq!(app.details.target_at(x, y), chosen, "{dialog}");
+
+            // The pull requests kept their place too, with #32 selected.
+            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Enter);
+            let text = details_after(&mut app, width, height);
+            assert!(text.contains("2 of 2"), "{dialog}: {text}");
+            press(&mut app, KeyCode::Left);
+            press(&mut app, KeyCode::Left);
+            assert_eq!(details_after(&mut app, width, height), reading, "{dialog}");
+            // None of it worked the facts, Lineage or the links out again, wrapped the text,
+            // moved the transcript, touched the draft or asked T3 for anything.
+            assert_eq!(counts(&app), before, "{dialog}");
+            assert_eq!(app.scroll.rows(), scrolled, "{dialog}");
+            assert_eq!(app.composer.text(), "draft", "{dialog}");
+            assert_eq!(reads(&runtime), started, "{dialog}");
+
+            // Enter on the pane, or a click on the dialog, opens the chosen fork with one
+            // watch. The details keep the keyboard and the Thread tab, the sidebar highlights
+            // the fork, and the draft keeps its cursor.
+            if dialog {
+                assert!(mouse(&mut app, CLICK, x, y), "{dialog}");
+            } else {
+                press(&mut app, KeyCode::Enter);
+            }
+            assert_eq!(open_id(&app), Some(id.as_str()), "{dialog}");
+            assert_eq!(reads(&runtime), started + 1, "{dialog}");
+            assert_eq!(app.focus, Focus::Details, "{dialog}");
+            assert_eq!(app.details.tab(), details::Tab::Thread, "{dialog}");
+            assert_eq!(app.sidebar.selected_thread_id(), Some(id.as_str()), "{dialog}");
+            press(&mut app, KeyCode::Esc);
+            app.focus = Focus::Composer;
+            press(&mut app, KeyCode::Char('x'));
+            assert_eq!(app.composer.text(), "drafxt", "{dialog}");
         }
     }
 
