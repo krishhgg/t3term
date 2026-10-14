@@ -1,6 +1,6 @@
 # Bounded RPC streams
 
-`RpcClient::bounded_stream` opens an Effect RPC stream whose caller acks each chunk, within limits the caller sets. An embedded terminal needs it to read terminal output without an unbounded queue. Nothing in t3term opens one yet. The embedded terminal is still missing ([parity.md, group 15](parity.md#15-embedded-terminal)), and the TUI's watches are unchanged: they use `RpcClient::stream`, which acks each chunk as it arrives and queues its values without a bound.
+`RpcClient::bounded_stream` opens an Effect RPC stream whose caller acks each chunk, within limits the caller sets. An embedded terminal needs it to read terminal output without an unbounded queue. src/terminal.rs opens them for a terminal's streams and for terminal metadata ([terminal-events.md](terminal-events.md)), but nothing in the TUI does yet. The embedded terminal is still missing ([parity.md, group 15](parity.md#15-embedded-terminal)), and the TUI's watches are unchanged: they use `RpcClient::stream`, which acks each chunk as it arrives and queues its values without a bound.
 
 ```rust
 let limits = StreamLimits::new(16, 256 * 1024).expect("limits above zero");

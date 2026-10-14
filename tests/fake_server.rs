@@ -881,8 +881,7 @@ async fn dropping_the_receiver_stops_a_setup_watch_that_waits_to_retry() {
 // ---- bounded streams ----
 
 /// The tag of each bounded stream, legacy stream and call below. rpc.rs reads a tag only to
-/// name a request in a failure, and nothing in t3term opens a bounded stream yet, so these
-/// are made up.
+/// name a request in a failure, so these are made up.
 const BOUNDED: &str = "example.bounded";
 const LEGACY: &str = "example.stream";
 const CALL: &str = "example.call";
