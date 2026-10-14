@@ -13,7 +13,7 @@ The fields and behavior below follow T3 Code at nightly f570bd21: `Orchestration
 ## Arguments
 
 - `PROJECT` is a project's full id, a unique id prefix such as the 8 characters `t3term projects` prints, or its exact title. t3term looks only on the chosen server and skips projects T3 has deleted. No match exits 3 with `PROJECT_NOT_FOUND`. More than one exits 2 with `AMBIGUOUS_PROJECT`, and the message lists each match's id prefix and title.
-- `PROMPT` is the first message. Leave it out and t3term reads stdin to the end. t3term trims it, and `--effort ultrathink` adds `Ultrathink:` to its start, as `send` and the desktop app do.
+- `PROMPT` is the first message. Leave it out and t3term reads stdin to the end. t3term sends it as typed, so an indented snippet keeps its indent and a message from stdin keeps its final newline. `send` trims its message instead. T3's Claude adapter trims the message before it passes it to Claude (`applyClaudePromptEffortPrefix` in apps/server/src/orchestration-v2/Adapters/ClaudeAdapterV2.ts), so Claude doesn't get the whitespace at the start and end of what t3term sent. The indent of later lines reaches it. `--effort ultrathink` puts `Ultrathink:` on a line before the message, as the desktop app does, unless the trimmed message starts with a slash command or with `Ultrathink:`. Then the message goes unchanged.
 - `--model` is required, in any form `send` takes. t3term doesn't pick a model, because the desktop app's choice depends on state it keeps in the browser.
 - `--title` names the thread, trimmed. Without it, the title is the trimmed message cut to 50 UTF-16 code units with `...` added, as the desktop app makes it, and T3 writes a better one. The desktop app can cut an emoji in half at the 50th unit. t3term cuts between characters, so it leaves that emoji out.
 - `--worktree BASE_REF` asks T3 for a new git worktree made from that branch, tag or commit. Without it the agent works in the project's folder.
@@ -81,7 +81,8 @@ An error before the launch goes out keeps the code any command gets, such as `T3
 | `THREAD_LAUNCH_UNCONFIRMED` | 5 | `unknown` | The connection dropped, or T3 didn't answer within 60 seconds. T3 may have launched the thread, or may still. |
 | `T3_INVALID_LAUNCH` | 1 | `unknown` | T3 answered, but not with the thread and run t3term asked for. |
 | `THREAD_LAUNCH_REJECTED` | 4 | `rejected` | T3 ran the launch and it failed with T3's own launch error, `OrchestrationV2ThreadLaunchError`. |
-| `T3_RPC_FAILED` | 4 | `rejected` | Any other failure, such as a session without the operate scope. |
+| `T3_RPC_FAILED` | 4 | `rejected` | Any other failure T3 tags, such as `EnvironmentAuthorizationError` for a session without the operate scope. |
+| `T3_RPC_FAILED` | 4 | `unknown` | A failure without a tag t3term can read, such as a defect from a handler that died. It doesn't say how far the launch got, so T3 may have created the thread. |
 
 ```json
 {"ok": false, "error": {"code": "THREAD_LAUNCH_UNCONFIRMED", "message": "..."},
@@ -93,6 +94,8 @@ An error before the launch goes out keeps the code any command gets, such as `T3
 ### A launch t3term can't confirm
 
 t3term never sends a launch again on its own, with the same ids or new ones. T3 holds a launch that arrives while its server starts until startup finishes (apps/server/src/serverRuntimeStartup.ts:123-133), so a launch t3term gave up on can still create its thread later. A thread missing from `read` right after doesn't prove T3 dropped the launch. Running `launch` again picks new ids and can start a second thread, so look for the first one with the `read` command the error prints.
+
+A failure without a tag gets the same `unknown` outcome and the same advice. t3term matches failures by tag alone and doesn't parse T3's message, so it can't tell a defect after T3 created the thread from one before. A T3 server without `orchestration.launchThread` answers with a defect too, so its launch is reported as unknown although nothing was created.
 
 ### A rejected launch
 
@@ -106,7 +109,7 @@ T3 creates the thread before it sends the first message. A launch that fails aft
 - A request is bound to the environment id of the client that built it. `Client::launch_thread` refuses a request built for another environment with `LAUNCH_WRONG_ENVIRONMENT`, exit 2, before it connects. The request T3 gets names no environment.
 - Sending the same request again, through a client for the same environment, is the only safe retry. T3 treats a command id it has accepted as the same command and answers with the thread that launch made, with `resumed` set to `true`. The request's fields are private, so its ids and content can't change between attempts.
 - `Client::launch_thread` returns a `LaunchReceipt` with the thread id, the run's id and status, `resumed` and the thread T3 returned. Its errors are the ones above, with the ids and `outcome` in `T3Error::details`.
-- `Debug` for a request or a receipt leaves out the message and the title.
+- `Debug` for a request prints its ids, the model's instance and model ids, how many options it has, the modes, the lengths of the message and the title, and the workspace's kind, the lengths of its base ref and branch and `start_from_origin`. It leaves out the message, the title, the options' values, any other field of the model selection and the ref and branch names. `Debug` for a receipt leaves out the thread.
 
 ## Not supported
 
