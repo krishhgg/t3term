@@ -29,8 +29,11 @@ pub use bounded::{BoundedChunk, BoundedStream, StreamLimits};
 
 /// Why calls end after `RpcClient::close`.
 const CLOSED: &str = "t3term closed the connection";
-/// How long a connection that ended gives its WebSocket Close frame to go out. A peer that
-/// stopped reading never takes it, and the socket drops without it.
+/// Why the requests still tracked end once no handle can use the connection.
+const ABANDONED: &str = "t3term dropped every handle on the connection";
+/// How long a connection that ended gives its WebSocket Close frame to go out, and after the
+/// last handle drops, the frames queued before it too. A peer that stopped reading never
+/// takes them, and the socket drops without them.
 const CLOSE_LIMIT: Duration = Duration::from_secs(1);
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 /// No frame at all for this long means the socket is dead even if TCP has not noticed.
@@ -93,19 +96,40 @@ enum Pending {
 
 type PendingMap = Arc<Mutex<HashMap<String, Pending>>>;
 
+/// A handle on one Effect RPC connection, which every clone shares.
+///
+/// The connection lasts while a clone, an [`RpcStream`] or a [`BoundedStream`] from it does.
+/// Once the last of them drops, its task sends T3 the frames they queued, such as a stream's
+/// `Interrupt`, then a WebSocket Close frame, and drops the socket. It gives all of that one
+/// second, so a write T3 stopped reading partway through can't hold the socket open. A
+/// [`BoundedChunk`] doesn't keep the connection: it acks only while its stream is open, and
+/// an open stream does.
 #[derive(Clone)]
 pub struct RpcClient {
     outgoing: mpsc::UnboundedSender<Value>,
     pending: PendingMap,
     next_id: Arc<AtomicU64>,
-    closing: Arc<Closing>,
+    owner: Arc<Owner>,
 }
 
-/// How [`RpcClient::close`] reaches every clone and the connection's task.
+/// How [`RpcClient::close`] and the last handle dropping reach every clone and the
+/// connection's task.
 #[derive(Default)]
 struct Closing {
     closed: AtomicBool,
+    /// No handle that can use the connection is left.
+    abandoned: AtomicBool,
     wake: Notify,
+}
+
+/// Why a connection's task stops.
+enum Stop {
+    /// `RpcClient::close` ran. Nothing still queued goes out.
+    Closed,
+    /// The last handle dropped. The frames the handles queued go out before the Close frame.
+    Abandoned,
+    /// The socket closed, failed or went silent, for this reason.
+    Lost(String),
 }
 
 impl Closing {
@@ -113,17 +137,44 @@ impl Closing {
         self.closed.load(Ordering::Acquire)
     }
 
-    /// Returns once `close` has run, whether that was before this call or after it.
-    async fn closed(&self) {
+    /// Whether the task should stop now. A close outranks the last handle dropping.
+    fn stop(&self) -> Option<Stop> {
+        if self.is_closed() {
+            Some(Stop::Closed)
+        } else if self.abandoned.load(Ordering::Acquire) {
+            Some(Stop::Abandoned)
+        } else {
+            None
+        }
+    }
+
+    /// Returns once `close` has run or the last handle has dropped, whether that was before
+    /// this call or after it.
+    async fn stopping(&self) -> Stop {
         loop {
-            // Made before the check, so a close between the check and the wait still wakes
-            // it. `notify_waiters` reaches every `Notified` made before it runs.
+            // Made before the check, so a close or drop between the check and the wait still
+            // wakes it. `notify_waiters` reaches every `Notified` made before it runs.
             let woken = self.wake.notified();
-            if self.is_closed() {
-                return;
+            if let Some(stop) = self.stop() {
+                return stop;
             }
             woken.await;
         }
+    }
+}
+
+/// A share in the connection. Each `RpcClient` clone, `RpcStream` and `BoundedStream` holds
+/// one, and when the last drops, the connection's task stops. The task and the map of
+/// requests hold none, since a share they held couldn't drop while the task runs. Neither
+/// does a bounded stream's `Shared`, which the map holds too.
+struct Owner {
+    closing: Arc<Closing>,
+}
+
+impl Drop for Owner {
+    fn drop(&mut self) {
+        self.closing.abandoned.store(true, Ordering::Release);
+        self.closing.wake.notify_waiters();
     }
 }
 
@@ -132,6 +183,9 @@ pub struct RpcStream {
     pub items: mpsc::UnboundedReceiver<Result<Value, RpcError>>,
     request_id: String,
     outgoing: mpsc::UnboundedSender<Value>,
+    /// Keeps the connection open while the stream lives. It drops after `drop` has queued the
+    /// `Interrupt`.
+    _owner: Arc<Owner>,
 }
 
 impl RpcStream {
@@ -179,6 +233,8 @@ impl RpcClient {
         let pending: PendingMap = Arc::default();
 
         let reader_pending = pending.clone();
+        // The task's own sender keeps nothing open, as the task stops when the last `Owner`
+        // drops, not when the last sender does.
         let ack = outgoing.clone();
         let closing = Arc::<Closing>::default();
         let reader_closing = closing.clone();
@@ -186,10 +242,11 @@ impl RpcClient {
             let mut ping = tokio::time::interval(PING_INTERVAL);
             ping.tick().await;
             let mut last_frame = Instant::now();
-            let reason = loop {
-                // `close` may have run while the task was busy, or before it first ran.
-                if reader_closing.is_closed() {
-                    break CLOSED.to_string();
+            let stop = loop {
+                // `close`, or the last handle dropping, may have come while the task was busy,
+                // or before it first ran.
+                if let Some(stop) = reader_closing.stop() {
+                    break stop;
                 }
                 tokio::select! {
                     frame = source.next() => {
@@ -197,10 +254,10 @@ impl RpcClient {
                         let text = match frame {
                             Some(Ok(Message::Text(text))) => text.to_string(),
                             Some(Ok(Message::Binary(bytes))) => String::from_utf8_lossy(&bytes).into_owned(),
-                            Some(Ok(Message::Close(frame))) => break format!("server closed the socket ({frame:?})"),
+                            Some(Ok(Message::Close(frame))) => break Stop::Lost(format!("server closed the socket ({frame:?})")),
                             Some(Ok(_)) => continue,
-                            Some(Err(e)) => break e.to_string(),
-                            None => break "socket ended".to_string(),
+                            Some(Err(e)) => break Stop::Lost(e.to_string()),
+                            None => break Stop::Lost("socket ended".to_string()),
                         };
                         let Ok(decoded) = serde_json::from_str::<Value>(&text) else { continue };
                         let messages = match decoded {
@@ -215,57 +272,76 @@ impl RpcClient {
                         if message["_tag"] == "Interrupt" {
                             forget_bounded(&reader_pending, &message).await;
                         }
-                        // A write T3 doesn't read can wait forever, so `close` cuts it short.
+                        // A write T3 doesn't read can wait forever, so `close` and the last
+                        // handle dropping cut it short.
                         tokio::select! {
                             biased;
-                            () = reader_closing.closed() => break CLOSED.to_string(),
+                            stop = reader_closing.stopping() => break stop,
                             sent = sink.send(Message::Text(message.to_string().into())) => {
                                 if let Err(e) = sent {
-                                    break e.to_string();
+                                    break Stop::Lost(e.to_string());
                                 }
                             }
                         }
                     }
                     _ = ping.tick() => {
                         if last_frame.elapsed() > SILENCE_LIMIT {
-                            break format!("no frame from T3 for {} seconds", SILENCE_LIMIT.as_secs());
+                            break Stop::Lost(format!("no frame from T3 for {} seconds", SILENCE_LIMIT.as_secs()));
                         }
                         tokio::select! {
                             biased;
-                            () = reader_closing.closed() => break CLOSED.to_string(),
+                            stop = reader_closing.stopping() => break stop,
                             sent = sink.send(Message::Text(json!({"_tag": "Ping"}).to_string().into())) => {
                                 if sent.is_err() {
-                                    break "ping failed".to_string();
+                                    break Stop::Lost("ping failed".to_string());
                                 }
                             }
                         }
                     }
-                    () = reader_closing.closed() => break CLOSED.to_string(),
+                    stop = reader_closing.stopping() => break stop,
                 }
             };
+            let (reason, send_queued) = match stop {
+                Stop::Closed => (CLOSED.to_string(), false),
+                Stop::Abandoned => (ABANDONED.to_string(), true),
+                Stop::Lost(reason) => (reason, false),
+            };
             // A request made from here on fails at once, rather than joining the map after the
-            // drain below and waiting forever. One still queued never goes out.
+            // drain below and waiting forever. After a close, one still queued never goes out.
             outgoing_rx.close();
             // Calls and streams end before the Close frame, which may never go out.
             for (_, entry) in reader_pending.lock().await.drain() {
                 fail(entry, RpcError::Disconnected(reason.clone()));
             }
-            // The socket drops when the task ends, whether the Close frame went or not.
-            let _ = tokio::time::timeout(CLOSE_LIMIT, sink.close()).await;
+            let leaving = async {
+                // Every handle has dropped, so these are the last frames they queued, such as
+                // a stream's Interrupt, in order. A write cut short above goes out first.
+                if send_queued {
+                    while let Ok(message) = outgoing_rx.try_recv() {
+                        let text = Message::Text(message.to_string().into());
+                        if sink.send(text).await.is_err() {
+                            return;
+                        }
+                    }
+                }
+                let _ = sink.close().await;
+            };
+            // The socket drops when the task ends, whether the frames went or not.
+            let _ = tokio::time::timeout(CLOSE_LIMIT, leaving).await;
         });
 
         let rpc = RpcClient {
             outgoing,
             pending,
             next_id: Arc::new(AtomicU64::new(1)),
-            closing,
+            owner: Arc::new(Owner { closing }),
         };
         (rpc, task)
     }
 
     /// True once [`close`](Self::close) ran, or once the connection stopped taking requests.
     pub fn is_closed(&self) -> bool {
-        self.closing.is_closed() || self.outgoing.is_closed()
+        self.owner.closing.is_closed() || self.outgoing.is_closed()
     }
 
     /// Closes the connection for this client and every clone of it, and returns at once.
@@ -276,14 +352,16 @@ impl RpcClient {
     /// stream still waiting with `Disconnected`, gives a WebSocket Close frame a second to go
     /// out and drops the socket. It sends T3 no request, so T3 sees a client that went away.
     ///
-    /// Nothing calls it on its own. A connection nobody closes lasts until its socket drops.
+    /// Nothing calls it on its own. A connection nobody closes lasts until its socket drops or
+    /// the last handle on it does, as [`RpcClient`] says. Unlike the last handle dropping, a
+    /// close sends nothing still queued, a stream's `Interrupt` included.
     pub fn close(&self) {
-        self.closing.closed.store(true, Ordering::Release);
-        self.closing.wake.notify_waiters();
+        self.owner.closing.closed.store(true, Ordering::Release);
+        self.owner.closing.wake.notify_waiters();
     }
 
     fn request(&self, id: &str, tag: &str, payload: Value) -> Result<(), RpcError> {
-        if self.closing.is_closed() {
+        if self.owner.closing.is_closed() {
             return Err(RpcError::Disconnected(CLOSED.into()));
         }
         self.outgoing
@@ -343,6 +421,7 @@ impl RpcClient {
             items: receiver,
             request_id: id,
             outgoing: self.outgoing.clone(),
+            _owner: self.owner.clone(),
         })
     }
 
@@ -373,7 +452,10 @@ impl RpcClient {
             self.pending.lock().await.remove(&id);
             return Err(error);
         }
-        Ok(BoundedStream { shared })
+        Ok(BoundedStream {
+            shared,
+            _owner: self.owner.clone(),
+        })
     }
 }
 
