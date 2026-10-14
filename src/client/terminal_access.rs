@@ -20,10 +20,12 @@
 //!
 //! T3 sets a socket's scopes once, when it opens, and revoking the session leaves the socket
 //! open with them (apps/server/src/ws.ts:3155-3213 and apps/server/src/auth/SessionStore.ts:
-//! 995-1012 at T3 f570bd21). So when the client drops, t3term closes the socket first, for
-//! every clone a caller still holds, and then revokes the session. Each step of a connect has a
-//! time limit, and the ticket and WebSocket handshake get 30 seconds together, so a connect
-//! still running when the client drops ends, and its session is revoked then.
+//! 995-1012 at T3 f570bd21). So when the client drops, t3term closes the connection first and
+//! then starts the revoke. `RpcClient::close` stops every clone a caller still holds before it
+//! returns, and the connection's task drops the socket soon after, giving the WebSocket Close
+//! frame at most a second. The revoke doesn't wait for the socket to drop. Each step of a
+//! connect has a time limit, and the ticket and WebSocket handshake get 30 seconds together, so
+//! a connect still running when the client drops ends, and its session is revoked then.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -87,8 +89,10 @@ struct Grant {
 
 impl Drop for Grant {
     fn drop(&mut self) {
-        // The socket keeps the session's scopes after T3 revokes it, so it closes first, for
-        // every clone. The session drops after this and is revoked.
+        // The socket keeps the session's scopes after T3 revokes it, so the connection closes
+        // first. `close` stops every clone before it returns, and the connection's task drops
+        // the socket soon after. The session drops after this, and its revoke starts without
+        // waiting for the socket.
         if let Some(rpc) = &self.rpc {
             rpc.close();
         }
@@ -968,10 +972,10 @@ mod tests {
         assert_eq!(t3.issues(), 1);
     }
 
-    /// Dropping the client closes the terminal's socket before it revokes the session, for
-    /// every clone a caller still holds. A call waiting on T3 ends, a later call fails at once,
-    /// and T3 gets no request for any of it, such as `terminal.close`. The login's socket stays
-    /// open and still carries calls.
+    /// Dropping the client closes the terminal's connection, for every clone a caller still
+    /// holds, before the session's revoke starts. A call waiting on T3 ends, a later call fails
+    /// at once, and T3 gets no request for any of it, such as `terminal.close`. The login's
+    /// socket stays open and still carries calls.
     #[tokio::test]
     async fn dropping_the_client_closes_the_terminal_socket_for_every_clone() {
         let setup = Setup::start(Duration::ZERO).await;
