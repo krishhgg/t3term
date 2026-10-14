@@ -1,29 +1,27 @@
 # Lineage verification
 
-This page records how GPT-6.1 Sol checked Lineage from [PR #33](https://github.com/krishhgg/t3term/pull/33) in the t3term binary, on 2026-10-13, at source `3d8ee0748f5f4af5f176a6d651bc6d7682e4ee60`. The README's [Lineage](../README.md#lineage) section describes the behavior. Nothing here measures speed, CPU, memory or latency.
+This page records how GPT-6.1 Sol checked Lineage from [PR #33](https://github.com/krishhgg/t3term/pull/33) in the t3term binary, on 2026-10-13, in two rounds. The [first round](#first-round-at-3d8ee07), at source `3d8ee0748f5f4af5f176a6d651bc6d7682e4ee60`, covered the feature in two fake-server runs. The [second round](#second-round-at-a29134c), at `a29134ccd4db20b2088494398e746b3fd2ae3f03`, covered the fixes for Greptile's two findings in a third run. The README's [Lineage](../README.md#lineage) section describes the behavior. Nothing here measures speed, CPU, memory or latency.
 
 Lineage follows T3 Code nightly `f570bd2` (v0.0.46-nightly.20261007.2787), the source the pull request traced. The fake server sends that source's records and events, with a few values of its own listed under [What this doesn't show](#what-this-doesnt-show). Nothing here says what a later nightly sends. Lineage only reads, so nothing here checks Stop, Merge back, Disconnect or a new fork.
 
-## After these runs
+## First round, at `3d8ee07`
 
-A later commit in the same pull request changes Lineage for two Greptile findings. When the feed drops the open thread, as after someone archives it in the desktop, the thread's watch now names its parent. A frame now looks for click targets only among the Lineage rows in view. The checks, runs, counts and images on this page come from `3d8ee07` and don't cover either change, and none of the runs archived the open thread itself. Sol hasn't checked the later commit yet.
-
-## Checks
+### Checks
 
 At `3d8ee07` Sol ran the three CI checks with Rust 1.95.0 and built the binary. `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked` and the build passed. The 457 tests are 423 library, 2 main, 18 CLI and 14 fake RPC tests. The pull request adds 25 of them to master's 432: 14 in `src/tui/lineage.rs`, 3 in `src/tui/details.rs` and 8 App tests in `src/tui/mod.rs`. [CI run 38515733627](https://github.com/krishhgg/t3term/actions/runs/38515733627) passed on macOS and on the optional Linux job.
 
-CI's macOS job had failed at `8b9ff45` on `cargo fmt --check`, over the layout of two test tuples in `src/tui/mod.rs`, so Clippy and the tests didn't run there. `3d8ee07` changes only those two layouts. Sol's earlier 456-test run at `929872c`, and its run of the archived-fork test alone at `8b9ff45`, came before that fix, and the 457-test run replaces them. The commit that adds this page and its images changes no source or test.
+CI's macOS job had failed at `8b9ff45` on `cargo fmt --check`, over the layout of two test tuples in `src/tui/mod.rs`, so Clippy and the tests didn't run there. `3d8ee07` changes only those two layouts. Sol's earlier 456-test run at `929872c`, and its run of the archived-fork test alone at `8b9ff45`, came before that fix, and the 457-test run replaces them. `3f6572c`, the commit that added this page and this round's images, changed no source or test.
 
-## How it ran
+### How it ran
 
 - The binary built from `3d8ee07` ran twice. The truecolor run started at 200x50, went down to 80x24, 40x12 and 16x8, and came back to 200x50. The 256-color run stayed at 120x36.
 - A temporary Python script, kept outside the repository, served a fake T3 server with its HTTP, WebSocket and auth endpoints on 127.0.0.1 only. Claude Opus 5.5 adapted it from the script of the [thread details check](thread-details-verification.md), and Sol ran it. It refuses every orchestration command. Every project, thread, agent, context transfer and reply is invented.
 - Each run had its own temporary `HOME` and `T3CODE_HOME`, `T3TERM_NO_SAVED_LOGIN=1` so no Keychain entry, a stand-in `t3` command and a private tmux socket. The script starts t3term under `env -i`. No real `~/.t3`, `.env`, project folder or live T3 server took part.
 - Each run started t3term once, with no restart and no reconnect. Each fake server issued one session and revoked it, and opened and closed one socket. Both fake servers and both tmux sessions stopped.
 
-## What the runs covered
+### What the runs covered
 
-Sol drove these cases and inspected the captures. The list records what Sol saw. The script's walkthrough says what each step should show, and those predictions don't count as results. Sol didn't try every control the script has, as the last section lists.
+Sol drove these cases and inspected the captures. The list records what Sol saw. The script's walkthrough says what each step should show, and those predictions don't count as results. Sol didn't try every control the script has, as [What this doesn't show](#what-this-doesnt-show) lists.
 
 **The main thread, truecolor 200x50.** With `Main: open me first` open, the pane read `Lineage · 3 running`. Under it were ↑ Root: where it began (Done), the forks Fork B (Running) and Fork A (Done), and muted ↳ rows under the ids `thr-dropped` (Queued) and `thr-merged` (Consumed). The script archived those two forks, so they show only through the fork transfers that made them. Then came the agents Read the docs (Running), Wait For Review (Waiting) and Resume the parser fix (Running), and a closed `› Previous agents (4)` with `1 failed`. Resume the parser fix has a completed task, but the script runs its thread again, and the row reads Running. The third running agent has no thread yet, so it counts but has no row.
 
@@ -41,7 +39,7 @@ Sol drove these cases and inspected the captures. The list records what Sol saw.
 
 **256 colors, 120x36.** With the sidebar shown, the details were a dialog. Previous agents showed Done, Failed and Stopped, the archived agent's thread didn't open, and the completed agent's thread opened.
 
-## Server counters
+### Server counters
 
 | | Truecolor | 256 colors |
 |---|---|---|
@@ -60,11 +58,11 @@ Sol drove these cases and inspected the captures. The list records what Sol saw.
 
 In the truecolor run the thread watches were 4 on `thr-main` and one each on `thr-root`, the completed agent's `thr-agent-done` and `thr-many`. In the 256-color run they were one each on `thr-main` and `thr-agent-done`. No other RPC request reached either server, so choosing rows, paging, opening Previous agents, scrolling and resizing started no request. The truecolor run's script also closed one watch, completed one agent, archived Fork B and sent it back, and changed two titles. The 256-color run's script changed nothing.
 
-## Control characters
+### Control characters
 
 The script searched every byte t3term wrote to its pane for markers of the hostile title: the SGR code for red, the OSC 52 write, the C1 CSI, a BEL with the text after it, and text placed past the title's cap. That was 208,991 bytes in the truecolor run and 31,145 in the 256-color run. Only the truecolor run sent the hostile titles. Every count was 0 in both runs, and 0 in the truecolor run's bytes after the titles went out. The screen's count of the capped text was 0 too. The search covers those markers only, so it doesn't prove that no other control byte got through.
 
-## Images
+### Images
 
 Sol took no native Terminal screenshots. Each image renders one `tmux capture-pane -p -e` capture, the cells tmux held for t3term's pane, with the temporary Swift renderer from the [provider status check](provider-status-verification.md#images), kept outside the repository. It draws each cell at 17x33 pixels with its SGR colors and bold, and adds no text, frame or cursor. Nobody edited or cropped the images. The 200x50 captures are 3400x1650 pixels and the 120x36 one is 2040x1188.
 
@@ -88,16 +86,101 @@ Sol recorded these SHA-256 sums for the three files:
 | `screenshots/lineage-previous-agents.png` | 200x50, truecolor | `166f1ef482c438b6dca952587e8770c470bdedc0c5088389e3f6ad8f3debe515` |
 | `screenshots/lineage-dialog-256.png` | 120x36, 256 colors | `4fc64c64a64d057d23acb89334064576cfd45a165ae3036440541b20726af5e3` |
 
-## What this doesn't show
+### What this doesn't show
 
 - The fake servers spoke real HTTP and WebSocket, but only on 127.0.0.1. No live T3 server, Keychain or GitHub host took part.
 - Sol didn't try these script controls here: adding an agent or giving one a thread, making a fork, changing a context transfer, a reconnect, blank and null agent titles, and the threads with no relations or an archived parent. Offline tests cover some of these cases, as the README's [Tests](../README.md#tests) section lists.
 - The archived copy of Fork B is invented. The pinned T3's active feed sends `thread.removed` for an archived thread instead.
 - A few of the script's values are its own guesses rather than traced from T3: the handoff ids, the agent threads' `createdBy` and `creationSource`, and `targetRunId: null` on consumed transfers. Each record in the script also holds both the thread's fields and the feed's.
-- The second run used the same source as the first, and didn't repeat every case of it.
+- The 256-color run used the same source as the truecolor run, and didn't repeat every case of it.
 - Sol took no idle sample.
 - The marker searches cover planted markers only.
 
+## Second round, at `a29134c`
+
+Greptile's first review, on `3f6572c`, raised two findings. First, when someone archived the open thread in the desktop, the feed dropped it, and Lineage dropped the parent row with it even while the parent was available. Second, each frame checked every expanded Lineage row to find the few on screen. `a29134c` takes the parent from the open thread's watch when the feed no longer lists the open thread, and a frame now looks for click targets only among the rows in view. None of the first round's runs had archived the open thread.
+
+### Checks
+
+At `a29134c` Sol ran the same three CI checks with Rust 1.95.0 and built the binary, and all of them passed. The 461 tests are 427 library, 2 main, 18 CLI and 14 fake RPC tests. `a29134c` adds 4 to the first round's 457:
+
+- `the_projection_names_the_parent_once_the_shell_drops_the_open_thread` and `the_projection_names_no_parent_the_shell_or_another_thread_speaks_for` in `src/tui/lineage.rs`
+- `a_frame_maps_the_lineage_rows_in_view_and_no_others` in `src/tui/details.rs`
+- the App test `the_parent_still_opens_after_the_shell_drops_the_open_thread` in `src/tui/mod.rs`
+
+[CI run 38520898977](https://github.com/krishhgg/t3term/actions/runs/38520898977) passed on macOS and Linux.
+
+Sol reviewed both fixes. In nightly `f570bd2`, Sol read the code that sets a thread's parent link when T3 creates the thread, and the projection's reads of that link. The desktop's Disconnect agent session calls `stopSession` and doesn't change the link. The fallback relies on the link staying as T3 made it.
+
+The commit that adds this section and its two images changes no source or test.
+
+### How it ran
+
+Sol built the binary from `a29134c` and ran it once with the first round's script, unchanged, which sets up the isolation [How it ran](#how-it-ran) describes. The run was truecolor. It started at 200x50, went to 80x24 and came back to 200x50. t3term started once, with no restart and no reconnect, and exited with code 0. The fake server issued one session and revoked it, and opened and closed one socket. The server and the private tmux session stopped.
+
+### What the run covered
+
+Sol drove these cases and inspected the captures. The script's walkthrough predates `a29134c`. Once the feed drops Main, it predicts Root as a consumed context-transfer row. The captures instead show ↑ Root: where it began with Done, and that row opened Root. This section records the captures, and the script is unchanged.
+
+**Archiving the open thread.** Sol opened `Main: open me first` with a click in the sidebar, typed the draft `parent navigation draft survives` and opened the details. The script archived Main the usual way, not with the first round's stale copy. It sent `thread.archived` and then the feed's `thread.removed`. Main left the sidebar, and the sidebar's highlight moved to the next card, as it does for any thread the feed drops. The pane kept ↑ Root: where it began with Done. A click on that row opened Root with a new watch. The script restored Main, and a click on Main's fork row in Root's Lineage opened Main again.
+
+**After the watch closes.** The script archived Main again and closed its watch. The pane kept the parent row and read `Lineage · 2 running`. ↓ chose Root, and the status line read `Enter open parent thread`, as the first image below shows. The script then archived Root as well. Its row became `↑ thr-root` with Unavailable. A click on it said `This related thread is unavailable.`, stayed on Main and started no watch. Once the script restored Root, Enter on the chosen parent row opened Root, with Main's watch still closed.
+
+**Many agents.** Sol clicked `Many: 134 agents` in the sidebar, showed the 2 more agents at work, opened Previous agents and clicked `+ Show 12 more` ten times, until all 124 showed. At 200x50, End showed Previous agents 81 to 124, with no Show more left. ↓ then chose Check Part 81, the first row in view, and the status line read `Enter open subagent`. PageUp and then End scrolled the details again.
+
+**A small dialog.** At 80x24 the details became a dialog, and End showed agents 106 to 124, with Check Part 111 Failed. That's the second image below. A click on Review chunk 124 in the dialog opened its thread, `thr-many-p124`, and a click on that thread's ↑ Many row went back to Many. Back at 200x50, Many's Lineage was on its default paging again, and the composer still held the draft.
+
+### Server counters
+
+| | Truecolor |
+|---|---|
+| t3term starts | 1 |
+| `subscribeServerConfig` | 1 |
+| `orchestration.subscribeShell` | 1 |
+| `orchestration.subscribeThread` | 7 |
+| `subscribeWorktreeSetup` | 0 |
+| `server.getConfig` reads | 0 |
+| Orchestration commands | 0 |
+| RPC interrupts, before quitting and in all | 6 and 9 |
+| Sockets opened and closed | 1 and 1 |
+| Sessions issued and revoked | 1 and 1 |
+| Reconnects and restarts | 0 |
+| Resizes | 2 |
+| Captures | 12 |
+
+The thread watches were 2 each on `thr-main`, `thr-root` and `thr-many`, and 1 on `thr-many-p124`. No other RPC request reached the server, so the refused click, choosing rows, paging, scrolling and resizing started no request. The script archived Main twice and Root once, restored each once, and closed Main's watch once.
+
+The script searched the run's 169,398 bytes of terminal output for the first round's markers, and every count was 0. This run sent no hostile title, so those zeros say nothing about how t3term handles one.
+
+### Images
+
+Each image renders one `tmux capture-pane -p -e` capture with the first round's renderer, at 17x33 pixels a cell, with no text, frame or cursor added. Nobody edited or cropped them. The 200x50 capture is 3400x1650 pixels and the 80x24 one is 1360x792. The threads and agents are invented and come from the fake server. Like the first round's, these images show this branch on its own, without the sidebar spacing and shelves of pull request #35.
+
+| Main archived and its watch closed, truecolor 200x50 |
+|---|
+| ![Main: open me first after the script archived it and closed its watch. The sidebar no longer lists Main, and the status line starts with closed. The details pane reads Lineage · 2 running over the chosen ↑ Root: where it began (Done), ↳ Fork B: still running (Running), ↳ Fork A: try another pars… (Done), the muted ids thr-dropped (Unavailable) and thr-merged (Consumed), ◆ Read the docs (Running), ◆ Wait For Review (Waiting), ◆ Resume the parser fix (Running) and › Previous agents (4) with 1 failed in red. The status line reads Enter open parent thread, and the composer holds parent navigation draft survives](screenshots/lineage-archived-parent.png) |
+
+| Previous agents 106 to 124 in a dialog, truecolor 80x24 |
+|---|
+| ![Many: 134 agents at 80x24, with the details as a dialog over the sidebar and transcript. The dialog lists Review chunk 106 through Review chunk 124, each Done except Check Part 111, which reads Failed in red, and its bottom edge reads more ↑. The status line reads live · ↑↓ choose · PgUp scroll · Esc close](screenshots/lineage-last-page-dialog.png) |
+
+A click on Review chunk 124 in this dialog then opened `thr-many-p124`.
+
+Sol recorded these SHA-256 sums for the two files:
+
+| File | Cells | SHA-256 |
+|---|---|---|
+| `screenshots/lineage-archived-parent.png` | 200x50, truecolor | `b6f3c259b2d8a26861b62d03c388e68498916eadda678f3c7b08ec2c3ed18963` |
+| `screenshots/lineage-last-page-dialog.png` | 80x24, truecolor | `7bd8279282cd0aa9ff92ed0f62cd5b08e3ec19561b2a1066d0c3216e1584fae4` |
+
+### What this round doesn't show
+
+- This round is one truecolor run, and it didn't repeat the first round's cases. The 256-color, 40x12 and 16x8 evidence comes from `3d8ee07` only.
+- The run sent no hostile title. It changed no title, agent or context transfer, made no fork and had no reconnect.
+- Each capture shows the screen once a step had settled, not the first frame after an event. The App test above draws that frame for the archived open thread.
+- Sol took no timing, CPU or memory sample, so nothing here says how much work drawing only the rows in view saves.
+- There's no native Terminal screenshot or video.
+
 ## Where the evidence is
 
-The captures, the raw terminal output and the script's logs stay on the machine that ran the checks, in `/private/tmp/t3term-pr33-fixture-hmmblccs` and `/private/tmp/t3term-pr33-fixture-qbww5blw`. They aren't committed or published, and neither are the script, the renderer or the raw asciicast recordings. The images on this page render t3term's captured terminal output, and everything in them comes from the fake server.
+The captures, the raw terminal output and the script's logs stay on the machine that ran the checks: `/private/tmp/t3term-pr33-fixture-hmmblccs` and `/private/tmp/t3term-pr33-fixture-qbww5blw` for the first round, and `/private/tmp/t3term-pr33-fixture-raxj38mb` for the second. They aren't committed or published, and neither are the script, the renderer or the raw asciicast recordings. The images on this page render t3term's captured terminal output, and everything in them comes from the fake server.
