@@ -209,11 +209,23 @@ fn serve_sockets(
 }
 
 /// How a fake server answers a request.
+#[derive(Clone)]
 enum Reply {
     /// 200, with this JSON.
     Json(Value),
     /// A redirect with this status to this URL.
     Redirect(u16, String),
+    /// This response as it is written. When it is empty, the server closes the connection
+    /// without an answer once it has read the request.
+    Raw(String),
+}
+
+/// A response with `status`, such as `500 Internal Server Error`, and `body` as it is.
+fn raw(status: &str, body: &str) -> Reply {
+    Reply::Raw(format!(
+        "HTTP/1.1 {status}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+        body.len()
+    ))
 }
 
 /// The HTTP response a fake server writes for `reply`, or a 404 when there is none.
@@ -224,6 +236,7 @@ fn response(reply: Option<Reply>) -> String {
             let location = format!("Location: {to}\r\n");
             (format!("{code} Redirect"), location, String::new())
         }
+        Some(Reply::Raw(text)) => return text,
         None => ("404 Not Found".to_string(), String::new(), String::new()),
     };
     format!(
@@ -232,7 +245,8 @@ fn response(reply: Option<Reply>) -> String {
     )
 }
 
-/// `serve_sockets`, with `respond` choosing how to answer each path, a redirect included.
+/// `serve_sockets`, with `respond` choosing how to answer each path, a redirect or a raw
+/// response included.
 fn serve_replies(
     respond: impl Fn(&str) -> Option<Reply> + Send + 'static,
     on_socket: impl Fn(Socket) + Send + Sync + 'static,
@@ -1722,6 +1736,10 @@ fn no_command_without_a_terminal_is_a_usage_error() {
     assert_error(&home.run(&["--json"]), 2, "NOT_A_TERMINAL");
 }
 
+/// An origin where nothing listens, so the system refuses a connection. No common service uses
+/// port 1.
+const STOPPED: &str = "http://127.0.0.1:1";
+
 /// A thread on environment A's server, and one on B's.
 const THREAD_A: &str = "a1c4e7f0-2b5d-4e8a-9c3f-6d0b2e5a8c11";
 const THREAD_B: &str = "b2d5f8a1-3c6e-4f9b-8d4a-7e1c3f6b9d22";
@@ -1895,17 +1913,22 @@ fn a_named_environment_that_fails_a_check_gets_no_login_and_no_other_server_is_t
     descriptor["orchestrationProtocolVersion"] = json!(1);
     let (old, old_paths) = fake_server(descriptor);
 
-    // Nothing listens on port 0, and 192.0.2.1 is a documentation address off this machine.
-    let down = home.t3_home("down/.t3", Some("env-down"), Some("http://127.0.0.1:0"));
+    // Nothing listens at `STOPPED`, and 192.0.2.1 is a documentation address off this machine.
+    let down = home.t3_home("down/.t3", Some("env-down"), Some(STOPPED));
     let unstarted = home.t3_home("unstarted/.t3", Some("env-unstarted"), None);
     let imposter = home.t3_home("imposter/.t3", Some("env-mine"), Some(&other.origin));
     let unverified = home.t3_home("unverified/.t3", None, Some(&fresh.origin));
     let pinned_home = home.t3_home("pinned/.t3", Some("env-pinned"), None);
     let old_home = home.t3_home("old/.t3", Some("env-test"), Some(&old));
     let lan = home.t3_home("lan/.t3", Some("env-lan"), Some("http://192.0.2.1:3773"));
+    // A's own port over https, saved and recorded. This t3term has no TLS to reach it with.
+    let a_https = a.origin.replace("http://", "https://");
+    let tls_home = home.t3_home("tls/.t3", Some("env-a"), Some(&a_https));
     let local = |t3_home: &Path| json!({"kind": "local", "t3Home": t3_home});
     let mut file = json!({"default": "a", "environments": {
         "a": local(&a_home),
+        "tls": {"kind": "local", "t3Home": a_home, "origin": a_https},
+        "tls-recorded": local(&tls_home),
         "down": local(&down),
         "unstarted": local(&unstarted),
         "imposter": local(&imposter),
@@ -1931,6 +1954,8 @@ fn a_named_environment_that_fails_a_check_gets_no_login_and_no_other_server_is_t
         ("old", 4, "T3_PROTOCOL_UNSUPPORTED"),
         ("lan", 4, "ENVIRONMENT_NOT_LOCAL"),
         ("far", 4, "ENVIRONMENT_NOT_LOCAL"),
+        ("tls", 4, "ENVIRONMENT_TLS_UNSUPPORTED"),
+        ("tls-recorded", 4, "ENVIRONMENT_TLS_UNSUPPORTED"),
         ("paired", 4, "ENVIRONMENT_UNSUPPORTED"),
         ("missing", 3, "ENVIRONMENT_NOT_FOUND"),
         ("Missing", 2, "ENVIRONMENT_NAME_INVALID"),
@@ -1980,6 +2005,55 @@ fn a_named_environment_that_fails_a_check_gets_no_login_and_no_other_server_is_t
 }
 
 #[test]
+fn a_dangling_default_or_a_broken_file_is_passed_only_the_documented_ways() {
+    // A runs, and T3CODE_HOME records no server, so a command reaches A only the way it names.
+    let home = Home::new();
+    let t3 = home.logging_t3();
+    let a = serve_environment("env-a", THREAD_A);
+    let a_home = home.t3_home("env a/.t3", Some("env-a"), Some(&a.origin));
+    let a_dir = a_home.to_str().unwrap();
+    let local = json!({"kind": "local", "t3Home": a_dir});
+    home.save_environments(&json!({"default": "gone", "environments": {"a": local}}));
+    let near_a = |args: &[&str]| {
+        let mut command = home.command(args, &t3);
+        command.env("T3TERM_ORIGIN", &a.origin);
+        command.output().expect("run t3term")
+    };
+    let named = ["--json", "--environment", "a", "threads"];
+
+    // A default that names no saved environment stops a command that names none. The file
+    // still reads, so `--environment` gets past it, and T3TERM_ORIGIN skips the file.
+    let threads = home.run_with(&["--json", "threads"], &t3);
+    assert_error(&threads, 3, "ENVIRONMENT_NOT_FOUND");
+    assert_eq!(listed_ids(&home.run_with(&named, &t3)), [THREAD_A]);
+    assert_eq!(listed_ids(&near_a(&["--json", "threads"])), [THREAD_A]);
+
+    // A file that doesn't parse stops `--environment` too, since t3term looks the name up in
+    // it, with T3TERM_ORIGIN set or not. T3TERM_ORIGIN skips the file only for a command that
+    // names no environment.
+    let broken = r#"{"default": "#;
+    std::fs::write(home.environments_path(), broken).unwrap();
+    let threads = home.run_with(&["--json", "threads"], &t3);
+    assert_error(&threads, 1, "ENVIRONMENTS_UNREADABLE");
+    assert_error(&home.run_with(&named, &t3), 1, "ENVIRONMENTS_UNREADABLE");
+    assert_error(&near_a(&named), 1, "ENVIRONMENTS_UNREADABLE");
+    assert_eq!(listed_ids(&near_a(&["--json", "threads"])), [THREAD_A]);
+    let text = std::fs::read_to_string(home.environments_path()).unwrap();
+    assert_eq!(text, broken);
+
+    // The three that ran logged in once each: `--environment a` with A's T3 home, and
+    // T3TERM_ORIGIN with the one discovery reads.
+    let ambient = home.0.path().join(".t3");
+    let ambient = session_log(ambient.to_str().unwrap(), READ_SCOPE);
+    let logins = session_log(a_dir, READ_SCOPE) + &ambient + &ambient;
+    assert_eq!(home.t3_log(), logins);
+    let descriptor = "/.well-known/t3/environment";
+    let reached = a.paths.lock().unwrap().clone();
+    let described = reached.iter().filter(|path| *path == descriptor).count();
+    assert_eq!(described, 3, "{reached:?}");
+}
+
+#[test]
 fn a_named_environment_whose_server_redirects_gets_no_login_and_its_target_no_request() {
     // A is the saved default and the server T3TERM_ORIGIN names. T3CODE_HOME records no
     // server, so a command that can't reach the server it chose has nowhere else to go.
@@ -2025,6 +2099,65 @@ fn a_named_environment_whose_server_redirects_gets_no_login_and_its_target_no_re
     assert!(reached.is_empty(), "A was asked for {reached:?}");
     let descriptor = "/.well-known/t3/environment";
     assert_eq!(*b_paths.lock().unwrap(), [descriptor; 4]);
+    assert_eq!(home.t3_log(), "");
+}
+
+#[test]
+fn a_named_environment_whose_server_answers_without_a_descriptor_gets_no_login() {
+    // A is the saved default, the server T3CODE_HOME records and the one T3TERM_ORIGIN names,
+    // as in `a_named_environment_gets_every_request_and_every_login`.
+    let home = Home::new();
+    let t3 = home.logging_t3();
+    let a = serve_environment("env-a", THREAD_A);
+    home.record_server(&a.origin);
+    let a_home = home.t3_home("env a/.t3", Some("env-a"), Some(&a.origin));
+    let local = |t3_home: &Path| json!({"kind": "local", "t3Home": t3_home});
+    let mut file = json!({"default": "a", "environments": {"a": local(&a_home)}});
+
+    // Each B answers its descriptor one of these ways. A server that answers at all is
+    // running, and one that took the connection and closed it unanswered may be busy rather
+    // than stopped. So each stops the command before a login, and `logout` removes nothing
+    // and reports the error.
+    let invalid = "T3_DESCRIPTOR_INVALID";
+    // Says 400 bytes follow, sends 17 and closes the connection.
+    let cut_short = "HTTP/1.1 200 OK\r\nContent-Length: 400\r\n\r\n{\"environmentId\":";
+    let answers = [
+        (raw("500 Internal Server Error", "{}"), 4, invalid),
+        (raw("404 Not Found", ""), 4, invalid),
+        (raw("200 OK", r#"{"environmentId":"env-b"}"#), 4, invalid),
+        (raw("200 OK", "not json"), 4, invalid),
+        (Reply::Raw(cut_short.to_string()), 4, invalid),
+        (Reply::Raw(String::new()), 5, "T3_SERVER_UNAVAILABLE"),
+    ];
+    let mut servers = Vec::new();
+    for (i, (answer, exit_code, code)) in answers.into_iter().enumerate() {
+        let (b, b_paths) = serve_replies(move |_| Some(answer.clone()), |_| {});
+        let name = format!("b{i}");
+        let b_home = home.t3_home(&format!("{name}/.t3"), Some("env-b"), Some(&b));
+        file["environments"][name.as_str()] = local(&b_home);
+        servers.push((name, b_paths, exit_code, code));
+    }
+    home.save_environments(&file);
+    let near_a = |args: &[&str]| {
+        let mut command = home.command(args, &t3);
+        command.env("T3TERM_ORIGIN", &a.origin);
+        command.output().expect("run t3term")
+    };
+
+    let commands: [&[&str]; 3] = [&["threads"], &["send", THREAD_B, "Hi"], &["logout"]];
+    let descriptor = "/.well-known/t3/environment";
+    for (name, b_paths, exit_code, code) in servers {
+        for command in commands {
+            let mut args = vec!["--json", "--environment", name.as_str()];
+            args.extend(command);
+            assert_error(&near_a(&args), exit_code, code);
+        }
+        assert_eq!(*b_paths.lock().unwrap(), [descriptor; 3], "{name}");
+    }
+
+    // A was asked for nothing, and no session was issued.
+    let reached = a.paths.lock().unwrap().clone();
+    assert!(reached.is_empty(), "A was asked for {reached:?}");
     assert_eq!(home.t3_log(), "");
 }
 
@@ -2127,14 +2260,14 @@ fn logging_out_of_a_named_environment_touches_its_login_alone() {
     assert_eq!(logged_out, "No saved logins.");
 
     // A runs, and is the default, the server T3CODE_HOME records and the one T3TERM_ORIGIN
-    // names. B is down, since nothing listens on port 0. Up runs. Other answers for a home
+    // names. B is down, since nothing listens at `STOPPED`. Up runs. Other answers for a home
     // other than imposter's. 192.0.2.1 is a documentation address off this machine.
     let a = serve_environment("env-a", THREAD_A);
     let up = serve_environment("env-up", THREAD_B);
     let other = serve_environment("env-other", THREAD_B);
     home.record_server(&a.origin);
     let a_home = home.t3_home("env a/.t3", Some("env-a"), Some(&a.origin));
-    let b_home = home.t3_home("env b/.t3", Some("env-b"), Some("http://127.0.0.1:0"));
+    let b_home = home.t3_home("env b/.t3", Some("env-b"), Some(STOPPED));
     let up_home = home.t3_home("up/.t3", Some("env-up"), Some(&up.origin));
     let imposter = home.t3_home("imposter/.t3", Some("env-mine"), Some(&other.origin));
     let lan = home.t3_home("lan/.t3", Some("env-lan"), Some("http://192.0.2.1:3773"));
@@ -2146,6 +2279,7 @@ fn logging_out_of_a_named_environment_touches_its_login_alone() {
         "imposter": local(&imposter),
         "lan": local(&lan),
         "far": {"kind": "local", "t3Home": b_home, "origin": "http://192.0.2.1:3773"},
+        "tls": {"kind": "local", "t3Home": b_home, "origin": "https://127.0.0.1:3773"},
         "paired": {"kind": "paired", "t3Home": b_home},
     }});
     home.save_environments(&file);
@@ -2171,6 +2305,7 @@ fn logging_out_of_a_named_environment_touches_its_login_alone() {
         ("imposter", 4, "T3_ENVIRONMENT_MISMATCH"),
         ("lan", 4, "ENVIRONMENT_NOT_LOCAL"),
         ("far", 4, "ENVIRONMENT_NOT_LOCAL"),
+        ("tls", 4, "ENVIRONMENT_TLS_UNSUPPORTED"),
         ("paired", 4, "ENVIRONMENT_UNSUPPORTED"),
         ("missing", 3, "ENVIRONMENT_NOT_FOUND"),
     ];
@@ -2242,6 +2377,11 @@ fn environments_are_saved_listed_renamed_and_removed_without_a_server() {
             "add c --t3-home /c --origin http://127.0.0.1:3773/api",
             2,
             "ENVIRONMENT_ORIGIN_INVALID",
+        ),
+        (
+            "add c --t3-home /c --origin https://127.0.0.1:3773",
+            4,
+            "ENVIRONMENT_TLS_UNSUPPORTED",
         ),
         ("rename missing c", 3, "ENVIRONMENT_NOT_FOUND"),
         ("rename a b", 4, "ENVIRONMENT_EXISTS"),
