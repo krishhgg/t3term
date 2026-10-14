@@ -856,14 +856,15 @@ async fn run(cli: Cli) -> Result<i32> {
                 .launch_thread(&request)
                 .await
                 .map_err(|error| with_next_step(error, environment))?;
-            if json_mode {
-                print_json(&launch_json(&request, &receipt, project, source));
+            let output = if json_mode {
+                json_text(&launch_json(&request, &receipt, project, source), true) + "\n"
             } else {
-                print!(
-                    "{}",
-                    launch_text(&request, &receipt, project, source, environment)
-                );
-            }
+                launch_text(&request, &receipt, project, source, environment)
+            };
+            // T3 has the thread now. A reader that closed stdout must not panic past the revoke
+            // in `main`, and must not make the launch look unconfirmed.
+            write_stdout(&output)
+                .map_err(|error| unprinted_launch(&request, &receipt, environment, &error))?;
             Ok(0)
         }
         Command::Wait { thread, timeout } => {
@@ -1130,6 +1131,37 @@ fn with_next_step(error: anyhow::Error, environment: Option<&str>) -> anyhow::Er
     t3.message.push_str(&hint);
     t3.details.insert("read".into(), json!(read));
     t3.into()
+}
+
+/// Writes `text` to stdout and flushes it. `print!` panics when stdout's reader has gone, and
+/// the panic would skip the revoke in `main`, so this returns the error instead.
+fn write_stdout(text: &str) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(text.as_bytes())?;
+    stdout.flush()
+}
+
+/// The error for a launch T3 accepted whose result t3term couldn't write. It names the thread,
+/// because launching again would start a second one.
+fn unprinted_launch(
+    request: &LaunchRequest,
+    receipt: &LaunchReceipt,
+    environment: Option<&str>,
+    error: &std::io::Error,
+) -> anyhow::Error {
+    let thread = receipt.thread_id.as_str();
+    let read = next_command(environment, &["read", thread]);
+    let mut details = request.ids();
+    details.insert("outcome".into(), json!("accepted"));
+    details.insert("read".into(), json!(read));
+    T3Error::new(
+        "OUTPUT_FAILED",
+        format!(
+            "T3 accepted the launch of thread {thread}, but t3term couldn't print it: {error}. Launching again would start a second thread. Run `{read}` to see this one."
+        ),
+    )
+    .with_details(details)
+    .into()
 }
 
 fn mode_source_text(source: ModeSource) -> &'static str {

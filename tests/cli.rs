@@ -3136,3 +3136,153 @@ fn a_workspace_that_fails_to_prepare_shows_in_wait_and_read() {
     let item = &json_stdout(&read)["projection"]["turnItems"][0];
     assert_eq!(item["failure"]["code"], "workspace_preparation_failed");
 }
+
+/// How long the closed-stdout test waits for t3term or its fake `t3` before it fails. A run that
+/// works takes a fraction of a second.
+const GUARD: std::time::Duration = std::time::Duration::from_secs(30);
+
+/// Checks `done` every few milliseconds until it holds, and fails the test after `GUARD`.
+fn wait_until(what: &str, mut done: impl FnMut() -> bool) {
+    let deadline = std::time::Instant::now() + GUARD;
+    while !done() {
+        assert!(
+            std::time::Instant::now() < deadline,
+            "gave up waiting for {what}"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(5));
+    }
+}
+
+/// `logging_t3`, with a revoke that logs `held|SESSION` and then waits for a file named
+/// `release` in the home before it logs the revoke as `logging_t3` does. It also stops waiting
+/// once the home is gone or after about a minute, so a failed test leaves nothing running.
+fn held_revoke_t3(home: &Home) -> String {
+    let logging = home.logging_t3();
+    let script = format!(
+        r#"if [ "$3" = revoke ]; then
+  echo "held|$4" >> t3.log
+  i=0
+  while [ ! -e release ] && [ -e t3.sh ] && [ "$i" -lt 3000 ]; do
+    sleep 0.02
+    i=$((i + 1))
+  done
+fi
+exec {logging} "$@"
+"#
+    );
+    std::fs::write(home.0.path().join("held-t3.sh"), script).unwrap();
+    "/bin/sh ./held-t3.sh".to_string()
+}
+
+/// A t3term run the test drives step by step. When a check fails first, dropping it lets the
+/// held revoke go and kills t3term, so nothing is left waiting.
+struct Running {
+    child: std::process::Child,
+    release: PathBuf,
+}
+
+impl Drop for Running {
+    fn drop(&mut self) {
+        let _ = std::fs::write(&self.release, "");
+        let _ = self.child.kill();
+        let _ = self.child.wait();
+    }
+}
+
+#[test]
+fn a_launch_whose_stdout_closed_revokes_its_session_before_t3term_exits() {
+    for json_mode in [true, false] {
+        launch_into_closed_stdout(json_mode);
+    }
+}
+
+/// Launches with stdout's reader gone before T3 answers. T3 accepts the launch and t3term can't
+/// print it. t3term must exit 1 without panicking, and only once its session's revoke is done.
+fn launch_into_closed_stdout(json_mode: bool) {
+    use std::io::Read as _;
+    let home = Home::new();
+    let t3 = held_revoke_t3(&home);
+    // The fake says when the launch arrives, then holds its answer until the test lets it go.
+    let (arrived, launch_arrived) = std::sync::mpsc::channel::<()>();
+    let (answer, held) = std::sync::mpsc::channel::<()>();
+    let held = Mutex::new(held);
+    let projects = launch_projects(PROJECT_B, "t3term");
+    let server = serve_launch_environment("env-test", projects, json!({}), move |payload| {
+        let _ = arrived.send(());
+        // A test that stops early drops `answer`, and the fake closes the socket.
+        held.lock().unwrap().recv_timeout(GUARD).ok()?;
+        launched(payload)
+    });
+    home.record_server(&server.origin);
+    let mut args = vec!["launch", "t3term", "Fix it", "--model", "claude-opus-5-5"];
+    if json_mode {
+        args.insert(0, "--json");
+    }
+    let mut command = home.command(&args, &t3);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut running = Running {
+        child: command.spawn().expect("run t3term"),
+        release: home.0.path().join("release"),
+    };
+
+    // stdout's reader goes away while T3 holds the launch, and then T3 accepts it.
+    launch_arrived
+        .recv_timeout(GUARD)
+        .expect("the launch reached T3");
+    drop(running.child.stdout.take());
+    answer.send(()).unwrap();
+
+    // t3term starts the revoke and is still running while the revoke is held.
+    let ambient = home.0.path().join(".t3");
+    let t3_home = ambient.to_str().unwrap();
+    let log_held = format!("issue|{t3_home}|{OPERATE_SCOPES}\nheld|session-test\n");
+    wait_until("the revoke", || {
+        home.t3_log().contains("held|session-test\n")
+    });
+    assert_eq!(home.t3_log(), log_held, "json {json_mode}");
+    let exited = running.child.try_wait().unwrap();
+    assert_eq!(
+        exited, None,
+        "json {json_mode}: t3term didn't wait for its revoke"
+    );
+
+    // Once the revoke is let go, it finishes before t3term exits.
+    std::fs::write(&running.release, "").unwrap();
+    wait_until("t3term to exit", || {
+        running.child.try_wait().unwrap().is_some()
+    });
+    let log_revoked = format!("{log_held}revoke|{t3_home}|session-test\n");
+    assert_eq!(home.t3_log(), log_revoked, "json {json_mode}");
+
+    // It exits 1 without a panic. `--json` sent the error to the closed stdout, and plain
+    // output puts it on stderr with the thread T3 launched.
+    let status = running.child.wait().unwrap();
+    let mut err = String::new();
+    let mut stderr = running.child.stderr.take().unwrap();
+    stderr.read_to_string(&mut err).unwrap();
+    assert_eq!(status.code(), Some(1), "json {json_mode}: {err}");
+    let launches = server.launches();
+    assert_eq!(launches.len(), 1, "{launches:?}");
+    let thread = text(&launches[0]["threadId"]);
+    if json_mode {
+        assert_eq!(err, "");
+    } else {
+        assert_printable(&err);
+        let start = format!(
+            "t3term: T3 accepted the launch of thread {thread}, but t3term couldn't print it: "
+        );
+        let end = format!(
+            ". Launching again would start a second thread. Run `t3term read {thread}` to see this one. [OUTPUT_FAILED]\n"
+        );
+        assert!(err.starts_with(&start) && err.ends_with(&end), "{err}");
+    }
+
+    // T3 got the launch once, on one socket, and nothing after it.
+    let requests = server.requests.lock().unwrap().clone();
+    let tags: Vec<&str> = requests
+        .iter()
+        .map(|request| text(&request["tag"]))
+        .collect();
+    assert_eq!(tags, ["server.getConfig", LAUNCH]);
+    assert_eq!(server.sockets(), 1);
+}
