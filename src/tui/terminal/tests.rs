@@ -478,12 +478,20 @@ async fn an_exited_failed_or_closed_shell_is_read_only() {
     pane.paste("echo hi");
     assert_eq!(pane.take_notice().as_deref(), Some(expected));
 
-    let failed = event("error", 3, json!({"message": "Failed to spawn"}));
+    // T3's message goes on the status line and the screen's last row, not in the header.
+    let failed = event("error", 3, json!({"message": "Failed to spawn\u{1b}[2J"}));
     send(&mut socket, chunk(&id, json!([failed]))).await;
     assert_eq!(step(&mut pane).await, "batch");
+    let notice = pane.take_notice();
+    assert_eq!(
+        notice.as_deref(),
+        Some("The shell failed: Failed to spawn[2J")
+    );
     let (_, rows) = draw(&mut pane, 80, 25);
-    let header = " Terminal · zsh · failed, read-only: Failed to spawn";
+    let header = " Terminal · zsh · failed, read-only ";
     assert!(rows[0].starts_with(header), "{rows:?}");
+    assert!(rows[0].ends_with(" F4 hide "), "{rows:?}");
+    assert_eq!(rows[24].trim_end(), " Failed to spawn[2J", "{rows:?}");
 
     // Output after closed still shows, and the terminal stays read-only.
     let events = json!([event("closed", 4, json!({})), output(5, "late")]);
@@ -713,20 +721,110 @@ async fn keys_go_in_order_one_write_at_a_time_with_the_programs_replies() {
     expect_request(&reply, WRITE, with(json!({"data": "\u{1b}[1;3R"})));
 }
 
+/// Runs the drawer while the server answers `pieces` writes, and returns what they carried,
+/// joined. Each piece is at most the 65,536 UTF-16 code units T3 takes in one write.
+async fn written(pane: &mut Pane, socket: &mut Socket, pieces: usize) -> String {
+    let serving = async {
+        let mut data = String::new();
+        for _ in 0..pieces {
+            let frame = recv(socket).await;
+            let piece = frame["payload"]["data"].as_str().expect("text").to_string();
+            assert!(piece.encode_utf16().count() <= 65_536);
+            let id = expect_request(&frame, WRITE, with(json!({"data": piece})));
+            data.push_str(&piece);
+            send(socket, done(&id)).await;
+        }
+        data
+    };
+    let (wrote, data) = tokio::join!(step(pane), serving);
+    assert_eq!(wrote, "wrote");
+    assert!(pane.take_notice().is_none());
+    data
+}
+
+/// What the drawer says of a paste that sends `size` bytes, over its limit.
+fn refused(size: usize) -> String {
+    format!(
+        "t3term pasted nothing: the paste is {} KiB, and the terminal takes at most 256 KiB at once.",
+        size.div_ceil(1024)
+    )
+}
+
 #[tokio::test]
-async fn a_paste_goes_whole_bracketed_if_the_program_asked_or_not_at_all() {
+async fn a_bracketed_paste_counts_its_brackets_and_not_the_esc_it_drops() {
     let fake = Fake::new().await;
     let mut pane = fake.pane();
     let (mut socket, id) = running(&fake, &mut pane, "$ ").await;
-    pane.paste(&"x".repeat(PASTE_BYTES + 1));
-    let notice = pane.take_notice().expect("a notice");
-    assert_eq!(
-        notice,
-        "t3term pasted nothing: the paste is 257 KiB, and the terminal takes at most 256 KiB at once."
-    );
+    send(&mut socket, chunk(&id, json!([output(2, "\u{1b}[?2004h")]))).await;
+    assert_eq!(step(&mut pane).await, "batch");
+    assert_eq!(recv(&mut socket).await, ack(&id));
+    let (start, end) = ("\u{1b}[200~", "\u{1b}[201~");
+    assert_eq!(262_132 + start.len() + end.len(), PASTE_BYTES);
+
+    // One byte over, with its brackets, is refused whole and sends nothing.
+    pane.paste(&"x".repeat(262_133));
+    assert_eq!(pane.take_notice(), Some(refused(262_145)));
     poll_once(&mut pane).await;
     assert_eq!(fake.sent(&mut socket).await, Vec::<Value>::new());
 
+    // At the limit it goes whole, in four writes.
+    let body = "x".repeat(262_132);
+    pane.paste(&body);
+    let data = written(&mut pane, &mut socket, 4).await;
+    assert!(
+        data == format!("{start}{body}{end}"),
+        "{} bytes",
+        data.len()
+    );
+
+    // An end marker in the text loses its Esc, which doesn't count, so this goes whole too.
+    let body = format!("{}{end}", "x".repeat(262_127));
+    assert_eq!(body.len(), 262_133);
+    pane.paste(&body);
+    let data = written(&mut pane, &mut socket, 4).await;
+    let kept = format!("{}[201~", "x".repeat(262_127));
+    assert!(
+        data == format!("{start}{kept}{end}"),
+        "{} bytes",
+        data.len()
+    );
+
+    // Bytes count, not characters: 131,066 é are 262,132 bytes, and one more byte is over.
+    let body = "é".repeat(131_066);
+    pane.paste(&format!("{body}x"));
+    assert_eq!(pane.take_notice(), Some(refused(262_145)));
+    pane.paste(&body);
+    let data = written(&mut pane, &mut socket, 3).await;
+    assert!(
+        data == format!("{start}{body}{end}"),
+        "{} bytes",
+        data.len()
+    );
+    assert_eq!(fake.sent(&mut socket).await, Vec::<Value>::new());
+}
+
+#[tokio::test]
+async fn an_unbracketed_paste_counts_each_line_break_as_the_one_byte_it_sends() {
+    let fake = Fake::new().await;
+    let mut pane = fake.pane();
+    let (mut socket, _) = running(&fake, &mut pane, "$ ").await;
+    // 512 KiB of `\r\n` sends 256 KiB of `\r`, which is the limit.
+    let body = "\r\n".repeat(PASTE_BYTES);
+    pane.paste(&format!("{body}x"));
+    assert_eq!(pane.take_notice(), Some(refused(PASTE_BYTES + 1)));
+    poll_once(&mut pane).await;
+    assert_eq!(fake.sent(&mut socket).await, Vec::<Value>::new());
+    pane.paste(&body);
+    let data = written(&mut pane, &mut socket, 4).await;
+    assert!(data == "\r".repeat(PASTE_BYTES), "{} bytes", data.len());
+    assert_eq!(fake.sent(&mut socket).await, Vec::<Value>::new());
+}
+
+#[tokio::test]
+async fn a_paste_brackets_its_text_only_if_the_program_asked() {
+    let fake = Fake::new().await;
+    let mut pane = fake.pane();
+    let (mut socket, id) = running(&fake, &mut pane, "$ ").await;
     // Without bracketed paste, line breaks go as Enter.
     pane.paste("echo one\necho two");
     poll_once(&mut pane).await;
@@ -899,6 +997,195 @@ async fn hiding_the_drawer_interrupts_its_stream_and_nothing_else() {
     drop(pane);
     // No close, write or resize: the shell goes on running.
     assert_eq!(fake.sent(&mut socket).await, [interrupt(&id)]);
+}
+
+/// Titles a program may give its terminal: long, wide, joined, marked, right to left, or full
+/// of controls and zero-width characters.
+pub(in crate::tui) fn hostile_titles() -> Vec<String> {
+    vec![
+        "cargo test --workspace --all-features -- --nocapture ".repeat(10),
+        "日本語のとても長いタイトル".repeat(10),
+        "👩\u{200d}💻".repeat(60),
+        "e\u{301}\u{302}".repeat(100),
+        "🇯🇵🇺🇸".repeat(40),
+        "مرحبا بالعالم ".repeat(10),
+        format!(
+            "\u{1b}[2J\u{7}vim\r\n\tnotes\u{9b}31m{}x",
+            "\u{200b}".repeat(500)
+        ),
+    ]
+}
+
+/// The widths the header tests draw at, from wide to a single column.
+const WIDTHS: [u16; 14] = [120, 80, 53, 40, 30, 25, 20, 19, 18, 12, 8, 5, 2, 1];
+
+/// A drawer that never connects, showing `title` and `status` as if its stream were open.
+fn showing(title: &str, status: Status) -> Pane {
+    let connect: Connect = Rc::new(|| {
+        async { Err::<RpcClient, _>(anyhow::anyhow!("this test has no server")) }.boxed_local()
+    });
+    let id = TerminalId::new(THREAD, TERMINAL_ID).unwrap();
+    let mut pane = Pane::open(id, connect);
+    pane.link = Link::Open;
+    pane.synced = true;
+    pane.seen = true;
+    pane.shell = Shell {
+        status,
+        label: label::cut(title, LABEL),
+    };
+    pane
+}
+
+/// Draws the drawer, unfocused, in a `width` by `height` area two columns and a row in from
+/// the corner of a frame of `#`. Returns the frame and the area.
+fn draw_inset(pane: &mut Pane, width: u16, height: u16) -> (Buffer, Rect) {
+    let mut terminal = ratatui::Terminal::new(TestBackend::new(width + 4, height + 2)).unwrap();
+    let theme = Theme::new(Depth::TrueColor);
+    let area = Rect::new(2, 1, width, height);
+    let frame = terminal
+        .draw(|frame| {
+            let whole = frame.area();
+            let rows = vec![Line::raw("#".repeat(whole.width.into())); whole.height.into()];
+            frame.render_widget(Paragraph::new(rows), whole);
+            pane.draw(frame, area, false, &theme);
+        })
+        .unwrap();
+    (frame.buffer.clone(), area)
+}
+
+#[test]
+fn the_header_lays_out_the_state_first_and_the_title_in_what_is_left() {
+    let states = [
+        ("running", "running"),
+        ("exited with 130, read-only", "exited"),
+    ];
+    let cues = [None, Some("↑ 3 rows"), Some("no room for the screen")];
+    let titles = hostile_titles()
+        .into_iter()
+        .chain(["zsh".to_string(), String::new()]);
+    for title in titles.map(|title| label::cut(&title, LABEL)) {
+        for (width, (long, short), cue) in WIDTHS
+            .iter()
+            .flat_map(|&width| states.iter().map(move |&state| (width, state)))
+            .flat_map(|(width, state)| cues.iter().map(move |&cue| (width, state, cue)))
+        {
+            let width = usize::from(width);
+            let at = format!("{title:?} at {width}, {long}, {cue:?}");
+            let row = header_row(width, &title, long, short, cue);
+            let gap = usize::from(!row.right.is_empty());
+            let used = row.name.width()
+                + label::columns(&row.title, width)
+                + row.state.width()
+                + gap
+                + row.right.width();
+            assert!(used <= width, "{at}: {row:?}");
+            // The state always shows, whole once the row has a column for it and one before.
+            let whole = [
+                format!("{DOT}{long}"),
+                format!("{DOT}{short}"),
+                format!(" {short}"),
+            ];
+            if width > short.len() {
+                assert!(whole.contains(&row.state), "{at}: {row:?}");
+            } else {
+                assert_eq!(row.state, label::cut(&format!(" {short}"), width), "{at}");
+            }
+            // F4's key shows only beside the whole title and the full state.
+            let whole_title = if title.is_empty() {
+                String::new()
+            } else {
+                format!("{DOT}{title}")
+            };
+            if row.right.contains(HINT) {
+                assert_eq!(row.state, format!("{DOT}{long}"), "{at}");
+                assert_eq!(row.title, whole_title, "{at}");
+            }
+            // A title shows beside the full state only, and a cut one ends in `…`.
+            if !row.title.is_empty() {
+                assert_eq!(row.state, format!("{DOT}{long}"), "{at}");
+            }
+            if row.title != whole_title && !row.title.is_empty() {
+                assert!(row.title.ends_with('…'), "{at}: {row:?}");
+            }
+        }
+    }
+    // Room for everything but the key: the title is cut to what is left beside the state.
+    let title = "x".repeat(64);
+    let row = header_row(80, &title, "running", "running", None);
+    let cut = format!("{DOT}{}…", "x".repeat(57));
+    assert_eq!((row.title.as_str(), row.right.as_str()), (cut.as_str(), ""));
+    // The name and the state fill the row, so the title goes.
+    let row = header_row(19, &title, "running", "running", None);
+    assert_eq!((row.name, row.title.as_str()), (NAME, ""));
+    // The short state alone.
+    let row = header_row(18, "zsh", "running", "running", Some("↑ 3 rows"));
+    assert_eq!(row.state, " running");
+    assert_eq!((row.name, row.right.as_str()), ("", ""));
+}
+
+#[test]
+fn the_header_shows_the_state_at_every_size_and_draws_nothing_outside_the_drawer() {
+    let exited = || Status::Exited {
+        code: Some(130),
+        signal: None,
+    };
+    for title in hostile_titles() {
+        for (status, long, short) in [
+            (Status::Running, "running", "running"),
+            (exited(), "exited with 130, read-only", "exited"),
+        ] {
+            let mut pane = showing(&title, status);
+            for width in WIDTHS {
+                for height in [36, 24, 3, 1] {
+                    let at = format!("{title:?} at {width}x{height}, {long}");
+                    let (buffer, area) = draw_inset(&mut pane, width, height);
+                    let whole = buffer.area;
+                    for (x, y) in
+                        (0..whole.height).flat_map(|y| (0..whole.width).map(move |x| (x, y)))
+                    {
+                        if !area.contains(Position::new(x, y)) {
+                            assert_eq!(buffer[(x, y)].symbol(), "#", "{at}: ({x}, {y})");
+                        }
+                    }
+                    let header: String = (area.left()..area.right())
+                        .map(|x| buffer[(x, area.y)].symbol())
+                        .collect();
+                    let state = [long, short]
+                        .iter()
+                        .any(|state| header.contains(&format!(" {state}")));
+                    if usize::from(width) > short.len() {
+                        assert!(state, "{at}: {header:?}");
+                    }
+                    let room = usize::from(width) >= NAME.len() + DOT.width() + short.len();
+                    assert_eq!(header.starts_with(NAME), room, "{at}: {header:?}");
+                }
+            }
+        }
+    }
+    // Wide enough, a short title has the key beside it, and the cue goes before the key.
+    let mut pane = showing("zsh", Status::Running);
+    let (buffer, area) = draw_inset(&mut pane, 80, 24);
+    let header: String = (area.left()..area.right())
+        .map(|x| buffer[(x, area.y)].symbol())
+        .collect();
+    assert!(
+        header.starts_with(" Terminal · zsh · running "),
+        "{header:?}"
+    );
+    assert!(header.ends_with(" F4 hide "), "{header:?}");
+    let (_, rows) = draw(&mut pane, 80, 1);
+    assert!(
+        rows[0].ends_with(" no room for the screen · F4 hide "),
+        "{rows:?}"
+    );
+    draw(&mut pane, 80, 25);
+    pane.emulator.apply(&"line\r\n".repeat(40));
+    pane.scroll(1);
+    let (_, rows) = draw(&mut pane, 80, 25);
+    assert!(rows[0].ends_with(" ↑ 1 row · F4 hide "), "{rows:?}");
+    pane.scroll(2);
+    let (_, rows) = draw(&mut pane, 80, 25);
+    assert!(rows[0].ends_with(" ↑ 3 rows · F4 hide "), "{rows:?}");
 }
 
 #[test]

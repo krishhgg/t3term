@@ -4,8 +4,8 @@
 
 use super::*;
 use crate::tui::terminal::tests::{
-    ATTACH, Fake, Socket, ack, chunk, expect_request, interrupt, kind, lookup_error, recv, refusal,
-    send, session, within,
+    ATTACH, Fake, Socket, ack, chunk, expect_request, hostile_titles, interrupt, kind,
+    lookup_error, recv, refusal, send, session, within,
 };
 
 /// The TUI with `thread` listed and open, in the projects `details_shell` lists.
@@ -488,4 +488,70 @@ async fn a_click_on_start_terminal_says_why_it_cant_and_sends_nothing() {
     assert!(below.contains(" T3 hasn't said where"), "{rows:#?}");
     assert!(pane(&app).missing());
     assert_eq!(fake.sent(&mut socket).await, Vec::<Value>::new());
+}
+
+/// Runs the drawer until its first attach goes out to `fake`, and answers it with a running
+/// shell's snapshot titled `title`. Returns the server's end of the connection and the
+/// stream's request id.
+async fn attach_running(fake: &Fake, app: &mut App, thread: &str, title: &str) -> (Socket, Value) {
+    let serving = async {
+        let mut socket = fake.accept().await;
+        let request = recv(&mut socket).await;
+        (socket, request)
+    };
+    let (happened, (mut socket, request)) = tokio::join!(run_drawer(app), serving);
+    assert_eq!(happened, "attached");
+    let named = json!({"threadId": thread, "terminalId": "term-1"});
+    let id = expect_request(&request, ATTACH, named);
+    let mut running = session(thread, 0, "running", "$ ");
+    running["label"] = json!(title);
+    let snapshot = json!({"type": "snapshot", "snapshot": running});
+    send(&mut socket, chunk(&id, json!([snapshot]))).await;
+    assert_eq!(run_drawer(app).await, "batch");
+    assert_eq!(recv(&mut socket).await, ack(&id));
+    (socket, id)
+}
+
+#[tokio::test]
+async fn a_hostile_title_leaves_the_state_in_the_header_and_the_cells_around_it_alone() {
+    for (width, height) in [(80, 24), (120, 36)] {
+        for title in hostile_titles() {
+            let at = format!("{title:?} at {width}x{height}");
+            let fake = Fake::new().await;
+            let mut app = opened(bound("t", "p", Value::Null, Value::Null));
+            app.connect_terminal = fake.connect();
+            press(&mut app, KeyCode::F(4));
+            // Until the snapshot the header has no title, so the cells beside it are the
+            // ones a title must leave alone.
+            let before = cells(&mut app, width, height);
+            let header = pane(&app).header;
+            let left = Rect {
+                x: 0,
+                width: header.x,
+                ..header
+            };
+            let right = Rect {
+                x: header.right(),
+                width: width - header.right(),
+                ..header
+            };
+            let (mut socket, id) = attach_running(&fake, &mut app, "t", &title).await;
+            let exited = json!({"type": "exited", "threadId": "t", "terminalId": "term-1",
+                "sequence": 1, "exitCode": 0, "exitSignal": null});
+            for (state, next) in [(" · running", Some(exited)), (" · exited", None)] {
+                let after = cells(&mut app, width, height);
+                assert_eq!(pane(&app).header, header, "{at}");
+                for area in [left, right] {
+                    assert_eq!(text_in(&after, area), text_in(&before, area), "{at}");
+                }
+                let text = text_in(&after, header);
+                assert!(text.starts_with(" Terminal · "), "{at}: {text:?}");
+                assert!(text.contains(state), "{at}: {text:?}");
+                if let Some(event) = next {
+                    send(&mut socket, chunk(&id, json!([event]))).await;
+                    assert_eq!(run_drawer(&mut app).await, "batch");
+                }
+            }
+        }
+    }
 }

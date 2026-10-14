@@ -63,18 +63,35 @@ pub(super) fn encode(key: &KeyEvent, modes: InputModes) -> Option<String> {
     })
 }
 
+/// What starts and ends a bracketed paste.
+const PASTE_START: &str = "\x1b[200~";
+const PASTE_END: &str = "\x1b[201~";
+
 /// What a paste of `text` sends. With bracketed paste on, the text goes between `ESC [200~`
 /// and `ESC [201~` as it is, less every Esc, so nothing in it can end the paste early. Without
 /// it, each line break goes as the Enter key's `\r`. Alacritty sends pastes the same way.
 pub(super) fn paste(text: &str, bracketed: bool) -> String {
     if bracketed {
-        let mut sent = String::with_capacity(text.len() + 12);
-        sent.push_str("\x1b[200~");
+        let mut sent = String::with_capacity(paste_len(text, true));
+        sent.push_str(PASTE_START);
         sent.extend(text.chars().filter(|&c| c != '\x1b'));
-        sent.push_str("\x1b[201~");
+        sent.push_str(PASTE_END);
         sent
     } else {
         text.replace("\r\n", "\r").replace('\n', "\r")
+    }
+}
+
+/// The length in bytes of what `paste(text, bracketed)` sends, counted without copying `text`.
+/// An Esc is one byte in UTF-8 and never part of another character, and `\r\n` can't overlap
+/// itself, so each Esc dropped and each `\r\n` sent as `\r` is one byte less.
+pub(super) fn paste_len(text: &str, bracketed: bool) -> usize {
+    if bracketed {
+        let escapes = text.bytes().filter(|&byte| byte == 0x1b).count();
+        let brackets = PASTE_START.len() + PASTE_END.len();
+        (text.len() - escapes).saturating_add(brackets)
+    } else {
+        text.len() - text.matches("\r\n").count()
     }
 }
 
@@ -274,6 +291,41 @@ mod tests {
             paste("a\x1b[201~rm -rf\x1b", true),
             "\x1b[200~a[201~rm -rf\x1b[201~"
         );
+    }
+
+    #[test]
+    fn a_paste_is_counted_as_the_bytes_it_sends() {
+        for text in [
+            "",
+            "a",
+            "\r",
+            "\n",
+            "\r\n",
+            "\n\r",
+            "\r\r\n\n\r\n",
+            "\x1b",
+            "\x1b\x1b[201~\x1b",
+            "a\x1b[201~rm -rf\x1b",
+            "\0\x07\x08\t\x7f\u{9b}\u{2028}",
+            "é\r\n€😀\n\u{301}",
+            "😀\x1b😀\r\n",
+        ] {
+            for bracketed in [false, true] {
+                let sent = paste(text, bracketed);
+                assert_eq!(
+                    paste_len(text, bracketed),
+                    sent.len(),
+                    "{text:?} {bracketed}"
+                );
+            }
+        }
+        // The brackets count, and the Esc they drop doesn't.
+        assert_eq!(paste_len("", true), 12);
+        assert_eq!(paste_len("\x1b\x1b", true), 12);
+        assert_eq!(paste_len("\x1b\x1b", false), 2);
+        // Without brackets, each `\r\n` goes as one `\r`.
+        assert_eq!(paste_len(&"\r\n".repeat(1000), false), 1000);
+        assert_eq!(paste_len("é", true), 14);
     }
 
     #[test]

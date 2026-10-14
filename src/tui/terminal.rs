@@ -58,7 +58,9 @@ const LIMITS: StreamLimits = StreamLimits::new(16, 56 << 20).unwrap();
 const QUEUED: usize = 256;
 /// ...and this many bytes.
 const QUEUED_BYTES: usize = 1 << 20;
-/// The largest paste the drawer sends. A larger one is refused whole.
+/// The largest paste the drawer sends, in bytes as it goes to the shell: with its brackets
+/// and without the Esc they drop, or with each `\r\n` sent as `\r`. A larger one is refused
+/// whole.
 const PASTE_BYTES: usize = 256 << 10;
 /// How long a new size holds still before the shell gets it.
 const RESIZE_DELAY: Duration = Duration::from_millis(100);
@@ -386,16 +388,18 @@ impl Pane {
         if text.is_empty() {
             return;
         }
-        let text = keys::paste(text, self.emulator.input_modes().bracketed_paste);
-        if text.len() > PASTE_BYTES {
+        let bracketed = self.emulator.input_modes().bracketed_paste;
+        // Counted before anything is copied, so a paste over the limit costs no memory.
+        let size = keys::paste_len(text, bracketed);
+        if size > PASTE_BYTES {
             self.notice = Some(format!(
                 "t3term pasted nothing: the paste is {} KiB, and the terminal takes at most {} KiB at once.",
-                text.len().div_ceil(1024),
+                size.div_ceil(1024),
                 PASTE_BYTES >> 10
             ));
             return;
         }
-        self.send(&text, "paste");
+        self.send(&keys::paste(text, bracketed), "paste");
     }
 
     /// Scrolls the view `rows` up into the history, or down toward the prompt when negative.
@@ -503,14 +507,27 @@ impl Pane {
                 }
             }
         }
+        // The header has no room for T3's message, so the screen's last row shows it.
+        if let Status::Failed(Some(message)) = &self.shell.status {
+            let last = Rect {
+                y: content.bottom() - 1,
+                height: 1,
+                ..content
+            };
+            let text = label::cut(&format!(" {message}"), usize::from(last.width));
+            let style = Style::new().bg(theme.bg).fg(theme.error_fg);
+            frame.render_widget(Paragraph::new(text).style(style), last);
+        }
         let live = focused && self.writable() && self.emulator.viewport_offset() == 0;
         cursor
             .filter(|_| live)
             .map(|cursor| Position::new(cursor.x, cursor.y))
     }
 
-    /// The header row: the drawer's name, the terminal's title and state, and what the
-    /// screen can't show, then F4's key when the row has room.
+    /// The header row: the drawer's name, the terminal's title and its state, and at the
+    /// right what the screen can't show and F4's key, as `header_row` lays them out. Each
+    /// part gets the columns it measured and no more, so a title that draws wider than it
+    /// measured can't push the state out of the row.
     fn draw_header(&self, frame: &mut Frame, focused: bool, theme: &Theme) {
         let area = self.header;
         if area.is_empty() {
@@ -522,80 +539,75 @@ impl Pane {
             Style::new().fg(theme.fg).add_modifier(Modifier::BOLD)
         };
         let muted = Style::new().fg(theme.muted);
-        let (state, color) = self.state(theme);
-        let mut pieces = vec![(" Terminal".to_string(), name)];
-        if !self.shell.label.is_empty() && self.seen {
-            pieces.push((format!(" · {}", self.shell.label), muted));
-        }
-        pieces.push((format!(" · {state}"), Style::new().fg(color)));
-        let content = self.content;
-        let cue = if content.height == 0 {
-            Some("no room for the screen".to_string())
-        } else if content.width < terminal_emulator::MIN_COLUMNS {
-            Some("too narrow".to_string())
+        let (long, short, color) = self.state(theme);
+        let title = if self.seen {
+            self.shell.label.as_str()
         } else {
-            match self.emulator.viewport_offset() {
-                0 => None,
-                rows => Some(format!("↑ {rows} rows")),
-            }
+            ""
         };
-        let width = usize::from(area.width);
-        let right = match cue {
-            Some(cue) => format!("{cue} · F4 hide "),
-            None => "F4 hide ".to_string(),
-        };
-        let used: usize = pieces.iter().map(|(text, _)| text.width()).sum();
-        let right = if used + 1 + right.width() <= width {
-            right
-        } else {
-            String::new()
-        };
-        let mut room = width.saturating_sub(right.width());
-        let mut spans = Vec::new();
-        for (text, style) in pieces {
-            let text = label::cut(&text, room);
-            room -= text.width().min(room);
-            spans.push(Span::styled(text, style));
-        }
-        spans.push(Span::raw(" ".repeat(room)));
-        spans.push(Span::styled(right, muted));
+        let cue = self.cue();
+        let row = header_row(usize::from(area.width), title, &long, short, cue.as_deref());
         let raised = Style::new().bg(theme.raised);
-        frame.render_widget(Paragraph::new(Line::from(spans)).style(raised), area);
+        frame.render_widget(Block::new().style(raised), area);
+        let buffer = frame.buffer_mut();
+        let mut x = area.x;
+        let parts = [
+            (row.name, name),
+            (row.title.as_str(), muted),
+            (row.state.as_str(), Style::new().fg(color)),
+        ];
+        for (text, style) in parts {
+            let width = label::columns(text, usize::from(area.right() - x));
+            buffer.set_stringn(x, area.y, text, width, style);
+            x += width as u16;
+        }
+        let width = row.right.width().min(usize::from(area.right() - x));
+        let x = area.right() - width as u16;
+        buffer.set_stringn(x, area.y, &row.right, width, muted);
     }
 
-    /// What the header says about the terminal, and its color.
-    fn state(&self, theme: &Theme) -> (String, Color) {
-        match &self.link {
-            Link::Attaching | Link::Open if !self.synced => {
-                ("attaching".to_string(), theme.warning_fg)
-            }
+    /// What the screen can't show, for the header: any of it, on a drawer of one row, or the
+    /// rows below the view, when it is scrolled up into the history.
+    fn cue(&self) -> Option<String> {
+        if self.content.height == 0 {
+            return Some("no room for the screen".to_string());
+        }
+        match self.emulator.viewport_offset() {
+            0 => None,
+            1 => Some("↑ 1 row".to_string()),
+            rows => Some(format!("↑ {rows} rows")),
+        }
+    }
+
+    /// What the header says about the terminal, in full and short, and its color. The short
+    /// form is for a row too narrow for the full one.
+    fn state(&self, theme: &Theme) -> (String, &'static str, Color) {
+        let (long, short, color) = match &self.link {
+            Link::Attaching | Link::Open if !self.synced => (None, "attaching", theme.warning_fg),
             Link::Attaching | Link::Open => match &self.shell.status {
-                Status::Starting => ("starting".to_string(), theme.warning_fg),
-                Status::Running if self.input_failed => {
-                    ("input stopped".to_string(), theme.error_fg)
-                }
-                Status::Running => ("running".to_string(), theme.success),
+                Status::Starting => (None, "starting", theme.warning_fg),
+                Status::Running if self.input_failed => (None, "input stopped", theme.error_fg),
+                Status::Running => (None, "running", theme.success),
                 Status::Exited { code, signal } => {
                     let how = match (code, signal) {
                         (_, Some(signal)) => format!("exited on signal {signal}"),
                         (Some(code), None) => format!("exited with {code}"),
                         (None, None) => "exited".to_string(),
                     };
-                    (format!("{how}, read-only"), theme.muted)
+                    (Some(format!("{how}, read-only")), "exited", theme.muted)
                 }
-                Status::Failed(Some(message)) => {
-                    (format!("failed, read-only: {message}"), theme.error_fg)
-                }
-                Status::Failed(None) => ("failed, read-only".to_string(), theme.error_fg),
-                Status::Closed => ("closed, read-only".to_string(), theme.muted),
+                // The screen's last row shows T3's message, which can be long.
+                Status::Failed(_) => (Some("failed, read-only".into()), "failed", theme.error_fg),
+                Status::Closed => (Some("closed, read-only".into()), "closed", theme.muted),
             },
-            Link::Missing(_) => ("not started".to_string(), theme.muted),
-            Link::Waiting(_) => (
-                format!("reconnecting, try {} of {RETRIES}", self.retries),
-                theme.warning_fg,
-            ),
-            Link::Stopped(_) => ("stopped".to_string(), theme.error_fg),
-        }
+            Link::Missing(_) => (None, "not started", theme.muted),
+            Link::Waiting(_) => {
+                let long = format!("reconnecting, try {} of {RETRIES}", self.retries);
+                (Some(long), "reconnecting", theme.warning_fg)
+            }
+            Link::Stopped(_) => (None, "stopped", theme.error_fg),
+        };
+        (long.unwrap_or_else(|| short.to_string()), short, color)
     }
 
     /// What a thread without a terminal shows: a line saying so, Start terminal, and why the
@@ -741,6 +753,7 @@ impl Pane {
             }
             TerminalEvent::Error { base, message } => {
                 if self.fresh(&base) {
+                    self.notice = Some(note(&format!("The shell failed: {message}")));
                     self.set_status(Status::Failed(Some(note(message))));
                 }
             }
@@ -960,6 +973,79 @@ impl Pane {
             .resize_at
             .filter(|_| unsent && self.resizing.is_none() && self.resizable());
         [sync, retry, resize].into_iter().flatten().min()
+    }
+}
+
+/// The drawer's name, its key, and what goes between the parts of its header.
+const NAME: &str = " Terminal";
+const HINT: &str = "F4 hide";
+const DOT: &str = " · ";
+/// The fewest columns of a cut title worth showing, its `…` among them.
+const SHORTEST_TITLE: usize = 4;
+
+/// The header row's text, left to right. The parts take at most the row's columns together.
+#[derive(Debug, PartialEq)]
+struct HeaderRow {
+    /// The drawer's name, or nothing.
+    name: &'static str,
+    /// `DOT` and the title, whole or cut, or nothing.
+    title: String,
+    /// The state, after `DOT` when the name shows.
+    state: String,
+    /// The cue and F4's key, and a space after them, or nothing.
+    right: String,
+}
+
+/// Lays out the header in `width` columns. The state always shows. Short of room, the row
+/// drops F4's key, then cuts the title or leaves it out, then drops the cue, then gives the
+/// state its short form. When even the name and the short state don't fit, the state shows
+/// alone, cut to the row.
+fn header_row(width: usize, title: &str, long: &str, short: &str, cue: Option<&str>) -> HeaderRow {
+    let title_width = label::columns(title, LABEL);
+    let tries = [
+        (long, cue, true),
+        (long, cue, false),
+        (long, None, false),
+        (short, None, false),
+    ];
+    for (index, (state, cue, hint)) in tries.into_iter().enumerate() {
+        let right = match (cue, hint) {
+            (Some(cue), true) => format!("{cue}{DOT}{HINT} "),
+            (Some(cue), false) => format!("{cue} "),
+            (None, true) => format!("{HINT} "),
+            (None, false) => String::new(),
+        };
+        let state = format!("{DOT}{state}");
+        // A column between the left and the right, when there is a right.
+        let gap = usize::from(!right.is_empty());
+        let fixed = NAME.width() + state.width() + gap + right.width();
+        let Some(room) = width.checked_sub(fixed) else {
+            continue;
+        };
+        // The title shows beside the full state only, and only whole beside F4's key.
+        let title = if title.is_empty() || index >= 2 {
+            String::new()
+        } else if DOT.width() + title_width <= room {
+            format!("{DOT}{title}")
+        } else if hint {
+            continue;
+        } else if room >= DOT.width() + SHORTEST_TITLE {
+            format!("{DOT}{}", label::cut(title, room - DOT.width()))
+        } else {
+            String::new()
+        };
+        return HeaderRow {
+            name: NAME,
+            title,
+            state,
+            right,
+        };
+    }
+    HeaderRow {
+        name: "",
+        title: String::new(),
+        state: label::cut(&format!(" {short}"), width),
+        right: String::new(),
     }
 }
 
