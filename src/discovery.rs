@@ -379,8 +379,13 @@ async fn descriptor_body(response: &mut reqwest::Response) -> Result<Vec<u8>, No
         if chunk.len() > MAX_DESCRIPTOR_BYTES - body.len() {
             return Err(too_long());
         }
-        // Grow only as far as the body needs, so the buffer stays within the cap too.
-        body.reserve_exact(chunk.len());
+        // Double the buffer when the chunk doesn't fit, so a body read in small chunks is
+        // copied a few times at most, but never ask for more room than the cap.
+        let needed = body.len() + chunk.len();
+        if needed > body.capacity() {
+            let room = needed.max(2 * body.capacity()).min(MAX_DESCRIPTOR_BYTES);
+            body.reserve_exact(room - body.len());
+        }
         body.extend_from_slice(&chunk);
     }
 }
