@@ -5,7 +5,7 @@
 use super::*;
 use crate::tui::terminal::tests::{
     ATTACH, Fake, Socket, ack, chunk, expect_request, hostile_titles, interrupt, kind,
-    lookup_error, recv, refusal, send, session, within,
+    lookup_error, recv, refusal, send, session, wire_label, within,
 };
 
 /// The TUI with `thread` listed and open, in the projects `details_shell` lists.
@@ -515,7 +515,10 @@ async fn attach_running(fake: &Fake, app: &mut App, thread: &str, title: &str) -
 #[tokio::test]
 async fn a_hostile_title_leaves_the_state_in_the_header_and_the_cells_around_it_alone() {
     for (width, height) in [(80, 24), (120, 36)] {
-        for title in hostile_titles() {
+        // Each title as long as T3 sends one, still wide, joined, marked or full of controls.
+        // A label over T3's 128 UTF-16 code units is malformed, which terminal.rs tests.
+        for title in hostile_titles().iter().map(|title| wire_label(title)) {
+            assert!(title.encode_utf16().count() <= 128, "{title:?}");
             let at = format!("{title:?} at {width}x{height}");
             let fake = Fake::new().await;
             let mut app = opened(bound("t", "p", Value::Null, Value::Null));
@@ -538,7 +541,11 @@ async fn a_hostile_title_leaves_the_state_in_the_header_and_the_cells_around_it_
             let (mut socket, id) = attach_running(&fake, &mut app, "t", &title).await;
             let exited = json!({"type": "exited", "threadId": "t", "terminalId": "term-1",
                 "sequence": 1, "exitCode": 0, "exitSignal": null});
-            for (state, next) in [(" · running", Some(exited)), (" · exited", None)] {
+            let states = [
+                (" · running", Some(exited)),
+                (" · exited with 0, read-only", None),
+            ];
+            for (state, next) in states {
                 let after = cells(&mut app, width, height);
                 assert_eq!(pane(&app).header, header, "{at}");
                 for area in [left, right] {

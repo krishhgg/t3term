@@ -478,10 +478,13 @@ async fn an_exited_failed_or_closed_shell_is_read_only() {
     pane.paste("echo hi");
     assert_eq!(pane.take_notice().as_deref(), Some(expected));
 
-    // T3's message goes on the status line and the screen's last row, not in the header.
-    let failed = event("error", 3, json!({"message": "Failed to spawn\u{1b}[2J"}));
-    send(&mut socket, chunk(&id, json!([failed]))).await;
+    // T3's message goes on the status line and the screen's last row, not in the header. The
+    // row is blanked first, so the output the screen had there doesn't show past it.
+    let last_row = output(3, &format!("\u{1b}[24;1H{}\u{1b}[1;3H", "z".repeat(80)));
+    let failed = event("error", 4, json!({"message": "Failed to spawn\u{1b}[2J"}));
+    send(&mut socket, chunk(&id, json!([last_row, failed]))).await;
     assert_eq!(step(&mut pane).await, "batch");
+    assert_eq!(screen(&pane)[23], "z".repeat(80));
     let notice = pane.take_notice();
     assert_eq!(
         notice.as_deref(),
@@ -491,10 +494,11 @@ async fn an_exited_failed_or_closed_shell_is_read_only() {
     let header = " Terminal · zsh · failed, read-only ";
     assert!(rows[0].starts_with(header), "{rows:?}");
     assert!(rows[0].ends_with(" F4 hide "), "{rows:?}");
-    assert_eq!(rows[24].trim_end(), " Failed to spawn[2J", "{rows:?}");
+    let message = format!("{:<80}", " Failed to spawn[2J");
+    assert_eq!(rows[24], message, "{rows:?}");
 
     // Output after closed still shows, and the terminal stays read-only.
-    let events = json!([event("closed", 4, json!({})), output(5, "late")]);
+    let events = json!([event("closed", 5, json!({})), output(6, "late")]);
     send(&mut socket, chunk(&id, events)).await;
     assert_eq!(step(&mut pane).await, "batch");
     assert_eq!(screen(&pane)[0], "$ late");
@@ -567,8 +571,22 @@ async fn a_missing_terminal_waits_for_start_and_a_reconnect_never_sends_the_laun
     send(&mut socket, chunk(&id, json!([snapshot(0, "$ ")]))).await;
     assert_eq!(step(&mut pane).await, "batch");
     assert!(pane.writable());
+    // The attach sent no size, so the snapshot sends the one drawn while T3 had no terminal.
+    // T3 answers it, and the drawer has nothing on its way when the connection drops.
+    let serving = async {
+        assert_eq!(recv(&mut socket).await, ack(&id));
+        let frame = recv(&mut socket).await;
+        send(&mut socket, done(&frame["id"])).await;
+        frame
+    };
+    let (resized, frame) = tokio::join!(step(&mut pane), serving);
+    assert_eq!(resized, "resized");
+    expect_request(&frame, RESIZE, with(json!({"cols": 80, "rows": 24})));
+    assert!(pane.writing.is_none() && pane.resizing.is_none());
+    assert_eq!(fake.sent(&mut socket).await, Vec::<Value>::new());
 
-    // The connection drops. The drawer attaches again by name alone.
+    // The connection drops, and the stream's end is the next thing that happens. The drawer
+    // attaches again by name alone: no launch, so T3 starts nothing.
     drop(socket);
     assert_eq!(step(&mut pane).await, "batch");
     assert!(matches!(pane.link, Link::Waiting(_)));
@@ -1016,6 +1034,21 @@ pub(in crate::tui) fn hostile_titles() -> Vec<String> {
     ]
 }
 
+/// `title` as T3 sends it in a snapshot: its first 128 UTF-16 code units, as
+/// `truncateTerminalWireLabel` in Manager.ts cuts it with `slice(0, 128)`. Where that cut splits
+/// a surrogate pair, T3 sends the pair's first half, which no Rust string holds, so this ends
+/// before the pair instead.
+pub(in crate::tui) fn wire_label(title: &str) -> String {
+    let mut units = 0;
+    title
+        .chars()
+        .take_while(|character| {
+            units += character.len_utf16();
+            units <= 128
+        })
+        .collect()
+}
+
 /// The widths the header tests draw at, from wide to a single column.
 const WIDTHS: [u16; 14] = [120, 80, 53, 40, 30, 25, 20, 19, 18, 12, 8, 5, 2, 1];
 
@@ -1140,12 +1173,14 @@ fn the_header_shows_the_state_at_every_size_and_draws_nothing_outside_the_drawer
                     let at = format!("{title:?} at {width}x{height}, {long}");
                     let (buffer, area) = draw_inset(&mut pane, width, height);
                     let whole = buffer.area;
+                    // The drawer paints every cell of its area, so none of the `#` under it
+                    // shows, and no cell outside it.
                     for (x, y) in
                         (0..whole.height).flat_map(|y| (0..whole.width).map(move |x| (x, y)))
                     {
-                        if !area.contains(Position::new(x, y)) {
-                            assert_eq!(buffer[(x, y)].symbol(), "#", "{at}: ({x}, {y})");
-                        }
+                        let inside = area.contains(Position::new(x, y));
+                        let hash = buffer[(x, y)].symbol() == "#";
+                        assert_eq!(hash, !inside, "{at}: ({x}, {y})");
                     }
                     let header: String = (area.left()..area.right())
                         .map(|x| buffer[(x, area.y)].symbol())
@@ -1162,17 +1197,15 @@ fn the_header_shows_the_state_at_every_size_and_draws_nothing_outside_the_drawer
             }
         }
     }
-    // Wide enough, a short title has the key beside it, and the cue goes before the key.
+    // Wide enough, a short title has the key beside it, and the cue goes before the key. The
+    // columns between them are blank, over the `#` drawn first.
     let mut pane = showing("zsh", Status::Running);
     let (buffer, area) = draw_inset(&mut pane, 80, 24);
     let header: String = (area.left()..area.right())
         .map(|x| buffer[(x, area.y)].symbol())
         .collect();
-    assert!(
-        header.starts_with(" Terminal · zsh · running "),
-        "{header:?}"
-    );
-    assert!(header.ends_with(" F4 hide "), "{header:?}");
+    let expected = format!("{:<72}F4 hide ", " Terminal · zsh · running");
+    assert_eq!(header, expected);
     let (_, rows) = draw(&mut pane, 80, 1);
     assert!(
         rows[0].ends_with(" no room for the screen · F4 hide "),

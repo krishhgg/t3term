@@ -25,7 +25,7 @@ use ratatui::Frame;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Paragraph, Wrap};
+use ratatui::widgets::{Block, Clear, Paragraph, Wrap};
 use tokio::time::Instant;
 use unicode_width::UnicodeWidthStr;
 
@@ -462,6 +462,10 @@ impl Pane {
             return None;
         }
         let canvas = Style::new().bg(theme.bg).fg(theme.fg);
+        // A block's style colors cells and keeps what they showed, so the screen is blanked
+        // first. The emulator writes every cell it draws, but a message or an empty screen
+        // doesn't.
+        frame.render_widget(Clear, content);
         frame.render_widget(Block::new().style(canvas), content);
         let missing = match &self.link {
             Link::Missing(note) => Some(note.clone()),
@@ -516,6 +520,8 @@ impl Pane {
             };
             let text = label::cut(&format!(" {message}"), usize::from(last.width));
             let style = Style::new().bg(theme.bg).fg(theme.error_fg);
+            // Blanked first, so the row the emulator drew doesn't show past a short message.
+            frame.render_widget(Clear, last);
             frame.render_widget(Paragraph::new(text).style(style), last);
         }
         let live = focused && self.writable() && self.emulator.viewport_offset() == 0;
@@ -548,6 +554,9 @@ impl Pane {
         let cue = self.cue();
         let row = header_row(usize::from(area.width), title, &long, short, cue.as_deref());
         let raised = Style::new().bg(theme.raised);
+        // Blanked first, since a block's style keeps what the cells showed. The row is then
+        // blank wherever the parts below don't write.
+        frame.render_widget(Clear, area);
         frame.render_widget(Block::new().style(raised), area);
         let buffer = frame.buffer_mut();
         let mut x = area.x;

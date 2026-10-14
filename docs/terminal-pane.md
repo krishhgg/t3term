@@ -21,7 +21,7 @@ The state always shows. A row too narrow for all of it drops parts in this order
 3. What the screen can't show, described below.
 4. The long state, for its short form.
 
-When even `Terminal` and the short state don't fit, the short state shows alone, cut to the row. Each part of the header gets the columns t3term measured for it and no more, so a title that draws wider than it measured can't push the state out of the row, and nothing draws outside the drawer. `header_row` in `src/tui/terminal.rs` lays the row out.
+When even `Terminal` and the short state don't fit, the short state shows alone, cut to the row. Each part of the header gets the columns t3term measured for it and no more, so a title that draws wider than it measured can't push the state out of the row, and nothing draws outside the drawer. `header_row` in `src/tui/terminal.rs` lays the row out. The drawer blanks the header row and the screen before it draws on them, so every cell inside the drawer is its own and nothing drawn under it shows through.
 
 | State | Short form | What it means |
 | --- | --- | --- |
@@ -30,7 +30,7 @@ When even `Terminal` and the short state don't fit, the short state shows alone,
 | running | | Keys go to the shell. |
 | input stopped | | A write failed, so nothing more goes to the shell until a new snapshot. F4 twice attaches again. |
 | exited with N, read-only; exited on signal N, read-only; exited, read-only | exited | The shell ended. The screen stays and takes no input. |
-| failed, read-only | failed | T3 couldn't start or run the shell. When T3's `error` event carries a message, the screen's last row shows it, cleaned and cut to the row, and so does a notice on the status line. A snapshot carries no message, so after the drawer attaches again the last row is the screen's own. |
+| failed, read-only | failed | T3 couldn't start or run the shell. When T3's `error` event carries a message, the screen's last row shows it in place of what the screen had there, cleaned and cut to the row, and so does a notice on the status line. A snapshot carries no message, so after the drawer attaches again the last row is the screen's own. |
 | closed, read-only | closed | T3 closed the terminal. |
 | not started | | The thread has no `term-1`. |
 | reconnecting, try N of 8 | reconnecting | The connection dropped, and t3term attaches again soon. |

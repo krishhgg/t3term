@@ -149,7 +149,8 @@ shell's last row. `F status` sums up the log.
     `--preset idle`; `F term clear --thread thr-running`;
     `F term exit --thread thr-running --code 3`; `F term restart --thread thr-running`;
     `F term error --thread thr-running --message "pty broke"`, after which the header reads
-    `failed, read-only`, the screen's last row reads ` pty broke` and a notice reads
+    `failed, read-only`, the screen's last row reads ` pty broke` with blanks after it, whatever
+    the screen had there, and a notice reads
     "The shell failed: pty broke"; `F term restart` again;
     `F term close --thread thr-running` (closed, read-only, and the stream stays open); then
     `F term start --thread thr-running`, the desktop opening it again from 0: the drawer takes
