@@ -2,7 +2,7 @@
 
 The thread details' Pull requests tab lists the pull requests T3 linked to the open thread. This first slice only reads: it shows what T3 already sent with the thread and asks T3 for nothing. This page cites the T3 code each part follows and plans the reads that come next. The README's [Linked pull requests](../README.md#linked-pull-requests) section describes the keys and what each row shows.
 
-Every T3 path below is in the T3 Code nightly v0.0.46-nightly.20261007.2787, commit `f570bd21663f56ce94c41829d3b7d72886e25a34`, built on October 7, 2026. Later nightlies may differ. [Linked pull requests verification](pull-request-panel-verification.md) records what Sol checked at `407566d`, `eac6096` and `13b7a29`, with five captures.
+Every T3 path below is in the T3 Code nightly v0.0.46-nightly.20261007.2787, commit `f570bd21663f56ce94c41829d3b7d72886e25a34`, built on October 7, 2026. Later nightlies may differ. [Linked pull requests verification](pull-request-panel-verification.md) records what Sol checked at `407566d`, `eac6096` and `13b7a29`, and at `1243427` after the merge with master, with seven captures.
 
 ## Where the links come from
 

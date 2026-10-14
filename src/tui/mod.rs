@@ -12967,7 +12967,12 @@ mod tests {
         let counts = |app: &App| {
             let details = &app.details;
             let builds = details.pulls.builds;
-            (details.prepares, details.wraps, details.lineage_prepares, builds)
+            (
+                details.prepares,
+                details.wraps,
+                details.lineage_prepares,
+                builds,
+            )
         };
         for dialog in [false, true] {
             let (width, height) = if dialog { (80, 24) } else { (200, 24) };
@@ -12996,7 +13001,10 @@ mod tests {
                 }
                 assert!(presses < 8, "{dialog}: the text never scrolled");
             };
-            assert!(id == "f" || id.starts_with('g'), "{dialog}: {id} is no fork");
+            assert!(
+                id == "f" || id.starts_with('g'),
+                "{dialog}: {id} is no fork"
+            );
             let chosen = Some(lineage::Target::Thread(id.clone()));
             let area = app.details.drawn.expect("the details").area;
             let x = area.x + area.width / 2;
@@ -13077,7 +13085,11 @@ mod tests {
             assert_eq!(reads(&runtime), started + 1, "{dialog}");
             assert_eq!(app.focus, Focus::Details, "{dialog}");
             assert_eq!(app.details.tab(), details::Tab::Thread, "{dialog}");
-            assert_eq!(app.sidebar.selected_thread_id(), Some(id.as_str()), "{dialog}");
+            assert_eq!(
+                app.sidebar.selected_thread_id(),
+                Some(id.as_str()),
+                "{dialog}"
+            );
             press(&mut app, KeyCode::Esc);
             app.focus = Focus::Composer;
             press(&mut app, KeyCode::Char('x'));

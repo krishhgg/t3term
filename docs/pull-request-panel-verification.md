@@ -2,6 +2,8 @@
 
 This page records how GPT-6.1 Sol checked the details' Pull requests tab from [PR #34](https://github.com/krishhgg/t3term/pull/34) on 2026-10-13. Sol first checked source `407566d49626bfb8061cb590ef1f5876c47766cc` with two runs against a fake server, which found two problems. `eac6096a53fdf910d61a0a373fb766596e74208a` fixes both, and Sol checked it with a third run. Greptile then found two more problems. `13b7a29e78e86ed793d3ad5a8decb0cd71fe9e05` fixes them, and Sol checked it with a fourth run. The README's [Linked pull requests](../README.md#linked-pull-requests) section describes the behavior. Nothing here measures time, CPU or memory.
 
+On 2026-10-14, after the branch merged master with Lineage from PR #33, Sol checked `12434275757e82cfdcc7b86bd6045dd17a2dc1ac` with two more runs. [After the merge with master](#after-the-merge-with-master-at-1243427) records them. The sections before it cover only the first four runs.
+
 ## Checks
 
 At `407566d` with Rust 1.95.0, Sol ran `cargo fmt --all -- --check`, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked` and a build, and all of them passed. The 460 tests were 426 library, 2 main, 18 CLI and 14 fake RPC tests. [CI run 38504684165](https://github.com/krishhgg/t3term/actions/runs/38504684165) passed on macOS and Linux.
@@ -74,7 +76,7 @@ At `407566d`, the script's command to set, unlink or sync a link raised an error
 - The fourth run checked only links built on a cycle, the unlink of a link whose details showed, a resize and the capability turned off. Between `eac6096` and `13b7a29`, the source changes are to `stacks_of` in `src/tui/pull_requests.rs` and the order of work in `App::draw` in `src/tui/mod.rs`, with their tests.
 - A capture can't show that a screen was the first frame after a resize or a change to the links. The unit tests check the first frame. The resize capture and the fourth run's two captures show only what the screen drew after the change.
 - Two earlier captures meant to show the URL's note showed other rows of the details. This page doesn't use them.
-- Only the five captures below are published, three from the first three runs and two from the fourth. Not every capture was rendered as an image.
+- Of these four runs' captures, only the five below are published, three from the first three runs and two from the fourth. Not every capture was rendered as an image.
 
 ## Captures
 
@@ -116,3 +118,67 @@ Sol took no native Terminal screenshots. Each image is a PNG of the cells tmux c
 ## Where the evidence is
 
 The captures, the raw terminal output, the asciicast v2 recordings and the script's logs stay on the machine that ran the checks, in `/private/tmp/t3term-pr34-fixture-v2jm_6hi` for the first run, `/private/tmp/t3term-pr34-fixture-qx_xfj5t` for the second, `/private/tmp/t3term-pr34-fixture-pfnt2_5w` for the third and `/private/tmp/t3term-pr34-fixture-e3bk69s5` for the fourth. Sol's records of the final counts are `/private/tmp/t3term-pr34-root-verification-eac6096.json` for the third run and `/private/tmp/t3term-pr34-root-verification-13b7a29.json` for the fourth. None of them is committed or published, and neither are the script and the renderer.
+
+## After the merge with master, at `1243427`
+
+`1788ecc` merged master at `e6909698b38e1016dcffda5656c7e77e516d7a50`, which brought Lineage from [PR #33](https://github.com/krishhgg/t3term/pull/33) and the sidebar's shelves from [PR #35](https://github.com/krishhgg/t3term/pull/35). Lineage stays on the Thread tab, and the links stay on the Pull requests tab, each with its own selection, scroll and paging. `1243427` adds one App test, `lineage_and_the_linked_pull_requests_keep_their_place_on_their_own_tabs`.
+
+That test runs in a pane at 200x24 and in a dialog at 80x24, on one thread with Lineage rows and two linked pull requests. It chooses a fork in Lineage, shows the Pull requests tab, opens #32's details, goes back to the list and the Thread tab, and shows #32 again. Each tab keeps its choice and its scroll. Until a frame draws a tab, a click on the chosen Lineage row's cell does nothing, and each tab's first frame offers that tab's keys. None of it asks T3 for anything, works out the facts, Lineage or the links again, wraps the text again, moves the transcript or changes the draft. Enter in the pane, or a click in the dialog, then opens the chosen fork with one watch. The details keep the keyboard and the Thread tab, and the sidebar highlights the fork.
+
+### Checks
+
+At `1243427` with Rust 1.95.0, `cargo clippy --locked --all-targets -- -D warnings`, `cargo test --locked` and a debug build passed. The 561 tests are 511 library, 2 main, 26 CLI and 22 fake RPC tests, with no doctests. `cargo fmt --all -- --check` failed on the layout of a tuple and two asserts in the new test in `src/tui/mod.rs`. The commit that adds this section lays out those three as `cargo fmt` asks and changes no other source or test. Sol hasn't run the checks on that commit yet, and CI and Greptile haven't reported on it.
+
+### How it ran
+
+- The binary built from `1243427` ran twice, each time in truecolor at 200x50, then 80x24, then 200x50 again.
+- The first run used this page's script. The second used the script from the [Lineage verification](lineage-verification.md). Sol changed neither.
+- Each run had the setup the earlier runs had: a fake T3 server on 127.0.0.1 only, its own temporary `HOME` and `T3CODE_HOME`, `T3TERM_NO_SAVED_LOGIN=1` so no Keychain entry, a stand-in `t3` command and a private tmux socket, with t3term under `env -i`. No real `~/.t3`, project folder or T3 server took part.
+- Each run started t3term once, with no restart and no reconnect. Each fake server issued and revoked one session and opened and closed one socket. t3term sent no command, and neither server refused one. Both fake servers and both tmux sessions stopped.
+
+### The pull requests run
+
+- At 200x50 with Mixed open, the Pull requests tab listed its 11 links with the stack, the chain and each status. The sidebar had the space at its top and the Working, Done and Settled shelves from PR #35.
+- Sol opened #70's details. Left went back to the list, and Left again showed the Thread tab. Right showed the list again with #70 still selected, and the composer kept its draft.
+- A resize to 80x24 turned the pane into a dialog that offered `Esc close`.
+- With #70's details showing, Sol unlinked #70, and the script sent `thread.metadata-updated` on the thread's subscription and `thread.updated` on the sidebar's. The tab went back to the list of the 10 links left, and the status line offered the keys for what it showed.
+- Sol turned `threadPullRequests` off and on again, and the tab followed each change.
+- Sol set the Single thread's links to the derived preset, and the script sent `thread.pull-request-synced`. The tab listed 9 links, and #37, #38 and #39 each stood alone.
+- The server got one config subscription, one subscription to the sidebar's feed and two thread subscriptions, one for Mixed and one for Single. t3term sent 4 RPC interrupts, as many as the subscriptions it opened. Sol took nine captures. The raw output was 109,093 bytes, and every leak count the script keeps over it was 0.
+
+After Sol opened Single, the run's last Left came while the composer had the keyboard. It didn't switch tabs, so the run's last capture doesn't show the Thread tab. The round trip on Mixed, earlier, did.
+
+### The Lineage run
+
+- At 200x50 with Main open, the Thread tab showed Lineage under the new tab row.
+- Sol chose the parent row in Main's Lineage, showed the Pull requests tab with the mouse and went back to the Thread tab. That script doesn't turn on `threadPullRequests`, so the Pull requests tab read unavailable. The parent row stayed chosen, and the captures before and after are the same byte for byte.
+- ↓ and Enter opened Fork B, which sat under the closed Working shelf. The sidebar then showed Fork B's row highlighted under that closed shelf, the details kept the keyboard, and the composer kept its draft.
+- At 80x24, ↓ and Enter in the dialog opened Main, Fork B's parent. Back at 200x50 the pane came back, and the composer kept its draft.
+- The server got one config subscription, one subscription to the sidebar's feed and three thread subscriptions, two for Main and one for Fork B. t3term sent 5 RPC interrupts, as many as the subscriptions it opened. Sol took seven captures. The raw output was 85,048 bytes, and every leak count the script keeps over it was 0.
+
+### What these runs don't show
+
+- Neither run had one thread with both Lineage rows and linked pull requests. The App test above covers that thread. The Lineage script doesn't turn on `threadPullRequests`.
+- The scripts sent no hostile text in these runs, so their leak counts of 0 don't check again how t3term handles it. No run repeated the thread with 1,005 links, the older `linkedPullRequest`, the 124 agents, the archived parent, a refused command or a reconnect.
+- Both runs were truecolor at 200x50 and 80x24 only.
+- The captures show each screen after its step settled. A capture can't show that a screen was the first frame after a change. The unit tests check the first frame.
+- The five images above show the branch before the merge. Only the two below show it after.
+
+### Captures
+
+| The Pull requests tab after the merge, 200x50 | Lineage after the merge, 200x50 |
+|---|---|
+| [![The Mixed: every state thread at 200x50 with invented data. The sidebar ends with Working (0), Done (0) and Settled (0). The details pane's tab row reads Thread and Pull requests 11, with Pull requests chosen. It lists #62 Waiting for host state, #70, the stack #41, #42 and #43 with each layer further in, the chain #51, #52 and #53, #80, #60 Merged and #61 Closed, over 9 open · 11 linked. The status line reads ↑↓ select · Enter details · ← thread · Esc leave · Alt+B close · Tab focus, and the composer holds integrated pr draft](screenshots/linked-pull-requests-combined-pane.png)](screenshots/linked-pull-requests-combined-pane.png) | [![The Fork B: still running thread at 200x50 with invented data. In the sidebar, Fork B's row is highlighted under the closed Working (1) shelf, with Done (0) open and Settled (0) closed below it. The details pane's tab row reads Thread and Pull requests, with Thread chosen, and the Thread tab ends with Lineage and ↑ Main: open me first, Done. The status line reads ↑↓ choose · PgUp scroll · Esc leave · Alt+B close · → pull requests · Tab focus, and the composer holds combined lineage draft](screenshots/linked-pull-requests-combined-lineage.png)](screenshots/linked-pull-requests-combined-lineage.png) |
+
+The first comes from the pull requests run. The second comes from the Lineage run, after Fork B opened from Main's Lineage while the Working shelf was closed. That script doesn't turn on `threadPullRequests`, and the Pull requests tab shows no count. Neither capture is known to be the first frame after its step.
+
+Both images use the renderer and cell size of the five above, so each is 3400x1650. No image is a mockup, and neither was edited or cropped. Sol approved both, and they are copied unchanged. The hashes are the ones Sol recorded for the source images before they were copied.
+
+| File | SHA-256 |
+|---|---|
+| `screenshots/linked-pull-requests-combined-pane.png` | `97f07eabdeef3dffef8787d0de4f3e4644ca0615575c3d25dc2ec1469e919788` |
+| `screenshots/linked-pull-requests-combined-lineage.png` | `77fba60c369247fa3e28f7dbe275fc25161ce3232e219fa55b6d8cbc149aae8f` |
+
+### Where this evidence is
+
+The captures, the raw terminal output and the scripts' logs stay on the machine that ran the checks, in `/private/tmp/t3term-pr34-fixture-lzs7yqui` for the pull requests run and `/private/tmp/t3term-pr33-fixture-awo03dau` for the Lineage run. None of them is committed or published.
