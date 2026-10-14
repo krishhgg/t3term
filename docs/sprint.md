@@ -41,6 +41,14 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 | 19 | https://github.com/krishhgg/t3term/pull/28 | The environment's label, host and port under the sidebar's wordmark, and a dot that follows the sidebar's own feed, not the open thread's watch. The breadcrumb's row shows both while the sidebar is hidden. No environment list or selector | `f210cd8ac137872b95388ac4e11c097d8b0cf159` |
 | 20 | https://github.com/krishhgg/t3term/pull/29 | The open thread's project, workspace, recorded branch and environment, read-only, in a pane beside the conversation or a dialog on a narrow screen, opened with Alt+B or a button in the title row. No Git status, actions, scripts or tabbed right panel | `739cead6795dd0a80151d657c48721c109dea86f` |
 
+## Open sprint PRs
+
+These have no number yet. Each takes the next one when it merges.
+
+| Pull request | What it does |
+|---|---|
+| https://github.com/krishhgg/t3term/pull/35 | A blank row over the sidebar's wordmark, its list and the conversation's breadcrumb on screens at least 20 rows tall. Separate Working, Done and Settled shelves, each with a heading, a count and a chevron, opened and closed with `w`, `d` and `e` or a click and saved. Working and Done start open and Settled closed, and an old settings file gets the Working shelf on once. The inbox has no heading except `Inbox` under pins. Done is t3term's own shelf, not the desktop's. No visits, pins, snoozes or settles sent. [Verification](sidebar-shelves-verification.md) |
+
 ## Maintenance review PRs
 
 | Pull request | Audit | What it does | Merge commit |

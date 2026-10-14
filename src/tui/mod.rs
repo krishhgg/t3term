@@ -52,7 +52,7 @@ use environment::{Feed, Identity};
 use markdown::Styles;
 use picker::{Item, Kind, Pick};
 use scroll::{Pin, Scroll};
-use sidebar::{Badges, Capabilities, Sidebar, View};
+use sidebar::{Badges, Capabilities, Shelf, ShelfChoices, Sidebar, View};
 use theme::{Theme, duration_label, model_display_name, now_ms, parse_iso_ms, runtime_mode_label};
 use unsent::{Failed, Unsent};
 
@@ -74,6 +74,9 @@ const NARROWEST_SIDEBAR: u16 = 20;
 const NARROWEST_MAIN: u16 = 20;
 /// How far `[` and `]` move the sidebar's edge, in columns.
 const SIDEBAR_STEP: u16 = 2;
+/// The fewest rows a screen has for the sidebar and the main column to keep a blank row at the
+/// top, over the wordmark and the breadcrumb.
+const ROOMY: u16 = 20;
 /// The columns of the thread's title the breadcrumb keeps before it gives any to the
 /// environment, while the sidebar doesn't show the environment.
 const KEPT_TITLE: usize = 16;
@@ -455,9 +458,9 @@ struct App {
     sidebar_width: Option<u16>,
     /// A drag of the sidebar's edge under way.
     drag: Option<Drag>,
-    /// Set when the sidebar is hidden, shown or resized, so the next frame draws at once
-    /// instead of waiting out the frame budget. Until it does, clicks would land on the old
-    /// layout.
+    /// Set when the sidebar is hidden, shown or resized, or one of its shelves opens or
+    /// closes, so the next frame draws at once instead of waiting out the frame budget. Until
+    /// it does, clicks would land on the old layout.
     layout_changed: bool,
     open: Option<OpenThread>,
     focus: Focus,
@@ -733,6 +736,12 @@ fn padded(main: Rect) -> Rect {
     }
 }
 
+/// The blank rows over the wordmark and the breadcrumb on a screen `height` rows tall: one
+/// from `ROOMY` rows, and none on a shorter screen, which needs every row.
+fn top_inset(height: u16) -> u16 {
+    u16::from(height >= ROOMY)
+}
+
 fn str_of<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or_default()
 }
@@ -768,10 +777,12 @@ impl App {
             badges: Badges::default(),
             feed: Feed::Connecting,
             environment,
-            sidebar: Sidebar::with_working(
-                settings.sidebar_working_shelf_enabled,
-                settings.sidebar_working_shelf_expanded,
-            ),
+            sidebar: Sidebar::with_choices(ShelfChoices {
+                working_enabled: settings.sidebar_working_shelf_enabled,
+                working_open: settings.sidebar_working_shelf_expanded,
+                done_open: settings.sidebar_done_shelf_expanded,
+                settled_open: settings.sidebar_settled_shelf_expanded,
+            }),
             sidebar_hidden: settings.sidebar_hidden,
             sidebar_width: settings.sidebar_width,
             drag: None,
@@ -1055,11 +1066,6 @@ impl App {
         })
     }
 
-    fn toggle_settled(&mut self) {
-        self.sidebar.show_settled = !self.sidebar.show_settled;
-        self.rebuild_rows();
-    }
-
     /// Hides or shows the sidebar and remembers it, as Ctrl+B and the desktop's Mod+B do. Focus
     /// on a sidebar being hidden moves to the transcript when a thread is open, or else to the
     /// composer. The rows, the highlight, the open thread and the composer stay as they are.
@@ -1180,14 +1186,20 @@ impl App {
         Settings::update(|settings| settings.sidebar_width = None);
     }
 
-    /// Opens or closes the Working shelf and remembers it, as the GUI does. Nothing happens
-    /// while the list has no Working heading.
-    fn toggle_working(&mut self) {
-        let Some(expanded) = self.sidebar.toggle_working() else {
+    /// Opens or closes `shelf` and remembers it, as the GUI does for Working. Nothing happens
+    /// while the list has no heading for it. The cards below the heading move, so the next
+    /// frame draws at once, and until it does a click on the list lands on nothing.
+    fn toggle_shelf(&mut self, shelf: Shelf) {
+        let Some(open) = self.sidebar.toggle(shelf) else {
             return;
         };
-        Settings::update(move |settings| settings.sidebar_working_shelf_expanded = expanded);
+        Settings::update(move |settings| match shelf {
+            Shelf::Working => settings.sidebar_working_shelf_expanded = open,
+            Shelf::Done => settings.sidebar_done_shelf_expanded = open,
+            _ => settings.sidebar_settled_shelf_expanded = open,
+        });
         self.rebuild_rows();
+        self.layout_changed = true;
     }
 
     fn shell_thread(&self, id: &str) -> Option<&Value> {
@@ -1202,6 +1214,8 @@ impl App {
         let Some(id) = self.sidebar.selected_thread_id().map(str::to_string) else {
             return;
         };
+        // A list that Down scrolled past the card scrolls back to it.
+        self.sidebar.select(&id);
         if self.open.as_ref().is_some_and(|o| o.id == id) {
             self.focus = Focus::Composer;
             return;
@@ -1584,14 +1598,13 @@ impl App {
                             (None, None) => self.focus = Focus::Transcript,
                         }
                     }
-                    MouseEventKind::Down(MouseButton::Left) if inside(self.sidebar.footer) => {
-                        self.toggle_settled()
-                    }
                     MouseEventKind::Down(MouseButton::Left)
                         if inside(self.sidebar.list)
-                            && self.sidebar.working_heading_at(mouse.row) =>
+                            && self.sidebar.shelf_at(mouse.row).is_some() =>
                     {
-                        self.toggle_working()
+                        if let Some(shelf) = self.sidebar.shelf_at(mouse.row) {
+                            self.toggle_shelf(shelf);
+                        }
                     }
                     MouseEventKind::Down(MouseButton::Left) if inside(self.sidebar.list) => {
                         if let Some(id) = self.sidebar.thread_at(mouse.row).map(str::to_string)
@@ -1786,8 +1799,9 @@ impl App {
                 KeyCode::Up | KeyCode::Char('k') => self.sidebar.move_selection(-1),
                 KeyCode::Down | KeyCode::Char('j') => self.sidebar.move_selection(1),
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.open_selected(),
-                KeyCode::Char('e') => self.toggle_settled(),
-                KeyCode::Char('w') => self.toggle_working(),
+                KeyCode::Char('w') => self.toggle_shelf(Shelf::Working),
+                KeyCode::Char('d') => self.toggle_shelf(Shelf::Done),
+                KeyCode::Char('e') => self.toggle_shelf(Shelf::Settled),
                 KeyCode::Char('[') => self.step_sidebar(false),
                 KeyCode::Char(']') => self.step_sidebar(true),
                 KeyCode::Char('0') => self.reset_sidebar_width(),
@@ -2549,10 +2563,16 @@ impl App {
             .layout(conversation.width.saturating_sub(4) as usize);
         // Text rows, a spacer, the chips row and two borders.
         let composer_height = composer_rows.len().clamp(1, COMPOSER_MAX_ROWS) as u16 + 4;
+        // The header has the title row and a blank row under it, and a blank row over it on a
+        // screen with room, level with the sidebar's over the wordmark.
+        let inset = top_inset(area.height);
+        let header_height = 2 + inset;
         // The panel leaves the header, three transcript rows, the composer and the status line
         // their space, less its own two borders.
         let panel_width = conversation.width.saturating_sub(4) as usize;
-        let panel_room = main.height.saturating_sub(2 + 3 + composer_height + 1 + 2);
+        let panel_room = main
+            .height
+            .saturating_sub(header_height + 3 + composer_height + 1 + 2);
         let panel = match self.request_panel(panel_width) {
             Some(panel) => self.panel_rows(panel, panel_width, panel_room as usize),
             None => Vec::new(),
@@ -2566,7 +2586,7 @@ impl App {
         // two never show together.
         let tasks_room = main
             .height
-            .saturating_sub(2 + 3 + composer_height + 1 + panel_height);
+            .saturating_sub(header_height + 3 + composer_height + 1 + panel_height);
         let tasks = self.tasks.lay_out(
             conversation.width.saturating_sub(4) as usize,
             tasks_room as usize,
@@ -2574,7 +2594,7 @@ impl App {
             &self.theme,
         );
         let [header, body, panel_area, drawer, composer_area, status_area] = Layout::vertical([
-            Constraint::Length(2),
+            Constraint::Length(header_height),
             Constraint::Min(3),
             Constraint::Length(panel_height),
             Constraint::Length(tasks.len() as u16),
@@ -2583,7 +2603,9 @@ impl App {
         ])
         .areas(conversation);
         let header = Rect {
+            y: header.y + inset.min(header.height),
             width: main.width,
+            height: header.height.saturating_sub(inset),
             ..header
         };
         let status_area = Rect {
@@ -2697,8 +2719,14 @@ impl App {
                     .draw_pane(frame, pane, focused, &self.environment, &self.theme);
             }
             Some(details::Layout::Dialog) => {
+                // Under the title row, wherever the inset puts it.
+                let below = Rect {
+                    y: area.y + inset,
+                    height: area.height - inset,
+                    ..area
+                };
                 self.details
-                    .draw_dialog(frame, area, &self.environment, &self.theme)
+                    .draw_dialog(frame, below, &self.environment, &self.theme)
             }
             None => self.details.forget_drawn(),
         }
@@ -3603,11 +3631,21 @@ impl App {
         let keys = match (self.focus, self.picker.as_ref().map(|p| p.kind)) {
             (_, Some(Kind::Model)) => "Type to search · ↑↓ choose · Enter select · Esc close",
             (_, Some(_)) => "↑↓ choose · Enter select · Esc close",
-            (Focus::Sidebar, None) if self.sidebar.has_working() => {
-                "↑↓ select · Enter open · w working · e settled · [ ] width · Ctrl+B hide · Tab focus · q quit"
-            }
             (Focus::Sidebar, None) => {
-                "↑↓ select · Enter open · e settled · [ ] width · Ctrl+B hide · Tab focus · q quit"
+                let working = if self.sidebar.has_shelf(Shelf::Working) {
+                    "w working · "
+                } else {
+                    ""
+                };
+                let folds = if self.sidebar.has_shelf(Shelf::Done) {
+                    "d done · e settled · "
+                } else {
+                    ""
+                };
+                hint = format!(
+                    "↑↓ select · Enter open · {working}{folds}[ ] width · Ctrl+B hide · Tab focus · q quit"
+                );
+                hint.as_str()
             }
             (Focus::Composer, None) => {
                 "Enter send · Alt+Enter newline · Alt+M model · Alt+E effort · Alt+P mode · Ctrl+X interrupt"
@@ -4890,13 +4928,16 @@ mod tests {
         // A closed Working shelf hides the busy card behind its heading, so it needs no tick.
         // Open, the card shows and ticks.
         let closed = drawn_by(
-            Sidebar::with_working(true, false),
+            Sidebar::with_choices(ShelfChoices {
+                working_open: false,
+                ..ShelfChoices::default()
+            }),
             vec![thread("busy", json!({}))],
         );
         assert!(!closed.drew_working());
         assert!(!needs_tick(None, &closed));
         let open_shelf = drawn_by(
-            Sidebar::with_working(true, true),
+            Sidebar::with_choices(ShelfChoices::default()),
             vec![thread("busy", json!({}))],
         );
         assert!(open_shelf.drew_working());
@@ -5737,7 +5778,8 @@ mod tests {
         assert!(!app.sidebar_hidden, "no settings file shows it");
         assert_eq!(app.focus, Focus::Sidebar);
         let rows = screen(&mut app, 80, 24);
-        assert!(rows[0].contains("T3 Code"), "{rows:#?}");
+        assert!(rows[0].trim().is_empty(), "{rows:#?}");
+        assert!(rows[1].contains("T3 Code"), "{rows:#?}");
         assert_ne!(app.sidebar.list, Rect::default());
         assert!(app.composer_area.x > app.sidebar.list.right());
 
@@ -5757,8 +5799,8 @@ mod tests {
         // The conversation takes the whole width, less a column of padding on each side.
         assert_eq!((app.composer_area.x, app.composer_area.width), (1, 78));
         assert_eq!((app.transcript_area.x, app.transcript_area.width), (1, 78));
-        assert_eq!(app.sidebar_toggle, Rect::new(1, 0, 3, 1));
-        assert!(rows[0].starts_with("  ◧  Pick a thread"), "{:?}", rows[0]);
+        assert_eq!(app.sidebar_toggle, Rect::new(1, 1, 3, 1));
+        assert!(rows[1].starts_with("  ◧  Pick a thread"), "{:?}", rows[1]);
         row_showing(&rows, "Press Ctrl+B to show the sidebar");
         assert!(rows[23].contains("Ctrl+B sidebar · Enter send"));
         // No `b` went in, and the cursor is still between the letters.
@@ -5770,7 +5812,7 @@ mod tests {
         assert!(!crate::settings::saved_in_test().sidebar_hidden);
         assert_eq!(app.focus, Focus::Composer, "showing it leaves focus alone");
         let rows = screen(&mut app, 80, 24);
-        assert!(rows[0].contains("T3 Code"), "{rows:#?}");
+        assert!(rows[1].contains("T3 Code"), "{rows:#?}");
         assert!(!rows[23].contains("Ctrl+B sidebar"), "{:?}", rows[23]);
         assert_eq!(app.composer.text(), "hid");
     }
@@ -5820,7 +5862,15 @@ mod tests {
     #[test]
     fn a_hidden_sidebar_leaves_its_clicks_and_wheel_to_the_conversation() {
         let mut app = tui(&Settings::default());
-        let threads = vec![listed("a", "Alpha", "idle"), listed("b", "Bravo", "idle")];
+        // Two finished runs with no visit, which counts as seen, so both cards are in the inbox
+        // at the top of the list, and the empty Working, Done and Settled shelves sit at its
+        // bottom. A thread whose status is idle after a run reads Waiting and belongs in
+        // Working, which would put the cards at the bottom, over the composer once the sidebar
+        // hides.
+        let threads = vec![
+            listed("a", "Alpha", "completed"),
+            listed("b", "Bravo", "completed"),
+        ];
         app.on_shell_event(shell_snapshot(threads));
         app.open = Some(long_thread());
         assert!(app.sidebar.select("a"));
@@ -5828,13 +5878,32 @@ mod tests {
         // Shown, a click on Bravo's card would open it, and the wheel there moves the highlight.
         let (x, y) = (5, row_showing(&rows, "Bravo"));
         assert_eq!(app.sidebar.thread_at(y), Some("b"));
-        let footer = app.sidebar.footer;
-        assert_ne!(footer, Rect::default());
+        // The Settled heading ends the list, on the screen's last row.
+        let settled = row_showing(&rows, "Settled (0)");
+        assert_eq!(settled, 23);
+        assert_eq!(app.sidebar.shelf_at(settled), Some(Shelf::Settled));
+        let working = row_showing(&rows, "Working (0)");
+        assert_eq!(app.sidebar.shelf_at(working), Some(Shelf::Working));
 
         app.focus = Focus::Composer;
         ctrl_b(&mut app);
-        screen(&mut app, 80, 24);
-        assert_eq!(app.sidebar.thread_at(y), None);
+        let hidden = screen(&mut app, 80, 24);
+        // Hidden, no row takes a click as a card or a heading.
+        for row in 0..24 {
+            assert_eq!(app.sidebar.thread_at(row), None, "row {row}");
+            assert_eq!(app.sidebar.shelf_at(row), None, "row {row}");
+        }
+        // Bravo's old place is inside the transcript, and the Settled heading's is the status
+        // line.
+        let body = app.transcript_area;
+        assert!(
+            (body.x..body.right()).contains(&x) && (body.y..body.bottom()).contains(&y),
+            "({x}, {y}) is outside {body:?}"
+        );
+        assert!(
+            hidden[settled as usize].contains("Ctrl+B sidebar"),
+            "{hidden:#?}"
+        );
         // Hidden, the wheel there scrolls the transcript and the highlight stays on Alpha.
         assert!(mouse(&mut app, MouseEventKind::ScrollUp, x, y));
         assert_eq!(app.scroll.rows(), 3);
@@ -5843,10 +5912,10 @@ mod tests {
         assert!(mouse(&mut app, CLICK, x, y));
         assert_eq!(app.focus, Focus::Transcript);
         assert_eq!(app.open.as_ref().map(|open| open.id.as_str()), Some("t"));
-        // A click on the old Settled footer lands on the status line.
-        assert!(mouse(&mut app, CLICK, footer.x, footer.y));
+        // A click where the Settled heading was lands on the status line and opens nothing.
+        assert!(mouse(&mut app, CLICK, x, settled));
         assert_eq!(app.focus, Focus::Composer);
-        assert!(!app.sidebar.show_settled);
+        assert!(!crate::settings::saved_in_test().sidebar_settled_shelf_expanded);
 
         // The toggle brings the sidebar back as it was, and its cards take clicks again.
         let toggle = app.sidebar_toggle;
@@ -5863,6 +5932,465 @@ mod tests {
         assert!(mouse(&mut app, CLICK, toggle.x + 2, toggle.y));
         assert!(app.sidebar_hidden);
         assert!(crate::settings::saved_in_test().sidebar_hidden);
+    }
+
+    #[test]
+    fn w_d_and_e_open_and_close_the_shelves_from_the_sidebar_and_remember_it() {
+        let mut app = tui(&Settings::default());
+        let mut delta = listed("d", "Delta", "completed");
+        delta["latestRunCompletedAt"] = json!("2026-10-08T11:00:00.000Z");
+        delta["lastVisitedAt"] = json!("2026-10-08T10:00:00.000Z");
+        let threads = vec![listed("w", "Whiskey", "running"), delta];
+        app.on_shell_event(shell_snapshot(threads));
+        assert_eq!(app.focus, Focus::Sidebar);
+        // A new settings file has Working and Done open and Settled closed, and the status
+        // line offers the keys.
+        let rows = screen(&mut app, 200, 30);
+        for shown in [
+            "Working (1) ",
+            "Whiskey",
+            "Done (1) ",
+            "Delta",
+            "Settled (0) ",
+        ] {
+            row_showing(&rows, shown);
+        }
+        assert!(
+            rows[29].contains("w working · d done · e settled"),
+            "{}",
+            rows[29]
+        );
+
+        // Each key opens or closes its own shelf and saves the choice.
+        press(&mut app, KeyCode::Char('w'));
+        assert!(!crate::settings::saved_in_test().sidebar_working_shelf_expanded);
+        press(&mut app, KeyCode::Char('d'));
+        assert!(!crate::settings::saved_in_test().sidebar_done_shelf_expanded);
+        press(&mut app, KeyCode::Char('e'));
+        assert!(crate::settings::saved_in_test().sidebar_settled_shelf_expanded);
+        let rows = screen(&mut app, 200, 30);
+        assert!(
+            !shows(&rows, "Whiskey") && !shows(&rows, "Delta"),
+            "{rows:#?}"
+        );
+        let at = |label: &str| rows[row_showing(&rows, label) as usize].clone();
+        assert!(at("Working (1) ").contains("─ ›"));
+        assert!(at("Done (1) ").contains("─ ›"));
+        assert!(at("Settled (0) ").contains("─ ⌄"));
+
+        // A click on a heading does the same.
+        let working = row_showing(&rows, "Working (1) ");
+        assert_eq!(app.sidebar.shelf_at(working), Some(Shelf::Working));
+        assert!(mouse(&mut app, CLICK, 5, working));
+        assert!(crate::settings::saved_in_test().sidebar_working_shelf_expanded);
+        assert_eq!(app.focus, Focus::Sidebar);
+        let rows = screen(&mut app, 200, 30);
+        assert_eq!(
+            app.sidebar.thread_at(row_showing(&rows, "Whiskey")),
+            Some("w")
+        );
+
+        // In the composer the same letters are text, and the shelves stay as they are.
+        app.focus = Focus::Composer;
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.composer.text(), "d");
+        assert!(!crate::settings::saved_in_test().sidebar_done_shelf_expanded);
+        assert!(!shows(&screen(&mut app, 200, 30), "Delta"));
+    }
+
+    #[test]
+    fn a_fold_draws_at_once_and_its_old_rows_take_no_click_until_then() {
+        let mut app = tui(&Settings::default());
+        // Five inbox cards fill the list down to Working, so Done waits below the screen
+        // until Working closes and Done takes Whiskey's place.
+        let mut threads: Vec<Value> = (1..=5)
+            .map(|n| listed(&format!("a{n}"), &format!("Inbox {n}"), "completed"))
+            .collect();
+        let mut delta = listed("d", "Delta", "completed");
+        delta["latestRunCompletedAt"] = json!("2026-10-08T11:00:00.000Z");
+        delta["lastVisitedAt"] = json!("2026-10-08T10:00:00.000Z");
+        threads.extend([listed("w", "Whiskey", "running"), delta]);
+        app.on_shell_event(shell_snapshot(threads));
+        app.open = Some(long_thread());
+        app.composer.insert_str("half a thought");
+        assert_eq!(app.focus, Focus::Sidebar);
+        let rows = screen(&mut app, 200, 30);
+        let working = row_showing(&rows, "Working (1) ");
+        let whiskey = row_showing(&rows, "Whiskey");
+        assert_eq!(app.sidebar.shelf_at(working), Some(Shelf::Working));
+        assert_eq!(app.sidebar.thread_at(whiskey), Some("w"));
+        assert!(!shows(&rows, "Done ("), "{rows:#?}");
+        app.scroll.set(3);
+        let still = |app: &App| {
+            assert_eq!(app.focus, Focus::Sidebar);
+            assert_eq!(app.open.as_ref().map(|open| open.id.as_str()), Some("t"));
+            assert_eq!(app.composer.text(), "half a thought");
+        };
+
+        // `w` closes Working, and the next frame waits for nothing. Until it draws, a click
+        // where Whiskey's card or the Working heading was opens nothing and folds nothing.
+        press(&mut app, KeyCode::Char('w'));
+        assert!(app.layout_changed);
+        assert!(!crate::settings::saved_in_test().sidebar_working_shelf_expanded);
+        for row in 0..30 {
+            assert_eq!(app.sidebar.thread_at(row), None, "row {row}");
+            assert_eq!(app.sidebar.shelf_at(row), None, "row {row}");
+        }
+        for row in [working, whiskey - 1, whiskey] {
+            assert!(mouse(&mut app, CLICK, 5, row));
+        }
+        assert!(!crate::settings::saved_in_test().sidebar_working_shelf_expanded);
+        assert!(crate::settings::saved_in_test().sidebar_done_shelf_expanded);
+        assert_eq!(app.scroll.rows(), 3);
+        still(&app);
+
+        // The frame draws Done where Whiskey was, and those rows now take Done's clicks.
+        let rows = screen(&mut app, 200, 30);
+        assert!(!app.layout_changed);
+        assert!(!shows(&rows, "Whiskey"), "{rows:#?}");
+        let done = row_showing(&rows, "Done (1) ");
+        let delta = row_showing(&rows, "Delta");
+        assert_eq!(done, whiskey - 1);
+        assert_eq!(app.sidebar.shelf_at(working), Some(Shelf::Working));
+        assert_eq!(app.sidebar.shelf_at(done), Some(Shelf::Done));
+        assert_eq!(app.sidebar.thread_at(delta), Some("d"));
+
+        // A click on Done closes it, and a second click on the same row before the next
+        // frame does nothing, nor does one on Delta's old card.
+        assert!(mouse(&mut app, CLICK, 5, done));
+        assert!(app.layout_changed);
+        assert!(!crate::settings::saved_in_test().sidebar_done_shelf_expanded);
+        assert!(mouse(&mut app, CLICK, 5, done));
+        assert!(mouse(&mut app, CLICK, 5, delta));
+        assert!(!crate::settings::saved_in_test().sidebar_done_shelf_expanded);
+        assert_eq!(app.scroll.rows(), 3);
+        still(&app);
+        let rows = screen(&mut app, 200, 30);
+        assert!(!shows(&rows, "Delta"), "{rows:#?}");
+        let done = row_showing(&rows, "Done (1) ");
+        assert!(rows[done as usize].contains("─ ›"), "{rows:#?}");
+        assert_eq!(app.sidebar.shelf_at(done), Some(Shelf::Done));
+        still(&app);
+    }
+
+    /// Settings with Working, Done and Settled closed.
+    fn shelves_closed() -> Settings {
+        Settings {
+            sidebar_working_shelf_expanded: false,
+            sidebar_done_shelf_expanded: false,
+            sidebar_settled_shelf_expanded: false,
+            ..Settings::default()
+        }
+    }
+
+    /// A thread whose latest run finished after the last visit, which puts it on Done.
+    fn finished_unseen(id: &str, title: &str) -> Value {
+        let mut thread = listed(id, title, "completed");
+        thread["latestRunCompletedAt"] = json!("2026-10-08T11:00:00.000Z");
+        thread["lastVisitedAt"] = json!("2026-10-08T10:00:00.000Z");
+        thread
+    }
+
+    /// Inbox cards a1 to a4 over the closed shelves, with Whiskey on Working and Delta on Done,
+    /// and the settings saved as the TUI starts with them. At 80x8 the list has six rows: room
+    /// for a4 and the Working heading under it, but not for Done and Settled too.
+    fn short_list_over_closed_shelves() -> App {
+        Settings::update(|saved| *saved = shelves_closed());
+        let mut app = tui(&shelves_closed());
+        let mut threads: Vec<Value> = (1..=4)
+            .map(|n| listed(&format!("a{n}"), &format!("Inbox {n}"), "completed"))
+            .collect();
+        threads.extend([
+            listed("w", "Whiskey", "running"),
+            finished_unseen("d", "Delta"),
+        ]);
+        app.on_shell_event(shell_snapshot(threads));
+        app.open = Some(long_thread());
+        app
+    }
+
+    /// What a click on each row of the sidebar's list lands on, by the last frame: a thread's
+    /// id, a shelf's name or nothing.
+    fn clickable(app: &App) -> Vec<String> {
+        let list = app.sidebar.list;
+        (list.y..list.bottom())
+            .map(
+                |y| match (app.sidebar.thread_at(y), app.sidebar.shelf_at(y)) {
+                    (Some(id), _) => id.to_string(),
+                    (None, Some(shelf)) => format!("{shelf:?}"),
+                    (None, None) => String::new(),
+                },
+            )
+            .collect()
+    }
+
+    #[test]
+    fn down_on_the_last_card_of_a_short_list_scrolls_on_to_the_headings_under_it() {
+        let mut app = short_list_over_closed_shelves();
+        let rows = screen(&mut app, 80, 8);
+        assert_eq!((app.sidebar.list.y, app.sidebar.list.bottom()), (2, 8));
+        assert_eq!(clickable(&app), ["a1", "a1", "a1", "", "a2", "a2"]);
+        assert!(!shows(&rows, "Working ("), "{rows:#?}");
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down);
+            screen(&mut app, 80, 8);
+        }
+        // a4, the last card, fills the list with Working under it. Done and Settled don't fit.
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a4"));
+        let at_a4 = ["a4", "a4", "a4", "", "", "Working"];
+        let rows = screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), at_a4);
+        assert!(rows[7].contains("Working (1) ─"), "{rows:#?}");
+        assert!(!shows(&rows, "Done ("), "{rows:#?}");
+
+        // Down scrolls on past a4, and the first frame after shows every heading under it, each
+        // taking clicks on the row that reads it. The highlight stays on a4.
+        let past_a4 = ["", "Working", "Done", "Settled", "", ""];
+        press(&mut app, KeyCode::Down);
+        let rows = screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), past_a4);
+        assert!(rows[3].contains("Working (1) ─"), "{rows:#?}");
+        assert!(rows[4].contains("Done (1) ─"), "{rows:#?}");
+        assert!(rows[5].contains("Settled (0) ─"), "{rows:#?}");
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a4"));
+
+        // That is as far as it goes. Repaints and a live change near the bottom keep it there.
+        press(&mut app, KeyCode::Down);
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), past_a4);
+        app.on_shell_event(thread_updated(2, finished_unseen("e", "Echo")));
+        let rows = screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), past_a4);
+        assert!(rows[4].contains("Done (2) ─"), "{rows:#?}");
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), past_a4);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a4"));
+
+        // Up scrolls back to a4 first, and then moves the highlight.
+        press(&mut app, KeyCode::Up);
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), at_a4);
+        press(&mut app, KeyCode::Up);
+        screen(&mut app, 80, 8);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a3"));
+        assert_eq!(clickable(&app), ["a3", "a3", "a3", "", "a4", "a4"]);
+
+        // Enter on the list scrolled past a4 opens a4, and the next frame shows it again.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), past_a4);
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.open.as_ref().map(|open| open.id.as_str()), Some("a4"));
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), at_a4);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_a_short_list_on_to_its_headings_and_their_clicks_fold_them() {
+        let mut app = short_list_over_closed_shelves();
+        screen(&mut app, 80, 8);
+        // Three turns take the highlight to a4, the fourth scrolls past it, and more do nothing.
+        for _ in 0..6 {
+            assert!(mouse(&mut app, MouseEventKind::ScrollDown, 5, 4));
+            screen(&mut app, 80, 8);
+        }
+        assert_eq!(clickable(&app), ["", "Working", "Done", "Settled", "", ""]);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a4"));
+
+        // A click on Done opens it. Nothing the last frame drew takes a click until the next
+        // one draws, so a click where Settled was folds nothing.
+        assert!(mouse(&mut app, CLICK, 5, 4));
+        assert!(app.layout_changed);
+        assert!(crate::settings::saved_in_test().sidebar_done_shelf_expanded);
+        assert!(clickable(&app).iter().all(String::is_empty));
+        assert!(mouse(&mut app, CLICK, 5, 5));
+        assert!(!crate::settings::saved_in_test().sidebar_settled_shelf_expanded);
+
+        // The frame keeps the view where it was, with Delta under the open Done.
+        let rows = screen(&mut app, 80, 8);
+        assert!(!app.layout_changed);
+        assert_eq!(clickable(&app), ["", "Working", "Done", "d", "d", "d"]);
+        assert!(rows[4].contains("Done (1) ─"), "{rows:#?}");
+        assert!(rows[4].contains("─ ⌄"), "{rows:#?}");
+        assert!(shows(&rows, "Delta"), "{rows:#?}");
+
+        // A click on Delta opens it, and the list follows the highlight to it, with Settled
+        // under it.
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        assert!(mouse(&mut app, CLICK, 5, 6));
+        assert_eq!(app.open.as_ref().map(|open| open.id.as_str()), Some("d"));
+        screen(&mut app, 80, 8);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("d"));
+        assert_eq!(clickable(&app), ["d", "d", "d", "", "", "Settled"]);
+
+        // A click there opens Settled, and the wheel goes back up through a4 to a3.
+        assert!(mouse(&mut app, CLICK, 5, 7));
+        assert!(crate::settings::saved_in_test().sidebar_settled_shelf_expanded);
+        let rows = screen(&mut app, 80, 8);
+        assert!(rows[7].contains("Settled (0) ─"), "{rows:#?}");
+        assert!(rows[7].contains("─ ⌄"), "{rows:#?}");
+        assert!(mouse(&mut app, MouseEventKind::ScrollUp, 5, 4));
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), ["a4", "a4", "a4", "", "", "Working"]);
+        assert!(mouse(&mut app, MouseEventKind::ScrollUp, 5, 4));
+        screen(&mut app, 80, 8);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a3"));
+    }
+
+    #[test]
+    fn a_list_with_room_for_every_row_has_nothing_to_scroll_past() {
+        let mut app = short_list_over_closed_shelves();
+        // At 120x36 the whole list fits, with the shelves at its bottom.
+        let rows = screen(&mut app, 120, 36);
+        assert_eq!(row_showing(&rows, "Working (1)"), 33);
+        assert_eq!(row_showing(&rows, "Settled (0)"), 35);
+        assert_eq!(app.sidebar.shelf_at(35), Some(Shelf::Settled));
+        let tall = clickable(&app);
+        // Down past a4 scrolls nothing, so Up moves the highlight at once.
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Down);
+            screen(&mut app, 120, 36);
+            assert_eq!(clickable(&app), tall);
+        }
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a4"));
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a3"));
+
+        // Shrunk to 80x8, Down scrolls past a4. Grown back, the list fits and shows as before.
+        // Shrunk again, it follows a4, so Up moves the highlight at once.
+        press(&mut app, KeyCode::Down);
+        app.on_terminal_event(Event::Resize(80, 8));
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), ["a4", "a4", "a4", "", "", "Working"]);
+        press(&mut app, KeyCode::Down);
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), ["", "Working", "Done", "Settled", "", ""]);
+        app.on_terminal_event(Event::Resize(120, 36));
+        let rows = screen(&mut app, 120, 36);
+        assert_eq!(clickable(&app), tall);
+        assert_eq!(row_showing(&rows, "Settled (0)"), 35);
+        app.on_terminal_event(Event::Resize(80, 8));
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), ["a4", "a4", "a4", "", "", "Working"]);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a3"));
+    }
+
+    #[test]
+    fn a_short_list_of_headings_scrolls_to_the_last_and_an_empty_list_stays_still() {
+        // With no thread, there is nothing to scroll to and nothing takes a click.
+        let mut app = tui(&shelves_closed());
+        app.on_shell_event(shell_snapshot(Vec::new()));
+        screen(&mut app, 80, 8);
+        press(&mut app, KeyCode::Down);
+        assert!(mouse(&mut app, MouseEventKind::ScrollDown, 5, 4));
+        let rows = screen(&mut app, 80, 8);
+        assert!(
+            rows[2].trim_start().starts_with("No threads yet"),
+            "{rows:#?}"
+        );
+        assert!(clickable(&app).iter().all(String::is_empty));
+        press(&mut app, KeyCode::Up);
+        let rows = screen(&mut app, 80, 8);
+        assert!(
+            rows[2].trim_start().starts_with("No threads yet"),
+            "{rows:#?}"
+        );
+
+        // Delta alone, on closed Done, leaves only the headings. At 80x4 the list has two rows,
+        // and Down scrolls on to Settled, whose click opens it.
+        let mut app = tui(&shelves_closed());
+        app.on_shell_event(shell_snapshot(vec![finished_unseen("d", "Delta")]));
+        screen(&mut app, 80, 4);
+        assert_eq!(clickable(&app), ["Working", "Done"]);
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Down);
+            screen(&mut app, 80, 4);
+            assert_eq!(clickable(&app), ["Done", "Settled"]);
+        }
+        assert!(mouse(&mut app, CLICK, 5, 3));
+        assert!(crate::settings::saved_in_test().sidebar_settled_shelf_expanded);
+        let rows = screen(&mut app, 80, 4);
+        assert_eq!(clickable(&app), ["Done", "Settled"]);
+        assert!(rows[3].contains("Settled (0) ─"), "{rows:#?}");
+        assert!(rows[3].contains("─ ⌄"), "{rows:#?}");
+        press(&mut app, KeyCode::Up);
+        screen(&mut app, 80, 4);
+        assert_eq!(clickable(&app), ["Working", "Done"]);
+    }
+
+    #[test]
+    fn the_open_thread_on_a_closed_shelf_stays_in_reach_above_the_headings_under_it() {
+        let mut app = short_list_over_closed_shelves();
+        // Whiskey is open, so closed Working still lists it.
+        app.open = Some(OpenThread::new("w".into(), mpsc::unbounded_channel().1));
+        app.rebuild_rows();
+        screen(&mut app, 80, 8);
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Down);
+            screen(&mut app, 80, 8);
+        }
+        assert_eq!(app.sidebar.selected_thread_id(), Some("w"));
+        let at_whiskey = ["", "Working", "w", "w", "w", ""];
+        assert_eq!(clickable(&app), at_whiskey);
+
+        // Down scrolls past Whiskey to Done and Settled, and no further.
+        let past_whiskey = ["", "Done", "Settled", "", "", ""];
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Down);
+            screen(&mut app, 80, 8);
+            assert_eq!(clickable(&app), past_whiskey);
+        }
+
+        // Opening Working there keeps the view. Closing it moves the highlight off its cards to
+        // Whiskey, which stays listed, and the list follows the highlight again.
+        press(&mut app, KeyCode::Char('w'));
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), past_whiskey);
+        press(&mut app, KeyCode::Char('w'));
+        let rows = screen(&mut app, 80, 8);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("w"));
+        assert_eq!(clickable(&app), at_whiskey);
+        assert!(rows[3].contains("Working (1) ─"), "{rows:#?}");
+        assert!(rows[3].contains("─ ›"), "{rows:#?}");
+    }
+
+    #[test]
+    fn a_tall_screen_keeps_a_blank_row_at_the_top_and_a_short_one_uses_it() {
+        let mut app = tui(&Settings::default());
+        let threads = vec![listed("a", "Alpha", "idle"), listed("b", "Bravo", "idle")];
+        app.on_shell_event(shell_snapshot(threads));
+        app.open = Some(long_thread());
+        for (width, height) in [(120, 36), (80, 24), (40, 12), (10, 5)] {
+            let rows = screen(&mut app, width, height);
+            let top = u16::from(height >= 20);
+            // The toggle leads the title row, under the blank row when there is one.
+            assert_eq!(app.sidebar_toggle.y, top, "{width}x{height}");
+            if top == 1 {
+                assert!(rows[0].trim().is_empty(), "{width}x{height}: {rows:#?}");
+            }
+            let sidebar = &app.sidebar;
+            if sidebar.list == Rect::default() {
+                // Too narrow for the sidebar, so nothing of it takes a click.
+                assert_eq!(width, 10);
+            } else {
+                // The wordmark, the environment, then the list after another blank row when
+                // there is room, running to the bottom.
+                assert!(rows[top as usize].contains("T3 Code"), "{rows:#?}");
+                assert_eq!(sidebar.list.y, 2 + 2 * top, "{width}x{height}");
+                assert_eq!(sidebar.list.bottom(), height);
+            }
+            // Every card and heading drawn takes clicks inside the list and nowhere else.
+            for y in 0..height {
+                let hit = sidebar.thread_at(y).is_some() || sidebar.shelf_at(y).is_some();
+                let inside = (sidebar.list.y..sidebar.list.bottom()).contains(&y);
+                assert!(!hit || inside, "{width}x{height} row {y}");
+            }
+        }
     }
 
     #[test]
@@ -5997,7 +6525,7 @@ mod tests {
         assert_eq!(app.sidebar.next_wake, None);
         ctrl_b(&mut app);
         let rows = screen(&mut app, 80, 24);
-        assert!(row_showing(&rows, "Active ─") < row_showing(&rows, "Zulu"));
+        assert!(row_showing(&rows, "Working (1)") < row_showing(&rows, "Zulu"));
         assert!(!rows.iter().any(|row| row.contains("Snoozed")), "{rows:#?}");
     }
 
@@ -6040,7 +6568,6 @@ mod tests {
                         app.composer_area,
                         app.picker_area,
                         app.sidebar.list,
-                        app.sidebar.footer,
                         app.sidebar.border,
                     ];
                     for area in drawn {
@@ -7600,7 +8127,7 @@ mod tests {
         assert_eq!(app.selected_pick(), gpt);
         let rows = screen(&mut app, 120, 30);
         assert!(!rows.iter().any(|row| row.contains("Snoozed")), "{rows:#?}");
-        assert!(row_showing(&rows, "Active ─") < row_showing(&rows, "Zulu"));
+        assert!(row_showing(&rows, "Working (1)") < row_showing(&rows, "Zulu"));
         assert_eq!(reads(&runtime), 0);
     }
 
@@ -9291,18 +9818,19 @@ mod tests {
     /// What one frame draws around the conversation.
     #[derive(Debug)]
     struct Chrome {
-        /// The sidebar's top row, with the wordmark and the dot.
+        /// The sidebar's first row under the inset, with the wordmark and the dot.
         wordmark: String,
         /// The sidebar's row under it.
         environment: String,
         /// The sidebar's list.
         list: String,
-        /// The main column's top row, with the toggle and the breadcrumb, up to the details'
+        /// The main column's title row, with the toggle and the breadcrumb, up to the details'
         /// button.
         header: String,
         /// The main column's bottom row.
         status: String,
-        /// The colors of the dots in the sidebar's top row and the main column's.
+        /// The colors of the dots in the sidebar's wordmark row and the main column's title
+        /// row.
         sidebar_dot: Option<Color>,
         header_dot: Option<Color>,
     }
@@ -9316,17 +9844,19 @@ mod tests {
             button if button.width > 0 => button.x,
             _ => width,
         };
+        // A screen with room has a blank row over the wordmark and the title row.
+        let top = top_inset(height);
         let dot = |columns: std::ops::Range<u16>| {
             columns
-                .map(|x| &buffer[(x, 0)])
+                .map(|x| &buffer[(x, top)])
                 .find(|cell| cell.symbol() == "●")
                 .map(|cell| cell.fg)
         };
         Chrome {
-            wordmark: text_in(&buffer, Rect::new(0, 0, main, 1)),
-            environment: text_in(&buffer, Rect::new(0, 1, main, 1)),
+            wordmark: text_in(&buffer, Rect::new(0, top, main, 1)),
+            environment: text_in(&buffer, Rect::new(0, top + 1, main, 1)),
             list: text_in(&buffer, app.sidebar.list),
-            header: text_in(&buffer, Rect::new(main, 0, end - main, 1)),
+            header: text_in(&buffer, Rect::new(main, top, end - main, 1)),
             status: text_in(&buffer, Rect::new(main, height - 1, width - main, 1)),
             sidebar_dot: dot(0..main),
             header_dot: dot(main..width),
@@ -9490,7 +10020,7 @@ mod tests {
         // its gap, four, then the breadcrumb, 30, then the gap and the button, four. Without
         // the button the breadcrumb had 34.
         let header = chrome(&mut app, 40, 24).header;
-        assert_eq!(app.details.button, Rect::new(36, 0, 3, 1));
+        assert_eq!(app.details.button, Rect::new(36, 1, 3, 1));
         assert_eq!(header, "  ◧  Pick a thread in th…  ● Studi… ");
         // Too narrow for it beside the title's 16 columns, the row is the title's.
         let drawn = chrome(&mut app, 24, 24);
@@ -9659,7 +10189,7 @@ mod tests {
                         "{width} ({x}, {y}) {symbol:?}"
                     );
                 }
-                let top = text_in(&buffer, Rect::new(0, 0, width, 2));
+                let top = text_in(&buffer, Rect::new(0, 0, width, 3));
                 // The label is cut long before its end.
                 assert!(!top.contains("evil"), "{top}");
                 // The title keeps its columns.
@@ -9693,11 +10223,12 @@ mod tests {
         app.focus = Focus::Composer;
         app.composer.insert_str("half a thought");
         chrome(&mut app, 80, 24);
-        // The list starts under the environment's row, where it always has.
-        assert_eq!(app.sidebar.list.y, 2);
+        // The list starts under the blank row below the environment's.
+        assert_eq!(app.sidebar.list.y, 4);
         let (border, list) = (app.sidebar.border, app.sidebar.list);
-        // A click on the dot or the environment does what a click on the wordmark did.
-        for (x, y) in [(border.x - 2, 0), (5, 1)] {
+        // A click on the dot, the environment or a blank row around them does what a click on
+        // the wordmark did.
+        for (x, y) in [(border.x - 2, 1), (5, 2), (5, 0), (5, 3)] {
             mouse(&mut app, CLICK, x, y);
             assert_eq!(app.focus, Focus::Composer);
             assert!(app.open.is_none() && app.picker.is_none() && app.drag.is_none());
@@ -9716,7 +10247,7 @@ mod tests {
         let header = chrome(&mut app, 120, 24).header;
         let at = header.find("Studio").expect("the environment");
         let x = header[..at].width() as u16;
-        mouse(&mut app, CLICK, x, 0);
+        mouse(&mut app, CLICK, x, 1);
         assert!(app.sidebar_hidden);
         assert!(crate::settings::saved_in_test().sidebar_hidden);
         assert!(app.open.is_none() && app.picker.is_none() && app.drag.is_none());
@@ -9802,8 +10333,9 @@ mod tests {
         assert!(!app.details.open);
         assert_eq!(app.details.drawn, None);
         let wide = app.composer_area;
-        // The button ends the title row, a column in from the screen's edge.
-        assert_eq!(app.details.button, Rect::new(196, 0, 3, 1));
+        // The button ends the title row, a column in from the screen's edge, under the blank
+        // row at the top.
+        assert_eq!(app.details.button, Rect::new(196, 1, 3, 1));
         assert_eq!(text_in(&buffer, app.details.button), " ◨ ");
 
         alt(&mut app, 'b');
@@ -10391,7 +10923,7 @@ mod tests {
             // The hostile text reached the breadcrumb, and the sidebar's card when it shows,
             // by its printable characters.
             let buffer = cells(&mut app, 200, 50);
-            let title_row = text_in(&buffer, Rect::new(0, 0, 200, 1));
+            let title_row = text_in(&buffer, Rect::new(0, 1, 200, 1));
             assert!(title_row.contains('名'), "{title_row}");
             let sidebar = text_in(&buffer, app.sidebar.list);
             assert_eq!(sidebar.contains('名'), !sidebar_hidden, "{sidebar}");
@@ -10754,7 +11286,6 @@ mod tests {
             app.provider_banner.close,
             app.details.button,
             app.sidebar.list,
-            app.sidebar.footer,
             app.sidebar.border,
         ];
         areas.extend(app.chips.iter().map(|&(area, _)| area));
