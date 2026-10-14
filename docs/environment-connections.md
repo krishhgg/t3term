@@ -26,6 +26,8 @@ t3term environment remove scratch
 
 These commands read and write `~/.config/t3term/environments.json` and nothing else. They reach no server and run no `t3`, so they work with every server stopped. `--json` prints what they changed. `environment list --json` prints each environment's name, kind, T3 home, origin and whether it is the default, and no other key the file holds.
 
+`environment status`, [below](#checking-which-servers-answer), is the one `environment` command that reaches a server. It reads the file, asks each server for its descriptor and changes nothing.
+
 ## Which server a command uses
 
 t3term chooses once per command, before it reaches any server:
@@ -58,6 +60,62 @@ For a saved environment, in this order:
 T3 writes `environment-id` in the state directory and reports the same id in its descriptor (apps/server/src/environment/ServerEnvironment.ts:89-177 at T3 f570bd21). A server started with `--base-dir` or `T3CODE_HOME` keeps its state in `userdata` under that home, even as a dev server (apps/server/src/cli/config.ts:319-332 and apps/server/src/config.ts:139-142).
 
 t3term reads `environment-id` and `server-runtime.json` once per command, on a blocking thread, so Ctrl-C still works while a slow disk holds the read up. It reads each only as a regular file of at most 16 KiB. A directory, a FIFO or a larger file counts as unreadable, so t3term never waits on a pipe or fills memory. Waiting can't cancel a read that never finishes. That read keeps its thread, and t3term exits without it.
+
+## Checking which servers answer
+
+```bash
+t3term environment status
+t3term environment status lab
+```
+
+`environment status` checks each saved environment as a command that names it would, through step 5 above, and stops before the login. It asks each server for `/.well-known/t3/environment` and nothing else. It runs no `t3`, reads nothing from the Keychain, asks for no session or ticket and opens no WebSocket. Each environment gets one of three phases:
+
+| Phase | Means |
+| --- | --- |
+| `ready` | The server answered the descriptor at the origin itself, reported the environment id its T3 home holds, and speaks orchestration protocol 2. |
+| `offline` | A check failed with exit code 5, `T3_SERVER_UNAVAILABLE`: nothing listens at the origin, the server closed the connection or didn't answer within 2.5 seconds, no origin is saved or recorded, or `server-runtime.json` can't be read. |
+| `blocked` | Any other check failed, such as an entry t3term refuses, a home with no environment id, a redirect, another environment's id, a descriptor that doesn't parse or protocol 1. Each keeps its code from [Errors](#errors). |
+
+`ready` means t3term verified the server's environment id and protocol from its descriptor. It doesn't mean a login would succeed or that an agent would start. Status logs in to no server and starts nothing, so a `ready` server can still refuse the login, or stop before the next command reaches it.
+
+Each environment is checked on its own. An entry t3term refuses, or a server that redirects or belongs to another home, doesn't stop the others. No check falls back to `T3TERM_ORIGIN`, `T3CODE_HOME`, the default or another environment's server. An entry saved under a name that breaks the naming rule is `blocked` with `ENVIRONMENT_NAME_INVALID`.
+
+t3term checks at most 8 environments at once and reports them in name order. It checks each once per run, with the 2.5 seconds every command waits for a descriptor, and doesn't retry. Nothing keeps running after the command ends, and status writes no file.
+
+Without a name, status reports every saved environment and exits 0 once the file reads, whatever each check found. With no file, or a file that saves no environment, it prints `No saved environments to check.`, or an empty list with `--json`. With a name, status checks that environment alone. It exits 0 when the environment is ready, and otherwise with its check's exit code, such as 5 when it is offline or 4 for another environment's id.
+
+The plain output prints a row for each environment: `*` for the default, the name and the phase, then the origin and label when it is ready, or the error's message and code when it isn't. A row loses its control characters, and a line break in a label or message reads as a space.
+
+`--json` prints one object. Each environment in it has these keys and no others: `name`, `default`, `phase`, `code`, `message`, `environmentId`, `label`, `origin` and `serverVersion`. A ready one has a null `code` and `message`. One that isn't ready has a null `environmentId`, `label`, `origin` and `serverVersion`. Its strings keep each character as the server or the check gave it, and a control character prints as a JSON escape.
+
+```json
+{
+  "ok": true,
+  "default": "work",
+  "environments": [
+    {"name": "lab", "default": false, "phase": "offline", "code": "T3_SERVER_UNAVAILABLE",
+     "message": "...", "environmentId": null, "label": null, "origin": null, "serverVersion": null},
+    {"name": "work", "default": true, "phase": "ready", "code": null, "message": null,
+     "environmentId": "...", "label": "Studio Mac", "origin": "http://127.0.0.1:3773",
+     "serverVersion": "..."}
+  ]
+}
+```
+
+A named environment that isn't ready prints `"ok": false`, its error, the default and that one environment, still in one object:
+
+```json
+{
+  "ok": false,
+  "error": {"code": "T3_SERVER_UNAVAILABLE", "message": "..."},
+  "default": "work",
+  "environments": [{"name": "lab", "phase": "offline", "...": "..."}]
+}
+```
+
+A name that isn't saved stops with `ENVIRONMENT_NOT_FOUND`, exit 3. A name that breaks the naming rule stops with `ENVIRONMENT_NAME_INVALID`, exit 2, before t3term reads the file. A file that doesn't read or parse stops with `ENVIRONMENTS_UNREADABLE`, exit 1. Each prints the usual error object, with no `environments`.
+
+A program that uses the t3term library gets the same checks from `Environments::probe` and `Environments::probe_all`.
 
 ## Redirects and proxies
 
@@ -139,6 +197,7 @@ It holds names, paths and origins, and never a login or a token. A change follow
 - Remote environments. t3term refuses an origin off this machine, and a saved kind other than `local`, before it reaches any server. T3 pairs a remote client by exchanging a one-time `t3 pair` credential at the server's `/oauth/token` for a bearer token. t3term's HTTP client is built without TLS, and its saved logins don't hold a remote token yet.
 - T3 Connect. The next section says what T3's clients do and what t3term lacks.
 - A picker in the TUI. The TUI opens on the environment the command chose, and the sidebar names it as before.
+- Watching servers. `environment status` checks once per run. t3term doesn't keep a connection to each environment or poll them, and the TUI doesn't show their phases.
 - A dev server started with `--dev-url` and no base dir keeps its state in `~/.t3/dev`, which a saved environment doesn't read. Discovery still finds it.
 - `remove` doesn't revoke the environment's login. Run `t3term --environment NAME logout` first.
 
