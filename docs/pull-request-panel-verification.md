@@ -1,6 +1,6 @@
 # Linked pull requests verification
 
-This page records how GPT-6.1 Sol checked the details' Pull requests tab from [PR #34](https://github.com/krishhgg/t3term/pull/34) on 2026-10-13. Sol first checked source `407566d49626bfb8061cb590ef1f5876c47766cc` with two runs against a fake server, which found two problems. `eac6096a53fdf910d61a0a373fb766596e74208a` fixes both, and Sol checked it with a third run. Greptile then found two more problems, which `13b7a29` fixes and Sol hasn't checked yet. The README's [Linked pull requests](../README.md#linked-pull-requests) section describes the behavior. Nothing here measures time, CPU or memory.
+This page records how GPT-6.1 Sol checked the details' Pull requests tab from [PR #34](https://github.com/krishhgg/t3term/pull/34) on 2026-10-13. Sol first checked source `407566d49626bfb8061cb590ef1f5876c47766cc` with two runs against a fake server, which found two problems. `eac6096a53fdf910d61a0a373fb766596e74208a` fixes both, and Sol checked it with a third run. Greptile then found two more problems. `13b7a29e78e86ed793d3ad5a8decb0cd71fe9e05` fixes them, and Sol checked it with a fourth run. The README's [Linked pull requests](../README.md#linked-pull-requests) section describes the behavior. Nothing here measures time, CPU or memory.
 
 ## Checks
 
@@ -8,14 +8,16 @@ At `407566d` with Rust 1.95.0, Sol ran `cargo fmt --all -- --check`, `cargo clip
 
 At `eac6096`, the same four commands passed. The 461 tests are 427 library, 2 main, 18 CLI and 14 fake RPC tests. Master at `f77df53` has 432, so the pull request adds 29. The one new test, `the_first_frame_at_a_new_size_offers_the_keys_for_how_it_draws_the_details`, checks that the first frame after a resize, an open or a close offers the keys for how that frame draws the details. [CI run 38508217636](https://github.com/krishhgg/t3term/actions/runs/38508217636) passed on macOS and Linux. Greptile hadn't reviewed the pull request, which was still a draft.
 
+At `13b7a29`, the same four commands passed. The 463 tests are 429 library, 2 main, 18 CLI and 14 fake RPC tests, 31 more than master. [CI run 38513183734](https://github.com/krishhgg/t3term/actions/runs/38513183734) passed on macOS and Linux at `13b7a29`. [CI run 38513551259](https://github.com/krishhgg/t3term/actions/runs/38513551259) passed on both at `2acad8f`, which changed only the README and two pages of docs.
+
 ## After Greptile's review
 
 Greptile reviewed `87a9d03`, which changed only this page, and found two problems. Sol confirmed both in the source.
 
-- Links that build on a cycle of branches showed as one stack with the cycle, at depths and in an order no branch gives. The desktop's walk does the same (packages/shared/src/threadPullRequests.ts:215-278). The script's #37 and #38 make a cycle, but nothing builds on them, so no run here showed it.
+- Links that build on a cycle of branches showed as one stack with the cycle, at depths and in an order no branch gives. The desktop's walk does the same (packages/shared/src/threadPullRequests.ts:215-278). In the first three runs, the script's #37 and #38 made a cycle with nothing built on it, so those runs couldn't show it.
 - When T3 removed the link whose details showed, the first frame without them still offered the details' keys, because `App::draw` took in the new links after it drew the status line. The third run's capture after unlinking #42 shows the list a later frame drew, not the first frame, so it couldn't show this.
 
-`13b7a29` fixes both. A walk down a chain stops where it comes back to a link it passed, and that link and the ones after it stand alone, while the links that build on them stack without them. `App::draw` takes in the details and the links before it draws the status line. Two unit tests are new. `links_that_build_on_a_cycle_stack_apart_from_it_in_any_order` lays out a two-link cycle and a self-cycle, each with links on it, in every order. `the_first_frame_after_t3_changes_the_links_offers_the_keys_for_what_it_shows` sends `thread.pull-request-synced` changes and checks the first frame's keys and what ← does, in a pane and a dialog, including a link removed and the capability turned off. Sol hasn't run the checks, the tests or the script at `13b7a29`, so nothing on this page shows that the fixes work.
+`13b7a29` fixes both. A walk down a chain stops where it comes back to a link it passed, and that link and the ones after it stand alone, while the links that build on them stack without them. `App::draw` takes in the details and the links before it draws the status line. Two unit tests are new. `links_that_build_on_a_cycle_stack_apart_from_it_in_any_order` lays out a two-link cycle and a self-cycle, each with links on it, in every order. `the_first_frame_after_t3_changes_the_links_offers_the_keys_for_what_it_shows` sends `thread.pull-request-synced` changes and checks the first frame's keys and what ← does, in a pane and a dialog, including a link removed and the capability turned off. Both pass among the 463 above, and the second is what shows the first frame's keys. The fourth run below shows the screens after each change.
 
 The script's derived preset now adds #39 on #37's head, and its model of the stacks stops at a cycle as t3term does. For a set or an unlink, the script sends `thread.metadata-updated` unless told otherwise. The pinned T3 server sends `thread.pull-request-synced` for both (apps/server/src/orchestration-v2/Orchestrator.ts:3188-3194). Each carries the whole thread, and t3term takes the thread from every `thread.` event the same way (src/projection.rs:116).
 
@@ -23,7 +25,7 @@ The script's derived preset now adds #39 on #37's head, and its model of the sta
 
 - A Python script, kept outside the repository, served a fake T3 server on 127.0.0.1 only: the environment descriptor, auth, and Effect RPC over WebSocket. Claude Opus 5.5 wrote it, and Sol ran it. Every project, thread, pull request, URL and reply is invented. It answers no pull request read, runs no `gh` and refuses every orchestration command. No GitHub host took part.
 - t3term ran in a tmux session on a private socket, under `env -i`, with its own temporary `HOME` and `T3CODE_HOME`, `T3TERM_NO_SAVED_LOGIN=1` so no Keychain entry, and a stand-in `t3` command that issues and revokes a fake session. No real `~/.t3`, project folder or T3 server took part.
-- Sol ran the script three times, twice with the binary built from `407566d` and once with the one built from `eac6096`.
+- Sol ran the script four times, twice with the binary built from `407566d` and once each with the binaries built from `eac6096` and `13b7a29`.
 
 **The first run, at `407566d`, truecolor 200x50.** The Mixed thread listed 11 links, with its stack-dismissed #71 and its second copy of #41 hidden, and #62 read `Waiting for host state`. Sol captured the pane at 200x50, a dialog at 80x24, a link's details at 40x12 and a 10x5 screen, scrolled a link's details with the keys, and sent End and PgUp with no frame between them. #42 stayed selected, and the composer kept its draft. The server's requests by tag, three tags, were the same before and after Sol opened the tab, the list and a link's details and resized the screen.
 
@@ -54,12 +56,25 @@ At `407566d`, the script's command to set, unlink or sync a link raised an error
 - The server issued and revoked one session, opened and closed one socket and refused no command. It got one config subscription, one subscription to the sidebar's feed and two thread subscriptions, one for Single and one for Mixed. The socket didn't drop, and t3term didn't restart.
 - Every leak count the script keeps over the raw output was 0. Its count over the screen was 0 before Sol stopped the run, and the script doesn't keep it after. The fake server and tmux had stopped.
 
+**The fourth run, at `13b7a29`.**
+
+- The first launch overlapped the debug build, so Sol restarted t3term after the build finished and before any check below. The counts at the end include that first, unused session.
+- Sol set the Single thread's links to the script's derived preset, sending `thread.pull-request-synced` as the pinned server does. The 200x50 pane listed 9 links. #31, #32 and #33, chained by branch, each sat a layer further in. #34 and #35 share a head, and they and #36, which builds on that head, stood alone. #37 and #38 make a cycle and #39 builds on #37's head, and all three stood alone at the left edge.
+- End and Enter opened #39's details, and the status line offered `← list`.
+- With #39's details open, Sol unlinked #39, and the script sent `thread.metadata-updated`. The pane showed the eight links left, the status line offered `← thread`, and Left then showed the Thread tab.
+- A resize to 80x24 turned the pane into a dialog that offered `Esc close`.
+- With #38's details open in the dialog, Sol turned `threadPullRequests` off. The details closed, the tab read `Linked pull requests unavailable`, and the status line offered `← thread` and `Esc close`.
+- Sol left the dialog with Left and Esc, and the composer kept its draft, `cycle draft survives`.
+- The server issued and revoked two sessions and opened and closed two sockets, one for each launch. It got two config subscriptions, two subscriptions to the sidebar's feed and one thread subscription, for Single. t3term sent no command, and the server refused none. Apart from the restart, the socket didn't close.
+- Every leak count the script keeps over the raw output was 0. Its count over the screen was 0 before Sol stopped the run, and the script doesn't keep it after. The fake server and tmux had stopped.
+
 ## What wasn't checked
 
 - The third run didn't repeat the other checks of the first two. Between `407566d` and `eac6096`, the only source change is to the status line's keys and a test, in `src/tui/mod.rs`.
-- A capture can't show that a screen was the first frame after a resize. The unit test checks the first frame, and the third capture below shows only what the screen drew.
+- The fourth run checked only links built on a cycle, the unlink of a link whose details showed, a resize and the capability turned off. Between `eac6096` and `13b7a29`, the source changes are to `stacks_of` in `src/tui/pull_requests.rs` and the order of work in `App::draw` in `src/tui/mod.rs`, with their tests.
+- A capture can't show that a screen was the first frame after a resize or a change to the links. The unit tests check the first frame. The resize capture and the fourth run's two captures show only what the screen drew after the change.
 - Two earlier captures meant to show the URL's note showed other rows of the details. This page doesn't use them.
-- Only the three captures below are published. Not every capture was rendered as an image.
+- Only the five captures below are published, three from the first three runs and two from the fourth. Not every capture was rendered as an image.
 
 ## Captures
 
@@ -73,15 +88,23 @@ In the second capture, the branches row shows `[31mred 2J` and `]52;c;eA==`. Tho
 |---|
 | [![The Single: one open link thread at 80x24 with the sidebar shown. A Thread details dialog covers the conversation with its Pull requests 1 tab chosen. It reads ← List and 1 of 1 over #7 Synced: #7 reached its host, Open, its URL, its repository, its branches fixture/pr-7 → main, its author fixture-dev and Linked by you · 2m ago, with more ↓ at the bottom. The status line reads ● live · ↑↓/PgUp scroll · ← list · Esc close](screenshots/linked-pull-requests-resize-dialog.png)](screenshots/linked-pull-requests-resize-dialog.png) |
 
+| Links built on a cycle, 200x50, fourth run | The capability turned off, 80x24, fourth run |
+|---|---|
+| [![The Single: one open link thread at 200x50 with invented links. The details pane lists Pull requests 9. #31 Derived base reads 3 chained, and #32 and #33 each sit a layer further in. #34 Shared head one, #35 Shared head two, #36 On the shared head, #37 Cycle one, #38 Cycle two and #39 On the cycle all sit at the left edge. The status line reads ↑↓ select · Enter details · ← thread · Esc leave · Alt+B close · Tab focus, and the composer holds cycle draft survives](screenshots/linked-pull-requests-cycle-child.png)](screenshots/linked-pull-requests-cycle-child.png) | [![The Single: one open link thread at 80x24 with invented data and the sidebar shown. A Thread details dialog has its Pull requests tab chosen and reads Linked pull requests unavailable over This environment does not support multiple linked pull requests. The status line reads ● live · ↑↓ · Enter details · ← thread · Esc close, and the composer holds cycle draft survives](screenshots/linked-pull-requests-live-hints-dialog.png)](screenshots/linked-pull-requests-live-hints-dialog.png) |
+
+The first shows #37 and #38, which make a cycle, and #39, built on #37's head, each standing alone. The second shows the dialog after Sol turned `threadPullRequests` off with #38's details open, not after the unlink. Neither capture is known to be the first frame after its change. The passing test `the_first_frame_after_t3_changes_the_links_offers_the_keys_for_what_it_shows` checks the first frame.
+
 ## Images
 
-Sol took no native Terminal screenshots. Each image is a PNG of the cells tmux captured from t3term's pane, drawn by the private Swift renderer the earlier verification pages describe. It draws each cell at 17x33 pixels, so 200x50 gives 3400x1650, 120x36 gives 2040x1188 and 80x24 gives 1360x792, and adds no text, frame or cursor. No image is a mockup, and none was edited or cropped. Sol approved all three, and they are copied unchanged. Sol recorded the third one's hash after `87a9d03`.
+Sol took no native Terminal screenshots. Each image is a PNG of the cells tmux captured from t3term's pane, drawn by the private Swift renderer the earlier verification pages describe. It draws each cell at 17x33 pixels, so 200x50 gives 3400x1650, 120x36 gives 2040x1188 and 80x24 gives 1360x792, and adds no text, frame or cursor. No image is a mockup, and none was edited or cropped. Sol approved all five, and they are copied unchanged. Sol recorded the third one's hash after `87a9d03`. The fourth run's two hashes are the ones Sol recorded for the source images before they were copied.
 
 | File | SHA-256 |
 |---|---|
 | `screenshots/linked-pull-requests-pane.png` | `fff90b0c6e0774f82664e1b104d23afd49ef274fa77157c7823c51860fc054db` |
 | `screenshots/linked-pull-requests-url-cut-256.png` | `5354db7ffcf3cb54ab707f68168b288cffd32162da6edd31ad889c381451488f` |
 | `screenshots/linked-pull-requests-resize-dialog.png` | `f9eef2ca5344941d2fe62e07200e89104d99e5a277ea7426c969977c0a55e62d` |
+| `screenshots/linked-pull-requests-cycle-child.png` | `8a6958c58c51a654845c6235604ebff2ad4b69d026b31f62b5e14435be9b71bf` |
+| `screenshots/linked-pull-requests-live-hints-dialog.png` | `6b82b256dae88bff803fa8764744ebb523b00ae8a82797ec4485a706b6403fa3` |
 
 ## What this doesn't show
 
@@ -92,4 +115,4 @@ Sol took no native Terminal screenshots. Each image is a PNG of the cells tmux c
 
 ## Where the evidence is
 
-The captures, the raw terminal output, the asciicast v2 recordings and the script's logs stay on the machine that ran the checks, in `/private/tmp/t3term-pr34-fixture-v2jm_6hi` for the first run, `/private/tmp/t3term-pr34-fixture-qx_xfj5t` for the second and `/private/tmp/t3term-pr34-fixture-pfnt2_5w` for the third. Sol's record of the third run's final counts is `/private/tmp/t3term-pr34-root-verification-eac6096.json`. None of them is committed or published, and neither are the script and the renderer.
+The captures, the raw terminal output, the asciicast v2 recordings and the script's logs stay on the machine that ran the checks, in `/private/tmp/t3term-pr34-fixture-v2jm_6hi` for the first run, `/private/tmp/t3term-pr34-fixture-qx_xfj5t` for the second, `/private/tmp/t3term-pr34-fixture-pfnt2_5w` for the third and `/private/tmp/t3term-pr34-fixture-e3bk69s5` for the fourth. Sol's records of the final counts are `/private/tmp/t3term-pr34-root-verification-eac6096.json` for the third run and `/private/tmp/t3term-pr34-root-verification-13b7a29.json` for the fourth. None of them is committed or published, and neither are the script and the renderer.
