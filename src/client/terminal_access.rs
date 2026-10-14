@@ -1111,7 +1111,7 @@ mod tests {
         let calls = join_calls(&setup.client, 3).await;
         let errors = failures(within(join_all(calls)).await);
         let ticket = format!("POST /api/auth/websocket-ticket {token}");
-        assert_eq!(server.tickets(), [ticket.clone()]);
+        assert_eq!(server.tickets(), std::slice::from_ref(&ticket));
         assert_eq!(t3.calls(), [issue_call(home)]);
 
         // The ticket's own error, from the same answer.
