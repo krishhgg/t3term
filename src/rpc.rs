@@ -387,6 +387,11 @@ async fn handle_message(message: Value, pending: &PendingMap, ack: &mpsc::Unboun
     }
 }
 
+/// What a failure says when T3's error carries no message of its own.
+pub(crate) fn rejected(tag: &str) -> String {
+    format!("T3 rejected {tag}.")
+}
+
 /// Reads the most useful message out of an encoded Effect `Exit` failure.
 fn failure(tag: &str, exit: &Value) -> RpcError {
     let reasons = exit
@@ -410,7 +415,7 @@ fn failure(tag: &str, exit: &Value) -> RpcError {
     let base = text(fail, "detail")
         .or_else(|| text(fail, "message"))
         .or_else(|| defect.and_then(Value::as_str).map(str::to_string))
-        .unwrap_or_else(|| format!("T3 rejected {tag}."));
+        .unwrap_or_else(|| rejected(tag));
     let cause = fail
         .and_then(|f| f.get("cause"))
         .and_then(|c| c.get("message"))
