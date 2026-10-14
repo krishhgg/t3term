@@ -3,9 +3,12 @@
 //! Client frames: `Request`, `Ack` (after each stream chunk, or once the caller accepts a bounded
 //! stream's chunk), `Interrupt`, `Ping`. Server frames: `Chunk`, `Exit`, `Defect`,
 //! `ClientProtocolError`, `Pong`. A frame may hold one message or an array of them. One
-//! connection multiplexes any number of calls and streams.
+//! connection multiplexes any number of calls and streams. A frame t3term can't parse ends
+//! the connection, since t3term can't tell which call or stream it was for. json.rs says how a
+//! frame with half a UTF-16 surrogate pair in it still parses.
 
 mod bounded;
+mod json;
 
 use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
@@ -49,6 +52,9 @@ pub enum RpcError {
         message: String,
         error_tag: Option<String>,
     },
+    /// T3 sent what t3term can't follow: a `Defect`, a `ClientProtocolError`, a bounded
+    /// stream's `Chunk` without a `values` array, or a frame t3term can't parse. A frame it
+    /// can't parse also closes the connection, and [`RpcClient::is_closed`] says so.
     Protocol(String),
     /// t3term stopped a bounded stream on its own side and interrupted it on the server. A
     /// chunk would have taken the stream over its limits, and that chunk and everything after
@@ -142,6 +148,9 @@ enum Stop {
     Abandoned,
     /// The socket closed, failed or went silent, for this reason.
     Lost(String),
+    /// T3 sent a frame t3term can't parse, for this reason. Nothing in it went to a call or
+    /// stream, and nothing acks it.
+    Malformed(String),
 }
 
 impl Closing {
@@ -266,15 +275,19 @@ impl RpcClient {
                 tokio::select! {
                     frame = source.next() => {
                         last_frame = Instant::now();
-                        let text = match frame {
-                            Some(Ok(Message::Text(text))) => text.to_string(),
-                            Some(Ok(Message::Binary(bytes))) => String::from_utf8_lossy(&bytes).into_owned(),
+                        let decoded = match frame {
+                            Some(Ok(Message::Text(text))) => json::decode(&text),
+                            Some(Ok(Message::Binary(bytes))) => json::decode(&String::from_utf8_lossy(&bytes)),
                             Some(Ok(Message::Close(frame))) => break Stop::Lost(format!("server closed the socket ({frame:?})")),
                             Some(Ok(_)) => continue,
                             Some(Err(e)) => break Stop::Lost(e.to_string()),
                             None => break Stop::Lost("socket ended".to_string()),
                         };
-                        let Ok(decoded) = serde_json::from_str::<Value>(&text) else { continue };
+                        // The reason is where serde_json stopped, never what the frame held.
+                        let decoded = match decoded {
+                            Ok(decoded) => decoded,
+                            Err(e) => break Stop::Malformed(format!("t3term couldn't parse a frame as JSON ({e})")),
+                        };
                         let messages = match decoded {
                             Value::Array(items) => items,
                             single => vec![single],
@@ -332,17 +345,18 @@ impl RpcClient {
                     stop = reader_closing.stopping() => break stop,
                 }
             };
-            let (reason, abandoned) = match stop {
-                Stop::Closed => (CLOSED.to_string(), false),
-                Stop::Abandoned => (ABANDONED.to_string(), true),
-                Stop::Lost(reason) => (reason, false),
+            let (error, abandoned) = match stop {
+                Stop::Closed => (RpcError::Disconnected(CLOSED.to_string()), false),
+                Stop::Abandoned => (RpcError::Disconnected(ABANDONED.to_string()), true),
+                Stop::Lost(reason) => (RpcError::Disconnected(reason), false),
+                Stop::Malformed(reason) => (RpcError::Protocol(reason), false),
             };
             // A request made from here on fails at once, rather than joining the map after the
             // drain below and waiting forever. After a close, one still queued never goes out.
             outgoing_rx.close();
             // Calls and streams end before the Close frame, which may never go out.
             for (_, entry) in reader_pending.lock().await.drain() {
-                fail(entry, RpcError::Disconnected(reason.clone()));
+                fail(entry, error.clone());
             }
             // `leave` looks at the clock before each frame, and the timeout cuts short a write
             // T3 doesn't read.
@@ -377,9 +391,10 @@ impl RpcClient {
     /// stream still waiting with `Disconnected`, gives a WebSocket Close frame a second to go
     /// out and drops the socket. It sends T3 no request, so T3 sees a client that went away.
     ///
-    /// Nothing calls it on its own. A connection nobody closes lasts until its socket drops or
-    /// the last handle on it does, as [`RpcClient`] says. Unlike the last handle dropping, a
-    /// close sends nothing still queued, a stream's `Interrupt` included.
+    /// Nothing calls it on its own. A connection nobody closes lasts until its socket drops,
+    /// T3 sends a frame t3term can't parse, or the last handle on it drops, which
+    /// [`RpcClient`] describes. Unlike the last handle dropping, a close sends nothing still
+    /// queued, a stream's `Interrupt` included.
     pub fn close(&self) {
         self.owner.closing.closed.store(true, Ordering::Release);
         self.owner.closing.wake.notify_waiters();
