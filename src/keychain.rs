@@ -99,24 +99,30 @@ mod real {
 }
 
 /// The Keychain of unit tests. Nothing runs `security`: each call is recorded on the thread
-/// that made it and answered as an empty Keychain answers, so no test reads, saves or deletes
-/// a real login. A test starts with `reset`.
+/// that made it and answered from the logins that thread's fake Keychain holds, so no test
+/// reads, saves or deletes a real login. A test starts with `reset`, which empties it.
 #[cfg(test)]
 pub(crate) mod fake {
     use std::cell::{Cell, RefCell};
+    use std::collections::BTreeMap;
     use std::process::Output;
+
+    use super::SavedLogin;
 
     thread_local! {
         /// Stands in for `T3TERM_NO_SAVED_LOGIN`, which a test can't set without changing it
         /// for the tests on other threads.
         pub(crate) static NO_SAVED_LOGIN: Cell<bool> = const { Cell::new(false) };
         static CALLS: RefCell<Vec<Vec<String>>> = const { RefCell::new(Vec::new()) };
+        /// Each login this thread's Keychain holds, by environment id, as `security` stores it.
+        static SAVED: RefCell<BTreeMap<String, String>> = const { RefCell::new(BTreeMap::new()) };
     }
 
-    /// Forgets this thread's calls, and sets whether saved logins are off.
+    /// Forgets this thread's calls and logins, and sets whether saved logins are off.
     pub(crate) fn reset(no_saved_login: bool) {
         NO_SAVED_LOGIN.set(no_saved_login);
         CALLS.take();
+        SAVED.take();
     }
 
     /// The arguments of each `security` call this thread made since `reset`.
@@ -124,26 +130,78 @@ pub(crate) mod fake {
         CALLS.with_borrow(Clone::clone)
     }
 
-    /// Records `args` and answers that no item matches. What goes to stdin, a login being
-    /// saved, isn't recorded.
-    pub(super) async fn security(args: &[&str], _input: Option<&str>) -> Option<Output> {
+    /// Puts a login in this thread's Keychain, as an earlier run would have saved it. It isn't
+    /// recorded as a call.
+    pub(crate) fn hold(environment_id: &str, login: &SavedLogin) {
+        let value = super::encode(login);
+        SAVED.with_borrow_mut(|saved| saved.insert(environment_id.to_string(), value));
+    }
+
+    /// The login this thread's Keychain holds for `environment_id`.
+    pub(crate) fn holds(environment_id: &str) -> Option<SavedLogin> {
+        SAVED.with_borrow(|saved| super::decode(saved.get(environment_id)?))
+    }
+
+    /// Records `args` and answers as `security` answers for the logins this thread holds.
+    /// What goes to stdin, a login being saved, isn't recorded.
+    pub(super) async fn security(args: &[&str], input: Option<&str>) -> Option<Output> {
         let call: Vec<String> = args.iter().map(|arg| arg.to_string()).collect();
         CALLS.with_borrow_mut(|calls| calls.push(call));
-        not_found()
+        SAVED.with_borrow_mut(|saved| answer(saved, args, input))
+    }
+
+    /// What `security` does with `args`: finds, deletes or, through `-i`, saves a login.
+    fn answer(
+        saved: &mut BTreeMap<String, String>,
+        args: &[&str],
+        input: Option<&str>,
+    ) -> Option<Output> {
+        match args.first().copied() {
+            Some("find-generic-password") => match account(args).and_then(|id| saved.get(id)) {
+                Some(value) => exited(0, format!("{value}\n")),
+                None => exited(super::NOT_FOUND, String::new()),
+            },
+            // Without `-a`, `security` deletes the first item of the service.
+            Some("delete-generic-password") => {
+                let id = account(args)
+                    .map(str::to_string)
+                    .or_else(|| saved.keys().next().cloned());
+                match id.and_then(|id| saved.remove(&id)) {
+                    Some(_) => exited(0, String::new()),
+                    None => exited(super::NOT_FOUND, String::new()),
+                }
+            }
+            Some("-i") => {
+                let words: Vec<&str> = input.unwrap_or_default().split_whitespace().collect();
+                let value = words.iter().position(|word| *word == "-w");
+                let value = value.and_then(|at| words.get(at + 1));
+                if let (Some(id), Some(value)) = (account(&words), value) {
+                    saved.insert(id.to_string(), value.to_string());
+                }
+                exited(0, String::new())
+            }
+            _ => exited(1, String::new()),
+        }
+    }
+
+    /// The account `-a` names among `words`.
+    fn account<'a>(words: &[&'a str]) -> Option<&'a str> {
+        let at = words.iter().position(|word| *word == "-a")?;
+        words.get(at + 1).copied()
     }
 
     #[cfg(unix)]
-    fn not_found() -> Option<Output> {
+    fn exited(code: i32, stdout: String) -> Option<Output> {
         use std::os::unix::process::ExitStatusExt;
         Some(Output {
-            status: std::process::ExitStatus::from_raw(super::NOT_FOUND << 8),
-            stdout: Vec::new(),
+            status: std::process::ExitStatus::from_raw(code << 8),
+            stdout: stdout.into_bytes(),
             stderr: Vec::new(),
         })
     }
 
     #[cfg(not(unix))]
-    fn not_found() -> Option<Output> {
+    fn exited(_code: i32, _stdout: String) -> Option<Output> {
         None
     }
 }
@@ -301,6 +359,25 @@ mod tests {
         assert_eq!(delete(Some("env-b")).await.unwrap(), 0);
         assert_eq!(delete(None).await.unwrap(), 0);
         assert_eq!(fake::calls(), Vec::<Vec<String>>::new());
+        fake::reset(false);
+    }
+
+    #[tokio::test]
+    async fn the_fake_keychain_keeps_what_was_saved_until_it_is_deleted() {
+        fake::reset(false);
+        fake::hold("env-a", &login());
+        assert_eq!(load("env-a").await, Some(login()));
+        assert_eq!(load("env-b").await, None);
+        let newer = SavedLogin {
+            session_id: "newer".into(),
+            ..login()
+        };
+        assert!(save("env-b", &newer).await);
+        assert_eq!(fake::holds("env-b"), Some(newer));
+        assert_eq!(delete(Some("env-a")).await.unwrap(), 1);
+        assert_eq!(fake::holds("env-a"), None);
+        assert_eq!(delete(None).await.unwrap(), 1);
+        assert_eq!(fake::holds("env-b"), None);
         fake::reset(false);
     }
 

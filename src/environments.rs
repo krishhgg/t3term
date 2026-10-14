@@ -465,6 +465,10 @@ mod tests {
                 "http://127.0.0.1:3773/api",
                 ("ENVIRONMENT_ORIGIN_INVALID", exit::USAGE),
             ),
+            (
+                "https://127.0.0.1:3773",
+                ("ENVIRONMENT_TLS_UNSUPPORTED", exit::REJECTED),
+            ),
         ] {
             let error = local_target("a", Path::new("/t3/a"), Some(origin)).unwrap_err();
             assert_eq!(code(error), expected, "{origin}");
@@ -483,6 +487,7 @@ mod tests {
             "kindless": {"t3Home": "/t3/kindless"},
             "relative": {"kind": "local", "t3Home": "t3/relative"},
             "remote": {"kind": "local", "t3Home": "/t3/remote", "origin": "https://example.com"},
+            "tls": {"kind": "local", "t3Home": "/t3/tls", "origin": "https://localhost:3773"},
             "path": {"kind": "local", "t3Home": "/t3/path", "origin": "http://127.0.0.1:1/x"},
             "number": {"kind": "local", "t3Home": "/t3/number", "origin": 3773},
         }});
@@ -500,6 +505,7 @@ mod tests {
             ("kindless", ("ENVIRONMENT_INVALID", exit::USAGE)),
             ("relative", ("ENVIRONMENT_INVALID", exit::USAGE)),
             ("remote", ("ENVIRONMENT_NOT_LOCAL", exit::REJECTED)),
+            ("tls", ("ENVIRONMENT_TLS_UNSUPPORTED", exit::REJECTED)),
             ("path", ("ENVIRONMENT_ORIGIN_INVALID", exit::USAGE)),
             ("number", ("ENVIRONMENT_INVALID", exit::USAGE)),
             ("missing", ("ENVIRONMENT_NOT_FOUND", exit::NOT_FOUND)),

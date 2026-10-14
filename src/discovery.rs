@@ -1,5 +1,6 @@
 //! Finds the T3 server a command talks to and checks that it speaks orchestration protocol 2.
 
+use std::io::{self, Read};
 use std::path::{Path, PathBuf};
 use std::time::Duration;
 
@@ -13,6 +14,10 @@ use crate::http::direct_client;
 pub const PROTOCOL_VERSION: u64 = 2;
 pub const PROTOCOL_HEADER: &str = "x-t3-orchestration-protocol";
 pub const PROTOCOL_QUERY_PARAM: &str = "orchestrationProtocol";
+
+/// The largest `server-runtime.json` or `environment-id` t3term reads. T3 writes well under
+/// 200 bytes to each.
+const MAX_RECORD_BYTES: u64 = 16 * 1024;
 
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
@@ -85,14 +90,6 @@ impl LocalTarget {
     pub fn state_dir(&self) -> PathBuf {
         self.t3_home.join("userdata")
     }
-
-    /// The environment id the server published in its state directory, which its descriptor
-    /// reports too (apps/server/src/environment/ServerEnvironment.ts:89-177 at T3 f570bd21).
-    pub fn environment_id(&self) -> Option<String> {
-        let raw = std::fs::read_to_string(self.state_dir().join("environment-id")).ok()?;
-        let id = raw.trim();
-        (!id.is_empty()).then(|| id.to_string())
-    }
 }
 
 /// Why an origin can't name a local server.
@@ -102,10 +99,13 @@ pub enum OriginError {
     Invalid,
     /// It names a host other than 127.0.0.0/8, ::1 or localhost.
     NotLoopback,
+    /// It is an https origin on this machine. t3term is built without TLS, and a local T3
+    /// server listens on plain http.
+    Https,
 }
 
-/// `text` as an origin on this machine's loopback, written the way t3term saves and compares
-/// origins: lowercase, without a trailing slash or a port the scheme implies.
+/// `text` as an http origin on this machine's loopback, written the way t3term saves and
+/// compares origins: lowercase, without a trailing slash or a port the scheme implies.
 pub fn loopback_origin(text: &str) -> Result<String, OriginError> {
     let url = reqwest::Url::parse(text).map_err(|_| OriginError::Invalid)?;
     let bare = matches!(url.scheme(), "http" | "https")
@@ -127,6 +127,9 @@ pub fn loopback_origin(text: &str) -> Result<String, OriginError> {
     if !loopback {
         return Err(OriginError::NotLoopback);
     }
+    if url.scheme() == "https" {
+        return Err(OriginError::Https);
+    }
     Ok(url.origin().ascii_serialization())
 }
 
@@ -147,7 +150,18 @@ pub fn local_origin(text: &str) -> Result<String> {
                 "{text:?} is not on this machine. A saved environment names a server at 127.0.0.1, ::1 or localhost, because t3term logs in to it with that server's own `t3` command. t3term can't pair with a remote environment or sign in to T3 Connect yet."
             ),
         ),
+        OriginError::Https => tls_unsupported(text),
     })
+}
+
+fn tls_unsupported(origin: &str) -> anyhow::Error {
+    err_exit(
+        "ENVIRONMENT_TLS_UNSUPPORTED",
+        exit::REJECTED,
+        format!(
+            "{origin:?} uses https. This t3term reaches a local server over plain http only, which is how a local T3 server listens, such as http://127.0.0.1:3773."
+        ),
+    )
 }
 
 #[derive(Deserialize)]
@@ -181,17 +195,117 @@ pub fn home_dir() -> PathBuf {
         .unwrap_or_else(|| PathBuf::from("."))
 }
 
-fn read_runtime_state(path: &Path) -> Option<RuntimeState> {
-    let state: RuntimeState = serde_json::from_slice(&std::fs::read(path).ok()?).ok()?;
-    (state.version == 1).then_some(state)
+/// The bytes of a small regular file, or `None` when there is none. A directory, a FIFO, a
+/// device or a file over `MAX_RECORD_BYTES` is an error, so a read can't wait on a writer or
+/// fill memory. It blocks, so callers run it through `off_runtime`.
+fn read_small_file(path: &Path) -> io::Result<Option<Vec<u8>>> {
+    let metadata = match std::fs::metadata(path) {
+        Ok(metadata) => metadata,
+        Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(None),
+        Err(error) => return Err(error),
+    };
+    let too_big = || io::Error::other("not a regular file of at most 16 KiB");
+    if !metadata.is_file() || metadata.len() > MAX_RECORD_BYTES {
+        return Err(too_big());
+    }
+    let mut bytes = Vec::new();
+    std::fs::File::open(path)?
+        .take(MAX_RECORD_BYTES + 1)
+        .read_to_end(&mut bytes)?;
+    if bytes.len() as u64 > MAX_RECORD_BYTES {
+        return Err(too_big());
+    }
+    Ok(Some(bytes))
+}
+
+/// What a state directory's `server-runtime.json` says.
+enum Record {
+    /// There is none. T3 writes it once its server listens and removes it when the server
+    /// stops (apps/server/src/serverRuntimeState.ts:72-113 at T3 f570bd21). A server that
+    /// crashed leaves it behind.
+    Absent,
+    /// It names a server.
+    Server(RuntimeState),
+    /// It can't be read or parsed, or it isn't a regular file of at most `MAX_RECORD_BYTES`.
+    Unreadable,
+}
+
+impl Record {
+    /// The server the record names, when it names `origin`.
+    fn server_at(&self, origin: &str) -> Option<&RuntimeState> {
+        let Record::Server(state) = self else {
+            return None;
+        };
+        let same = loopback_origin(&state.origin).is_ok_and(|o| o == origin);
+        same.then_some(state)
+    }
+}
+
+fn read_record(path: &Path) -> Record {
+    match read_small_file(path) {
+        Ok(None) => Record::Absent,
+        Ok(Some(bytes)) => match serde_json::from_slice::<RuntimeState>(&bytes) {
+            Ok(state) if state.version == 1 => Record::Server(state),
+            _ => Record::Unreadable,
+        },
+        Err(_) => Record::Unreadable,
+    }
+}
+
+/// The environment id the server published in its state directory, which its descriptor
+/// reports too (apps/server/src/environment/ServerEnvironment.ts:89-177 at T3 f570bd21).
+fn read_environment_id(path: &Path) -> Option<String> {
+    let bytes = read_small_file(path).ok()??;
+    let id = std::str::from_utf8(&bytes).ok()?.trim();
+    (!id.is_empty()).then(|| id.to_string())
+}
+
+/// What one T3 home's state directory says about its server, read once.
+struct HomeState {
+    record: Record,
+    environment_id: Option<String>,
+}
+
+impl HomeState {
+    fn read(state_dir: &Path) -> HomeState {
+        HomeState {
+            record: read_record(&state_dir.join("server-runtime.json")),
+            environment_id: read_environment_id(&state_dir.join("environment-id")),
+        }
+    }
+}
+
+/// Runs `read` on Tokio's blocking threads, so the runtime keeps serving signals while a slow
+/// disk holds it up. Waiting here can't stop a read that never finishes. That read keeps its
+/// thread, and `main` stops waiting for it 200 ms after the command ends.
+async fn off_runtime<T: Send + 'static>(read: impl FnOnce() -> T + Send + 'static) -> Result<T> {
+    Ok(tokio::task::spawn_blocking(read).await?)
 }
 
 /// Why `fetch_descriptor` has no descriptor.
 enum NoDescriptor {
+    /// Nothing listens at the origin: the system refused the connection.
+    Refused,
+    /// No whole answer came. The request timed out, or the connection failed another way or
+    /// closed before the server answered.
+    Unanswered,
     /// The server answered with a redirect, which t3term doesn't follow.
     Redirected,
-    /// Nothing answered, or the answer wasn't a descriptor.
-    Unanswered,
+    /// The server answered with something other than a descriptor, described here.
+    Invalid(String),
+}
+
+/// Whether the system refused the connection, which it does when nothing listens at the port.
+fn refused(error: &reqwest::Error) -> bool {
+    let mut source: Option<&(dyn std::error::Error + 'static)> = Some(error);
+    while let Some(cause) = source {
+        let kind = cause.downcast_ref::<io::Error>().map(io::Error::kind);
+        if kind == Some(io::ErrorKind::ConnectionRefused) {
+            return true;
+        }
+        source = cause.source();
+    }
+    false
 }
 
 /// What the server at `origin` reports at `/.well-known/t3/environment`. `http` is a
@@ -209,15 +323,29 @@ async fn fetch_descriptor(
         .timeout(Duration::from_millis(2500))
         .send()
         .await
-        .map_err(|_| NoDescriptor::Unanswered)?;
+        .map_err(|error| {
+            if refused(&error) {
+                NoDescriptor::Refused
+            } else {
+                NoDescriptor::Unanswered
+            }
+        })?;
     let status = response.status();
     if status.is_redirection() {
         return Err(NoDescriptor::Redirected);
     }
     if !status.is_success() {
-        return Err(NoDescriptor::Unanswered);
+        return Err(NoDescriptor::Invalid(format!("HTTP {status}")));
     }
-    response.json().await.map_err(|_| NoDescriptor::Unanswered)
+    let body = response.bytes().await.map_err(|error| {
+        if error.is_timeout() {
+            NoDescriptor::Unanswered
+        } else {
+            NoDescriptor::Invalid("the answer stopped partway".into())
+        }
+    })?;
+    serde_json::from_slice(&body)
+        .map_err(|_| NoDescriptor::Invalid("the body doesn't parse as one".into()))
 }
 
 struct Candidate {
@@ -230,8 +358,22 @@ struct Candidate {
 pub async fn discover(target: &Target) -> Result<Runtime> {
     match target {
         Target::Discover => discover_any().await,
-        Target::Local(local) => discover_local(local).await,
+        Target::Local(local) => discover_local(local)
+            .await
+            .map_err(|unreached| unreached.error),
     }
+}
+
+/// The servers a T3 home records in `userdata` and then `dev`, each with its state directory.
+fn recorded_servers(home: &Path) -> Vec<(PathBuf, RuntimeState)> {
+    let mut servers = Vec::new();
+    for dir in ["userdata", "dev"] {
+        let state_dir = home.join(dir);
+        if let Record::Server(state) = read_record(&state_dir.join("server-runtime.json")) {
+            servers.push((state_dir, state));
+        }
+    }
+    servers
 }
 
 /// Tries `T3TERM_ORIGIN` first, then the servers recorded under `~/.t3/userdata` and `~/.t3/dev`.
@@ -245,11 +387,12 @@ async fn discover_any() -> Result<Runtime> {
             pid: None,
         });
     }
-    for dir in ["userdata", "dev"] {
-        let state_dir = home.join(dir);
-        let Some(state) = read_runtime_state(&state_dir.join("server-runtime.json")) else {
-            continue;
-        };
+    let recorded = off_runtime({
+        let home = home.clone();
+        move || recorded_servers(&home)
+    })
+    .await?;
+    for (state_dir, state) in recorded {
         let candidate = Candidate {
             origin: state.origin,
             state_dir: Some(state_dir),
@@ -285,17 +428,39 @@ async fn discover_any() -> Result<Runtime> {
     ))
 }
 
+/// Why `discover_local` found no server to log in to.
+#[derive(Debug)]
+pub struct Unreached {
+    /// The error the command reports.
+    pub error: anyhow::Error,
+    /// The id the environment's T3 home holds, set only when the failure shows that no server
+    /// runs for that home: nothing listens at its origin, or no origin is saved and the home
+    /// records no server. An answer of any kind, a timeout, or a record t3term can't read
+    /// leaves it unset, and so does a refused origin when the home records another one.
+    pub stopped: Option<String>,
+}
+
 /// The server of one named environment. Every failure stops here: t3term never tries the
 /// server `T3TERM_ORIGIN` names or one recorded under `T3CODE_HOME` or `~/.t3` instead.
 ///
 /// The server must answer at the environment's origin, or at the origin its home records, and
 /// its descriptor must report the environment id that home holds. So a server that belongs to
 /// another home, such as one that took over the port, gets no login. A redirect stops it too,
-/// since its answer would come from another server.
+/// since its answer would come from another server, and so does any answer that isn't a
+/// descriptor.
 ///
 /// `local` is checked here again, however it was made, before t3term reads the home or reaches
-/// a server: the home must be absolute and the origin on this machine.
-async fn discover_local(local: &LocalTarget) -> Result<Runtime> {
+/// a server: the home must be absolute and the origin an http origin on this machine. The home
+/// is read once, off the runtime.
+pub async fn discover_local(local: &LocalTarget) -> Result<Runtime, Unreached> {
+    let mut stopped = None;
+    let found = find_local(local, &mut stopped).await;
+    found.map_err(|error| Unreached { error, stopped })
+}
+
+/// `discover_local`. When it fails because no server runs for the environment's home, it sets
+/// `stopped` to the id the home holds.
+async fn find_local(local: &LocalTarget, stopped: &mut Option<String>) -> Result<Runtime> {
     let name = &local.name;
     let home = local.t3_home.display();
     if !local.t3_home.is_absolute() {
@@ -307,20 +472,14 @@ async fn discover_local(local: &LocalTarget) -> Result<Runtime> {
     }
     let chosen = local.origin.as_deref().map(local_origin).transpose()?;
     let state_dir = local.state_dir();
-    let recorded = read_runtime_state(&state_dir.join("server-runtime.json"));
-    let origin = match (chosen, &recorded) {
+    let read_from = state_dir.clone();
+    let home_state = off_runtime(move || HomeState::read(&read_from)).await?;
+    let origin = match (chosen, &home_state.record) {
         (Some(origin), _) => origin,
-        (None, Some(state)) => loopback_origin(&state.origin).map_err(|_| {
-            err_exit(
-                "ENVIRONMENT_NOT_LOCAL",
-                exit::REJECTED,
-                format!(
-                    "Environment {name}'s server records the origin {}, which is not a loopback address. t3term sends a local login only to 127.0.0.1, ::1 or localhost. Save the environment with a loopback --origin to reach that server.",
-                    state.origin
-                ),
-            )
-        })?,
-        (None, None) => {
+        (None, Record::Server(state)) => recorded_origin(name, &state.origin)?,
+        (None, Record::Absent) => {
+            // T3 removes the record when its server stops, so no server runs for this home.
+            *stopped = home_state.environment_id;
             return Err(err_exit(
                 "T3_SERVER_UNAVAILABLE",
                 exit::UNAVAILABLE,
@@ -330,8 +489,18 @@ async fn discover_local(local: &LocalTarget) -> Result<Runtime> {
                 ),
             ));
         }
+        (None, Record::Unreadable) => {
+            return Err(err_exit(
+                "T3_SERVER_UNAVAILABLE",
+                exit::UNAVAILABLE,
+                format!(
+                    "t3term can't read {}, so it can't tell where environment {name}'s server listens or whether it runs. Restarting T3 Code with --base-dir {home} writes the file again. t3term does not try another server.",
+                    state_dir.join("server-runtime.json").display()
+                ),
+            ));
+        }
     };
-    let expected = local.environment_id().ok_or_else(|| {
+    let expected = home_state.environment_id.ok_or_else(|| {
         err_exit(
             "T3_ENVIRONMENT_UNVERIFIED",
             exit::REJECTED,
@@ -343,6 +512,31 @@ async fn discover_local(local: &LocalTarget) -> Result<Runtime> {
     })?;
     let descriptor = match fetch_descriptor(&direct_client(), &origin).await {
         Ok(descriptor) => descriptor,
+        Err(NoDescriptor::Refused) => {
+            // A crashed server leaves its record behind, so a record of this origin doesn't
+            // show a server running. A record of another origin might, since the server may
+            // listen there now.
+            let absent = matches!(home_state.record, Record::Absent);
+            if absent || home_state.record.server_at(&origin).is_some() {
+                *stopped = Some(expected);
+            }
+            return Err(err_exit(
+                "T3_SERVER_UNAVAILABLE",
+                exit::UNAVAILABLE,
+                format!(
+                    "Nothing is listening at {origin}, environment {name}'s origin. Start T3 Code with --base-dir {home} and retry. t3term does not try another server."
+                ),
+            ));
+        }
+        Err(NoDescriptor::Unanswered) => {
+            return Err(err_exit(
+                "T3_SERVER_UNAVAILABLE",
+                exit::UNAVAILABLE,
+                format!(
+                    "Environment {name}'s server at {origin} did not answer in time. t3term does not try another server."
+                ),
+            ));
+        }
         Err(NoDescriptor::Redirected) => {
             return Err(err_exit(
                 "T3_REDIRECTED",
@@ -352,12 +546,12 @@ async fn discover_local(local: &LocalTarget) -> Result<Runtime> {
                 ),
             ));
         }
-        Err(NoDescriptor::Unanswered) => {
+        Err(NoDescriptor::Invalid(answer)) => {
             return Err(err_exit(
-                "T3_SERVER_UNAVAILABLE",
-                exit::UNAVAILABLE,
+                "T3_DESCRIPTOR_INVALID",
+                exit::REJECTED,
                 format!(
-                    "Environment {name}'s server at {origin} did not answer. Start T3 Code with --base-dir {home} and retry. t3term does not try another server."
+                    "Environment {name}'s server at {origin} answered /.well-known/t3/environment, but not with a T3 environment descriptor: {answer}. t3term stopped before logging in."
                 ),
             ));
         }
@@ -374,9 +568,7 @@ async fn discover_local(local: &LocalTarget) -> Result<Runtime> {
     }
     // The recorded pid is this server's only when the record names the same origin. Without
     // it, logging in needs T3TERM_T3_COMMAND.
-    let pid = recorded
-        .filter(|state| loopback_origin(&state.origin).is_ok_and(|o| o == origin))
-        .map(|state| state.pid);
+    let pid = home_state.record.server_at(&origin).map(|state| state.pid);
     Ok(described(
         &origin,
         local.t3_home.clone(),
@@ -384,6 +576,21 @@ async fn discover_local(local: &LocalTarget) -> Result<Runtime> {
         pid,
         descriptor,
     ))
+}
+
+/// The origin a home's record names, as `loopback_origin` writes it, or why t3term won't use
+/// it.
+fn recorded_origin(name: &str, recorded: &str) -> Result<String> {
+    loopback_origin(recorded).map_err(|problem| match problem {
+        OriginError::Https => tls_unsupported(recorded),
+        OriginError::Invalid | OriginError::NotLoopback => err_exit(
+            "ENVIRONMENT_NOT_LOCAL",
+            exit::REJECTED,
+            format!(
+                "Environment {name}'s server records the origin {recorded:?}, which is not an http origin on this machine. t3term sends a local login only to 127.0.0.1, ::1 or localhost. Save the environment with a loopback --origin to reach that server."
+            ),
+        ),
+    })
 }
 
 fn described(
@@ -427,9 +634,35 @@ mod tests {
             ("HTTP://LOCALHOST:3773", "http://localhost:3773"),
             ("http://[::1]:3773", "http://[::1]:3773"),
             ("http://127.1.2.3:80", "http://127.1.2.3"),
-            ("https://127.0.0.1", "https://127.0.0.1"),
         ] {
             assert_eq!(loopback_origin(text).as_deref(), Ok(saved), "{text}");
+        }
+    }
+
+    #[test]
+    fn an_https_origin_on_this_machine_is_refused_as_unsupported() {
+        for text in [
+            "https://127.0.0.1",
+            "https://127.0.0.1:3773",
+            "HTTPS://LOCALHOST:3773/",
+            "https://[::1]:3773",
+        ] {
+            assert_eq!(loopback_origin(text), Err(OriginError::Https), "{text}");
+            let error = local_origin(text).unwrap_err();
+            let error = error.downcast_ref::<T3Error>().unwrap();
+            assert_eq!(
+                (error.code, error.exit_code),
+                ("ENVIRONMENT_TLS_UNSUPPORTED", exit::REJECTED),
+                "{text}"
+            );
+        }
+        // An https origin off this machine, or with a path, fails as an http one does.
+        let others = [
+            ("https://example.com", OriginError::NotLoopback),
+            ("https://127.0.0.1:3773/api", OriginError::Invalid),
+        ];
+        for (text, problem) in others {
+            assert_eq!(loopback_origin(text), Err(problem), "{text}");
         }
     }
 
@@ -483,6 +716,8 @@ mod tests {
             t3_home: home.path().to_path_buf(),
             origin: None,
         };
+        // The server's own port over https, which this t3term can't speak.
+        let https = format!("https://127.0.0.1:{port}");
         let refused = [
             ("http://192.0.2.1:3773", "ENVIRONMENT_NOT_LOCAL"),
             ("https://example.com", "ENVIRONMENT_NOT_LOCAL"),
@@ -490,6 +725,7 @@ mod tests {
             ("http://user:pw@127.0.0.1:9", "ENVIRONMENT_ORIGIN_INVALID"),
             ("ftp://127.0.0.1:9", "ENVIRONMENT_ORIGIN_INVALID"),
             ("127.0.0.1:9", "ENVIRONMENT_ORIGIN_INVALID"),
+            (https.as_str(), "ENVIRONMENT_TLS_UNSUPPORTED"),
         ];
         for (origin, expected) in refused {
             let target = Target::Local(LocalTarget {
@@ -507,10 +743,137 @@ mod tests {
         let connected = Client::connect(&relative, &[Scope::Read], "1m").await;
         let error = connected.err().expect("a relative home");
         assert_eq!(code(&error), Some("ENVIRONMENT_HOME_INVALID"));
+        // A home whose record names that origin over https.
+        let recorded = serde_json::json!({"version": 1, "pid": 1, "origin": https});
+        std::fs::write(state_dir.join("server-runtime.json"), recorded.to_string()).unwrap();
+        let connected = Client::connect(&Target::Local(b.clone()), &[Scope::Read], "1m").await;
+        let error = connected.err().expect("a recorded https origin");
+        assert_eq!(code(&error), Some("ENVIRONMENT_TLS_UNSUPPORTED"));
         // Nothing reached the server the home records, so no descriptor was read, and no login
         // was looked up, issued or saved.
         let accepted = listener.accept().map_err(|error| error.kind());
         assert_eq!(accepted.err(), Some(std::io::ErrorKind::WouldBlock));
         assert_eq!(crate::keychain::fake::calls(), Vec::<Vec<String>>::new());
+    }
+
+    /// An origin where nothing listens, so the system refuses a connection. No common service
+    /// uses port 1.
+    const STOPPED: &str = "http://127.0.0.1:1";
+
+    /// Environment `b` at `origin`, whose T3 home holds the id `env-b` and `record` as its
+    /// `server-runtime.json` when given.
+    fn environment_b(home: &Path, origin: Option<&str>, record: Option<&str>) -> LocalTarget {
+        let state_dir = home.join("userdata");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        std::fs::write(state_dir.join("environment-id"), "env-b\n").unwrap();
+        if let Some(record) = record {
+            std::fs::write(state_dir.join("server-runtime.json"), record).unwrap();
+        }
+        LocalTarget {
+            name: "b".into(),
+            t3_home: home.to_path_buf(),
+            origin: origin.map(str::to_string),
+        }
+    }
+
+    fn record_of(origin: &str) -> String {
+        serde_json::json!({"version": 1, "pid": 1, "origin": origin}).to_string()
+    }
+
+    /// Only a failure that shows no server running for the home names the home's id, which
+    /// lets `logout` remove that environment's login.
+    #[tokio::test]
+    async fn only_a_refused_origin_or_no_record_shows_the_server_stopped() {
+        let here = record_of(STOPPED);
+        let elsewhere = record_of("http://127.0.0.1:2");
+        // A record that would name the stopped origin, longer than t3term reads.
+        let padded = here.clone() + &" ".repeat(MAX_RECORD_BYTES as usize);
+        let cases = [
+            // T3 removed the record when its server stopped.
+            (None, None, true),
+            (Some(STOPPED), None, true),
+            // A server that crashed left its record.
+            (None, Some(here.as_str()), true),
+            (Some(STOPPED), Some(here.as_str()), true),
+            // The server may listen at the origin the home records.
+            (Some(STOPPED), Some(elsewhere.as_str()), false),
+            // t3term can't tell where the server listens.
+            (Some(STOPPED), Some("{\"version\":"), false),
+            (None, Some("{\"version\":"), false),
+            (None, Some(padded.as_str()), false),
+        ];
+        for (origin, record, stopped) in cases {
+            let home = tempfile::tempdir().unwrap();
+            let b = environment_b(home.path(), origin, record);
+            let unreached = discover_local(&b).await.unwrap_err();
+            let case = format!("{origin:?} {}", record.unwrap_or_default().len());
+            assert_eq!(
+                code(&unreached.error),
+                Some("T3_SERVER_UNAVAILABLE"),
+                "{case}"
+            );
+            assert_eq!(
+                unreached.stopped.as_deref(),
+                stopped.then_some("env-b"),
+                "{case}"
+            );
+        }
+    }
+
+    #[test]
+    fn a_record_is_read_only_as_a_small_regular_file() {
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("record");
+        assert_eq!(read_small_file(&path).unwrap(), None);
+        let largest = vec![b' '; MAX_RECORD_BYTES as usize];
+        std::fs::write(&path, &largest).unwrap();
+        assert_eq!(read_small_file(&path).unwrap(), Some(largest));
+        std::fs::write(&path, vec![b' '; MAX_RECORD_BYTES as usize + 1]).unwrap();
+        assert!(read_small_file(&path).is_err());
+        std::fs::remove_file(&path).unwrap();
+        std::fs::create_dir(&path).unwrap();
+        assert!(read_small_file(&path).is_err());
+    }
+
+    #[cfg(unix)]
+    fn make_fifo(path: &Path) {
+        let made = std::process::Command::new("mkfifo").arg(path).status();
+        assert!(made.unwrap().success(), "mkfifo {}", path.display());
+    }
+
+    /// Opening a FIFO waits until something writes to it, so t3term opens neither file when
+    /// one is a FIFO. Opened, it would hold this test up for good.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_fifo_in_the_home_is_not_opened() {
+        let home = tempfile::tempdir().unwrap();
+        let b = environment_b(home.path(), None, None);
+        let state_dir = home.path().join("userdata");
+        make_fifo(&state_dir.join("server-runtime.json"));
+        let unreached = discover_local(&b).await.unwrap_err();
+        assert_eq!(code(&unreached.error), Some("T3_SERVER_UNAVAILABLE"));
+        assert_eq!(unreached.stopped, None);
+
+        std::fs::remove_file(state_dir.join("server-runtime.json")).unwrap();
+        std::fs::write(state_dir.join("server-runtime.json"), record_of(STOPPED)).unwrap();
+        std::fs::remove_file(state_dir.join("environment-id")).unwrap();
+        make_fifo(&state_dir.join("environment-id"));
+        let unreached = discover_local(&b).await.unwrap_err();
+        assert_eq!(code(&unreached.error), Some("T3_ENVIRONMENT_UNVERIFIED"));
+        assert_eq!(unreached.stopped, None);
+    }
+
+    /// The read waits for a message that only another task on this single-threaded runtime
+    /// sends. Run on the runtime's own thread, it would wait out its 10 seconds and fail.
+    #[tokio::test]
+    async fn a_home_read_leaves_the_runtime_free() {
+        let (send, receive) = std::sync::mpsc::channel();
+        let wait = Duration::from_secs(10);
+        let read = off_runtime(move || receive.recv_timeout(wait).is_ok());
+        let other = async move {
+            let _ = send.send(());
+        };
+        let (read, ()) = tokio::join!(read, other);
+        assert!(read.unwrap(), "the read held up the runtime");
     }
 }

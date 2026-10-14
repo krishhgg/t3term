@@ -11,7 +11,7 @@ use serde_json::{Value, json};
 
 use t3term::auth::Scope;
 use t3term::client::{Client, IfBusy, WatchEvent};
-use t3term::discovery::{self, Target};
+use t3term::discovery::{self, Runtime, Target};
 use t3term::environments;
 use t3term::error::{T3Error, err, err_exit, exit};
 use t3term::models::{self, Choice, Plan};
@@ -1164,28 +1164,23 @@ async fn doctor(environment: Option<&str>, json_mode: bool) -> Result<i32> {
 
 async fn logout(environment: Option<&str>, json_mode: bool) -> Result<i32> {
     let target = environments::target(environment).await?;
-    let message = match discovery::discover(&target).await {
-        Ok(runtime) => match t3term::auth::logout(&runtime).await? {
-            Some(session) => {
-                format!(
-                    "Logged out of {}. Revoked session {session}.",
-                    runtime.origin
-                )
-            }
-            None => format!("No saved login for {}.", runtime.origin),
-        },
-        Err(error) => match &target {
+    let message = match &target {
+        Target::Discover => match discovery::discover(&target).await {
+            Ok(runtime) => logged_out(&runtime).await?,
             // Without the server there is no environment id to pick one login, so remove them
             // all.
-            Target::Discover => match t3term::keychain::delete(None).await? {
+            Err(_) => match t3term::keychain::delete(None).await? {
                 0 => "No saved logins.".to_string(),
                 removed => format!(
                     "Removed {removed} saved login(s) from the Keychain. T3 is not running, so they could not be revoked; each expires within 30 days of being issued."
                 ),
             },
-            // A named environment's home holds its id, so `forget` removes that environment's
-            // login alone, and only when its server is down.
-            Target::Local(local) => match t3term::auth::forget(local, error).await? {
+        },
+        Target::Local(local) => match discovery::discover_local(local).await {
+            Ok(runtime) => logged_out(&runtime).await?,
+            // `forget` removes this environment's login alone, and only when the check showed
+            // its server stopped. Any other failure is returned as it was.
+            Err(unreached) => match t3term::auth::forget(unreached).await? {
                 0 => format!("No saved login for environment {}.", local.name),
                 _ => format!(
                     "Removed environment {}'s saved login from the Keychain. Its server is not running, so the login could not be revoked; it expires within 30 days of being issued.",
@@ -1200,6 +1195,18 @@ async fn logout(environment: Option<&str>, json_mode: bool) -> Result<i32> {
         println!("{}", plain(&message));
     }
     Ok(0)
+}
+
+/// Revokes and removes the saved login of the server `runtime` describes, and says what it
+/// did.
+async fn logged_out(runtime: &Runtime) -> Result<String> {
+    Ok(match t3term::auth::logout(runtime).await? {
+        Some(session) => format!(
+            "Logged out of {}. Revoked session {session}.",
+            runtime.origin
+        ),
+        None => format!("No saved login for {}.", runtime.origin),
+    })
 }
 
 /// `environment list`, `add`, `rename`, `remove` and `default`. Each reads or changes
