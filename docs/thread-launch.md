@@ -83,6 +83,7 @@ An error before the launch goes out keeps the code any command gets, such as `T3
 | `THREAD_LAUNCH_REJECTED` | 4 | `rejected` | T3 ran the launch and it failed with T3's own launch error, `OrchestrationV2ThreadLaunchError`. |
 | `T3_RPC_FAILED` | 4 | `rejected` | Any other failure T3 tags, such as `EnvironmentAuthorizationError` for a session without the operate scope. |
 | `T3_RPC_FAILED` | 4 | `unknown` | A failure without a tag t3term can read, such as a defect from a handler that died. It doesn't say how far the launch got, so T3 may have created the thread. |
+| `OUTPUT_FAILED` | 1 | `accepted` | T3 accepted the launch, but t3term couldn't write the result to stdout, for example because the program reading it exited. The thread exists, so launching again would start a second one. |
 
 ```json
 {"ok": false, "error": {"code": "THREAD_LAUNCH_UNCONFIRMED", "message": "..."},
@@ -97,6 +98,10 @@ t3term never sends a launch again on its own, with the same ids or new ones. T3 
 
 A failure without a tag gets the same `unknown` outcome and the same advice. t3term matches failures by tag alone and doesn't parse T3's message, so it can't tell a defect after T3 created the thread from one before. A T3 server without `orchestration.launchThread` answers with a defect too, so its launch is reported as unknown although nothing was created.
 
+### A launch t3term can't print
+
+`OUTPUT_FAILED` comes from the CLI after T3 has answered, so t3term doesn't send the launch again or call it unconfirmed. With `--json` the error goes to the same stdout that failed, so it usually doesn't arrive and only the exit code shows. Without `--json` it goes to stderr with the thread's id. Either way t3term revokes its temporary session and waits up to three seconds for the revoke to finish before it exits, as it does after any other error.
+
 ### A rejected launch
 
 T3 creates the thread before it sends the first message. A launch that fails after that leaves the thread behind under the id t3term printed, possibly without its first message. The `read` command shows whether it did. t3term reports T3's message as it came, and doesn't parse it or the cause T3 attaches.
@@ -108,7 +113,7 @@ T3 creates the thread before it sends the first message. A launch that fails aft
 - `LaunchRequest::new` takes a connected `Client`, a project id, the message, an optional title, a `Plan` from `models::plan_new_thread` and a `Workspace`. It checks them as the CLI does and picks the three ids.
 - A request is bound to the environment id of the client that built it. `Client::launch_thread` refuses a request built for another environment with `LAUNCH_WRONG_ENVIRONMENT`, exit 2, before it connects. The request T3 gets names no environment.
 - Sending the same request again, through a client for the same environment, is the only safe retry. T3 treats a command id it has accepted as the same command and answers with the thread that launch made, with `resumed` set to `true`. The request's fields are private, so its ids and content can't change between attempts.
-- `Client::launch_thread` returns a `LaunchReceipt` with the thread id, the run's id and status, `resumed` and the thread T3 returned. Its errors are the ones above, with the ids and `outcome` in `T3Error::details`.
+- `Client::launch_thread` returns a `LaunchReceipt` with the thread id, the run's id and status, `resumed` and the thread T3 returned. Its errors are the ones above except `OUTPUT_FAILED`, which only the CLI returns, with the ids and `outcome` in `T3Error::details`.
 - `Debug` for a request prints its ids, the model's instance and model ids, how many options it has, the modes, the lengths of the message and the title, and the workspace's kind, the lengths of its base ref and branch and `start_from_origin`. It leaves out the message, the title, the options' values, any other field of the model selection and the ref and branch names. `Debug` for a receipt leaves out the thread.
 
 ## Not supported
