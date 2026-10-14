@@ -4,9 +4,9 @@
 //! program could make it grow without bound. This guard tracks the three parser states that
 //! decide whether a byte joins that buffer, following vte 0.15.0's `advance_esc` and
 //! `advance_osc_string` byte for byte. Once a string has passed the cap, the guard drops its
-//! bytes up to the one that ends or cancels it. It never drops that byte, or any byte outside
-//! a string, so displayed text and the sequences after a long string arrive intact. DCS, APC, PM and SOS strings need no guard:
-//! vte keeps none of their bytes.
+//! bytes up to the one that ends it. It never drops that byte, or any byte outside a string, so
+//! displayed text and the sequences after a long string arrive intact. DCS, APC, PM and SOS
+//! strings need no guard, because vte keeps none of their bytes.
 //!
 //! The guard sees the stream before the parser does, including bytes the parser holds back
 //! during a synchronized update, so what the parser buffers is already capped.

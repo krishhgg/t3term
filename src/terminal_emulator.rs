@@ -9,6 +9,8 @@
 mod guard;
 mod handler;
 mod render;
+#[cfg(test)]
+mod tests;
 
 use std::fmt;
 use std::time::Instant;
@@ -265,6 +267,10 @@ impl TerminalEmulator {
 
     /// Scrolls the view by `rows`, up into the scrollback when positive.
     pub fn scroll_viewport(&mut self, rows: i32) {
+        // `Grid::scroll_display` adds the delta to the offset as an `i32`. No scrollback is
+        // deeper than this bound, so clamping changes nothing but the overflow.
+        let bound = MAX_SCROLLBACK_ROWS as i32;
+        let rows = rows.clamp(-bound, bound);
         self.engine.term.scroll_display(Scroll::Delta(rows));
     }
 

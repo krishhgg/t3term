@@ -73,11 +73,11 @@ impl EventListener for ReplyListener {
 /// - hyperlinks,
 /// - clipboard reads and writes,
 /// - the text-area size in pixels, which only a window could answer.
-pub(super) struct GuardedTerm<'a> {
-    pub(super) term: &'a mut Term<ReplyListener>,
+pub(super) struct GuardedTerm<'a, T> {
+    pub(super) term: &'a mut Term<T>,
 }
 
-impl GuardedTerm<'_> {
+impl<T> GuardedTerm<'_, T> {
     /// Whether the cell `Term::input` in alacritty_terminal 0.26.0 would add a zero-width
     /// character to is full. It picks the cell before the cursor, or the cursor's own cell when
     /// the next character wraps, and moves left off the second half of a wide character.
@@ -96,7 +96,7 @@ impl GuardedTerm<'_> {
     }
 }
 
-impl Handler for GuardedTerm<'_> {
+impl<T: EventListener> Handler for GuardedTerm<'_, T> {
     fn set_title(&mut self, _: Option<String>) {}
 
     fn set_cursor_style(&mut self, style: Option<CursorStyle>) {
