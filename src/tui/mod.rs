@@ -11195,10 +11195,16 @@ mod tests {
             ("End and the wheel", vec![end, wheel]),
             ("End Home", vec![end, home]),
             // Pages past the end, and a row back up.
-            ("PageDown three times and ↑", vec![page_down, page_down, page_down, up]),
+            (
+                "PageDown three times and ↑",
+                vec![page_down, page_down, page_down, up],
+            ),
             // ↓ chooses rows below the last one in view, which scroll into view, and the wheel
             // scrolls up from there.
-            ("↓ to Previous agents and the wheel", [vec![down; 9], vec![wheel]].concat()),
+            (
+                "↓ to Previous agents and the wheel",
+                [vec![down; 9], vec![wheel]].concat(),
+            ),
         ];
         for dialog in [false, true] {
             let (width, height) = if dialog { (80, 24) } else { (200, 24) };
