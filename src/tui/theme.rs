@@ -336,9 +336,15 @@ pub fn now_ms() -> i64 {
 
 /// The sidebar's compact relative time: `now`, `5m`, `3h`, `12d`.
 pub fn relative_time(iso: &str, now: i64) -> String {
-    let Some(then) = parse_iso_ms(iso) else {
-        return String::new();
-    };
+    match parse_iso_ms(iso) {
+        Some(then) => age(then, now),
+        None => String::new(),
+    }
+}
+
+/// How long before `now` the moment `then` was, both in milliseconds, as `relative_time`
+/// writes it.
+pub fn age(then: i64, now: i64) -> String {
     let seconds = (now - then).max(0) / 1000;
     if seconds < 60 {
         "now".into()
@@ -450,6 +456,9 @@ mod tests {
         assert_eq!(relative_time("2026-10-08T00:06:52Z", now), "3m");
         assert_eq!(relative_time("2026-10-07T21:00:00Z", now), "3h");
         assert_eq!(relative_time("2026-09-26T00:00:00Z", now), "12d");
+        assert_eq!(relative_time("nope", now), "");
+        assert_eq!(age(now - 7_200_000, now), "2h");
+        assert_eq!(age(now + 5_000, now), "now");
         assert_eq!(duration_label(3_800), "3.8s");
         assert_eq!(duration_label(12_400), "12s");
         assert_eq!(duration_label(152_000), "2m 32s");

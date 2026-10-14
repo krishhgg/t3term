@@ -55,6 +55,14 @@ These have no number yet. Each takes the next one when it merges.
 |---|---|
 | https://github.com/krishhgg/t3term/pull/33 | Lineage in the thread details: the parent, forks, context transfers, running agents and a closed Previous agents group with its failed count, 6 rows and then 12 more at a time. ↑, ↓, Enter and clicks open a related thread the shell lists. Read-only, with no Stop, Merge back, Disconnect or new fork |
 
+## Merged without a number
+
+#35 merged into master on 2026-10-14 and has no number yet. #37, #32 and #36 merged just before it and have no row in this record. Sol records their numbers and whether each is a sprint or a maintenance PR.
+
+| Pull request | What it does | Merge commit |
+|---|---|---|
+| https://github.com/krishhgg/t3term/pull/35 | A blank row over the sidebar's wordmark, its list and the conversation's breadcrumb on screens at least 20 rows tall. Separate Working, Done and Settled shelves, each with a heading, a count and a chevron, opened and closed with `w`, `d` and `e` or a click and saved. Working and Done start open and Settled closed, and an old settings file gets the Working shelf on once. The inbox has no heading except `Inbox` under pins. Done is t3term's own shelf, not the desktop's. No visits, pins, snoozes or settles sent. [Verification](sidebar-shelves-verification.md) | `0b86d4fac4aa80eaa77c1f8d820ab725701bd607` |
+
 ## Maintenance review PRs
 
 | Pull request | Audit | What it does | Merge commit |
@@ -121,4 +129,4 @@ Sol checked #31 at `e9390bf` with Rust 1.95.0. Clippy over all targets with `-D 
 
 Sol checked #31 again at `3b86aa9` with Rust 1.95.0. `cargo fmt --all -- --check`, Clippy over all targets with `-D warnings`, `cargo test --locked` and `cargo build --locked` passed. The 432 tests are 398 in the library, 2 in main.rs, 18 CLI and 14 fake RPC, with no doctests, so the PR adds 11 to master's 421. That count is for the PR's unmerged source. Sol also ran the builds of `7bf41af` and `3b86aa9` against a fake server on 127.0.0.1 and viewed captures of a long CJK project name and of one with a tab and a line break. [Bounded titles verification](bounded-titles-verification.md) records the runs and four of the captures. The PR's final head, `7987da5`, added only that page and its captures. CI passed there, and Greptile Review gave it 5/5 with no findings. On the user's go-ahead, #31 merged at `f77df53450f54f0cef9906d995a69c4f3616d39d`, whose tree is the same as `7987da5`'s.
 
-20 sprint PRs have merged. The next audit is due when sprint PR 30 merges.
+20 sprint PRs have merged with a number, and the four pull requests under Merged without a number merged without one. The next audit is due when sprint PR 30 merges.
