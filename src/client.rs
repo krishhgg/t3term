@@ -10,7 +10,7 @@ use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc};
 
 use crate::auth::{LoginSource, Scope, Session};
-use crate::discovery::{self, Runtime};
+use crate::discovery::{self, Runtime, Target};
 use crate::error::{err, err_exit, exit};
 use crate::http::Api;
 use crate::models::Plan;
@@ -44,8 +44,10 @@ pub struct SendReceipt {
 }
 
 impl Client {
-    pub async fn connect(scopes: &[Scope], ttl: &str) -> Result<Client> {
-        let runtime = discovery::discover().await?;
+    /// Finds the server `target` names and logs in to it. The client then talks to that server
+    /// alone, and reconnects to the same origin after a drop.
+    pub async fn connect(target: &Target, scopes: &[Scope], ttl: &str) -> Result<Client> {
+        let runtime = discovery::discover(target).await?;
         runtime.require_supported_protocol()?;
         let session = Session::login(&runtime, scopes, ttl).await?;
         let api = Api::new(&runtime, session.token());

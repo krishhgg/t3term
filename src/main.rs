@@ -1,6 +1,7 @@
 use std::borrow::Cow;
 use std::collections::HashMap;
 use std::io::{IsTerminal, Read, Write};
+use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -10,7 +11,8 @@ use serde_json::{Value, json};
 
 use t3term::auth::Scope;
 use t3term::client::{Client, IfBusy, WatchEvent};
-use t3term::discovery;
+use t3term::discovery::{self, Runtime, Target};
+use t3term::environments;
 use t3term::error::{T3Error, err, err_exit, exit};
 use t3term::models::{self, Choice, Plan};
 use t3term::projection::{Applied, ThreadState, is_active_status, is_terminal_status, status};
@@ -26,6 +28,9 @@ struct Cli {
     /// Print machine-readable JSON instead of text.
     #[arg(long, global = true)]
     json: bool,
+    /// Use this saved environment's server and no other. `t3term environment list` shows them.
+    #[arg(long, global = true, value_name = "NAME")]
+    environment: Option<String>,
     #[command(subcommand)]
     command: Option<Command>,
 }
@@ -112,6 +117,45 @@ enum Command {
     },
     /// Revoke the saved login for this server and remove it from the Keychain.
     Logout,
+    /// List, save, rename and remove named environments, and choose the default. Needs no server.
+    Environment {
+        #[command(subcommand)]
+        command: EnvironmentCommand,
+    },
+}
+
+/// Named environments are saved in ~/.config/t3term/environments.json. Each names a T3 home on
+/// this machine, and `--environment NAME` sends a command to that home's server and no other.
+#[derive(Subcommand)]
+enum EnvironmentCommand {
+    /// List the saved environments. `*` marks the default.
+    List,
+    /// Save a local environment: a T3 home and, optionally, the origin of its server.
+    Add {
+        name: String,
+        /// The T3 home the server was started with as --base-dir or T3CODE_HOME, such as ~/.t3.
+        #[arg(long, value_name = "PATH")]
+        t3_home: PathBuf,
+        /// Where the server listens on this machine, such as http://127.0.0.1:3773. Without it,
+        /// t3term uses the origin the T3 home records each time it connects.
+        #[arg(long, value_name = "URL")]
+        origin: Option<String>,
+        /// Make it the default for commands that name no environment.
+        #[arg(long)]
+        default: bool,
+    },
+    /// Give a saved environment a new name.
+    Rename { name: String, new_name: String },
+    /// Forget a saved environment. Its server and its saved login are left as they are.
+    Remove { name: String },
+    /// Choose the environment commands use when they name none.
+    Default {
+        #[arg(required_unless_present = "clear", conflicts_with = "clear")]
+        name: Option<String>,
+        /// Clear the default, so commands that name no environment go back to discovery.
+        #[arg(long)]
+        clear: bool,
+    },
 }
 
 /// Model and mode choices. Anything left out keeps the thread's current value.
@@ -453,16 +497,24 @@ fn json_text(value: &Value, pretty: bool) -> String {
     escaped
 }
 
-async fn connect(scopes: &[Scope], ttl: &str) -> Result<Arc<Client>> {
-    Ok(Arc::new(Client::connect(scopes, ttl).await?))
+/// Connects to the server this run chose. `environments::target` decides which, from
+/// `--environment`, `T3TERM_ORIGIN` and the saved default.
+async fn connect(environment: Option<&str>, scopes: &[Scope], ttl: &str) -> Result<Arc<Client>> {
+    let target = environments::target(environment).await?;
+    Ok(Arc::new(Client::connect(&target, scopes, ttl).await?))
 }
 
 const READ: &[Scope] = &[Scope::Read];
 const OPERATE: &[Scope] = &[Scope::Read, Scope::Operate];
 
 async fn run(cli: Cli) -> Result<i32> {
-    let json_mode = cli.json;
-    match cli.command.unwrap_or(Command::Tui) {
+    let Cli {
+        json: json_mode,
+        environment,
+        command,
+    } = cli;
+    let environment = environment.as_deref();
+    match command.unwrap_or(Command::Tui) {
         Command::Tui => {
             if !std::io::stdout().is_terminal() {
                 return Err(err_exit(
@@ -471,13 +523,13 @@ async fn run(cli: Cli) -> Result<i32> {
                     "The TUI needs a terminal. Use a subcommand; see --help.",
                 ));
             }
-            let client = connect(OPERATE, "12h").await?;
+            let client = connect(environment, OPERATE, "12h").await?;
             t3term::tui::run(client).await?;
             Ok(0)
         }
-        Command::Doctor => doctor(json_mode).await,
+        Command::Doctor => doctor(environment, json_mode).await,
         Command::Models { all } => {
-            let client = connect(READ, "10m").await?;
+            let client = connect(environment, READ, "10m").await?;
             let config = client.server_config().await?;
             let providers: Vec<&Value> = models::providers(&config)
                 .iter()
@@ -493,7 +545,7 @@ async fn run(cli: Cli) -> Result<i32> {
         Command::Settings { thread, choice } => {
             let choice = choice.choice()?;
             let scopes = if choice.is_empty() { READ } else { OPERATE };
-            let client = connect(scopes, "10m").await?;
+            let client = connect(environment, scopes, "10m").await?;
             let id = resolve_thread(&client, &thread).await?;
             let state = client.thread(&id, true).await?;
             let config = client.server_config().await?;
@@ -523,9 +575,10 @@ async fn run(cli: Cli) -> Result<i32> {
             }
             Ok(0)
         }
-        Command::Logout => logout(json_mode).await,
+        Command::Logout => logout(environment, json_mode).await,
+        Command::Environment { command } => manage_environments(command, json_mode).await,
         Command::Projects => {
-            let client = connect(READ, "10m").await?;
+            let client = connect(environment, READ, "10m").await?;
             let shell = client.shell().await?;
             if json_mode {
                 print_json(&json!({"ok": true, "projects": shell.projects}));
@@ -546,7 +599,7 @@ async fn run(cli: Cli) -> Result<i32> {
             limit,
             all,
         } => {
-            let client = connect(READ, "10m").await?;
+            let client = connect(environment, READ, "10m").await?;
             let shell = client.shell().await?;
             let project_id = match project {
                 None => None,
@@ -608,7 +661,7 @@ async fn run(cli: Cli) -> Result<i32> {
             last,
             reasoning,
         } => {
-            let client = connect(READ, "10m").await?;
+            let client = connect(environment, READ, "10m").await?;
             let id = resolve_thread(&client, &thread).await?;
             let state = client.thread(&id, false).await?;
             if json_mode {
@@ -623,7 +676,7 @@ async fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Command::Watch { thread } => {
-            let client = connect(READ, "12h").await?;
+            let client = connect(environment, READ, "12h").await?;
             let id = resolve_thread(&client, &thread).await?;
             let mut events = client.watch_thread(&id, None);
             let mut state = ThreadState::default();
@@ -676,7 +729,7 @@ async fn run(cli: Cli) -> Result<i32> {
                 }
             };
             let ttl = format!("{}m", timeout / 60 + 10);
-            let client = connect(OPERATE, &ttl).await?;
+            let client = connect(environment, OPERATE, &ttl).await?;
             let id = resolve_thread(&client, &thread).await?;
             let state = client.thread(&id, true).await?;
             let if_busy = match if_busy {
@@ -713,7 +766,8 @@ async fn run(cli: Cli) -> Result<i32> {
             .await
         }
         Command::Wait { thread, timeout } => {
-            let client = connect(READ, &format!("{}m", timeout / 60 + 10)).await?;
+            let ttl = format!("{}m", timeout / 60 + 10);
+            let client = connect(environment, READ, &ttl).await?;
             let id = resolve_thread(&client, &thread).await?;
             let state = client.thread(&id, true).await?;
             let run = state.active_run().or_else(|| state.latest_run());
@@ -738,7 +792,7 @@ async fn run(cli: Cli) -> Result<i32> {
             .await
         }
         Command::Requests { thread } => {
-            let client = connect(READ, "10m").await?;
+            let client = connect(environment, READ, "10m").await?;
             let id = resolve_thread(&client, &thread).await?;
             let state = client.thread(&id, true).await?;
             let requests: Vec<Value> = state
@@ -771,7 +825,7 @@ async fn run(cli: Cli) -> Result<i32> {
             request,
             decision,
         } => {
-            let client = connect(OPERATE, "10m").await?;
+            let client = connect(environment, OPERATE, "10m").await?;
             let id = resolve_thread(&client, &thread).await?;
             let state = client.thread(&id, true).await?;
             let pending: Vec<&Value> = state
@@ -810,7 +864,7 @@ async fn run(cli: Cli) -> Result<i32> {
             Ok(0)
         }
         Command::Interrupt { thread } => {
-            let client = connect(OPERATE, "10m").await?;
+            let client = connect(environment, OPERATE, "10m").await?;
             let id = resolve_thread(&client, &thread).await?;
             let state = client.thread(&id, true).await?;
             let run = state.active_run().ok_or_else(|| {
@@ -1029,10 +1083,17 @@ async fn wait_for_reply(
     }
 }
 
-async fn doctor(json_mode: bool) -> Result<i32> {
+async fn doctor(environment: Option<&str>, json_mode: bool) -> Result<i32> {
     let mut checks = serde_json::Map::new();
     let mut ok = true;
-    let runtime = match discovery::discover().await {
+    let target = environments::target(environment).await?;
+    if let Target::Local(local) = &target {
+        checks.insert(
+            "environment".into(),
+            json!({"ok": true, "name": local.name, "t3Home": local.t3_home.to_string_lossy()}),
+        );
+    }
+    let runtime = match discovery::discover(&target).await {
         Ok(runtime) => runtime,
         Err(error) => {
             checks.insert(
@@ -1062,7 +1123,7 @@ async fn doctor(json_mode: bool) -> Result<i32> {
         }
     };
     let started = Instant::now();
-    match Client::connect(READ, "5m").await {
+    match Client::connect(&target, READ, "5m").await {
         Err(error) => {
             ok = false;
             checks.insert(
@@ -1101,23 +1162,32 @@ async fn doctor(json_mode: bool) -> Result<i32> {
     finish_doctor(checks, ok, json_mode)
 }
 
-async fn logout(json_mode: bool) -> Result<i32> {
-    let message = match discovery::discover().await {
-        Ok(runtime) => match t3term::auth::logout(&runtime).await? {
-            Some(session) => {
-                format!(
-                    "Logged out of {}. Revoked session {session}.",
-                    runtime.origin
-                )
-            }
-            None => format!("No saved login for {}.", runtime.origin),
+async fn logout(environment: Option<&str>, json_mode: bool) -> Result<i32> {
+    let target = environments::target(environment).await?;
+    let message = match &target {
+        Target::Discover => match discovery::discover(&target).await {
+            Ok(runtime) => logged_out(&runtime).await?,
+            // Without the server there is no environment id to pick one login, so remove them
+            // all.
+            Err(_) => match t3term::keychain::delete(None).await? {
+                0 => "No saved logins.".to_string(),
+                removed => format!(
+                    "Removed {removed} saved login(s) from the Keychain. T3 is not running, so they could not be revoked; each expires within 30 days of being issued."
+                ),
+            },
         },
-        // Without the server there is no environment id to pick one login, so remove them all.
-        Err(_) => match t3term::keychain::delete(None).await? {
-            0 => "No saved logins.".to_string(),
-            removed => format!(
-                "Removed {removed} saved login(s) from the Keychain. T3 is not running, so they could not be revoked; each expires within 30 days of being issued."
-            ),
+        Target::Local(local) => match discovery::discover_local(local).await {
+            Ok(runtime) => logged_out(&runtime).await?,
+            // `forget` removes this environment's login alone, and only when this check and a
+            // second one under the login lock both show its server stopped. Any other failure
+            // is returned as it was.
+            Err(unreached) => match t3term::auth::forget(local, unreached).await? {
+                0 => format!("No saved login for environment {}.", local.name),
+                _ => format!(
+                    "Removed environment {}'s saved login from the Keychain. Its server is not running, so the login could not be revoked; it expires within 30 days of being issued.",
+                    local.name
+                ),
+            },
         },
     };
     if json_mode {
@@ -1126,6 +1196,120 @@ async fn logout(json_mode: bool) -> Result<i32> {
         println!("{}", plain(&message));
     }
     Ok(0)
+}
+
+/// Revokes and removes the saved login of the server `runtime` describes, and says what it
+/// did.
+async fn logged_out(runtime: &Runtime) -> Result<String> {
+    Ok(match t3term::auth::logout(runtime).await? {
+        Some(session) => format!(
+            "Logged out of {}. Revoked session {session}.",
+            runtime.origin
+        ),
+        None => format!("No saved login for {}.", runtime.origin),
+    })
+}
+
+/// `environment list`, `add`, `rename`, `remove` and `default`. Each reads or changes
+/// `environments.json` alone and reaches no server.
+async fn manage_environments(command: EnvironmentCommand, json_mode: bool) -> Result<i32> {
+    let (body, message) = match command {
+        EnvironmentCommand::List => {
+            let saved = environments::load().await?;
+            let list = saved.list();
+            let body = json!({"ok": true, "default": saved.default, "environments": list});
+            (body, environments_text(&list))
+        }
+        EnvironmentCommand::Add {
+            name,
+            t3_home,
+            origin,
+            default,
+        } => {
+            let target = environments::local_target(&name, &t3_home, origin.as_deref())?;
+            let summary = environments::update(move |saved| {
+                saved.add(&target, default)?;
+                Ok(saved.summary(&target.name))
+            })
+            .await?;
+            let message = if default {
+                format!("Saved environment {name} and made it the default.")
+            } else {
+                format!("Saved environment {name}.")
+            };
+            (json!({"ok": true, "environment": summary}), message)
+        }
+        EnvironmentCommand::Rename { name, new_name } => {
+            environments::check_name(&name)?;
+            environments::check_name(&new_name)?;
+            let (from, to) = (name.clone(), new_name.clone());
+            let summary = environments::update(move |saved| {
+                saved.rename(&from, &to)?;
+                Ok(saved.summary(&to))
+            })
+            .await?;
+            let body = json!({"ok": true, "renamed": name, "environment": summary});
+            (body, format!("Renamed environment {name} to {new_name}."))
+        }
+        EnvironmentCommand::Remove { name } => {
+            environments::check_name(&name)?;
+            let removed = name.clone();
+            let change = move |saved: &mut environments::Environments| saved.remove(&removed);
+            environments::update(change).await?;
+            let body = json!({"ok": true, "removed": name});
+            (body, format!("Removed environment {name}."))
+        }
+        EnvironmentCommand::Default { name, .. } => {
+            if let Some(name) = &name {
+                environments::check_name(name)?;
+            }
+            let chosen = name.clone();
+            environments::update(move |saved| match &chosen {
+                Some(name) => saved.set_default(name),
+                None => {
+                    saved.default = None;
+                    Ok(())
+                }
+            })
+            .await?;
+            let destination = match &name {
+                Some(name) => format!("environment {name}"),
+                None => "the server discovery finds".to_string(),
+            };
+            let message = format!("Commands that name no environment now go to {destination}.");
+            (json!({"ok": true, "default": name}), message)
+        }
+    };
+    if json_mode {
+        print_json(&body);
+    } else {
+        println!("{}", plain(&message));
+    }
+    Ok(0)
+}
+
+/// One line per saved environment: a `*` for the default, then its name, kind, T3 home and
+/// origin, each as the file holds it.
+fn environments_text(list: &[Value]) -> String {
+    if list.is_empty() {
+        return "No saved environments. Commands go to the server discovery finds.".to_string();
+    }
+    let mut lines = Vec::new();
+    for environment in list {
+        let marker = match environment["default"] {
+            Value::Bool(true) => '*',
+            _ => ' ',
+        };
+        let line = format!(
+            "{marker} {:<12} {:<6} {}  {}",
+            shown(&environment["name"]),
+            shown(&environment["kind"]),
+            shown(&environment["t3Home"]),
+            shown(&environment["origin"])
+        );
+        lines.push(line.trim_end().to_string());
+    }
+    lines.join("\n")
 }
 
 fn finish_doctor(checks: serde_json::Map<String, Value>, ok: bool, json_mode: bool) -> Result<i32> {
