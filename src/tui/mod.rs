@@ -1214,6 +1214,8 @@ impl App {
         let Some(id) = self.sidebar.selected_thread_id().map(str::to_string) else {
             return;
         };
+        // A list that Down scrolled past the card scrolls back to it.
+        self.sidebar.select(&id);
         if self.open.as_ref().is_some_and(|o| o.id == id) {
             self.focus = Focus::Composer;
             return;
@@ -6069,6 +6071,284 @@ mod tests {
         assert!(rows[done as usize].contains("─ ›"), "{rows:#?}");
         assert_eq!(app.sidebar.shelf_at(done), Some(Shelf::Done));
         still(&app);
+    }
+
+    /// Settings with Working, Done and Settled closed.
+    fn shelves_closed() -> Settings {
+        Settings {
+            sidebar_working_shelf_expanded: false,
+            sidebar_done_shelf_expanded: false,
+            sidebar_settled_shelf_expanded: false,
+            ..Settings::default()
+        }
+    }
+
+    /// A thread whose latest run finished after the last visit, which puts it on Done.
+    fn finished_unseen(id: &str, title: &str) -> Value {
+        let mut thread = listed(id, title, "completed");
+        thread["latestRunCompletedAt"] = json!("2026-10-08T11:00:00.000Z");
+        thread["lastVisitedAt"] = json!("2026-10-08T10:00:00.000Z");
+        thread
+    }
+
+    /// Inbox cards a1 to a4 over the closed shelves, with Whiskey on Working and Delta on Done,
+    /// and the settings saved as the TUI starts with them. At 80x8 the list has six rows: room
+    /// for a4 and the Working heading under it, but not for Done and Settled too.
+    fn short_list_over_closed_shelves() -> App {
+        Settings::update(|saved| *saved = shelves_closed());
+        let mut app = tui(&shelves_closed());
+        let mut threads: Vec<Value> = (1..=4)
+            .map(|n| listed(&format!("a{n}"), &format!("Inbox {n}"), "completed"))
+            .collect();
+        threads.extend([
+            listed("w", "Whiskey", "running"),
+            finished_unseen("d", "Delta"),
+        ]);
+        app.on_shell_event(shell_snapshot(threads));
+        app.open = Some(long_thread());
+        app
+    }
+
+    /// What a click on each row of the sidebar's list lands on, by the last frame: a thread's
+    /// id, a shelf's name or nothing.
+    fn clickable(app: &App) -> Vec<String> {
+        let list = app.sidebar.list;
+        (list.y..list.bottom())
+            .map(|y| match (app.sidebar.thread_at(y), app.sidebar.shelf_at(y)) {
+                (Some(id), _) => id.to_string(),
+                (None, Some(shelf)) => format!("{shelf:?}"),
+                (None, None) => String::new(),
+            })
+            .collect()
+    }
+
+    #[test]
+    fn down_on_the_last_card_of_a_short_list_scrolls_on_to_the_headings_under_it() {
+        let mut app = short_list_over_closed_shelves();
+        let rows = screen(&mut app, 80, 8);
+        assert_eq!((app.sidebar.list.y, app.sidebar.list.bottom()), (2, 8));
+        assert_eq!(clickable(&app), ["a1", "a1", "a1", "", "a2", "a2"]);
+        assert!(!shows(&rows, "Working ("), "{rows:#?}");
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down);
+            screen(&mut app, 80, 8);
+        }
+        // a4, the last card, fills the list with Working under it. Done and Settled don't fit.
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a4"));
+        let at_a4 = ["a4", "a4", "a4", "", "", "Working"];
+        let rows = screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), at_a4);
+        assert!(rows[7].contains("Working (1) ─"), "{rows:#?}");
+        assert!(!shows(&rows, "Done ("), "{rows:#?}");
+
+        // Down scrolls on past a4, and the first frame after shows every heading under it, each
+        // taking clicks on the row that reads it. The highlight stays on a4.
+        let past_a4 = ["", "Working", "Done", "Settled", "", ""];
+        press(&mut app, KeyCode::Down);
+        let rows = screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), past_a4);
+        assert!(rows[3].contains("Working (1) ─"), "{rows:#?}");
+        assert!(rows[4].contains("Done (1) ─"), "{rows:#?}");
+        assert!(rows[5].contains("Settled (0) ─"), "{rows:#?}");
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a4"));
+
+        // That is as far as it goes. Repaints and a live change near the bottom keep it there.
+        press(&mut app, KeyCode::Down);
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), past_a4);
+        app.on_shell_event(thread_updated(2, finished_unseen("e", "Echo")));
+        let rows = screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), past_a4);
+        assert!(rows[4].contains("Done (2) ─"), "{rows:#?}");
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), past_a4);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a4"));
+
+        // Up scrolls back to a4 first, and then moves the highlight.
+        press(&mut app, KeyCode::Up);
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), at_a4);
+        press(&mut app, KeyCode::Up);
+        screen(&mut app, 80, 8);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a3"));
+        assert_eq!(clickable(&app), ["a3", "a3", "a3", "", "a4", "a4"]);
+
+        // Enter on the list scrolled past a4 opens a4, and the next frame shows it again.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), past_a4);
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.open.as_ref().map(|open| open.id.as_str()), Some("a4"));
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), at_a4);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_a_short_list_on_to_its_headings_and_their_clicks_fold_them() {
+        let mut app = short_list_over_closed_shelves();
+        screen(&mut app, 80, 8);
+        // Three turns take the highlight to a4, the fourth scrolls past it, and more do nothing.
+        for _ in 0..6 {
+            assert!(mouse(&mut app, MouseEventKind::ScrollDown, 5, 4));
+            screen(&mut app, 80, 8);
+        }
+        assert_eq!(clickable(&app), ["", "Working", "Done", "Settled", "", ""]);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a4"));
+
+        // A click on Done opens it. Nothing the last frame drew takes a click until the next
+        // one draws, so a click where Settled was folds nothing.
+        assert!(mouse(&mut app, CLICK, 5, 4));
+        assert!(app.layout_changed);
+        assert!(crate::settings::saved_in_test().sidebar_done_shelf_expanded);
+        assert!(clickable(&app).iter().all(String::is_empty));
+        assert!(mouse(&mut app, CLICK, 5, 5));
+        assert!(!crate::settings::saved_in_test().sidebar_settled_shelf_expanded);
+
+        // The frame keeps the view where it was, with Delta under the open Done.
+        let rows = screen(&mut app, 80, 8);
+        assert!(!app.layout_changed);
+        assert_eq!(clickable(&app), ["", "Working", "Done", "d", "d", "d"]);
+        assert!(rows[4].contains("Done (1) ─"), "{rows:#?}");
+        assert!(rows[4].contains("─ ⌄"), "{rows:#?}");
+        assert!(shows(&rows, "Delta"), "{rows:#?}");
+
+        // A click on Delta opens it, and the list follows the highlight to it, with Settled
+        // under it.
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        assert!(mouse(&mut app, CLICK, 5, 6));
+        assert_eq!(app.open.as_ref().map(|open| open.id.as_str()), Some("d"));
+        screen(&mut app, 80, 8);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("d"));
+        assert_eq!(clickable(&app), ["d", "d", "d", "", "", "Settled"]);
+
+        // A click there opens Settled, and the wheel goes back up through a4 to a3.
+        assert!(mouse(&mut app, CLICK, 5, 7));
+        assert!(crate::settings::saved_in_test().sidebar_settled_shelf_expanded);
+        let rows = screen(&mut app, 80, 8);
+        assert!(rows[7].contains("Settled (0) ─"), "{rows:#?}");
+        assert!(rows[7].contains("─ ⌄"), "{rows:#?}");
+        assert!(mouse(&mut app, MouseEventKind::ScrollUp, 5, 4));
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), ["a4", "a4", "a4", "", "", "Working"]);
+        assert!(mouse(&mut app, MouseEventKind::ScrollUp, 5, 4));
+        screen(&mut app, 80, 8);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a3"));
+    }
+
+    #[test]
+    fn a_list_with_room_for_every_row_has_nothing_to_scroll_past() {
+        let mut app = short_list_over_closed_shelves();
+        // At 120x36 the whole list fits, with the shelves at its bottom.
+        let rows = screen(&mut app, 120, 36);
+        assert_eq!(row_showing(&rows, "Working (1)"), 33);
+        assert_eq!(row_showing(&rows, "Settled (0)"), 35);
+        assert_eq!(app.sidebar.shelf_at(35), Some(Shelf::Settled));
+        let tall = clickable(&app);
+        // Down past a4 scrolls nothing, so Up moves the highlight at once.
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Down);
+            screen(&mut app, 120, 36);
+            assert_eq!(clickable(&app), tall);
+        }
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a4"));
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a3"));
+
+        // Shrunk to 80x8, Down scrolls past a4. Grown back, the list fits and shows as before.
+        // Shrunk again, it follows a4, so Up moves the highlight at once.
+        press(&mut app, KeyCode::Down);
+        app.on_terminal_event(Event::Resize(80, 8));
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), ["a4", "a4", "a4", "", "", "Working"]);
+        press(&mut app, KeyCode::Down);
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), ["", "Working", "Done", "Settled", "", ""]);
+        app.on_terminal_event(Event::Resize(120, 36));
+        let rows = screen(&mut app, 120, 36);
+        assert_eq!(clickable(&app), tall);
+        assert_eq!(row_showing(&rows, "Settled (0)"), 35);
+        app.on_terminal_event(Event::Resize(80, 8));
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), ["a4", "a4", "a4", "", "", "Working"]);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a3"));
+    }
+
+    #[test]
+    fn a_short_list_of_headings_scrolls_to_the_last_and_an_empty_list_stays_still() {
+        // With no thread, there is nothing to scroll to and nothing takes a click.
+        let mut app = tui(&shelves_closed());
+        app.on_shell_event(shell_snapshot(Vec::new()));
+        screen(&mut app, 80, 8);
+        press(&mut app, KeyCode::Down);
+        assert!(mouse(&mut app, MouseEventKind::ScrollDown, 5, 4));
+        let rows = screen(&mut app, 80, 8);
+        assert!(rows[2].trim_start().starts_with("No threads yet"), "{rows:#?}");
+        assert!(clickable(&app).iter().all(String::is_empty));
+        press(&mut app, KeyCode::Up);
+        let rows = screen(&mut app, 80, 8);
+        assert!(rows[2].trim_start().starts_with("No threads yet"), "{rows:#?}");
+
+        // Delta alone, on closed Done, leaves only the headings. At 80x4 the list has two rows,
+        // and Down scrolls on to Settled, whose click opens it.
+        let mut app = tui(&shelves_closed());
+        app.on_shell_event(shell_snapshot(vec![finished_unseen("d", "Delta")]));
+        screen(&mut app, 80, 4);
+        assert_eq!(clickable(&app), ["Working", "Done"]);
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Down);
+            screen(&mut app, 80, 4);
+            assert_eq!(clickable(&app), ["Done", "Settled"]);
+        }
+        assert!(mouse(&mut app, CLICK, 5, 3));
+        assert!(crate::settings::saved_in_test().sidebar_settled_shelf_expanded);
+        let rows = screen(&mut app, 80, 4);
+        assert_eq!(clickable(&app), ["Done", "Settled"]);
+        assert!(rows[3].contains("Settled (0) ─"), "{rows:#?}");
+        assert!(rows[3].contains("─ ⌄"), "{rows:#?}");
+        press(&mut app, KeyCode::Up);
+        screen(&mut app, 80, 4);
+        assert_eq!(clickable(&app), ["Working", "Done"]);
+    }
+
+    #[test]
+    fn the_open_thread_on_a_closed_shelf_stays_in_reach_above_the_headings_under_it() {
+        let mut app = short_list_over_closed_shelves();
+        // Whiskey is open, so closed Working still lists it.
+        app.open = Some(OpenThread::new("w".into(), mpsc::unbounded_channel().1));
+        app.rebuild_rows();
+        screen(&mut app, 80, 8);
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Down);
+            screen(&mut app, 80, 8);
+        }
+        assert_eq!(app.sidebar.selected_thread_id(), Some("w"));
+        let at_whiskey = ["", "Working", "w", "w", "w", ""];
+        assert_eq!(clickable(&app), at_whiskey);
+
+        // Down scrolls past Whiskey to Done and Settled, and no further.
+        let past_whiskey = ["", "Done", "Settled", "", "", ""];
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Down);
+            screen(&mut app, 80, 8);
+            assert_eq!(clickable(&app), past_whiskey);
+        }
+
+        // Opening Working there keeps the view. Closing it moves the highlight off its cards to
+        // Whiskey, which stays listed, and the list follows the highlight again.
+        press(&mut app, KeyCode::Char('w'));
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), past_whiskey);
+        press(&mut app, KeyCode::Char('w'));
+        let rows = screen(&mut app, 80, 8);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("w"));
+        assert_eq!(clickable(&app), at_whiskey);
+        assert!(rows[3].contains("Working (1) ─"), "{rows:#?}");
+        assert!(rows[3].contains("─ ›"), "{rows:#?}");
     }
 
     #[test]

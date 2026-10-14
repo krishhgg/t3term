@@ -10,6 +10,8 @@ Sol first checked `e3dc6e3`. Clippy and the build passed there, but `cargo fmt -
 
 The commit that adds this page, its image and the links to them changes no source or test. CI and Greptile at the PR's final head are pending, and this page doesn't record them.
 
+A later commit on #35 lets Down and the wheel scroll on past the last thread, so a short list can reach the headings under it. Nothing on this page checked that change.
+
 ## How it ran
 
 Fake-server scripts kept outside the repository served auth and RPC on 127.0.0.1 only. Every project, thread and reply is invented. Each run used `env -i`, its own temporary `HOME` and `T3CODE_HOME`, `T3TERM_NO_SAVED_LOGIN=1` and a private tmux server. No real T3 server, Keychain entry, `~/.t3`, project folder or user file took part. Sol made three runs.

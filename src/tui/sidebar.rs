@@ -720,6 +720,22 @@ fn fits(rows: &[Row], height: usize) -> bool {
     })
 }
 
+/// The top row of the list scrolled as far down as it goes: where the longest run of rows at
+/// the end that fits in `height` lines starts, so the last row shows whole. A last row taller
+/// than the list starts it alone. It measures only the rows that fit, and the one past them.
+fn deepest(rows: &[Row], height: usize) -> usize {
+    let mut lines = 0;
+    let fit = rows
+        .iter()
+        .rev()
+        .take_while(|row| {
+            lines += row.height();
+            lines <= height
+        })
+        .count();
+    (rows.len() - fit).min(rows.len().saturating_sub(1))
+}
+
 /// Whether busy threads get the Working shelf, and which of the shelves that fold list their
 /// threads. The settings decide them at start.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -772,6 +788,12 @@ pub struct Sidebar {
     selected: usize,
     /// The first row drawn.
     offset: usize,
+    /// How many rows below the highlighted one the list starts, after Down or the wheel on the
+    /// last thread scrolled past its card, or 0 while the list follows the highlight. A short
+    /// list can't show the last card and the headings under it together, and those keys can't
+    /// move the highlight further, so they scroll instead. Up, the wheel up, a move of the
+    /// highlight and a pick of a thread take it back.
+    past: usize,
     choices: ShelfChoices,
     /// Whether the list has any thread, which gives it the headings of the shelves that fold.
     listed: bool,
@@ -884,10 +906,11 @@ impl Sidebar {
         // the last.
         let is_card = |row: &Row| row.thread().is_some();
         self.selected = selected
+            .as_deref()
             .and_then(|selected| {
                 self.rows
                     .iter()
-                    .position(|row| row.thread() == Some(selected.as_str()))
+                    .position(|row| row.thread() == Some(selected))
             })
             .or_else(|| {
                 self.rows
@@ -898,6 +921,11 @@ impl Sidebar {
             })
             .or_else(|| self.rows.iter().rposition(is_card))
             .unwrap_or(0);
+        // A scroll past the last card goes with the thread it scrolled past, so a highlight
+        // that moved to another thread follows that one.
+        if self.selected_thread_id() != selected.as_deref() {
+            self.past = 0;
+        }
         self.offset = match top {
             Some(top) => self
                 .rows
@@ -912,26 +940,50 @@ impl Sidebar {
         self.rows.get(self.selected).and_then(Row::thread)
     }
 
-    /// Moves the highlight `delta` threads, past headings. It stops at either end.
+    /// Moves the highlight `delta` threads, past headings. It stops at the top. Down on the
+    /// last thread scrolls the list instead, first to the row under its card and then a row at
+    /// a time, until the last row shows, so the headings under the last card come into view
+    /// on a list too short for both. Up scrolls those rows back one at a time before it moves
+    /// the highlight.
     pub fn move_selection(&mut self, delta: isize) {
+        if delta < 0 && self.past > 0 {
+            self.past -= 1;
+            return;
+        }
         let mut index = self.selected as isize;
         loop {
             index += delta;
-            if index < 0 || index >= self.rows.len() as isize {
+            if index < 0 {
+                return;
+            }
+            if index >= self.rows.len() as isize {
+                self.scroll_past();
                 return;
             }
             if self.rows[index as usize].thread().is_some() {
                 self.selected = index as usize;
+                self.past = 0;
                 return;
             }
         }
     }
 
-    /// Highlights a thread's row. False when the list has no row for it.
+    /// Scrolls the list a row further past the highlighted card while the last row is off the
+    /// list, by the height the last frame drew it at. The next frame checks it against its own.
+    fn scroll_past(&mut self) {
+        let height = usize::from(self.list.height);
+        if height > 0 && self.selected + self.past < deepest(&self.rows, height) {
+            self.past += 1;
+        }
+    }
+
+    /// Highlights a thread's row, and brings it back into view if Down scrolled the list past
+    /// it. False, and nothing changes, when the list has no row for it.
     pub fn select(&mut self, id: &str) -> bool {
         let found = self.rows.iter().position(|row| row.thread() == Some(id));
         if let Some(index) = found {
             self.selected = index;
+            self.past = 0;
         }
         found.is_some()
     }
@@ -1021,6 +1073,7 @@ impl Sidebar {
             let threads = heading + 1..end;
             if threads.contains(&self.selected) {
                 self.selected = heading;
+                self.past = 0;
             }
             if threads.contains(&self.offset) {
                 self.offset = heading;
@@ -1032,11 +1085,16 @@ impl Sidebar {
     /// Scrolls so the highlighted card fits in `height` rows, with the headings straight under
     /// it and its shelf's heading above it when those fit too, and so rows above fill any room
     /// left below the last row. The headings under the last card are the closed shelves at the
-    /// end of the list, which come into view this way.
-    fn scroll_into_view(&mut self, height: usize) {
+    /// end of the list, which come into view this way when they fit beside it.
+    ///
+    /// It returns the first row to draw. That is the top row, unless Down scrolled the list
+    /// past the last card. Then it is the row as far under the card as Down took it, short of
+    /// the furthest the list scrolls at this height.
+    fn scroll_into_view(&mut self, height: usize) -> usize {
         let Some(last) = self.rows.len().checked_sub(1) else {
             self.offset = 0;
-            return;
+            self.past = 0;
+            return 0;
         };
         let selected = self.selected.min(last);
         let under = self.rows[selected + 1..]
@@ -1061,6 +1119,12 @@ impl Sidebar {
         while self.offset > 0 && fits(&self.rows[self.offset - 1..], height) {
             self.offset -= 1;
         }
+        if self.past == 0 {
+            return self.offset;
+        }
+        let furthest = deepest(&self.rows, height);
+        self.past = self.past.min(furthest.saturating_sub(selected));
+        selected + self.past
     }
 
     /// Forgets what the last frame drew, so nothing left from it takes clicks, the wheel or the
@@ -1139,10 +1203,10 @@ impl Sidebar {
         let list = Rect::new(inner.x, top, inner.width, inner.bottom() - top);
         self.list = list;
         let height = list.height as usize;
-        self.scroll_into_view(height);
+        let first = self.scroll_into_view(height);
         // When the whole list fits, the shelves under the inbox sit at its bottom, as the GUI's
         // do, and the room left over goes above them.
-        let room = if self.offset == 0 && fits(&self.rows, height) {
+        let room = if first == 0 && fits(&self.rows, height) {
             height - self.rows.iter().map(Row::height).sum::<usize>()
         } else {
             0
@@ -1161,7 +1225,7 @@ impl Sidebar {
             None
         };
         let mut lines: Vec<Line> = Vec::with_capacity(height);
-        for (index, row) in self.rows.iter().enumerate().skip(self.offset) {
+        for (index, row) in self.rows.iter().enumerate().skip(first) {
             if lines.len() >= height {
                 break;
             }

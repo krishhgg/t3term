@@ -33,6 +33,7 @@ The highlight is a `▎` bar, in the primary color while the sidebar has the key
 - A card takes three lines and a blank one. A settled thread takes one line with no blank. A heading under a card has a blank line over it, and one under another heading has none, so empty shelves stack.
 - When the whole list fits, the leftover rows go above the first of the Working, Done, Snoozed and Settled headings, so those shelves sit at the bottom. That matches the desktop's `mt-auto` on the Working header, and on Snoozed and Settled when the shelves above are empty. A list that doesn't fit starts at the top.
 - Scrolling keeps the highlighted card in view with its shelf's heading above it, and with the headings straight under it when they fit. That brings the closed shelves at the end of a long list into view from the last card.
+- On a list too short for the last card and the headings under it, Down or the wheel on the last card scrolls on past it, then a row at a time, until the last row shows. The highlight stays on the card, and repaints and changes to the list keep the view. Up or the wheel up scrolls back to the card before it moves the highlight. Opening a thread, moving the highlight to another thread, or a screen tall enough for the whole list brings the list back to following the highlight.
 
 ## Settings and the migration
 
