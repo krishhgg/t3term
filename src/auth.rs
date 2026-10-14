@@ -17,7 +17,7 @@ use anyhow::{Context, Result};
 use serde::Deserialize;
 use serde_json::Value;
 
-use crate::discovery::{Runtime, Unreached};
+use crate::discovery::{LocalTarget, Runtime, Unreached, discover_local};
 use crate::error::{err, err_exit, exit};
 use crate::http::Api;
 use crate::keychain::{self, SavedLogin};
@@ -356,8 +356,13 @@ async fn open_lock(environment_id: &str) -> Option<std::fs::File> {
 /// An exclusive lock shared by every t3term process that changes this environment's saved
 /// login. Polls without blocking so signals still get through, and gives up after `LOCK_WAIT`.
 async fn lock_logins(environment_id: &str) -> Option<std::fs::File> {
+    lock_logins_within(environment_id, LOCK_WAIT).await
+}
+
+/// `lock_logins`, giving up after `wait`.
+async fn lock_logins_within(environment_id: &str, wait: Duration) -> Option<std::fs::File> {
     let file = open_lock(environment_id).await?;
-    let deadline = tokio::time::Instant::now() + LOCK_WAIT;
+    let deadline = tokio::time::Instant::now() + wait;
     loop {
         match file.try_lock() {
             Ok(()) => return Some(file),
@@ -419,48 +424,59 @@ pub async fn logout(runtime: &Runtime) -> Result<Option<String>> {
 /// that doesn't answer in time, or a target t3term refuses, removes nothing and is returned as
 /// it was.
 ///
-/// The delete holds the lock `Session::login` holds while it checks, issues and saves this
-/// environment's login, and doesn't wait for it. A process that holds it is logging in, and the
-/// login it saves may be for a server that started after the check above, so `forget` removes
-/// nothing and asks for another run, which checks the server again. The lock can't help with a
-/// login that started and finished between that check and this lock.
-pub async fn forget(unreached: Unreached) -> Result<usize> {
-    let Some(environment_id) = unreached.stopped else {
-        return Err(unreached.error);
+/// That check can be out of date by the time `forget` runs. The server may have started since,
+/// and a login may have saved a new session for it. So `forget` takes the lock `Session::login`
+/// holds from its check to its save, waiting for it as `logout` does, and checks `local` again
+/// while it holds it. It deletes only when that check also finds the server stopped and the
+/// home holding the same id, and it holds the lock through the delete, so no login can save a
+/// session in between. A server that answers now, a home that holds another id or any other
+/// failure keeps the login, and a logout once the server runs revokes it.
+pub async fn forget(local: &LocalTarget, unreached: Unreached) -> Result<usize> {
+    forget_within(local, unreached, LOCK_WAIT).await
+}
+
+/// `forget`, giving up on the login lock after `wait`.
+async fn forget_within(local: &LocalTarget, down: Unreached, wait: Duration) -> Result<usize> {
+    let Some(environment_id) = down.stopped else {
+        return Err(down.error);
     };
     if !keychain::available() {
         return Ok(0);
     }
-    let path = lock_path(&environment_id);
-    let lock = open_lock(&environment_id).await.ok_or_else(|| {
-        err(
+    let name = &local.name;
+    let lock = lock_logins_within(&environment_id, wait).await;
+    // Held until `forget` returns, after the check and the delete below.
+    let Some(_lock) = lock else {
+        return Err(err(
             "T3_AUTH_FAILED",
             format!(
-                "t3term could not open {}, so it kept the saved login.",
-                path.display()
+                "t3term could not lock {}, so it kept environment {name}'s saved login. Another t3term may be logging in to it. Run logout again once that finishes.",
+                lock_path(&environment_id).display()
             ),
-        )
-    })?;
-    match lock.try_lock() {
-        Ok(()) => {}
-        Err(std::fs::TryLockError::WouldBlock) => {
-            return Err(err(
-                "T3_AUTH_FAILED",
-                "Another t3term process is logging in to this environment, so t3term kept its saved login. Run logout again once that finishes.",
-            ));
-        }
-        Err(std::fs::TryLockError::Error(error)) => {
+        ));
+    };
+    let again = match discover_local(local).await {
+        Ok(runtime) => {
             return Err(err(
                 "T3_AUTH_FAILED",
                 format!(
-                    "t3term could not lock {}: {error}. It kept the saved login.",
-                    path.display()
+                    "Environment {name}'s server answers at {} now, so t3term kept the saved login. Run logout again to revoke it.",
+                    runtime.origin
                 ),
             ));
         }
+        Err(again) => again,
+    };
+    match again.stopped {
+        Some(now) if now == environment_id => keychain::delete(Some(&environment_id)).await,
+        Some(now) => Err(err(
+            "T3_AUTH_FAILED",
+            format!(
+                "Environment {name}'s T3 home holds the id {now} now, not {environment_id}, so t3term kept the saved login. Run logout again."
+            ),
+        )),
+        None => Err(again.error),
     }
-    // `lock` stays held until the delete finishes.
-    keychain::delete(Some(&environment_id)).await
 }
 
 async fn issue_session(
@@ -589,7 +605,6 @@ impl Drop for Session {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::discovery::{LocalTarget, discover_local};
     use crate::error::T3Error;
     use crate::http::fake;
 
@@ -664,14 +679,6 @@ mod tests {
             server_version: "0.0.0".into(),
             protocol_version: Some(crate::discovery::PROTOCOL_VERSION),
             capabilities: serde_json::json!({}),
-        }
-    }
-
-    /// What `discover_local` returns for a stopped server whose home holds `environment_id`.
-    fn stopped(environment_id: &str) -> Unreached {
-        Unreached {
-            error: err_exit("T3_SERVER_UNAVAILABLE", exit::UNAVAILABLE, "made up"),
-            stopped: Some(environment_id.to_string()),
         }
     }
 
@@ -779,10 +786,15 @@ mod tests {
         let down = discover_local(&b).await.unwrap_err();
         assert_eq!(code(&down.error), Some("T3_SERVER_UNAVAILABLE"));
         assert_eq!(down.stopped.as_deref(), Some(id.as_str()));
-        assert_eq!(forget(down).await.unwrap(), 1);
+        assert_eq!(forget(&b, down).await.unwrap(), 1);
+        // `keychain::delete` deletes until `security` finds no match, so a second call finds
+        // none. Both name this environment's login alone.
         let verb = "delete-generic-password";
         let deleted = [verb, "-s", "t3term", "-a", id.as_str()].map(String::from);
-        assert_eq!(keychain::fake::calls(), [deleted.to_vec()]);
+        assert_eq!(
+            keychain::fake::calls(),
+            [deleted.to_vec(), deleted.to_vec()]
+        );
         assert_eq!(keychain::fake::holds(&id), None);
         assert!(keychain::fake::holds(&other).is_some());
         let _ = std::fs::remove_file(lock_path(&id));
@@ -842,7 +854,7 @@ mod tests {
             };
             let unreached = discover_local(&target).await.unwrap_err();
             assert_eq!(unreached.stopped, None, "{expected}");
-            let error = forget(unreached).await.unwrap_err();
+            let error = forget(&target, unreached).await.unwrap_err();
             assert_eq!(code(&error), Some(expected));
             assert_eq!(b.paths(), ["/.well-known/t3/environment"], "{expected}");
             let held = keychain::fake::holds(&id);
@@ -872,38 +884,117 @@ mod tests {
             };
             let unreached = discover_local(&target).await.unwrap_err();
             assert_eq!(unreached.stopped, None, "{origin}");
-            let error = forget(unreached).await.unwrap_err();
+            let error = forget(&target, unreached).await.unwrap_err();
             assert_eq!(code(&error), Some(expected), "{origin}");
         }
         // A stopped server whose home holds no id names no login.
         std::fs::remove_file(home.path().join("userdata").join("environment-id")).unwrap();
         let down = discover_local(&b).await.unwrap_err();
         assert_eq!(down.stopped, None);
-        let error = forget(down).await.unwrap_err();
+        let error = forget(&b, down).await.unwrap_err();
         assert_eq!(code(&error), Some("T3_SERVER_UNAVAILABLE"));
         assert_eq!(keychain::fake::calls(), Vec::<Vec<String>>::new());
         assert!(keychain::fake::holds(&id).is_some());
     }
 
     /// `Session::login` holds the lock from its check to its save. Logout of a stopped server
-    /// doesn't wait for it or delete around it: it keeps the login and fails, and the next run
-    /// deletes it once the lock is free.
+    /// deletes nothing while another process holds it, and fails once it has waited as long as
+    /// it may. With the lock free, the same logout deletes the login.
     #[tokio::test]
     async fn forgetting_keeps_the_login_while_another_process_is_logging_in() {
         keychain::fake::reset(false);
+        let home = tempfile::tempdir().unwrap();
         let id = unique_id();
         keychain::fake::hold(&id, &fresh_login());
+        let b = environment_b(home.path(), &id);
         // The lock a login holds. It is another open file, so it conflicts as another
-        // process's would.
+        // process's would. It stays held until the first `forget` has returned, so how long
+        // that one may wait doesn't change what it finds.
         let login = lock_logins(&id).await.unwrap();
-        let error = forget(stopped(&id)).await.unwrap_err();
+        let down = discover_local(&b).await.unwrap_err();
+        let error = forget_within(&b, down, Duration::ZERO).await.unwrap_err();
         assert_eq!(code(&error), Some("T3_AUTH_FAILED"));
         assert_eq!(keychain::fake::calls(), Vec::<Vec<String>>::new());
         assert!(keychain::fake::holds(&id).is_some());
         drop(login);
-        assert_eq!(forget(stopped(&id)).await.unwrap(), 1);
+        let down = discover_local(&b).await.unwrap_err();
+        assert_eq!(forget(&b, down).await.unwrap(), 1);
         assert_eq!(keychain::fake::holds(&id), None);
         let _ = std::fs::remove_file(lock_path(&id));
+    }
+
+    /// Logout checks the server, then takes the lock and deletes. Here the server was stopped
+    /// at that check, then started, and another t3term saved a new login for it before logout
+    /// took the lock. Checked again under the lock, the server answers, so the new login stays
+    /// saved and unrevoked, and a logout once the server runs revokes it.
+    #[tokio::test]
+    async fn forgetting_keeps_a_login_saved_for_a_server_that_started_after_the_check() {
+        keychain::fake::reset(false);
+        let home = tempfile::tempdir().unwrap();
+        let id = unique_id();
+        keychain::fake::hold(&id, &fresh_login());
+        let b = environment_b(home.path(), &id);
+        let down = discover_local(&b).await.unwrap_err();
+        assert_eq!(down.stopped.as_deref(), Some(id.as_str()));
+        // B starts and records its origin, as T3 does once it listens, and another t3term
+        // saves a new login for it.
+        let descriptor = serde_json::json!({
+            "environmentId": id,
+            "serverVersion": "0.0.0",
+            "orchestrationProtocolVersion": 2,
+        });
+        let answer = fake::response("200 OK", &[], &descriptor.to_string());
+        let started = fake::Server::start(move |_| answer.clone());
+        let origin = &started.origin;
+        let record = serde_json::json!({"version": 1, "pid": 1, "origin": origin});
+        let record_path = home.path().join("userdata").join("server-runtime.json");
+        std::fs::write(record_path, record.to_string()).unwrap();
+        let replacement = SavedLogin {
+            session_id: "replacement".into(),
+            ..fresh_login()
+        };
+        keychain::fake::hold(&id, &replacement);
+        let error = forget(&b, down).await.unwrap_err();
+        assert_eq!(code(&error), Some("T3_AUTH_FAILED"));
+        assert_eq!(started.paths(), ["/.well-known/t3/environment"]);
+        assert_eq!(keychain::fake::calls(), Vec::<Vec<String>>::new());
+        assert_eq!(keychain::fake::holds(&id), Some(replacement));
+        let _ = std::fs::remove_file(lock_path(&id));
+    }
+
+    /// Checked again under the lock, a home made again with a new id, or one that now records
+    /// a server answering with an error, keeps the login too.
+    #[tokio::test]
+    async fn forgetting_keeps_the_login_when_the_home_changed_after_the_check() {
+        keychain::fake::reset(false);
+        let answer = fake::response("500 Internal Server Error", &[], "{}");
+        let failing = fake::Server::start(move |_| answer.clone());
+        let origin = &failing.origin;
+        let record = serde_json::json!({"version": 1, "pid": 1, "origin": origin});
+        let changes = [
+            ("environment-id", unique_id(), "T3_AUTH_FAILED"),
+            (
+                "server-runtime.json",
+                record.to_string(),
+                "T3_DESCRIPTOR_INVALID",
+            ),
+        ];
+        for (file, contents, expected) in changes {
+            let home = tempfile::tempdir().unwrap();
+            let id = unique_id();
+            let saved = fresh_login();
+            keychain::fake::hold(&id, &saved);
+            let b = environment_b(home.path(), &id);
+            let down = discover_local(&b).await.unwrap_err();
+            assert_eq!(down.stopped.as_deref(), Some(id.as_str()), "{file}");
+            std::fs::write(home.path().join("userdata").join(file), contents).unwrap();
+            let error = forget(&b, down).await.unwrap_err();
+            assert_eq!(code(&error), Some(expected), "{file}");
+            assert_eq!(keychain::fake::holds(&id), Some(saved), "{file}");
+            let _ = std::fs::remove_file(lock_path(&id));
+        }
+        assert_eq!(failing.paths(), ["/.well-known/t3/environment"]);
+        assert_eq!(keychain::fake::calls(), Vec::<Vec<String>>::new());
     }
 
     #[tokio::test]
@@ -913,7 +1004,7 @@ mod tests {
         let b = environment_b(home.path(), &unique_id());
         let down = discover_local(&b).await.unwrap_err();
         assert!(down.stopped.is_some());
-        assert_eq!(forget(down).await.unwrap(), 0);
+        assert_eq!(forget(&b, down).await.unwrap(), 0);
         assert_eq!(keychain::fake::calls(), Vec::<Vec<String>>::new());
         keychain::fake::reset(false);
     }

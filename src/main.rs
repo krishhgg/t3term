@@ -1178,9 +1178,10 @@ async fn logout(environment: Option<&str>, json_mode: bool) -> Result<i32> {
         },
         Target::Local(local) => match discovery::discover_local(local).await {
             Ok(runtime) => logged_out(&runtime).await?,
-            // `forget` removes this environment's login alone, and only when the check showed
-            // its server stopped. Any other failure is returned as it was.
-            Err(unreached) => match t3term::auth::forget(unreached).await? {
+            // `forget` removes this environment's login alone, and only when this check and a
+            // second one under the login lock both show its server stopped. Any other failure
+            // is returned as it was.
+            Err(unreached) => match t3term::auth::forget(local, unreached).await? {
                 0 => format!("No saved login for environment {}.", local.name),
                 _ => format!(
                     "Removed environment {}'s saved login from the Keychain. Its server is not running, so the login could not be revoked; it expires within 30 days of being issued.",
