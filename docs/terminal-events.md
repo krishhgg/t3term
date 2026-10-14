@@ -1,6 +1,6 @@
 # Terminal events
 
-`src/terminal.rs` reads one T3 terminal's streams as typed events and sends that terminal input, resizes and a close. It is the first part of the embedded terminal ([parity.md, group 15](parity.md#15-embedded-terminal)). Nothing in the TUI or the CLI calls it yet.
+`src/terminal.rs` reads one T3 terminal's streams as typed events and sends that terminal input, resizes and a close. It is the first part of the embedded terminal ([parity.md, group 15](parity.md#15-embedded-terminal)). The TUI's terminal drawer attaches, writes and resizes through it ([terminal-pane.md](terminal-pane.md)). The CLI doesn't call it.
 
 Everything here follows T3 Code at commit `f570bd2`, nightly v0.0.46-nightly.20261007.2787: `packages/contracts/src/terminal.ts` for the shapes, `rpc.ts` for the method names and `apps/server/src/terminal/Manager.ts` for what the server does.
 
@@ -28,7 +28,7 @@ while let Some(batch) = stream.next().await {
 | `terminal.close` | `terminal:operate` | `threadId`, `terminalId`, `deleteHistory` |
 | `subscribeTerminalMetadata` | `terminal:read` | `{}` |
 
-The scopes come from `apps/server/src/auth/RpcAuthorization.ts`. t3term asks for neither yet, so a saved login gets T3's `EnvironmentAuthorizationError`, whose message names the missing scope.
+The scopes come from `apps/server/src/auth/RpcAuthorization.ts`. The saved login holds neither, so a call on it gets T3's `EnvironmentAuthorizationError`, whose message names the missing scope. The terminal session holds both ([terminal-auth.md](terminal-auth.md)).
 
 An attach never sends `restartIfNotRunning` or `providerInstanceId`, so it never starts a shell that has exited again. Without a launch, T3 fails the attach with `TerminalSessionLookupError` if the terminal doesn't exist. With one, T3 starts a shell if the terminal doesn't exist and ignores the launch if it does. `Launch::for_thread` builds the launch the desktop sends: the thread's worktree as `cwd` if it has one, otherwise the project root, with `T3CODE_PROJECT_ROOT` and `T3CODE_WORKTREE_PATH` in `env`. A launch's `Debug` shows its environment keys and not their values.
 

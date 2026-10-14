@@ -1,6 +1,6 @@
 # Terminal emulator
 
-`TerminalEmulator` in `src/terminal_emulator.rs` keeps the screen of one terminal in memory and draws it into a ratatui buffer. It parses output with vte 0.15.0 into alacritty_terminal 0.26.0's `Term`, both pinned to exact versions. It opens no PTY, starts no thread and writes nothing to the host terminal, the clipboard or the window title. Nothing calls it yet. The TUI has no terminal pane, and t3term doesn't subscribe to T3's terminal events ([parity.md, group 15](parity.md#15-embedded-terminal)).
+`TerminalEmulator` in `src/terminal_emulator.rs` keeps the screen of one terminal in memory and draws it into a ratatui buffer. It parses output with vte 0.15.0 into alacritty_terminal 0.26.0's `Term`, both pinned to exact versions. It opens no PTY, starts no thread and writes nothing to the host terminal, the clipboard or the window title. The TUI's terminal drawer holds one while it shows, and feeds it the events of the open thread's terminal ([terminal-pane.md](terminal-pane.md)).
 
 ```rust
 let mut screen = TerminalEmulator::new(columns, rows);

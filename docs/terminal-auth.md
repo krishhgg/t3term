@@ -2,7 +2,7 @@
 
 T3 checks each terminal RPC against `terminal:read` or `terminal:operate`, never against the orchestration scopes (apps/server/src/auth/RpcAuthorization.ts:172-181 at T3 f570bd21). The saved login holds `orchestration:read` and `orchestration:operate` alone and stays that way, since it lasts 30 days in the Keychain. So the terminal gets a session and a WebSocket of its own.
 
-`Client::terminal_rpc` makes both. Nothing in the CLI or TUI calls it yet, so no t3term command issues a terminal session today.
+`Client::terminal_rpc` makes both. The TUI calls it the first time its terminal drawer shows ([terminal-pane.md](terminal-pane.md)), so a TUI that never shows the drawer issues no terminal session. No CLI command calls it.
 
 ## The session
 
@@ -73,4 +73,4 @@ The session lasts 12 hours, and nothing renews it. At T3 f570bd21, a socket's se
 - `TERMINAL_ACCESS_REFUSED` lasts until t3term starts again. After any other error, the next call checks the server and the session again.
 - While the client lives, a write T3 doesn't read waits on the open connection, and the 30-second silence check doesn't run until it ends. The login's connection works the same way. Dropping the client ends the wait, as [Closing](#closing) says.
 - An open terminal socket may outlive its 12-hour session, as [Closing](#closing) says.
-- The terminal itself, opening a shell and the TUI's terminal panel aren't built yet.
+- The drawer is the only caller, and it always uses `terminal:operate`. Nothing calls `terminal.observe`, so a session with `terminal:read` alone has no use yet.
