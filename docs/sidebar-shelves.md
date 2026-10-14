@@ -21,7 +21,7 @@ A closed shelf still lists the open thread, as `renderedSettledThreads` and `vis
 
 ## Keys and clicks
 
-In the sidebar, `w`, `d` and `e` open or close Working, Done and Settled, and a click on a heading does the same. In the composer the letters are text. The status line offers each key only while its heading is in the list. A click acts on the heading the last frame drew on that row, which is the one on screen.
+In the sidebar, `w`, `d` and `e` open or close Working, Done and Settled, and a click on a heading does the same. In the composer the letters are text. The status line offers each key only while its heading is in the list. A click acts on the heading the last frame drew on that row, which is the one on screen. Opening or closing a shelf moves the rows below its heading, so the next frame draws at once instead of waiting out the frame budget. Until it does, the sidebar forgets where it drew its cards and headings, and a click on the list does nothing rather than open a thread that has moved or fold another shelf.
 
 Closing the shelf that holds the highlight moves the highlight to the next thread below the shelf, or else the last one above. A list scrolled into the closed shelf's threads keeps the heading at the top. The draft, the open thread and the transcript's place stay as they were. Nothing goes to T3.
 

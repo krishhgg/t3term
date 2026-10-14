@@ -634,9 +634,7 @@ fn shelves<'a>(
     for thread in threads.iter().filter(|t| visible(t)) {
         let list = match shelf(thread, capabilities, now) {
             Shelf::Pinned => &mut shelves.pinned,
-            Shelf::Inbox if returns.is_some() && belongs_in_working(thread) => {
-                &mut shelves.working
-            }
+            Shelf::Inbox if returns.is_some() && belongs_in_working(thread) => &mut shelves.working,
             Shelf::Inbox => &mut shelves.inbox,
             Shelf::Working => &mut shelves.working,
             Shelf::Done => &mut shelves.done,
@@ -668,10 +666,7 @@ fn shelves<'a>(
 enum Row {
     /// A shelf's name over its threads. A heading under a thread has a blank line above it. One
     /// under another heading has none, so empty shelves stack.
-    Heading {
-        shelf: Shelf,
-        gap: bool,
-    },
+    Heading { shelf: Shelf, gap: bool },
     /// A thread's card.
     Thread(String),
     /// A settled thread's one-line row, after the GUI's slim row.
@@ -1001,6 +996,10 @@ impl Sidebar {
     /// heading first, so `rebuild` puts the highlight on the first thread below the heading
     /// and keeps the heading where it was. Otherwise both would land on whatever rows fill the
     /// old positions, which can be far down the list.
+    ///
+    /// The rows under the heading move, so the cards and headings the last frame drew take no
+    /// click until the next frame draws them where they are now. A click before then on the
+    /// list lands on nothing.
     pub fn toggle(&mut self, shelf: Shelf) -> Option<bool> {
         if !self.has_shelf(shelf) {
             return None;
@@ -1008,6 +1007,8 @@ impl Sidebar {
         let open = self.choices.open_mut(shelf)?;
         *open = !*open;
         let open = *open;
+        self.cards.clear();
+        self.headings.clear();
         let heading = self
             .rows
             .iter()
@@ -1184,7 +1185,8 @@ impl Sidebar {
                     // which has the word, is on screen even when the rest is cut off.
                     let top = list.y + lines.len() as u16;
                     let bottom = top + if slim { 1 } else { 3 };
-                    self.cards.push((top, bottom.min(list.bottom()), id.clone()));
+                    self.cards
+                        .push((top, bottom.min(list.bottom()), id.clone()));
                     let thread = view.shell.and_then(|shell| find_thread(shell, id));
                     self.drew_working |= thread.is_some_and(working);
                     let is_open = view.open_id == Some(id.as_str());
@@ -2011,7 +2013,11 @@ mod tests {
             ]
         );
         assert_eq!(
-            (sidebar.working_count, sidebar.done_count, sidebar.settled_count),
+            (
+                sidebar.working_count,
+                sidebar.done_count,
+                sidebar.settled_count
+            ),
             (0, 0, 1)
         );
         // An open Settled shelf lists its threads as slim rows.
@@ -3368,7 +3374,10 @@ mod tests {
         // Four rows leave the list two lines. The card's first line, word and all, takes the
         // top one, ahead of its shelf's heading.
         let lines = text(&render(&mut sidebar, Some(&listed), None, (30, 4)));
-        assert!(lines[2].contains("Working") && !lines[2].contains("Working ("), "{lines:#?}");
+        assert!(
+            lines[2].contains("Working") && !lines[2].contains("Working ("),
+            "{lines:#?}"
+        );
         assert!(lines[3].contains("Thread t"));
         assert!(sidebar.drew_working());
     }
@@ -3736,10 +3745,7 @@ mod tests {
         let threads = vec![new, finished_now, reopened];
         let returns = Returns::default();
         let shelves = shelves(&threads, ALL, now(), Some(&returns));
-        assert_eq!(
-            ids(&shelves.inbox),
-            ["old-finished-now", "reopened", "new"]
-        );
+        assert_eq!(ids(&shelves.inbox), ["old-finished-now", "reopened", "new"]);
 
         // A return the server doesn't stamp, seen at 11:55, tops them all.
         let returns = Returns {
@@ -3751,10 +3757,7 @@ mod tests {
             ms("2026-10-08T11:55:00.000Z")
         );
         let shelves = super::shelves(&threads, ALL, now(), Some(&returns));
-        assert_eq!(
-            ids(&shelves.inbox),
-            ["new", "old-finished-now", "reopened"]
-        );
+        assert_eq!(ids(&shelves.inbox), ["new", "old-finished-now", "reopened"]);
         // A run's request counts as a return too, and a finish time that doesn't parse
         // counts as none.
         let asked = with(
@@ -4038,6 +4041,48 @@ mod tests {
         let lines = text(&render(&mut sidebar, Some(&listed), None, (30, 24)));
         assert!(lines.iter().any(|line| line.contains("Working (2)")));
         assert!(!lines.iter().any(|line| line.contains("Thread w")));
+    }
+
+    #[test]
+    fn a_fold_forgets_the_cards_and_headings_the_last_frame_drew() {
+        let listed = shell(vec![
+            thread("a"),
+            busy("w", json!({})),
+            unseen("d", "11:00"),
+        ]);
+        let mut sidebar = Sidebar::default();
+        sidebar.rebuild(&listed.threads, ALL, None, now());
+        let lines = text(&render(&mut sidebar, Some(&listed), None, (30, 24)));
+        let heading = row_of(&lines, "Working (1)");
+        let card = row_of(&lines, "Thread w");
+        assert_eq!(sidebar.shelf_at(heading), Some(Shelf::Working));
+        assert_eq!(sidebar.thread_at(card), Some("w"));
+        let (list, border) = (sidebar.list, sidebar.border);
+
+        // Closing Working takes its card away and moves its heading down to the shelves at
+        // the bottom. Until the next frame no row takes a click as a card or a heading, and
+        // the list keeps its place, so the app knows a click there lands on nothing.
+        assert_eq!(sidebar.toggle(Shelf::Working), Some(false));
+        sidebar.rebuild(&listed.threads, ALL, None, now());
+        for y in 0..24 {
+            assert_eq!(sidebar.thread_at(y), None, "row {y}");
+            assert_eq!(sidebar.shelf_at(y), None, "row {y}");
+        }
+        assert_eq!((sidebar.list, sidebar.border), (list, border));
+
+        // The next frame draws the heading where it is now, and the card's old rows take
+        // nothing.
+        let lines = text(&render(&mut sidebar, Some(&listed), None, (30, 24)));
+        let moved = row_of(&lines, "Working (1)");
+        assert!(moved > heading, "{lines:#?}");
+        assert_eq!(sidebar.shelf_at(moved), Some(Shelf::Working));
+        assert_eq!(sidebar.shelf_at(heading), None);
+        assert_eq!(sidebar.thread_at(card), None);
+        assert_eq!(sidebar.thread_at(row_of(&lines, "Thread d")), Some("d"));
+
+        // A shelf the list has no heading for changes nothing, so it forgets nothing either.
+        assert_eq!(sidebar.toggle(Shelf::Snoozed), None);
+        assert_eq!(sidebar.shelf_at(moved), Some(Shelf::Working));
     }
 
     #[test]
@@ -4481,7 +4526,12 @@ mod tests {
         assert!(sidebar.select("t-search"));
         capture("shelves", &mut sidebar, Some(&demo), Some("t-search"));
         depth.set(Depth::Indexed);
-        capture("shelves-indexed", &mut sidebar, Some(&demo), Some("t-search"));
+        capture(
+            "shelves-indexed",
+            &mut sidebar,
+            Some(&demo),
+            Some("t-search"),
+        );
         depth.set(Depth::TrueColor);
 
         sidebar.toggle(Shelf::Settled);

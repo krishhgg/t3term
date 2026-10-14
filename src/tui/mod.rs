@@ -458,9 +458,9 @@ struct App {
     sidebar_width: Option<u16>,
     /// A drag of the sidebar's edge under way.
     drag: Option<Drag>,
-    /// Set when the sidebar is hidden, shown or resized, so the next frame draws at once
-    /// instead of waiting out the frame budget. Until it does, clicks would land on the old
-    /// layout.
+    /// Set when the sidebar is hidden, shown or resized, or one of its shelves opens or
+    /// closes, so the next frame draws at once instead of waiting out the frame budget. Until
+    /// it does, clicks would land on the old layout.
     layout_changed: bool,
     open: Option<OpenThread>,
     focus: Focus,
@@ -1187,7 +1187,8 @@ impl App {
     }
 
     /// Opens or closes `shelf` and remembers it, as the GUI does for Working. Nothing happens
-    /// while the list has no heading for it.
+    /// while the list has no heading for it. The cards below the heading move, so the next
+    /// frame draws at once, and until it does a click on the list lands on nothing.
     fn toggle_shelf(&mut self, shelf: Shelf) {
         let Some(open) = self.sidebar.toggle(shelf) else {
             return;
@@ -1198,6 +1199,7 @@ impl App {
             _ => settings.sidebar_settled_shelf_expanded = open,
         });
         self.rebuild_rows();
+        self.layout_changed = true;
     }
 
     fn shell_thread(&self, id: &str) -> Option<&Value> {
@@ -5858,7 +5860,15 @@ mod tests {
     #[test]
     fn a_hidden_sidebar_leaves_its_clicks_and_wheel_to_the_conversation() {
         let mut app = tui(&Settings::default());
-        let threads = vec![listed("a", "Alpha", "idle"), listed("b", "Bravo", "idle")];
+        // Two finished runs with no visit, which counts as seen, so both cards are in the inbox
+        // at the top of the list, and the empty Working, Done and Settled shelves sit at its
+        // bottom. A thread whose status is idle after a run reads Waiting and belongs in
+        // Working, which would put the cards at the bottom, over the composer once the sidebar
+        // hides.
+        let threads = vec![
+            listed("a", "Alpha", "completed"),
+            listed("b", "Bravo", "completed"),
+        ];
         app.on_shell_event(shell_snapshot(threads));
         app.open = Some(long_thread());
         assert!(app.sidebar.select("a"));
@@ -5870,12 +5880,28 @@ mod tests {
         let settled = row_showing(&rows, "Settled (0)");
         assert_eq!(settled, 23);
         assert_eq!(app.sidebar.shelf_at(settled), Some(Shelf::Settled));
+        let working = row_showing(&rows, "Working (0)");
+        assert_eq!(app.sidebar.shelf_at(working), Some(Shelf::Working));
 
         app.focus = Focus::Composer;
         ctrl_b(&mut app);
-        screen(&mut app, 80, 24);
-        assert_eq!(app.sidebar.thread_at(y), None);
-        assert_eq!(app.sidebar.shelf_at(settled), None);
+        let hidden = screen(&mut app, 80, 24);
+        // Hidden, no row takes a click as a card or a heading.
+        for row in 0..24 {
+            assert_eq!(app.sidebar.thread_at(row), None, "row {row}");
+            assert_eq!(app.sidebar.shelf_at(row), None, "row {row}");
+        }
+        // Bravo's old place is inside the transcript, and the Settled heading's is the status
+        // line.
+        let body = app.transcript_area;
+        assert!(
+            (body.x..body.right()).contains(&x) && (body.y..body.bottom()).contains(&y),
+            "({x}, {y}) is outside {body:?}"
+        );
+        assert!(
+            hidden[settled as usize].contains("Ctrl+B sidebar"),
+            "{hidden:#?}"
+        );
         // Hidden, the wheel there scrolls the transcript and the highlight stays on Alpha.
         assert!(mouse(&mut app, MouseEventKind::ScrollUp, x, y));
         assert_eq!(app.scroll.rows(), 3);
@@ -5941,7 +5967,10 @@ mod tests {
         press(&mut app, KeyCode::Char('e'));
         assert!(crate::settings::saved_in_test().sidebar_settled_shelf_expanded);
         let rows = screen(&mut app, 200, 30);
-        assert!(!shows(&rows, "Whiskey") && !shows(&rows, "Delta"), "{rows:#?}");
+        assert!(
+            !shows(&rows, "Whiskey") && !shows(&rows, "Delta"),
+            "{rows:#?}"
+        );
         let at = |label: &str| rows[row_showing(&rows, label) as usize].clone();
         assert!(at("Working (1) ").contains("─ ›"));
         assert!(at("Done (1) ").contains("─ ›"));
@@ -5965,6 +5994,81 @@ mod tests {
         assert_eq!(app.composer.text(), "d");
         assert!(!crate::settings::saved_in_test().sidebar_done_shelf_expanded);
         assert!(!shows(&screen(&mut app, 200, 30), "Delta"));
+    }
+
+    #[test]
+    fn a_fold_draws_at_once_and_its_old_rows_take_no_click_until_then() {
+        let mut app = tui(&Settings::default());
+        // Five inbox cards fill the list down to Working, so Done waits below the screen
+        // until Working closes and Done takes Whiskey's place.
+        let mut threads: Vec<Value> = (1..=5)
+            .map(|n| listed(&format!("a{n}"), &format!("Inbox {n}"), "completed"))
+            .collect();
+        let mut delta = listed("d", "Delta", "completed");
+        delta["latestRunCompletedAt"] = json!("2026-10-08T11:00:00.000Z");
+        delta["lastVisitedAt"] = json!("2026-10-08T10:00:00.000Z");
+        threads.extend([listed("w", "Whiskey", "running"), delta]);
+        app.on_shell_event(shell_snapshot(threads));
+        app.open = Some(long_thread());
+        app.composer.insert_str("half a thought");
+        assert_eq!(app.focus, Focus::Sidebar);
+        let rows = screen(&mut app, 200, 30);
+        let working = row_showing(&rows, "Working (1) ");
+        let whiskey = row_showing(&rows, "Whiskey");
+        assert_eq!(app.sidebar.shelf_at(working), Some(Shelf::Working));
+        assert_eq!(app.sidebar.thread_at(whiskey), Some("w"));
+        assert!(!shows(&rows, "Done ("), "{rows:#?}");
+        app.scroll.set(3);
+        let still = |app: &App| {
+            assert_eq!(app.focus, Focus::Sidebar);
+            assert_eq!(app.open.as_ref().map(|open| open.id.as_str()), Some("t"));
+            assert_eq!(app.composer.text(), "half a thought");
+        };
+
+        // `w` closes Working, and the next frame waits for nothing. Until it draws, a click
+        // where Whiskey's card or the Working heading was opens nothing and folds nothing.
+        press(&mut app, KeyCode::Char('w'));
+        assert!(app.layout_changed);
+        assert!(!crate::settings::saved_in_test().sidebar_working_shelf_expanded);
+        for row in 0..30 {
+            assert_eq!(app.sidebar.thread_at(row), None, "row {row}");
+            assert_eq!(app.sidebar.shelf_at(row), None, "row {row}");
+        }
+        for row in [working, whiskey - 1, whiskey] {
+            assert!(mouse(&mut app, CLICK, 5, row));
+        }
+        assert!(!crate::settings::saved_in_test().sidebar_working_shelf_expanded);
+        assert!(crate::settings::saved_in_test().sidebar_done_shelf_expanded);
+        assert_eq!(app.scroll.rows(), 3);
+        still(&app);
+
+        // The frame draws Done where Whiskey was, and those rows now take Done's clicks.
+        let rows = screen(&mut app, 200, 30);
+        assert!(!app.layout_changed);
+        assert!(!shows(&rows, "Whiskey"), "{rows:#?}");
+        let done = row_showing(&rows, "Done (1) ");
+        let delta = row_showing(&rows, "Delta");
+        assert_eq!(done, whiskey - 1);
+        assert_eq!(app.sidebar.shelf_at(working), Some(Shelf::Working));
+        assert_eq!(app.sidebar.shelf_at(done), Some(Shelf::Done));
+        assert_eq!(app.sidebar.thread_at(delta), Some("d"));
+
+        // A click on Done closes it, and a second click on the same row before the next
+        // frame does nothing, nor does one on Delta's old card.
+        assert!(mouse(&mut app, CLICK, 5, done));
+        assert!(app.layout_changed);
+        assert!(!crate::settings::saved_in_test().sidebar_done_shelf_expanded);
+        assert!(mouse(&mut app, CLICK, 5, done));
+        assert!(mouse(&mut app, CLICK, 5, delta));
+        assert!(!crate::settings::saved_in_test().sidebar_done_shelf_expanded);
+        assert_eq!(app.scroll.rows(), 3);
+        still(&app);
+        let rows = screen(&mut app, 200, 30);
+        assert!(!shows(&rows, "Delta"), "{rows:#?}");
+        let done = row_showing(&rows, "Done (1) ");
+        assert!(rows[done as usize].contains("─ ›"), "{rows:#?}");
+        assert_eq!(app.sidebar.shelf_at(done), Some(Shelf::Done));
+        still(&app);
     }
 
     #[test]
