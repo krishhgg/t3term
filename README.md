@@ -351,7 +351,7 @@ t3term reads the first 1,000 links of a thread and counts the rest in the footer
 
 <a href="docs/pull-request-panel-verification.md"><img src="docs/screenshots/linked-pull-requests-pane.png" alt="The Mixed: every state thread at 200x50. The details pane at the right shows Pull requests 11 and lists #62 Waiting for host state, #70, the stack #41, #42 and #43 with each layer further in, the chain #51, #52 and #53, #80, #60 Merged and #61 Closed, over the footer 9 open · 11 linked. The status line reads ↑↓ select · Enter details · ← thread · Esc leave · Alt+B close · Tab focus, and the composer holds draft kept" width="640"></a>
 
-The thread and its pull requests are invented and come from a fake T3 server. The image renders t3term's captured terminal cells in truecolor, not a screenshot of a terminal app. [Linked pull requests verification](docs/pull-request-panel-verification.md) lists what was checked at `407566d`, with a capture of a URL cut short in 256 colors, and what wasn't checked yet.
+The thread and its pull requests are invented and come from a fake T3 server. The image renders t3term's captured terminal cells in truecolor, not a screenshot of a terminal app. [Linked pull requests verification](docs/pull-request-panel-verification.md) lists what was checked at `407566d` and `eac6096`, including live link changes, with captures of a URL cut short in 256 colors and of the dialog after a resize.
 
 ### Tool calls and reasoning
 
