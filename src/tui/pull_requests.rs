@@ -587,7 +587,9 @@ fn chained(raws: Vec<Raw>) -> Vec<Entry> {
 /// host keeps it, as `resolveThreadPullRequestChains` groups them. Links in one host-native
 /// stack keep the order of the first one's layers. The others chain where one's base branch
 /// is another's head branch in the same repository, except where two links share that head.
-/// A cycle leaves each of its links alone.
+/// A cycle leaves each of its links alone, and the links that build on one stack apart from
+/// it. The desktop's walk from them carries on into the cycle and shows them all as one stack,
+/// in an order no branch gives. This walk stops where it comes back to a link it passed.
 fn stacks_of(raws: &[Raw]) -> Vec<(bool, Vec<usize>)> {
     let count = raws.len();
     let mut placed = vec![false; count];
@@ -669,12 +671,21 @@ fn stacks_of(raws: &[Raw]) -> Vec<(bool, Vec<usize>)> {
             layers.push(index);
             cursor = parent_of(index);
         }
+        // A walk that comes back to a link it passed has run into a cycle. That link and the
+        // ones the walk passed after it stand alone, and the links that build on them stack
+        // without them.
+        let cycle = layers.iter().position(|&index| Some(index) == cursor);
+        if let Some(start) = cycle {
+            for index in layers.drain(start..) {
+                stacks.push((false, vec![index]));
+            }
+        }
         layers.reverse();
         if !layers.is_empty() {
             stacks.push((false, layers));
         }
     }
-    // A cycle has no top, so each of its links stands alone.
+    // A cycle nothing else builds on has no top, so each of its links stands alone.
     for &index in &remaining {
         if !placed[index] {
             stacks.push((false, vec![index]));
@@ -1669,6 +1680,45 @@ mod tests {
             .collect()
     }
 
+    /// Each of `links`' numbers, how many layers of its stack lie under it and the stack its
+    /// bottom layer names, by number, so the order T3 sent them in doesn't change it.
+    fn layout_of(links: &[Value]) -> Vec<(u64, usize, Option<Chain>)> {
+        let list = list_of(&thread(links.to_vec()));
+        let mut shown: Vec<_> = entries(&list)
+            .iter()
+            .map(|entry| (entry.number, entry.depth, entry.chain))
+            .collect();
+        shown.sort_by_key(|&(number, ..)| number);
+        shown
+    }
+
+    /// Link `number` in no stack of two or more, as `layout_of` has it.
+    fn alone(number: u64) -> (u64, usize, Option<Chain>) {
+        (number, 0, None)
+    }
+
+    /// Every order of `links`.
+    fn orders(links: &[Value]) -> Vec<Vec<Value>> {
+        if links.len() < 2 {
+            return vec![links.to_vec()];
+        }
+        let mut all = Vec::new();
+        for (at, first) in links.iter().enumerate() {
+            let mut rest = links.to_vec();
+            rest.remove(at);
+            for mut order in orders(&rest) {
+                order.insert(0, first.clone());
+                all.push(order);
+            }
+        }
+        all
+    }
+
+    /// The numbers of `links`, in the order T3 sent them.
+    fn sent(links: &[Value]) -> Vec<&Value> {
+        links.iter().map(|link| &link["number"]).collect()
+    }
+
     fn key_text(entry: &Entry) -> String {
         let key = &entry.key;
         format!("{}/{}#{}", key.host, key.repository, key.number)
@@ -1990,6 +2040,95 @@ mod tests {
         assert!(rows[7].starts_with("  3 chained · Open"), "{rows:#?}");
         assert!(rows[9].starts_with("  ● #12"), "{rows:#?}");
         assert!(rows[12].starts_with("    ● #13"), "{rows:#?}");
+    }
+
+    #[test]
+    fn links_that_build_on_a_cycle_stack_apart_from_it_in_any_order() {
+        // #1 is on #2's head and #2 on #1's, and #3 builds on #1. The walk from #3 comes back
+        // to #1, so no link stacks on another, whatever order T3 sends them in.
+        let pair = [
+            link("o/r", 1, "b", "c"),
+            link("o/r", 2, "c", "b"),
+            link("o/r", 3, "d", "b"),
+        ];
+        // #3 on #2 instead.
+        let mut other = pair.clone();
+        other[2] = link("o/r", 3, "d", "c");
+        let three = [alone(1), alone(2), alone(3)];
+        for links in [pair.clone(), other] {
+            for order in orders(&links) {
+                assert_eq!(layout_of(&order), three, "{:?}", sent(&order));
+            }
+        }
+        // None of them reads as a layer or names a stack.
+        let rows = page_rows(list_of(&thread(pair.to_vec())), 40, 10);
+        for at in [0, 3, 6] {
+            assert!(rows[at].starts_with("● #"), "{rows:#?}");
+        }
+        assert!(!rows.join("\n").contains("chained"), "{rows:#?}");
+
+        // #5 is on its own head, and #6 builds on #5.
+        let own = [link("o/r", 5, "s", "s"), link("o/r", 6, "t", "s")];
+        let two = [alone(5), alone(6)];
+        for order in orders(&own) {
+            assert_eq!(layout_of(&order), two, "{:?}", sent(&order));
+        }
+        assert_eq!(layout_of(&own[..1]), [alone(5)]);
+
+        // #4 builds on #3, which builds on the cycle. #3 and #4 still stack, from #3 up.
+        let mut longer = pair.to_vec();
+        longer.push(link("o/r", 4, "e", "d"));
+        let derived = Chain {
+            native: false,
+            size: 2,
+        };
+        let expected = [alone(1), alone(2), (3, 0, Some(derived)), (4, 1, None)];
+        for order in orders(&longer) {
+            assert_eq!(layout_of(&order), expected, "{:?}", sent(&order));
+        }
+
+        // Beside a chain, a head two links share and a GitHub stack, which stack as before
+        // whichever link comes first.
+        let native = |number: u64| {
+            let mut pull = link("o/r", number, &format!("n{number}"), "main");
+            pull["stack"] = json!({"kind": "native", "id": "s1",
+                "layers": [{"number": 21}, {"number": 22}]});
+            pull
+        };
+        let mut mixed = [
+            link("o/r", 1, "x", "y"),
+            link("o/r", 2, "y", "x"),
+            link("o/r", 3, "z", "x"),
+            link("o/r", 11, "a", "main"),
+            link("o/r", 12, "b", "a"),
+            native(22),
+            native(21),
+            link("o/r", 31, "same", "main"),
+            link("o/r", 32, "same", "main"),
+            link("o/r", 33, "top", "same"),
+        ];
+        let github = Chain {
+            native: true,
+            size: 2,
+        };
+        let expected = [
+            alone(1),
+            alone(2),
+            alone(3),
+            (11, 0, Some(derived)),
+            (12, 1, None),
+            (21, 0, Some(github)),
+            (22, 1, None),
+            alone(31),
+            alone(32),
+            alone(33),
+        ];
+        for _ in 0..mixed.len() {
+            mixed.rotate_left(1);
+            assert_eq!(layout_of(&mixed), expected, "{:?}", sent(&mixed));
+            let reversed: Vec<Value> = mixed.iter().rev().cloned().collect();
+            assert_eq!(layout_of(&reversed), expected, "{:?}", sent(&reversed));
+        }
     }
 
     #[test]

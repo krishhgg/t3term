@@ -2704,13 +2704,10 @@ impl App {
             };
             self.draw_picker(frame, above);
         }
-        frame.render_widget(
-            Paragraph::new(self.status_line(status_area.width as usize, shown)),
-            status_area,
-        );
         // The details and the pull requests linked to the thread are worked out again only after
         // an event that can change them, or for another thread, and wrapped again only at
-        // another width.
+        // another width. That comes before the status line, so when T3 removes the link whose
+        // details show, the first frame without them offers the list's keys.
         let open_id = self.open.as_ref().map(|open| open.id.as_str());
         if self.details.wants(open_id) {
             let facts = details::Facts::of(open_id, self.details_record(), self.details_projects());
@@ -2721,6 +2718,10 @@ impl App {
             let list = pull_requests::List::of(open_id, self.details_record(), supported);
             self.details.pulls.set(list);
         }
+        frame.render_widget(
+            Paragraph::new(self.status_line(status_area.width as usize, shown)),
+            status_area,
+        );
         let now = self.now;
         match shown {
             Some(details::Layout::Pane) => {
@@ -10591,11 +10592,11 @@ mod tests {
         }
     }
 
-    /// Draws two frames `width` columns by `height` rows and checks the status line. The first
-    /// frame draws it as the second does, so its keys follow how that frame draws the details,
-    /// not how the frame before it did. With `esc`, the details' keys show it. Without, the
-    /// line offers no keys of theirs.
-    fn first_status(app: &mut App, width: u16, height: u16, esc: Option<&str>) {
+    /// Draws two frames `width` columns by `height` rows, checks the status line and returns
+    /// the first frame's. The first frame draws it as the second does, so its keys follow how
+    /// that frame draws the details and what they show, not what the frame before it drew.
+    /// With `esc`, the details' keys show it. Without, the line offers no keys of theirs.
+    fn first_status(app: &mut App, width: u16, height: u16, esc: Option<&str>) -> String {
         let row = Rect::new(0, height - 1, width, 1);
         let first = text_in(&cells(app, width, height), row);
         let layout = app.details.shown();
@@ -10609,6 +10610,7 @@ mod tests {
                 }
             }
         }
+        first
     }
 
     #[test]
@@ -10932,6 +10934,115 @@ mod tests {
                 first_status(&mut app, 40, 12, None);
                 assert_eq!(app.composer.text(), "draft");
             }
+        }
+    }
+
+    #[test]
+    fn the_first_frame_after_t3_changes_the_links_offers_the_keys_for_what_it_shows() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        // The pane, which a click gives the keyboard, then the dialog.
+        for (width, height, esc) in [(200, 50, "Esc leave"), (80, 24, "Esc close")] {
+            let size = format!("{width}x{height}");
+            let both = vec![linked(31, "Bound titles"), linked(32, "Lineage")];
+            let mut app = pulls_tui(both, false);
+            app.focus = Focus::Transcript;
+            cells(&mut app, width, height);
+            alt(&mut app, 'b');
+            cells(&mut app, width, height);
+            let drawn = app.details.drawn.expect("the details");
+            assert!(mouse(&mut app, CLICK, drawn.tabs[1].x, drawn.tabs[1].y));
+            assert_eq!(app.focus, Focus::Details);
+            let started = reads(&runtime);
+            // #32's details show, and the keys lead back to the list.
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            let status = first_status(&mut app, width, height, Some(esc));
+            assert!(status.contains("← list"), "{size}: {status:?}");
+            let mut builds = app.details.pulls.builds;
+
+            // The host syncs #32 as merged. A sync, a link and an unlink each reach the thread's
+            // watch as `thread.pull-request-synced` (apps/server/src/orchestration-v2/
+            // Orchestrator.ts:3188-3194 in the nightly), which carries the whole thread
+            // (packages/contracts/src/orchestrationV2.ts:1665-1672). #32's details still show,
+            // so the first frame after still offers the list.
+            let mut merged = linked(32, "Lineage");
+            merged["snapshot"]["state"] = json!("merged");
+            let synced = linked_thread(vec![linked(31, "Bound titles"), merged.clone()]);
+            app.on_thread_event(live(2, "thread.pull-request-synced", synced));
+            let status = first_status(&mut app, width, height, Some(esc));
+            assert!(status.contains("← list"), "{size}: {status:?}");
+            let text = details_after(&mut app, width, height);
+            assert!(text.contains("2 of 2"), "{size}: {text}");
+            assert!(text.contains("Merged"), "{size}: {text}");
+            // T3 unlinks #31, and the first frame still offers the list, where ← leads.
+            let unlinked = linked_thread(vec![merged]);
+            app.on_thread_event(live(3, "thread.pull-request-synced", unlinked));
+            let status = first_status(&mut app, width, height, Some(esc));
+            assert!(status.contains("← list"), "{size}: {status:?}");
+            let text = details_after(&mut app, width, height);
+            assert!(text.contains("1 of 1"), "{size}: {text}");
+            builds += 2;
+            assert_eq!(app.details.pulls.builds, builds, "{size}");
+            press(&mut app, KeyCode::Left);
+            assert!(!app.details.pulls.viewing(), "{size}");
+            assert_eq!(app.details.tab(), details::Tab::PullRequests, "{size}");
+
+            // T3 unlinks #32 while its details show, and links #31 again. The first frame after
+            // shows the list, and its keys say ← goes to the thread's tab, as it then does.
+            press(&mut app, KeyCode::Enter);
+            cells(&mut app, width, height);
+            let back = linked_thread(vec![linked(31, "Bound titles")]);
+            app.on_thread_event(live(4, "thread.pull-request-synced", back));
+            let status = first_status(&mut app, width, height, Some(esc));
+            assert!(status.contains("← thread"), "{size}: {status:?}");
+            assert!(!status.contains("← list"), "{size}: {status:?}");
+            assert!(!app.details.pulls.viewing(), "{size}");
+            let text = details_after(&mut app, width, height);
+            assert!(text.contains("#31 Bound titles"), "{size}: {text}");
+            assert!(!text.contains("← List"), "{size}: {text}");
+            builds += 1;
+            assert_eq!(app.details.pulls.builds, builds, "{size}");
+            press(&mut app, KeyCode::Left);
+            assert_eq!(app.details.tab(), details::Tab::Thread, "{size}");
+
+            // The environment stops linking pull requests to threads while #31's details show.
+            // The first frame after says so and offers the list's keys too.
+            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Enter);
+            let text = details_after(&mut app, width, height);
+            assert!(text.contains("1 of 1"), "{size}: {text}");
+            let off = json!({"threadPullRequests": false});
+            app.on_config_event(config_snapshot(Vec::new(), off));
+            let status = first_status(&mut app, width, height, Some(esc));
+            assert!(status.contains("← thread"), "{size}: {status:?}");
+            let text = details_after(&mut app, width, height);
+            assert!(text.contains("Linked pull requests unavailable"), "{text}");
+            assert!(!app.details.pulls.viewing(), "{size}");
+
+            // A ← that comes before the frame does what the last frame offered. With #31's
+            // details showing again, T3 unlinks it, and ← then leads to the list.
+            let on = json!({"threadPullRequests": true});
+            app.on_config_event(config_snapshot(Vec::new(), on));
+            cells(&mut app, width, height);
+            press(&mut app, KeyCode::Enter);
+            let text = details_after(&mut app, width, height);
+            assert!(text.contains("1 of 1"), "{size}: {text}");
+            let none = linked_thread(Vec::new());
+            app.on_thread_event(live(5, "thread.pull-request-synced", none));
+            press(&mut app, KeyCode::Left);
+            assert_eq!(app.details.tab(), details::Tab::PullRequests, "{size}");
+            let status = first_status(&mut app, width, height, Some(esc));
+            assert!(status.contains("← thread"), "{size}: {status:?}");
+            let text = details_after(&mut app, width, height);
+            assert!(text.contains("No linked pull requests"), "{size}: {text}");
+            builds += 3;
+            assert_eq!(app.details.pulls.builds, builds, "{size}");
+
+            // None of it moved the keyboard, touched the draft or asked T3 for anything.
+            assert_eq!(app.focus, Focus::Details, "{size}");
+            assert_eq!(app.composer.text(), "draft");
+            assert_eq!(reads(&runtime), started, "{size}");
         }
     }
 
