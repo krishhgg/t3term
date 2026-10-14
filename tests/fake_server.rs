@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, poll};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
@@ -1134,6 +1134,61 @@ async fn dropping_an_unaccepted_chunk_or_the_stream_interrupts_it_and_acks_nothi
     let interrupted = refusal(&id, json!({"_tag": "Interrupt"}));
     send(&mut socket, interrupted).await;
     assert_eq!(sent(&rpc, &mut socket).await, [interrupt(&id)]);
+}
+
+/// Each read below is polled once, with this task's waker, while the stream has nothing for
+/// it, and then dropped, as a `select!` drops the branch that loses. The Box owns the read,
+/// so dropping the Box ends the read and its borrow of the stream.
+#[tokio::test]
+async fn cancelling_a_waiting_read_loses_no_chunk_or_end_and_sends_nothing() {
+    let (rpc, mut socket) = connected().await;
+    let (mut stream, id) = open(&rpc, &mut socket, limits(4, 4096)).await;
+
+    // A read cancelled before a chunk arrives. The next read waits, and the chunk wakes it.
+    let mut read = Box::pin(stream.next());
+    assert!(poll!(&mut read).is_pending());
+    drop(read);
+    let mut read = Box::pin(stream.next());
+    assert!(poll!(&mut read).is_pending());
+    send(&mut socket, chunk(&id, json!(["a"]))).await;
+    let a = within(read).await.unwrap().unwrap();
+    // Neither the cancelled read nor the chunk's arrival sent anything. Accepting sends one Ack.
+    nothing_sent(&rpc, &mut socket).await;
+    assert_eq!(a.accept(), [json!("a")]);
+    assert_eq!(sent(&rpc, &mut socket).await, [ack(&id)]);
+
+    // A read the next chunk wakes, cancelled before it returns the chunk, leaves it queued.
+    let mut read = Box::pin(stream.next());
+    assert!(poll!(&mut read).is_pending());
+    send(&mut socket, chunk(&id, json!(["b"]))).await;
+    // Once nothing_sent returns, the reader has queued b and woken the read.
+    nothing_sent(&rpc, &mut socket).await;
+    drop(read);
+    let b = next_chunk(&mut stream).await;
+    assert_eq!(b.accept(), [json!("b")]);
+    assert_eq!(sent(&rpc, &mut socket).await, [ack(&id)]);
+
+    // A read cancelled before T3 ends the stream. A later read returns the end without
+    // another chunk.
+    let mut read = Box::pin(stream.next());
+    assert!(poll!(&mut read).is_pending());
+    drop(read);
+    send(&mut socket, normal_end(&id)).await;
+    nothing_sent(&rpc, &mut socket).await;
+    assert!(end(&mut stream).await.is_none());
+
+    // A read that T3's failure wakes, cancelled before it returns the failure.
+    let (mut failed, failed_id) = open(&rpc, &mut socket, limits(4, 4096)).await;
+    let mut read = Box::pin(failed.next());
+    assert!(poll!(&mut read).is_pending());
+    let reason = json!({"_tag": "Fail", "error": {"_tag": "ExampleError", "message": "Refused"}});
+    send(&mut socket, refusal(&failed_id, reason)).await;
+    nothing_sent(&rpc, &mut socket).await;
+    drop(read);
+    match ended_with(&mut failed).await {
+        RpcError::Failed { message, .. } => assert_eq!(message, "Refused"),
+        other => panic!("expected the failure, got {other:?}"),
+    }
 }
 
 #[tokio::test]
