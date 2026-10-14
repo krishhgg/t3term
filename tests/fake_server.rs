@@ -1582,8 +1582,9 @@ async fn a_frame_t3term_cannot_parse_ends_every_call_and_stream_with_a_protocol_
 }
 
 /// A binary message of UTF-8 reads as a text one does. Raw multi-byte text and a pair's
-/// escapes stay as they are, and each half becomes U+FFFD. A legacy stream acks its chunk on
-/// arrival, and a bounded stream acks its chunk once the caller accepts it.
+/// escapes stay as they are, and each half becomes U+FFFD. A legacy stream acks its chunk once
+/// on arrival and returns its values one at a time, and a bounded stream acks its chunk once
+/// the caller accepts it.
 #[tokio::test]
 async fn a_binary_frame_of_utf8_reads_and_is_acked_as_a_text_frame_is() {
     let (rpc, mut socket) = connected().await;
@@ -1601,7 +1602,9 @@ async fn a_binary_frame_of_utf8_reads_and_is_acked_as_a_text_frame_is() {
 
     let read = json!(["é漢🙂", "🙂", "a\u{fffd}b", {"label": read_label()}]);
     assert_eq!(within(recv(&mut socket)).await, ack(&legacy_id));
-    assert_eq!(within(legacy.next()).await.unwrap().unwrap(), read);
+    for value in read.as_array().unwrap() {
+        assert_eq!(within(legacy.next()).await.unwrap().unwrap(), *value);
+    }
     let arrived = next_chunk(&mut bounded).await;
     nothing_sent(&rpc, &mut socket).await;
     assert_eq!(Value::from(arrived.accept()), read);
