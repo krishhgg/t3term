@@ -24,7 +24,7 @@ use serde::{Deserialize, Serialize};
 
 use crate::discovery::home_dir;
 
-#[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 #[serde(default, rename_all = "camelCase")]
 pub struct Settings {
     /// Show every reasoning block and tool call in full, including for finished runs.
@@ -33,14 +33,24 @@ pub struct Settings {
     /// shares the key. Off, the default, every message from the TUI runs in Build, and a thread
     /// left in Plan goes back to Build with its next message. The CLI's `--plan` ignores it.
     pub plan_mode_enabled: bool,
-    /// Move threads with a run under way out of Active into a Working shelf of their own, like
-    /// the desktop's "Working shelf" setting, which shares the key. Read at start, like
-    /// `plan_mode_enabled`, so a change takes effect when t3term starts again.
+    /// Move threads with a run under way out of the inbox into a Working shelf of their own,
+    /// like the desktop's "Working shelf" setting, which shares the key. The desktop starts
+    /// with it off. t3term starts with it on, so the sidebar shows what is working without an
+    /// edit to this file. Read at start, like `plan_mode_enabled`, so a change takes effect
+    /// when t3term starts again. `upgrade` says what a file from before that gets.
     pub sidebar_working_shelf_enabled: bool,
     /// Whether the Working shelf lists every thread in it or only its heading. `w` and a click
     /// on the heading save it. The desktop keeps its own in the browser's storage, so this key
     /// is t3term's.
     pub sidebar_working_shelf_expanded: bool,
+    /// Whether the Done shelf, the finished runs nobody has looked at since, lists them or only
+    /// its heading. `d` and a click on the heading save it. The desktop has no Done shelf, so
+    /// this key is t3term's.
+    pub sidebar_done_shelf_expanded: bool,
+    /// Whether the Settled shelf lists its threads or only its heading. `e` and a click on the
+    /// heading save it. The desktop keeps its own in the browser's storage and starts it
+    /// closed, as t3term does, so this key is t3term's.
+    pub sidebar_settled_shelf_expanded: bool,
     /// Whether the main sidebar is hidden. Ctrl+B and the toggle at the top left of the
     /// conversation save it. The desktop writes its choice to a cookie that it never reads back,
     /// so it opens with the sidebar shown each time, and this key is t3term's. A file without it
@@ -52,6 +62,56 @@ pub struct Settings {
     /// browser's storage, under `chat_thread_sidebar_width`, so this key is t3term's.
     #[serde(skip_serializing_if = "Option::is_none")]
     pub sidebar_width: Option<u16>,
+    /// The layout of the sidebar's shelves the file was last saved with. A file from before
+    /// version 1 has no key, which reads as 0 rather than as the default, and `upgrade` brings
+    /// it up to date. Every save writes the current version.
+    #[serde(default)]
+    pub sidebar_shelves_version: u32,
+}
+
+/// The version of the sidebar's shelves this build saves. Version 1 has the Working, Done and
+/// Settled shelves, each with its own key.
+const SHELVES_VERSION: u32 = 1;
+
+impl Default for Settings {
+    fn default() -> Self {
+        Settings {
+            verbose: false,
+            plan_mode_enabled: false,
+            sidebar_working_shelf_enabled: true,
+            sidebar_working_shelf_expanded: true,
+            sidebar_done_shelf_expanded: true,
+            sidebar_settled_shelf_expanded: false,
+            sidebar_hidden: false,
+            sidebar_width: None,
+            sidebar_shelves_version: SHELVES_VERSION,
+        }
+    }
+}
+
+impl Settings {
+    /// Brings a file from before version 1 of the shelves up to it. Every save before then
+    /// wrote both Working keys, so a `false` there is almost always the old default rather
+    /// than a choice. A file with the shelf off gets it on and open, as a new file has it.
+    /// Nothing in the TUI turned the shelf on, so a file with it on was edited by hand, and
+    /// whether it is open came from `w`: both stay. The next save writes the version, so a
+    /// choice made after that stays too. A file that is never saved upgrades the same way at
+    /// each start.
+    fn upgrade(mut self) -> Self {
+        if self.sidebar_shelves_version < SHELVES_VERSION {
+            if !self.sidebar_working_shelf_enabled {
+                self.sidebar_working_shelf_enabled = true;
+                self.sidebar_working_shelf_expanded = true;
+            }
+            self.sidebar_shelves_version = SHELVES_VERSION;
+        }
+        self
+    }
+}
+
+/// The settings in `raw`, upgraded to the current shelves.
+fn parse(raw: &[u8]) -> serde_json::Result<Settings> {
+    serde_json::from_slice(raw).map(Settings::upgrade)
 }
 
 fn path() -> PathBuf {
@@ -71,7 +131,7 @@ fn beside(path: &Path, suffix: &str) -> PathBuf {
 fn read(path: &Path) -> Settings {
     std::fs::read(path)
         .ok()
-        .and_then(|raw| serde_json::from_slice(&raw).ok())
+        .and_then(|raw| parse(&raw).ok())
         .unwrap_or_default()
 }
 
@@ -80,7 +140,7 @@ fn read(path: &Path) -> Settings {
 /// saving the change would put the defaults over whatever it holds.
 fn read_for_change(path: &Path) -> io::Result<Settings> {
     match std::fs::read(path) {
-        Ok(raw) => Ok(serde_json::from_slice(&raw)?),
+        Ok(raw) => Ok(parse(&raw)?),
         Err(error) if error.kind() == io::ErrorKind::NotFound => Ok(Settings::default()),
         Err(error) => Err(error),
     }
@@ -258,24 +318,29 @@ mod tests {
         Some((metadata.dev(), metadata.ino()))
     }
 
+    /// What the file at `path` holds, as JSON.
+    fn saved_json(path: &Path) -> serde_json::Value {
+        serde_json::from_str(&std::fs::read_to_string(path).unwrap()).unwrap()
+    }
+
     #[test]
     fn unknown_and_missing_fields_fall_back_to_the_defaults() {
         // A file from a later version, and one from an earlier one.
-        let later: Settings = serde_json::from_str(r#"{"verbose": true, "future": 3}"#).unwrap();
+        let later = parse(br#"{"verbose": true, "future": 3}"#).unwrap();
         assert!(later.verbose);
-        let earlier: Settings = serde_json::from_str("{}").unwrap();
+        let earlier = parse(b"{}").unwrap();
         assert_eq!(earlier, Settings::default());
         assert!(!earlier.verbose);
         // A file from before plan mode was a setting hides Build and Plan, as the desktop does.
-        let before_plan: Settings = serde_json::from_str(r#"{"verbose": true}"#).unwrap();
+        let before_plan = parse(br#"{"verbose": true}"#).unwrap();
         assert!(!before_plan.plan_mode_enabled);
         // A file that holds something else entirely fails, and `load` then uses the defaults.
-        assert!(serde_json::from_str::<Settings>(r#""verbose""#).is_err());
+        assert!(parse(br#""verbose""#).is_err());
     }
 
     #[test]
     fn plan_mode_uses_the_desktops_key() {
-        let on: Settings = serde_json::from_str(r#"{"planModeEnabled": true}"#).unwrap();
+        let on = parse(br#"{"planModeEnabled": true}"#).unwrap();
         assert!(on.plan_mode_enabled);
         assert!(!on.verbose);
         let saved = serde_json::to_value(&on).unwrap();
@@ -284,46 +349,125 @@ mod tests {
             serde_json::json!({
                 "verbose": false,
                 "planModeEnabled": true,
-                "sidebarWorkingShelfEnabled": false,
-                "sidebarWorkingShelfExpanded": false,
+                "sidebarWorkingShelfEnabled": true,
+                "sidebarWorkingShelfExpanded": true,
+                "sidebarDoneShelfExpanded": true,
+                "sidebarSettledShelfExpanded": false,
                 "sidebarHidden": false,
+                "sidebarShelvesVersion": 1,
             })
         );
     }
 
     #[test]
-    fn the_working_shelf_uses_the_desktops_key_and_starts_off() {
-        let before: Settings =
-            serde_json::from_str(r#"{"verbose": true, "planModeEnabled": true}"#).unwrap();
-        assert!(!before.sidebar_working_shelf_enabled);
-        assert!(
-            !before.sidebar_working_shelf_expanded,
-            "the shelf starts collapsed"
-        );
+    fn a_new_file_opens_working_and_done_and_closes_settled() {
+        let fresh = Settings::default();
+        assert!(fresh.sidebar_working_shelf_enabled);
+        assert!(fresh.sidebar_working_shelf_expanded);
+        assert!(fresh.sidebar_done_shelf_expanded);
+        assert!(!fresh.sidebar_settled_shelf_expanded);
+        assert_eq!(fresh.sidebar_shelves_version, SHELVES_VERSION);
 
-        let on: Settings = serde_json::from_str(r#"{"sidebarWorkingShelfEnabled": true}"#).unwrap();
-        assert!(on.sidebar_working_shelf_enabled);
-        assert!(!on.sidebar_working_shelf_expanded);
-        assert!(!on.plan_mode_enabled && !on.verbose);
+        // No file reads as a new one, and so does one that doesn't parse.
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("settings.json");
+        assert_eq!(read(&path), fresh);
+        std::fs::write(&path, "{").unwrap();
+        assert_eq!(read(&path), fresh);
 
-        let open: Settings =
-            serde_json::from_str(r#"{"sidebarWorkingShelfExpanded": true}"#).unwrap();
-        assert!(open.sidebar_working_shelf_expanded);
-        assert!(!open.sidebar_working_shelf_enabled);
+        // The first change writes every shelf's key and the version.
+        std::fs::remove_file(&path).unwrap();
+        update_at(&path, |settings| settings.verbose = true).unwrap();
+        let saved = saved_json(&path);
+        assert_eq!(saved["sidebarWorkingShelfEnabled"], true);
+        assert_eq!(saved["sidebarWorkingShelfExpanded"], true);
+        assert_eq!(saved["sidebarDoneShelfExpanded"], true);
+        assert_eq!(saved["sidebarSettledShelfExpanded"], false);
+        assert_eq!(saved["sidebarShelvesVersion"], 1);
     }
 
     #[test]
-    fn opening_the_working_shelf_keeps_the_other_settings() {
-        // The shelf turned on by hand, then `w` pressed in the TUI and then `t`.
+    fn a_file_from_before_the_shelves_gets_working_once() {
+        // What every save before version 1 wrote, for a user who never turned the shelf on.
+        let home = tempfile::tempdir().unwrap();
+        let path = home.path().join("settings.json");
+        let legacy = r#"{
+            "verbose": true,
+            "planModeEnabled": false,
+            "sidebarWorkingShelfEnabled": false,
+            "sidebarWorkingShelfExpanded": false,
+            "sidebarHidden": false,
+            "sidebarWidth": 30
+        }"#;
+        std::fs::write(&path, legacy).unwrap();
+        let upgraded = Settings {
+            verbose: true,
+            sidebar_width: Some(30),
+            ..Settings::default()
+        };
+        assert_eq!(read(&path), upgraded);
+        // Reading writes nothing, so the next start upgrades the file the same way.
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), legacy);
+        assert_eq!(read(&path), upgraded);
+
+        // `w` closes Working and `e` opens Settled. The first save writes the version, so
+        // both choices are still there at the next start.
+        update_at(&path, |settings| {
+            settings.sidebar_working_shelf_expanded = false;
+        })
+        .unwrap();
+        update_at(&path, |settings| {
+            settings.sidebar_settled_shelf_expanded = true;
+        })
+        .unwrap();
+        let chosen = Settings {
+            sidebar_working_shelf_expanded: false,
+            sidebar_settled_shelf_expanded: true,
+            ..upgraded
+        };
+        assert_eq!(read(&path), chosen);
+        assert_eq!(saved_json(&path)["sidebarShelvesVersion"], 1);
+        assert_eq!(saved_json(&path)["sidebarWorkingShelfExpanded"], false);
+
+        // Working turned off by hand once the file has the version stays off, through a save.
+        std::fs::write(
+            &path,
+            r#"{"sidebarWorkingShelfEnabled": false, "sidebarShelvesVersion": 1}"#,
+        )
+        .unwrap();
+        assert!(!read(&path).sidebar_working_shelf_enabled);
+        update_at(&path, |settings| settings.verbose = false).unwrap();
+        assert!(!read(&path).sidebar_working_shelf_enabled);
+
+        // A file from before version 1 with the shelf turned on by hand keeps whether `w` left
+        // it open.
+        std::fs::write(
+            &path,
+            r#"{"sidebarWorkingShelfEnabled": true, "sidebarWorkingShelfExpanded": false}"#,
+        )
+        .unwrap();
+        let kept = read(&path);
+        assert!(kept.sidebar_working_shelf_enabled);
+        assert!(!kept.sidebar_working_shelf_expanded);
+        assert_eq!(kept.sidebar_shelves_version, SHELVES_VERSION);
+    }
+
+    #[test]
+    fn opening_and_closing_a_shelf_keeps_the_other_settings() {
+        // Plan mode turned on by hand, then `w`, `d` and `t` pressed in the TUI.
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("settings.json");
         std::fs::write(
             &path,
-            r#"{"planModeEnabled": true, "sidebarWorkingShelfEnabled": true}"#,
+            r#"{"planModeEnabled": true, "sidebarShelvesVersion": 1}"#,
         )
         .unwrap();
         update_at(&path, |settings| {
-            settings.sidebar_working_shelf_expanded = true;
+            settings.sidebar_working_shelf_expanded = false;
+        })
+        .unwrap();
+        update_at(&path, |settings| {
+            settings.sidebar_done_shelf_expanded = false;
         })
         .unwrap();
         update_at(&path, |settings| settings.verbose = true).unwrap();
@@ -333,21 +477,25 @@ mod tests {
                 verbose: true,
                 plan_mode_enabled: true,
                 sidebar_working_shelf_enabled: true,
-                sidebar_working_shelf_expanded: true,
+                sidebar_working_shelf_expanded: false,
+                sidebar_done_shelf_expanded: false,
+                sidebar_settled_shelf_expanded: false,
                 sidebar_hidden: false,
                 sidebar_width: None,
+                sidebar_shelves_version: 1,
             }
         );
 
-        // Closing it again leaves the switch alone.
+        // Opening Working again leaves the switch and the other shelves alone.
         update_at(&path, |settings| {
-            settings.sidebar_working_shelf_expanded = false;
+            settings.sidebar_working_shelf_expanded = true;
         })
         .unwrap();
-        let saved: serde_json::Value =
-            serde_json::from_str(&std::fs::read_to_string(&path).unwrap()).unwrap();
+        let saved = saved_json(&path);
         assert_eq!(saved["sidebarWorkingShelfEnabled"], true);
-        assert_eq!(saved["sidebarWorkingShelfExpanded"], false);
+        assert_eq!(saved["sidebarWorkingShelfExpanded"], true);
+        assert_eq!(saved["sidebarDoneShelfExpanded"], false);
+        assert_eq!(saved["sidebarSettledShelfExpanded"], false);
         assert_eq!(saved["planModeEnabled"], true);
     }
 
@@ -363,7 +511,7 @@ mod tests {
             assert!(!settings.sidebar_hidden, "{raw}");
         }
         assert!(!Settings::default().sidebar_hidden);
-        let hidden: Settings = serde_json::from_str(r#"{"sidebarHidden": true}"#).unwrap();
+        let hidden = parse(br#"{"sidebarHidden": true}"#).unwrap();
         assert_eq!(
             hidden,
             Settings {
@@ -377,16 +525,19 @@ mod tests {
 
     #[test]
     fn hiding_the_sidebar_keeps_the_other_settings() {
-        // Every other setting turned on by hand, then Ctrl+B pressed in the TUI.
+        // Every other setting changed from its default by hand, then Ctrl+B pressed in the TUI.
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("settings.json");
         let others = Settings {
             verbose: true,
             plan_mode_enabled: true,
-            sidebar_working_shelf_enabled: true,
-            sidebar_working_shelf_expanded: true,
+            sidebar_working_shelf_enabled: false,
+            sidebar_working_shelf_expanded: false,
+            sidebar_done_shelf_expanded: false,
+            sidebar_settled_shelf_expanded: true,
             sidebar_hidden: false,
             sidebar_width: Some(42),
+            sidebar_shelves_version: SHELVES_VERSION,
         };
         std::fs::write(&path, serde_json::to_string(&others).unwrap()).unwrap();
         update_at(&path, |settings| settings.sidebar_hidden = true).unwrap();
@@ -425,7 +576,7 @@ mod tests {
             let settings: Settings = serde_json::from_str(raw).unwrap();
             assert_eq!(settings.sidebar_width, None, "{raw}");
         }
-        let chosen: Settings = serde_json::from_str(r#"{"sidebarWidth": 42}"#).unwrap();
+        let chosen = parse(br#"{"sidebarWidth": 42}"#).unwrap();
         assert_eq!(
             chosen,
             Settings {
@@ -446,16 +597,20 @@ mod tests {
 
     #[test]
     fn resizing_the_sidebar_keeps_the_other_settings() {
-        // Every other setting turned on by hand, then the sidebar's edge dragged in the TUI.
+        // Every other setting changed from its default by hand, then the sidebar's edge dragged
+        // in the TUI.
         let home = tempfile::tempdir().unwrap();
         let path = home.path().join("settings.json");
         let others = Settings {
             verbose: true,
             plan_mode_enabled: true,
-            sidebar_working_shelf_enabled: true,
-            sidebar_working_shelf_expanded: true,
+            sidebar_working_shelf_enabled: false,
+            sidebar_working_shelf_expanded: false,
+            sidebar_done_shelf_expanded: false,
+            sidebar_settled_shelf_expanded: true,
             sidebar_hidden: true,
             sidebar_width: None,
+            sidebar_shelves_version: SHELVES_VERSION,
         };
         std::fs::write(&path, serde_json::to_string(&others).unwrap()).unwrap();
         update_at(&path, |settings| settings.sidebar_width = Some(42)).unwrap();

@@ -11,6 +11,7 @@ mod composer;
 mod details;
 mod environment;
 mod label;
+mod lineage;
 mod markdown;
 mod picker;
 mod plan;
@@ -53,7 +54,7 @@ use environment::{Feed, Identity};
 use markdown::Styles;
 use picker::{Item, Kind, Pick};
 use scroll::{Pin, Scroll};
-use sidebar::{Badges, Capabilities, Sidebar, View};
+use sidebar::{Badges, Capabilities, Shelf, ShelfChoices, Sidebar, View};
 use theme::{Theme, duration_label, model_display_name, now_ms, parse_iso_ms, runtime_mode_label};
 use unsent::{Failed, Unsent};
 
@@ -75,6 +76,9 @@ const NARROWEST_SIDEBAR: u16 = 20;
 const NARROWEST_MAIN: u16 = 20;
 /// How far `[` and `]` move the sidebar's edge, in columns.
 const SIDEBAR_STEP: u16 = 2;
+/// The fewest rows a screen has for the sidebar and the main column to keep a blank row at the
+/// top, over the wordmark and the breadcrumb.
+const ROOMY: u16 = 20;
 /// The columns of the thread's title the breadcrumb keeps before it gives any to the
 /// environment, while the sidebar doesn't show the environment.
 const KEPT_TITLE: usize = 16;
@@ -456,9 +460,9 @@ struct App {
     sidebar_width: Option<u16>,
     /// A drag of the sidebar's edge under way.
     drag: Option<Drag>,
-    /// Set when the sidebar is hidden, shown or resized, so the next frame draws at once
-    /// instead of waiting out the frame budget. Until it does, clicks would land on the old
-    /// layout.
+    /// Set when the sidebar is hidden, shown or resized, or one of its shelves opens or
+    /// closes, so the next frame draws at once instead of waiting out the frame budget. Until
+    /// it does, clicks would land on the old layout.
     layout_changed: bool,
     open: Option<OpenThread>,
     focus: Focus,
@@ -734,6 +738,12 @@ fn padded(main: Rect) -> Rect {
     }
 }
 
+/// The blank rows over the wordmark and the breadcrumb on a screen `height` rows tall: one
+/// from `ROOMY` rows, and none on a shorter screen, which needs every row.
+fn top_inset(height: u16) -> u16 {
+    u16::from(height >= ROOMY)
+}
+
 fn str_of<'a>(value: &'a Value, key: &str) -> &'a str {
     value.get(key).and_then(Value::as_str).unwrap_or_default()
 }
@@ -769,10 +779,12 @@ impl App {
             badges: Badges::default(),
             feed: Feed::Connecting,
             environment,
-            sidebar: Sidebar::with_working(
-                settings.sidebar_working_shelf_enabled,
-                settings.sidebar_working_shelf_expanded,
-            ),
+            sidebar: Sidebar::with_choices(ShelfChoices {
+                working_enabled: settings.sidebar_working_shelf_enabled,
+                working_open: settings.sidebar_working_shelf_expanded,
+                done_open: settings.sidebar_done_shelf_expanded,
+                settled_open: settings.sidebar_settled_shelf_expanded,
+            }),
             sidebar_hidden: settings.sidebar_hidden,
             sidebar_width: settings.sidebar_width,
             drag: None,
@@ -1066,11 +1078,6 @@ impl App {
         capabilities["threadPullRequests"] == Value::Bool(true)
     }
 
-    fn toggle_settled(&mut self) {
-        self.sidebar.show_settled = !self.sidebar.show_settled;
-        self.rebuild_rows();
-    }
-
     /// Hides or shows the sidebar and remembers it, as Ctrl+B and the desktop's Mod+B do. Focus
     /// on a sidebar being hidden moves to the transcript when a thread is open, or else to the
     /// composer. The rows, the highlight, the open thread and the composer stay as they are.
@@ -1191,14 +1198,20 @@ impl App {
         Settings::update(|settings| settings.sidebar_width = None);
     }
 
-    /// Opens or closes the Working shelf and remembers it, as the GUI does. Nothing happens
-    /// while the list has no Working heading.
-    fn toggle_working(&mut self) {
-        let Some(expanded) = self.sidebar.toggle_working() else {
+    /// Opens or closes `shelf` and remembers it, as the GUI does for Working. Nothing happens
+    /// while the list has no heading for it. The cards below the heading move, so the next
+    /// frame draws at once, and until it does a click on the list lands on nothing.
+    fn toggle_shelf(&mut self, shelf: Shelf) {
+        let Some(open) = self.sidebar.toggle(shelf) else {
             return;
         };
-        Settings::update(move |settings| settings.sidebar_working_shelf_expanded = expanded);
+        Settings::update(move |settings| match shelf {
+            Shelf::Working => settings.sidebar_working_shelf_expanded = open,
+            Shelf::Done => settings.sidebar_done_shelf_expanded = open,
+            _ => settings.sidebar_settled_shelf_expanded = open,
+        });
         self.rebuild_rows();
+        self.layout_changed = true;
     }
 
     fn shell_thread(&self, id: &str) -> Option<&Value> {
@@ -1213,12 +1226,55 @@ impl App {
         let Some(id) = self.sidebar.selected_thread_id().map(str::to_string) else {
             return;
         };
+        // A list that Down scrolled past the card scrolls back to it.
+        self.sidebar.select(&id);
         if self.open.as_ref().is_some_and(|o| o.id == id) {
             self.focus = Focus::Composer;
             return;
         }
+        self.open_by_id(id);
+    }
+
+    /// Opens thread `id` with a watch of its own, in place of the thread that was open.
+    fn open_by_id(&mut self, id: String) {
         let events = self.client.watch_thread(&id, None);
         self.open_thread(OpenThread::new(id, events));
+    }
+
+    /// Opens related thread `id` from the details' Lineage, as the sidebar opens a thread. The
+    /// sidebar highlights it when it lists it, and the details keep the keyboard when they had
+    /// it. The open thread itself does nothing.
+    fn open_related(&mut self, id: String) {
+        if self.open.as_ref().is_some_and(|open| open.id == id) {
+            return;
+        }
+        let had_keyboard = self.focus == Focus::Details;
+        self.open_by_id(id.clone());
+        // Opening it lays the sidebar out again, and a closed shelf lists the open thread, so
+        // its row is there to highlight only now. A subagent's thread has none.
+        self.sidebar.select(&id);
+        if had_keyboard {
+            self.focus = Focus::Details;
+        }
+    }
+
+    /// Acts on a row of the details' Lineage: opens its thread, shows more of its group, or
+    /// opens or closes Previous agents. A thread the shell doesn't list stays closed, and the
+    /// status line says why. The shell is asked again here, since an event since the last
+    /// frame can have archived or removed a thread whose row still says it opens.
+    fn act_on_lineage(&mut self, target: lineage::Target) {
+        match target {
+            lineage::Target::Thread(id) => {
+                let listed = self.shell_thread(&id).is_some_and(lineage::opens);
+                if self.details.can_open(&id) && listed {
+                    self.open_related(id);
+                } else {
+                    self.message = Some(("This related thread is unavailable.".into(), false));
+                }
+            }
+            lineage::Target::More(group) => self.details.show_more(group),
+            lineage::Target::Previous => self.details.toggle_previous(),
+        }
     }
 
     /// Shows `open` in place of the thread that was open, as when one is picked in the sidebar.
@@ -1326,9 +1382,11 @@ impl App {
     /// A key for the details while they have the keyboard. Esc closes a dialog. On a pane it
     /// gives the keyboard back and leaves the pane open. → or `l` shows the thread's pull
     /// requests, and ← or `h` goes back: from a pull request's details to the list, and from
-    /// the list to the thread's tab. The up and down arrows, `j` and `k`, the page keys, Home,
-    /// End, `g` and `G` scroll the thread's text, move along its pull requests, or scroll the
-    /// selected one's details, which Enter shows in the list's place and hides again.
+    /// the list to the thread's tab. On the thread's tab the up and down arrows, `j` and `k`
+    /// choose among Lineage's rows, and scroll the text past them or without them, and Enter
+    /// acts on the chosen row. On the pull requests' tab they move along the pull requests, or
+    /// scroll the selected one's details, which Enter shows in the list's place and hides
+    /// again. The page keys, Home, End, `g` and `G` scroll the text, the list or the details.
     fn on_details_key(&mut self, key: KeyEvent) {
         let plain = !key
             .modifiers
@@ -1342,11 +1400,15 @@ impl App {
             KeyCode::Char('h') if plain => self.details.back(),
             KeyCode::Right => self.details.show(details::Tab::PullRequests),
             KeyCode::Char('l') if plain => self.details.show(details::Tab::PullRequests),
-            KeyCode::Enter => self.details.toggle_pull(),
-            KeyCode::Up => self.details.scroll_by(-1),
-            KeyCode::Char('k') if plain => self.details.scroll_by(-1),
-            KeyCode::Down => self.details.scroll_by(1),
-            KeyCode::Char('j') if plain => self.details.scroll_by(1),
+            KeyCode::Enter => {
+                if let Some(target) = self.details.enter() {
+                    self.act_on_lineage(target);
+                }
+            }
+            KeyCode::Up => self.details.up(),
+            KeyCode::Char('k') if plain => self.details.up(),
+            KeyCode::Down => self.details.down(),
+            KeyCode::Char('j') if plain => self.details.down(),
             KeyCode::PageUp => self.details.page(false),
             KeyCode::PageDown => self.details.page(true),
             KeyCode::Home => self.details.scroll_home(),
@@ -1382,6 +1444,28 @@ impl App {
             (None, None) if closed || answered => details::Record::Unavailable,
             (None, None) => details::Record::Loading,
         }
+    }
+
+    /// The open thread's Lineage, from the shell's threads and the thread's projection. Once
+    /// the thread's watch closes, the shell's copy of each thread it lists comes first, as it
+    /// does for the record in `details_record`.
+    fn details_lineage(&self) -> lineage::Lineage {
+        let open = self.open.as_ref();
+        let threads = match self.shell.as_ref() {
+            Some(shell) => shell.threads.as_slice(),
+            None => &[],
+        };
+        let projection = open
+            .and_then(|open| open.state.as_ref())
+            .map(|state| &state.projection);
+        let closed = open.is_some_and(|open| open.connection == "closed");
+        lineage::Lineage::of(
+            open.map(|open| open.id.as_str()),
+            threads,
+            projection,
+            closed,
+            self.details.paging(),
+        )
     }
 
     /// The shell's projects for the details, or why it has none yet.
@@ -1447,27 +1531,28 @@ impl App {
                     }
                 }
                 // A dialog of the thread's details takes the mouse. A click on its × closes it,
-                // as does a click outside it, on the button too. A click on a tab or a pull
-                // request acts on it, and the wheel over it scrolls it. Nothing reaches what it
-                // covers. Until a frame draws it after a change, it takes events and does
-                // nothing with them.
+                // as does a click outside it, on the button too. A click on a tab, a pull
+                // request or a Lineage row acts on it, and the wheel over the dialog scrolls it.
+                // Nothing reaches what it covers. Until a frame draws it after a change, it
+                // takes events and does nothing with them.
                 if self.details_modal() {
                     let fresh = !self.details.moved && !self.layout_changed;
                     let Some(drawn) = self.details.drawn.filter(|_| fresh) else {
                         return false;
                     };
+                    let lineage_row = self.details.target_at(mouse.column, mouse.row);
                     match mouse.kind {
                         _ if click && inside(drawn.close) => self.close_details(),
                         _ if click && inside(drawn.area) => {
-                            return self.details.click(mouse.column, mouse.row);
+                            let Some(target) = lineage_row else {
+                                return self.details.click(mouse.column, mouse.row);
+                            };
+                            self.details.choose(target.clone());
+                            self.act_on_lineage(target);
                         }
                         _ if click => self.close_details(),
-                        MouseEventKind::ScrollUp if inside(drawn.area) => {
-                            self.details.scroll_by(-1)
-                        }
-                        MouseEventKind::ScrollDown if inside(drawn.area) => {
-                            self.details.scroll_by(1)
-                        }
+                        MouseEventKind::ScrollUp if inside(drawn.area) => self.details.wheel(-1),
+                        MouseEventKind::ScrollDown if inside(drawn.area) => self.details.wheel(1),
                         _ => return false,
                     }
                     return true;
@@ -1521,10 +1606,10 @@ impl App {
                     return true;
                 }
                 // The details' button opens and closes them. Their pane takes what lands on
-                // it: a click on × closes it, and a click elsewhere on it acts on the tab or
-                // the pull request under it and gives it the keyboard. The wheel scrolls it.
-                // Until a frame draws them after a change, the button and the pane take events
-                // and do nothing with them.
+                // it: a click on × closes it, and a click elsewhere on it gives it the keyboard
+                // and acts on the tab, the pull request or the Lineage row under it. The wheel
+                // scrolls it. Until a frame draws them after a change, the button and the pane
+                // take events and do nothing with them.
                 let moved = self.details.moved || self.layout_changed;
                 if click && inside(self.details.button) {
                     if moved {
@@ -1541,14 +1626,20 @@ impl App {
                     if moved {
                         return false;
                     }
+                    let lineage_row = self.details.target_at(mouse.column, mouse.row);
                     match mouse.kind {
                         _ if click && inside(drawn.close) => self.close_details(),
                         _ if click => {
-                            self.details.click(mouse.column, mouse.row);
-                            self.focus_details(false)
+                            self.focus_details(false);
+                            if let Some(target) = lineage_row {
+                                self.details.choose(target.clone());
+                                self.act_on_lineage(target);
+                            } else {
+                                self.details.click(mouse.column, mouse.row);
+                            }
                         }
-                        MouseEventKind::ScrollUp => self.details.scroll_by(-1),
-                        MouseEventKind::ScrollDown => self.details.scroll_by(1),
+                        MouseEventKind::ScrollUp => self.details.wheel(-1),
+                        MouseEventKind::ScrollDown => self.details.wheel(1),
                         _ => return false,
                     }
                     return true;
@@ -1610,14 +1701,13 @@ impl App {
                             (None, None) => self.focus = Focus::Transcript,
                         }
                     }
-                    MouseEventKind::Down(MouseButton::Left) if inside(self.sidebar.footer) => {
-                        self.toggle_settled()
-                    }
                     MouseEventKind::Down(MouseButton::Left)
                         if inside(self.sidebar.list)
-                            && self.sidebar.working_heading_at(mouse.row) =>
+                            && self.sidebar.shelf_at(mouse.row).is_some() =>
                     {
-                        self.toggle_working()
+                        if let Some(shelf) = self.sidebar.shelf_at(mouse.row) {
+                            self.toggle_shelf(shelf);
+                        }
                     }
                     MouseEventKind::Down(MouseButton::Left) if inside(self.sidebar.list) => {
                         if let Some(id) = self.sidebar.thread_at(mouse.row).map(str::to_string)
@@ -1647,7 +1737,7 @@ impl App {
                 self.sidebar.border = Rect::default();
                 // The details' button and the details may have moved too, so they take no
                 // click until then.
-                self.details.moved = true;
+                self.details.resized();
                 true
             }
             _ => false,
@@ -1812,8 +1902,9 @@ impl App {
                 KeyCode::Up | KeyCode::Char('k') => self.sidebar.move_selection(-1),
                 KeyCode::Down | KeyCode::Char('j') => self.sidebar.move_selection(1),
                 KeyCode::Enter | KeyCode::Right | KeyCode::Char('l') => self.open_selected(),
-                KeyCode::Char('e') => self.toggle_settled(),
-                KeyCode::Char('w') => self.toggle_working(),
+                KeyCode::Char('w') => self.toggle_shelf(Shelf::Working),
+                KeyCode::Char('d') => self.toggle_shelf(Shelf::Done),
+                KeyCode::Char('e') => self.toggle_shelf(Shelf::Settled),
                 KeyCode::Char('[') => self.step_sidebar(false),
                 KeyCode::Char(']') => self.step_sidebar(true),
                 KeyCode::Char('0') => self.reset_sidebar_width(),
@@ -2542,6 +2633,25 @@ impl App {
             Some(details::Layout::Pane) => {}
             None => self.leave_details(),
         }
+        // The details and the pull requests linked to the thread are worked out again only
+        // after an event that can change them, or for another thread, and wrapped again only at
+        // another width. That comes before the status line, which says what Enter does with the
+        // Lineage row they keep chosen. When T3 removes the link whose details show, the first
+        // frame without them offers the list's keys.
+        let open_id = self.open.as_ref().map(|open| open.id.as_str());
+        if self.details.wants(open_id) {
+            let facts = details::Facts::of(open_id, self.details_record(), self.details_projects());
+            self.details.set(facts);
+        }
+        if self.details.wants_lineage(open_id) {
+            let lineage = self.details_lineage();
+            self.details.set_lineage(lineage);
+        }
+        let supported = self.links_supported();
+        if self.details.wants_pulls(open_id, supported) {
+            let list = pull_requests::List::of(open_id, self.details_record(), supported);
+            self.details.pulls.set(list);
+        }
         // The wake timer usually moves a woken thread first, but it runs on a clock that
         // stops while the machine sleeps. A hidden sidebar keeps its rows current too, so it
         // comes back as T3 has it.
@@ -2575,10 +2685,16 @@ impl App {
             .layout(conversation.width.saturating_sub(4) as usize);
         // Text rows, a spacer, the chips row and two borders.
         let composer_height = composer_rows.len().clamp(1, COMPOSER_MAX_ROWS) as u16 + 4;
+        // The header has the title row and a blank row under it, and a blank row over it on a
+        // screen with room, level with the sidebar's over the wordmark.
+        let inset = top_inset(area.height);
+        let header_height = 2 + inset;
         // The panel leaves the header, three transcript rows, the composer and the status line
         // their space, less its own two borders.
         let panel_width = conversation.width.saturating_sub(4) as usize;
-        let panel_room = main.height.saturating_sub(2 + 3 + composer_height + 1 + 2);
+        let panel_room = main
+            .height
+            .saturating_sub(header_height + 3 + composer_height + 1 + 2);
         let panel = match self.request_panel(panel_width) {
             Some(panel) => self.panel_rows(panel, panel_width, panel_room as usize),
             None => Vec::new(),
@@ -2592,7 +2708,7 @@ impl App {
         // two never show together.
         let tasks_room = main
             .height
-            .saturating_sub(2 + 3 + composer_height + 1 + panel_height);
+            .saturating_sub(header_height + 3 + composer_height + 1 + panel_height);
         let tasks = self.tasks.lay_out(
             conversation.width.saturating_sub(4) as usize,
             tasks_room as usize,
@@ -2600,7 +2716,7 @@ impl App {
             &self.theme,
         );
         let [header, body, panel_area, drawer, composer_area, status_area] = Layout::vertical([
-            Constraint::Length(2),
+            Constraint::Length(header_height),
             Constraint::Min(3),
             Constraint::Length(panel_height),
             Constraint::Length(tasks.len() as u16),
@@ -2609,7 +2725,9 @@ impl App {
         ])
         .areas(conversation);
         let header = Rect {
+            y: header.y + inset.min(header.height),
             width: main.width,
+            height: header.height.saturating_sub(inset),
             ..header
         };
         let status_area = Rect {
@@ -2704,20 +2822,6 @@ impl App {
             };
             self.draw_picker(frame, above);
         }
-        // The details and the pull requests linked to the thread are worked out again only after
-        // an event that can change them, or for another thread, and wrapped again only at
-        // another width. That comes before the status line, so when T3 removes the link whose
-        // details show, the first frame without them offers the list's keys.
-        let open_id = self.open.as_ref().map(|open| open.id.as_str());
-        if self.details.wants(open_id) {
-            let facts = details::Facts::of(open_id, self.details_record(), self.details_projects());
-            self.details.set(facts);
-        }
-        let supported = self.links_supported();
-        if self.details.wants_pulls(open_id, supported) {
-            let list = pull_requests::List::of(open_id, self.details_record(), supported);
-            self.details.pulls.set(list);
-        }
         frame.render_widget(
             Paragraph::new(self.status_line(status_area.width as usize, shown)),
             status_area,
@@ -2731,8 +2835,14 @@ impl App {
                     .draw_pane(frame, pane, focused, now, &self.environment, &self.theme);
             }
             Some(details::Layout::Dialog) => {
+                // Under the title row, wherever the inset puts it.
+                let below = Rect {
+                    y: area.y + inset,
+                    height: area.height - inset,
+                    ..area
+                };
                 self.details
-                    .draw_dialog(frame, area, now, &self.environment, &self.theme)
+                    .draw_dialog(frame, below, now, &self.environment, &self.theme)
             }
             None => self.details.forget_drawn(),
         }
@@ -3656,11 +3766,21 @@ impl App {
         let keys = match (self.focus, self.picker.as_ref().map(|p| p.kind)) {
             (_, Some(Kind::Model)) => "Type to search · ↑↓ choose · Enter select · Esc close",
             (_, Some(_)) => "↑↓ choose · Enter select · Esc close",
-            (Focus::Sidebar, None) if self.sidebar.has_working() => {
-                "↑↓ select · Enter open · w working · e settled · [ ] width · Ctrl+B hide · Tab focus · q quit"
-            }
             (Focus::Sidebar, None) => {
-                "↑↓ select · Enter open · e settled · [ ] width · Ctrl+B hide · Tab focus · q quit"
+                let working = if self.sidebar.has_shelf(Shelf::Working) {
+                    "w working · "
+                } else {
+                    ""
+                };
+                let folds = if self.sidebar.has_shelf(Shelf::Done) {
+                    "d done · e settled · "
+                } else {
+                    ""
+                };
+                hint = format!(
+                    "↑↓ select · Enter open · {working}{folds}[ ] width · Ctrl+B hide · Tab focus · q quit"
+                );
+                hint.as_str()
             }
             (Focus::Composer, None) => {
                 "Enter send · Alt+Enter newline · Alt+M model · Alt+E effort · Alt+P mode · Ctrl+X interrupt"
@@ -3669,8 +3789,9 @@ impl App {
             // details this frame draws as a dialog and leaves a pane.
             (Focus::Details, None) => {
                 let modal = shown != Some(details::Layout::Pane);
-                let keys = self.details.keys(modal);
-                fitting(keys, room.saturating_sub(restore.width()))
+                let choices = self.details.keys(modal);
+                hint = fitting(&choices, room.saturating_sub(restore.width())).to_string();
+                hint.as_str()
             }
             (Focus::Transcript, None) => {
                 let plan = self
@@ -3973,9 +4094,9 @@ fn fit(text: &str, width: usize) -> String {
 }
 
 /// The first of `choices` that fits in `room` columns, or else the last, which `fit` cuts.
-fn fitting(choices: &[&'static str], room: usize) -> &'static str {
+fn fitting(choices: &[String], room: usize) -> &str {
     let fits = choices.iter().find(|choice| choice.width() <= room);
-    fits.or(choices.last()).copied().unwrap_or_default()
+    fits.or(choices.last()).map_or("", String::as_str)
 }
 
 /// `text` cut with `…` to at most `width` columns, at a place `transcript::clusters` finds, so
@@ -4937,13 +5058,16 @@ mod tests {
         // A closed Working shelf hides the busy card behind its heading, so it needs no tick.
         // Open, the card shows and ticks.
         let closed = drawn_by(
-            Sidebar::with_working(true, false),
+            Sidebar::with_choices(ShelfChoices {
+                working_open: false,
+                ..ShelfChoices::default()
+            }),
             vec![thread("busy", json!({}))],
         );
         assert!(!closed.drew_working());
         assert!(!needs_tick(None, &closed));
         let open_shelf = drawn_by(
-            Sidebar::with_working(true, true),
+            Sidebar::with_choices(ShelfChoices::default()),
             vec![thread("busy", json!({}))],
         );
         assert!(open_shelf.drew_working());
@@ -5784,7 +5908,8 @@ mod tests {
         assert!(!app.sidebar_hidden, "no settings file shows it");
         assert_eq!(app.focus, Focus::Sidebar);
         let rows = screen(&mut app, 80, 24);
-        assert!(rows[0].contains("T3 Code"), "{rows:#?}");
+        assert!(rows[0].trim().is_empty(), "{rows:#?}");
+        assert!(rows[1].contains("T3 Code"), "{rows:#?}");
         assert_ne!(app.sidebar.list, Rect::default());
         assert!(app.composer_area.x > app.sidebar.list.right());
 
@@ -5804,8 +5929,8 @@ mod tests {
         // The conversation takes the whole width, less a column of padding on each side.
         assert_eq!((app.composer_area.x, app.composer_area.width), (1, 78));
         assert_eq!((app.transcript_area.x, app.transcript_area.width), (1, 78));
-        assert_eq!(app.sidebar_toggle, Rect::new(1, 0, 3, 1));
-        assert!(rows[0].starts_with("  ◧  Pick a thread"), "{:?}", rows[0]);
+        assert_eq!(app.sidebar_toggle, Rect::new(1, 1, 3, 1));
+        assert!(rows[1].starts_with("  ◧  Pick a thread"), "{:?}", rows[1]);
         row_showing(&rows, "Press Ctrl+B to show the sidebar");
         assert!(rows[23].contains("Ctrl+B sidebar · Enter send"));
         // No `b` went in, and the cursor is still between the letters.
@@ -5817,7 +5942,7 @@ mod tests {
         assert!(!crate::settings::saved_in_test().sidebar_hidden);
         assert_eq!(app.focus, Focus::Composer, "showing it leaves focus alone");
         let rows = screen(&mut app, 80, 24);
-        assert!(rows[0].contains("T3 Code"), "{rows:#?}");
+        assert!(rows[1].contains("T3 Code"), "{rows:#?}");
         assert!(!rows[23].contains("Ctrl+B sidebar"), "{:?}", rows[23]);
         assert_eq!(app.composer.text(), "hid");
     }
@@ -5867,7 +5992,15 @@ mod tests {
     #[test]
     fn a_hidden_sidebar_leaves_its_clicks_and_wheel_to_the_conversation() {
         let mut app = tui(&Settings::default());
-        let threads = vec![listed("a", "Alpha", "idle"), listed("b", "Bravo", "idle")];
+        // Two finished runs with no visit, which counts as seen, so both cards are in the inbox
+        // at the top of the list, and the empty Working, Done and Settled shelves sit at its
+        // bottom. A thread whose status is idle after a run reads Waiting and belongs in
+        // Working, which would put the cards at the bottom, over the composer once the sidebar
+        // hides.
+        let threads = vec![
+            listed("a", "Alpha", "completed"),
+            listed("b", "Bravo", "completed"),
+        ];
         app.on_shell_event(shell_snapshot(threads));
         app.open = Some(long_thread());
         assert!(app.sidebar.select("a"));
@@ -5875,13 +6008,32 @@ mod tests {
         // Shown, a click on Bravo's card would open it, and the wheel there moves the highlight.
         let (x, y) = (5, row_showing(&rows, "Bravo"));
         assert_eq!(app.sidebar.thread_at(y), Some("b"));
-        let footer = app.sidebar.footer;
-        assert_ne!(footer, Rect::default());
+        // The Settled heading ends the list, on the screen's last row.
+        let settled = row_showing(&rows, "Settled (0)");
+        assert_eq!(settled, 23);
+        assert_eq!(app.sidebar.shelf_at(settled), Some(Shelf::Settled));
+        let working = row_showing(&rows, "Working (0)");
+        assert_eq!(app.sidebar.shelf_at(working), Some(Shelf::Working));
 
         app.focus = Focus::Composer;
         ctrl_b(&mut app);
-        screen(&mut app, 80, 24);
-        assert_eq!(app.sidebar.thread_at(y), None);
+        let hidden = screen(&mut app, 80, 24);
+        // Hidden, no row takes a click as a card or a heading.
+        for row in 0..24 {
+            assert_eq!(app.sidebar.thread_at(row), None, "row {row}");
+            assert_eq!(app.sidebar.shelf_at(row), None, "row {row}");
+        }
+        // Bravo's old place is inside the transcript, and the Settled heading's is the status
+        // line.
+        let body = app.transcript_area;
+        assert!(
+            (body.x..body.right()).contains(&x) && (body.y..body.bottom()).contains(&y),
+            "({x}, {y}) is outside {body:?}"
+        );
+        assert!(
+            hidden[settled as usize].contains("Ctrl+B sidebar"),
+            "{hidden:#?}"
+        );
         // Hidden, the wheel there scrolls the transcript and the highlight stays on Alpha.
         assert!(mouse(&mut app, MouseEventKind::ScrollUp, x, y));
         assert_eq!(app.scroll.rows(), 3);
@@ -5890,10 +6042,10 @@ mod tests {
         assert!(mouse(&mut app, CLICK, x, y));
         assert_eq!(app.focus, Focus::Transcript);
         assert_eq!(app.open.as_ref().map(|open| open.id.as_str()), Some("t"));
-        // A click on the old Settled footer lands on the status line.
-        assert!(mouse(&mut app, CLICK, footer.x, footer.y));
+        // A click where the Settled heading was lands on the status line and opens nothing.
+        assert!(mouse(&mut app, CLICK, x, settled));
         assert_eq!(app.focus, Focus::Composer);
-        assert!(!app.sidebar.show_settled);
+        assert!(!crate::settings::saved_in_test().sidebar_settled_shelf_expanded);
 
         // The toggle brings the sidebar back as it was, and its cards take clicks again.
         let toggle = app.sidebar_toggle;
@@ -5910,6 +6062,465 @@ mod tests {
         assert!(mouse(&mut app, CLICK, toggle.x + 2, toggle.y));
         assert!(app.sidebar_hidden);
         assert!(crate::settings::saved_in_test().sidebar_hidden);
+    }
+
+    #[test]
+    fn w_d_and_e_open_and_close_the_shelves_from_the_sidebar_and_remember_it() {
+        let mut app = tui(&Settings::default());
+        let mut delta = listed("d", "Delta", "completed");
+        delta["latestRunCompletedAt"] = json!("2026-10-08T11:00:00.000Z");
+        delta["lastVisitedAt"] = json!("2026-10-08T10:00:00.000Z");
+        let threads = vec![listed("w", "Whiskey", "running"), delta];
+        app.on_shell_event(shell_snapshot(threads));
+        assert_eq!(app.focus, Focus::Sidebar);
+        // A new settings file has Working and Done open and Settled closed, and the status
+        // line offers the keys.
+        let rows = screen(&mut app, 200, 30);
+        for shown in [
+            "Working (1) ",
+            "Whiskey",
+            "Done (1) ",
+            "Delta",
+            "Settled (0) ",
+        ] {
+            row_showing(&rows, shown);
+        }
+        assert!(
+            rows[29].contains("w working · d done · e settled"),
+            "{}",
+            rows[29]
+        );
+
+        // Each key opens or closes its own shelf and saves the choice.
+        press(&mut app, KeyCode::Char('w'));
+        assert!(!crate::settings::saved_in_test().sidebar_working_shelf_expanded);
+        press(&mut app, KeyCode::Char('d'));
+        assert!(!crate::settings::saved_in_test().sidebar_done_shelf_expanded);
+        press(&mut app, KeyCode::Char('e'));
+        assert!(crate::settings::saved_in_test().sidebar_settled_shelf_expanded);
+        let rows = screen(&mut app, 200, 30);
+        assert!(
+            !shows(&rows, "Whiskey") && !shows(&rows, "Delta"),
+            "{rows:#?}"
+        );
+        let at = |label: &str| rows[row_showing(&rows, label) as usize].clone();
+        assert!(at("Working (1) ").contains("─ ›"));
+        assert!(at("Done (1) ").contains("─ ›"));
+        assert!(at("Settled (0) ").contains("─ ⌄"));
+
+        // A click on a heading does the same.
+        let working = row_showing(&rows, "Working (1) ");
+        assert_eq!(app.sidebar.shelf_at(working), Some(Shelf::Working));
+        assert!(mouse(&mut app, CLICK, 5, working));
+        assert!(crate::settings::saved_in_test().sidebar_working_shelf_expanded);
+        assert_eq!(app.focus, Focus::Sidebar);
+        let rows = screen(&mut app, 200, 30);
+        assert_eq!(
+            app.sidebar.thread_at(row_showing(&rows, "Whiskey")),
+            Some("w")
+        );
+
+        // In the composer the same letters are text, and the shelves stay as they are.
+        app.focus = Focus::Composer;
+        press(&mut app, KeyCode::Char('d'));
+        assert_eq!(app.composer.text(), "d");
+        assert!(!crate::settings::saved_in_test().sidebar_done_shelf_expanded);
+        assert!(!shows(&screen(&mut app, 200, 30), "Delta"));
+    }
+
+    #[test]
+    fn a_fold_draws_at_once_and_its_old_rows_take_no_click_until_then() {
+        let mut app = tui(&Settings::default());
+        // Five inbox cards fill the list down to Working, so Done waits below the screen
+        // until Working closes and Done takes Whiskey's place.
+        let mut threads: Vec<Value> = (1..=5)
+            .map(|n| listed(&format!("a{n}"), &format!("Inbox {n}"), "completed"))
+            .collect();
+        let mut delta = listed("d", "Delta", "completed");
+        delta["latestRunCompletedAt"] = json!("2026-10-08T11:00:00.000Z");
+        delta["lastVisitedAt"] = json!("2026-10-08T10:00:00.000Z");
+        threads.extend([listed("w", "Whiskey", "running"), delta]);
+        app.on_shell_event(shell_snapshot(threads));
+        app.open = Some(long_thread());
+        app.composer.insert_str("half a thought");
+        assert_eq!(app.focus, Focus::Sidebar);
+        let rows = screen(&mut app, 200, 30);
+        let working = row_showing(&rows, "Working (1) ");
+        let whiskey = row_showing(&rows, "Whiskey");
+        assert_eq!(app.sidebar.shelf_at(working), Some(Shelf::Working));
+        assert_eq!(app.sidebar.thread_at(whiskey), Some("w"));
+        assert!(!shows(&rows, "Done ("), "{rows:#?}");
+        app.scroll.set(3);
+        let still = |app: &App| {
+            assert_eq!(app.focus, Focus::Sidebar);
+            assert_eq!(app.open.as_ref().map(|open| open.id.as_str()), Some("t"));
+            assert_eq!(app.composer.text(), "half a thought");
+        };
+
+        // `w` closes Working, and the next frame waits for nothing. Until it draws, a click
+        // where Whiskey's card or the Working heading was opens nothing and folds nothing.
+        press(&mut app, KeyCode::Char('w'));
+        assert!(app.layout_changed);
+        assert!(!crate::settings::saved_in_test().sidebar_working_shelf_expanded);
+        for row in 0..30 {
+            assert_eq!(app.sidebar.thread_at(row), None, "row {row}");
+            assert_eq!(app.sidebar.shelf_at(row), None, "row {row}");
+        }
+        for row in [working, whiskey - 1, whiskey] {
+            assert!(mouse(&mut app, CLICK, 5, row));
+        }
+        assert!(!crate::settings::saved_in_test().sidebar_working_shelf_expanded);
+        assert!(crate::settings::saved_in_test().sidebar_done_shelf_expanded);
+        assert_eq!(app.scroll.rows(), 3);
+        still(&app);
+
+        // The frame draws Done where Whiskey was, and those rows now take Done's clicks.
+        let rows = screen(&mut app, 200, 30);
+        assert!(!app.layout_changed);
+        assert!(!shows(&rows, "Whiskey"), "{rows:#?}");
+        let done = row_showing(&rows, "Done (1) ");
+        let delta = row_showing(&rows, "Delta");
+        assert_eq!(done, whiskey - 1);
+        assert_eq!(app.sidebar.shelf_at(working), Some(Shelf::Working));
+        assert_eq!(app.sidebar.shelf_at(done), Some(Shelf::Done));
+        assert_eq!(app.sidebar.thread_at(delta), Some("d"));
+
+        // A click on Done closes it, and a second click on the same row before the next
+        // frame does nothing, nor does one on Delta's old card.
+        assert!(mouse(&mut app, CLICK, 5, done));
+        assert!(app.layout_changed);
+        assert!(!crate::settings::saved_in_test().sidebar_done_shelf_expanded);
+        assert!(mouse(&mut app, CLICK, 5, done));
+        assert!(mouse(&mut app, CLICK, 5, delta));
+        assert!(!crate::settings::saved_in_test().sidebar_done_shelf_expanded);
+        assert_eq!(app.scroll.rows(), 3);
+        still(&app);
+        let rows = screen(&mut app, 200, 30);
+        assert!(!shows(&rows, "Delta"), "{rows:#?}");
+        let done = row_showing(&rows, "Done (1) ");
+        assert!(rows[done as usize].contains("─ ›"), "{rows:#?}");
+        assert_eq!(app.sidebar.shelf_at(done), Some(Shelf::Done));
+        still(&app);
+    }
+
+    /// Settings with Working, Done and Settled closed.
+    fn shelves_closed() -> Settings {
+        Settings {
+            sidebar_working_shelf_expanded: false,
+            sidebar_done_shelf_expanded: false,
+            sidebar_settled_shelf_expanded: false,
+            ..Settings::default()
+        }
+    }
+
+    /// A thread whose latest run finished after the last visit, which puts it on Done.
+    fn finished_unseen(id: &str, title: &str) -> Value {
+        let mut thread = listed(id, title, "completed");
+        thread["latestRunCompletedAt"] = json!("2026-10-08T11:00:00.000Z");
+        thread["lastVisitedAt"] = json!("2026-10-08T10:00:00.000Z");
+        thread
+    }
+
+    /// Inbox cards a1 to a4 over the closed shelves, with Whiskey on Working and Delta on Done,
+    /// and the settings saved as the TUI starts with them. At 80x8 the list has six rows: room
+    /// for a4 and the Working heading under it, but not for Done and Settled too.
+    fn short_list_over_closed_shelves() -> App {
+        Settings::update(|saved| *saved = shelves_closed());
+        let mut app = tui(&shelves_closed());
+        let mut threads: Vec<Value> = (1..=4)
+            .map(|n| listed(&format!("a{n}"), &format!("Inbox {n}"), "completed"))
+            .collect();
+        threads.extend([
+            listed("w", "Whiskey", "running"),
+            finished_unseen("d", "Delta"),
+        ]);
+        app.on_shell_event(shell_snapshot(threads));
+        app.open = Some(long_thread());
+        app
+    }
+
+    /// What a click on each row of the sidebar's list lands on, by the last frame: a thread's
+    /// id, a shelf's name or nothing.
+    fn clickable(app: &App) -> Vec<String> {
+        let list = app.sidebar.list;
+        (list.y..list.bottom())
+            .map(
+                |y| match (app.sidebar.thread_at(y), app.sidebar.shelf_at(y)) {
+                    (Some(id), _) => id.to_string(),
+                    (None, Some(shelf)) => format!("{shelf:?}"),
+                    (None, None) => String::new(),
+                },
+            )
+            .collect()
+    }
+
+    #[test]
+    fn down_on_the_last_card_of_a_short_list_scrolls_on_to_the_headings_under_it() {
+        let mut app = short_list_over_closed_shelves();
+        let rows = screen(&mut app, 80, 8);
+        assert_eq!((app.sidebar.list.y, app.sidebar.list.bottom()), (2, 8));
+        assert_eq!(clickable(&app), ["a1", "a1", "a1", "", "a2", "a2"]);
+        assert!(!shows(&rows, "Working ("), "{rows:#?}");
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Down);
+            screen(&mut app, 80, 8);
+        }
+        // a4, the last card, fills the list with Working under it. Done and Settled don't fit.
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a4"));
+        let at_a4 = ["a4", "a4", "a4", "", "", "Working"];
+        let rows = screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), at_a4);
+        assert!(rows[7].contains("Working (1) ─"), "{rows:#?}");
+        assert!(!shows(&rows, "Done ("), "{rows:#?}");
+
+        // Down scrolls on past a4, and the first frame after shows every heading under it, each
+        // taking clicks on the row that reads it. The highlight stays on a4.
+        let past_a4 = ["", "Working", "Done", "Settled", "", ""];
+        press(&mut app, KeyCode::Down);
+        let rows = screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), past_a4);
+        assert!(rows[3].contains("Working (1) ─"), "{rows:#?}");
+        assert!(rows[4].contains("Done (1) ─"), "{rows:#?}");
+        assert!(rows[5].contains("Settled (0) ─"), "{rows:#?}");
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a4"));
+
+        // That is as far as it goes. Repaints and a live change near the bottom keep it there.
+        press(&mut app, KeyCode::Down);
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), past_a4);
+        app.on_shell_event(thread_updated(2, finished_unseen("e", "Echo")));
+        let rows = screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), past_a4);
+        assert!(rows[4].contains("Done (2) ─"), "{rows:#?}");
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), past_a4);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a4"));
+
+        // Up scrolls back to a4 first, and then moves the highlight.
+        press(&mut app, KeyCode::Up);
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), at_a4);
+        press(&mut app, KeyCode::Up);
+        screen(&mut app, 80, 8);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a3"));
+        assert_eq!(clickable(&app), ["a3", "a3", "a3", "", "a4", "a4"]);
+
+        // Enter on the list scrolled past a4 opens a4, and the next frame shows it again.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), past_a4);
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.open.as_ref().map(|open| open.id.as_str()), Some("a4"));
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), at_a4);
+    }
+
+    #[test]
+    fn the_wheel_scrolls_a_short_list_on_to_its_headings_and_their_clicks_fold_them() {
+        let mut app = short_list_over_closed_shelves();
+        screen(&mut app, 80, 8);
+        // Three turns take the highlight to a4, the fourth scrolls past it, and more do nothing.
+        for _ in 0..6 {
+            assert!(mouse(&mut app, MouseEventKind::ScrollDown, 5, 4));
+            screen(&mut app, 80, 8);
+        }
+        assert_eq!(clickable(&app), ["", "Working", "Done", "Settled", "", ""]);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a4"));
+
+        // A click on Done opens it. Nothing the last frame drew takes a click until the next
+        // one draws, so a click where Settled was folds nothing.
+        assert!(mouse(&mut app, CLICK, 5, 4));
+        assert!(app.layout_changed);
+        assert!(crate::settings::saved_in_test().sidebar_done_shelf_expanded);
+        assert!(clickable(&app).iter().all(String::is_empty));
+        assert!(mouse(&mut app, CLICK, 5, 5));
+        assert!(!crate::settings::saved_in_test().sidebar_settled_shelf_expanded);
+
+        // The frame keeps the view where it was, with Delta under the open Done.
+        let rows = screen(&mut app, 80, 8);
+        assert!(!app.layout_changed);
+        assert_eq!(clickable(&app), ["", "Working", "Done", "d", "d", "d"]);
+        assert!(rows[4].contains("Done (1) ─"), "{rows:#?}");
+        assert!(rows[4].contains("─ ⌄"), "{rows:#?}");
+        assert!(shows(&rows, "Delta"), "{rows:#?}");
+
+        // A click on Delta opens it, and the list follows the highlight to it, with Settled
+        // under it.
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        assert!(mouse(&mut app, CLICK, 5, 6));
+        assert_eq!(app.open.as_ref().map(|open| open.id.as_str()), Some("d"));
+        screen(&mut app, 80, 8);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("d"));
+        assert_eq!(clickable(&app), ["d", "d", "d", "", "", "Settled"]);
+
+        // A click there opens Settled, and the wheel goes back up through a4 to a3.
+        assert!(mouse(&mut app, CLICK, 5, 7));
+        assert!(crate::settings::saved_in_test().sidebar_settled_shelf_expanded);
+        let rows = screen(&mut app, 80, 8);
+        assert!(rows[7].contains("Settled (0) ─"), "{rows:#?}");
+        assert!(rows[7].contains("─ ⌄"), "{rows:#?}");
+        assert!(mouse(&mut app, MouseEventKind::ScrollUp, 5, 4));
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), ["a4", "a4", "a4", "", "", "Working"]);
+        assert!(mouse(&mut app, MouseEventKind::ScrollUp, 5, 4));
+        screen(&mut app, 80, 8);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a3"));
+    }
+
+    #[test]
+    fn a_list_with_room_for_every_row_has_nothing_to_scroll_past() {
+        let mut app = short_list_over_closed_shelves();
+        // At 120x36 the whole list fits, with the shelves at its bottom.
+        let rows = screen(&mut app, 120, 36);
+        assert_eq!(row_showing(&rows, "Working (1)"), 33);
+        assert_eq!(row_showing(&rows, "Settled (0)"), 35);
+        assert_eq!(app.sidebar.shelf_at(35), Some(Shelf::Settled));
+        let tall = clickable(&app);
+        // Down past a4 scrolls nothing, so Up moves the highlight at once.
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Down);
+            screen(&mut app, 120, 36);
+            assert_eq!(clickable(&app), tall);
+        }
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a4"));
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a3"));
+
+        // Shrunk to 80x8, Down scrolls past a4. Grown back, the list fits and shows as before.
+        // Shrunk again, it follows a4, so Up moves the highlight at once.
+        press(&mut app, KeyCode::Down);
+        app.on_terminal_event(Event::Resize(80, 8));
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), ["a4", "a4", "a4", "", "", "Working"]);
+        press(&mut app, KeyCode::Down);
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), ["", "Working", "Done", "Settled", "", ""]);
+        app.on_terminal_event(Event::Resize(120, 36));
+        let rows = screen(&mut app, 120, 36);
+        assert_eq!(clickable(&app), tall);
+        assert_eq!(row_showing(&rows, "Settled (0)"), 35);
+        app.on_terminal_event(Event::Resize(80, 8));
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), ["a4", "a4", "a4", "", "", "Working"]);
+        press(&mut app, KeyCode::Up);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("a3"));
+    }
+
+    #[test]
+    fn a_short_list_of_headings_scrolls_to_the_last_and_an_empty_list_stays_still() {
+        // With no thread, there is nothing to scroll to and nothing takes a click.
+        let mut app = tui(&shelves_closed());
+        app.on_shell_event(shell_snapshot(Vec::new()));
+        screen(&mut app, 80, 8);
+        press(&mut app, KeyCode::Down);
+        assert!(mouse(&mut app, MouseEventKind::ScrollDown, 5, 4));
+        let rows = screen(&mut app, 80, 8);
+        assert!(
+            rows[2].trim_start().starts_with("No threads yet"),
+            "{rows:#?}"
+        );
+        assert!(clickable(&app).iter().all(String::is_empty));
+        press(&mut app, KeyCode::Up);
+        let rows = screen(&mut app, 80, 8);
+        assert!(
+            rows[2].trim_start().starts_with("No threads yet"),
+            "{rows:#?}"
+        );
+
+        // Delta alone, on closed Done, leaves only the headings. At 80x4 the list has two rows,
+        // and Down scrolls on to Settled, whose click opens it.
+        let mut app = tui(&shelves_closed());
+        app.on_shell_event(shell_snapshot(vec![finished_unseen("d", "Delta")]));
+        screen(&mut app, 80, 4);
+        assert_eq!(clickable(&app), ["Working", "Done"]);
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Down);
+            screen(&mut app, 80, 4);
+            assert_eq!(clickable(&app), ["Done", "Settled"]);
+        }
+        assert!(mouse(&mut app, CLICK, 5, 3));
+        assert!(crate::settings::saved_in_test().sidebar_settled_shelf_expanded);
+        let rows = screen(&mut app, 80, 4);
+        assert_eq!(clickable(&app), ["Done", "Settled"]);
+        assert!(rows[3].contains("Settled (0) ─"), "{rows:#?}");
+        assert!(rows[3].contains("─ ⌄"), "{rows:#?}");
+        press(&mut app, KeyCode::Up);
+        screen(&mut app, 80, 4);
+        assert_eq!(clickable(&app), ["Working", "Done"]);
+    }
+
+    #[test]
+    fn the_open_thread_on_a_closed_shelf_stays_in_reach_above_the_headings_under_it() {
+        let mut app = short_list_over_closed_shelves();
+        // Whiskey is open, so closed Working still lists it.
+        app.open = Some(OpenThread::new("w".into(), mpsc::unbounded_channel().1));
+        app.rebuild_rows();
+        screen(&mut app, 80, 8);
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Down);
+            screen(&mut app, 80, 8);
+        }
+        assert_eq!(app.sidebar.selected_thread_id(), Some("w"));
+        let at_whiskey = ["", "Working", "w", "w", "w", ""];
+        assert_eq!(clickable(&app), at_whiskey);
+
+        // Down scrolls past Whiskey to Done and Settled, and no further.
+        let past_whiskey = ["", "Done", "Settled", "", "", ""];
+        for _ in 0..2 {
+            press(&mut app, KeyCode::Down);
+            screen(&mut app, 80, 8);
+            assert_eq!(clickable(&app), past_whiskey);
+        }
+
+        // Opening Working there keeps the view. Closing it moves the highlight off its cards to
+        // Whiskey, which stays listed, and the list follows the highlight again.
+        press(&mut app, KeyCode::Char('w'));
+        screen(&mut app, 80, 8);
+        assert_eq!(clickable(&app), past_whiskey);
+        press(&mut app, KeyCode::Char('w'));
+        let rows = screen(&mut app, 80, 8);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("w"));
+        assert_eq!(clickable(&app), at_whiskey);
+        assert!(rows[3].contains("Working (1) ─"), "{rows:#?}");
+        assert!(rows[3].contains("─ ›"), "{rows:#?}");
+    }
+
+    #[test]
+    fn a_tall_screen_keeps_a_blank_row_at_the_top_and_a_short_one_uses_it() {
+        let mut app = tui(&Settings::default());
+        let threads = vec![listed("a", "Alpha", "idle"), listed("b", "Bravo", "idle")];
+        app.on_shell_event(shell_snapshot(threads));
+        app.open = Some(long_thread());
+        for (width, height) in [(120, 36), (80, 24), (40, 12), (10, 5)] {
+            let rows = screen(&mut app, width, height);
+            let top = u16::from(height >= 20);
+            // The toggle leads the title row, under the blank row when there is one.
+            assert_eq!(app.sidebar_toggle.y, top, "{width}x{height}");
+            if top == 1 {
+                assert!(rows[0].trim().is_empty(), "{width}x{height}: {rows:#?}");
+            }
+            let sidebar = &app.sidebar;
+            if sidebar.list == Rect::default() {
+                // Too narrow for the sidebar, so nothing of it takes a click.
+                assert_eq!(width, 10);
+            } else {
+                // The wordmark, the environment, then the list after another blank row when
+                // there is room, running to the bottom.
+                assert!(rows[top as usize].contains("T3 Code"), "{rows:#?}");
+                assert_eq!(sidebar.list.y, 2 + 2 * top, "{width}x{height}");
+                assert_eq!(sidebar.list.bottom(), height);
+            }
+            // Every card and heading drawn takes clicks inside the list and nowhere else.
+            for y in 0..height {
+                let hit = sidebar.thread_at(y).is_some() || sidebar.shelf_at(y).is_some();
+                let inside = (sidebar.list.y..sidebar.list.bottom()).contains(&y);
+                assert!(!hit || inside, "{width}x{height} row {y}");
+            }
+        }
     }
 
     #[test]
@@ -6044,7 +6655,7 @@ mod tests {
         assert_eq!(app.sidebar.next_wake, None);
         ctrl_b(&mut app);
         let rows = screen(&mut app, 80, 24);
-        assert!(row_showing(&rows, "Active ─") < row_showing(&rows, "Zulu"));
+        assert!(row_showing(&rows, "Working (1)") < row_showing(&rows, "Zulu"));
         assert!(!rows.iter().any(|row| row.contains("Snoozed")), "{rows:#?}");
     }
 
@@ -6087,7 +6698,6 @@ mod tests {
                         app.composer_area,
                         app.picker_area,
                         app.sidebar.list,
-                        app.sidebar.footer,
                         app.sidebar.border,
                     ];
                     for area in drawn {
@@ -7647,7 +8257,7 @@ mod tests {
         assert_eq!(app.selected_pick(), gpt);
         let rows = screen(&mut app, 120, 30);
         assert!(!rows.iter().any(|row| row.contains("Snoozed")), "{rows:#?}");
-        assert!(row_showing(&rows, "Active ─") < row_showing(&rows, "Zulu"));
+        assert!(row_showing(&rows, "Working (1)") < row_showing(&rows, "Zulu"));
         assert_eq!(reads(&runtime), 0);
     }
 
@@ -9160,7 +9770,10 @@ mod tests {
             let answers = answers().into_iter().take(count).collect();
             open_setup_thread(&mut app, "t", worktree_thread("t", true, runs, answers));
             let stages = setup_stages(["done", "done", "skipped", "done", "done"]);
-            let item = setup_item("t", "done", 1, stages);
+            let mut item = setup_item("t", "done", 1, stages);
+            // A done setup with its end, so its elapsed time can't tick over between the
+            // frames compared below.
+            item["endedAt"] = json!("2026-10-07T00:00:12.000Z");
             assert!(deliver(&mut app, &subscriptions, WatchEvent::Item(item)));
             press(&mut app, KeyCode::Esc);
             press(&mut app, key);
@@ -9335,18 +9948,19 @@ mod tests {
     /// What one frame draws around the conversation.
     #[derive(Debug)]
     struct Chrome {
-        /// The sidebar's top row, with the wordmark and the dot.
+        /// The sidebar's first row under the inset, with the wordmark and the dot.
         wordmark: String,
         /// The sidebar's row under it.
         environment: String,
         /// The sidebar's list.
         list: String,
-        /// The main column's top row, with the toggle and the breadcrumb, up to the details'
+        /// The main column's title row, with the toggle and the breadcrumb, up to the details'
         /// button.
         header: String,
         /// The main column's bottom row.
         status: String,
-        /// The colors of the dots in the sidebar's top row and the main column's.
+        /// The colors of the dots in the sidebar's wordmark row and the main column's title
+        /// row.
         sidebar_dot: Option<Color>,
         header_dot: Option<Color>,
     }
@@ -9360,17 +9974,19 @@ mod tests {
             button if button.width > 0 => button.x,
             _ => width,
         };
+        // A screen with room has a blank row over the wordmark and the title row.
+        let top = top_inset(height);
         let dot = |columns: std::ops::Range<u16>| {
             columns
-                .map(|x| &buffer[(x, 0)])
+                .map(|x| &buffer[(x, top)])
                 .find(|cell| cell.symbol() == "●")
                 .map(|cell| cell.fg)
         };
         Chrome {
-            wordmark: text_in(&buffer, Rect::new(0, 0, main, 1)),
-            environment: text_in(&buffer, Rect::new(0, 1, main, 1)),
+            wordmark: text_in(&buffer, Rect::new(0, top, main, 1)),
+            environment: text_in(&buffer, Rect::new(0, top + 1, main, 1)),
             list: text_in(&buffer, app.sidebar.list),
-            header: text_in(&buffer, Rect::new(main, 0, end - main, 1)),
+            header: text_in(&buffer, Rect::new(main, top, end - main, 1)),
             status: text_in(&buffer, Rect::new(main, height - 1, width - main, 1)),
             sidebar_dot: dot(0..main),
             header_dot: dot(main..width),
@@ -9534,7 +10150,7 @@ mod tests {
         // its gap, four, then the breadcrumb, 30, then the gap and the button, four. Without
         // the button the breadcrumb had 34.
         let header = chrome(&mut app, 40, 24).header;
-        assert_eq!(app.details.button, Rect::new(36, 0, 3, 1));
+        assert_eq!(app.details.button, Rect::new(36, 1, 3, 1));
         assert_eq!(header, "  ◧  Pick a thread in th…  ● Studi… ");
         // Too narrow for it beside the title's 16 columns, the row is the title's.
         let drawn = chrome(&mut app, 24, 24);
@@ -9703,7 +10319,7 @@ mod tests {
                         "{width} ({x}, {y}) {symbol:?}"
                     );
                 }
-                let top = text_in(&buffer, Rect::new(0, 0, width, 2));
+                let top = text_in(&buffer, Rect::new(0, 0, width, 3));
                 // The label is cut long before its end.
                 assert!(!top.contains("evil"), "{top}");
                 // The title keeps its columns.
@@ -9737,11 +10353,12 @@ mod tests {
         app.focus = Focus::Composer;
         app.composer.insert_str("half a thought");
         chrome(&mut app, 80, 24);
-        // The list starts under the environment's row, where it always has.
-        assert_eq!(app.sidebar.list.y, 2);
+        // The list starts under the blank row below the environment's.
+        assert_eq!(app.sidebar.list.y, 4);
         let (border, list) = (app.sidebar.border, app.sidebar.list);
-        // A click on the dot or the environment does what a click on the wordmark did.
-        for (x, y) in [(border.x - 2, 0), (5, 1)] {
+        // A click on the dot, the environment or a blank row around them does what a click on
+        // the wordmark did.
+        for (x, y) in [(border.x - 2, 1), (5, 2), (5, 0), (5, 3)] {
             mouse(&mut app, CLICK, x, y);
             assert_eq!(app.focus, Focus::Composer);
             assert!(app.open.is_none() && app.picker.is_none() && app.drag.is_none());
@@ -9760,7 +10377,7 @@ mod tests {
         let header = chrome(&mut app, 120, 24).header;
         let at = header.find("Studio").expect("the environment");
         let x = header[..at].width() as u16;
-        mouse(&mut app, CLICK, x, 0);
+        mouse(&mut app, CLICK, x, 1);
         assert!(app.sidebar_hidden);
         assert!(crate::settings::saved_in_test().sidebar_hidden);
         assert!(app.open.is_none() && app.picker.is_none() && app.drag.is_none());
@@ -9846,8 +10463,9 @@ mod tests {
         assert!(!app.details.open);
         assert_eq!(app.details.drawn, None);
         let wide = app.composer_area;
-        // The button ends the title row, a column in from the screen's edge.
-        assert_eq!(app.details.button, Rect::new(196, 0, 3, 1));
+        // The button ends the title row, a column in from the screen's edge, under the blank
+        // row at the top.
+        assert_eq!(app.details.button, Rect::new(196, 1, 3, 1));
         assert_eq!(text_in(&buffer, app.details.button), " ◨ ");
 
         alt(&mut app, 'b');
@@ -10435,7 +11053,7 @@ mod tests {
             // The hostile text reached the breadcrumb, and the sidebar's card when it shows,
             // by its printable characters.
             let buffer = cells(&mut app, 200, 50);
-            let title_row = text_in(&buffer, Rect::new(0, 0, 200, 1));
+            let title_row = text_in(&buffer, Rect::new(0, 1, 200, 1));
             assert!(title_row.contains('名'), "{title_row}");
             let sidebar = text_in(&buffer, app.sidebar.list);
             assert_eq!(sidebar.contains('名'), !sidebar_hidden, "{sidebar}");
@@ -10867,8 +11485,8 @@ mod tests {
             }
             let buffer = cells(&mut app, 200, 50);
             let status = text_in(&buffer, Rect::new(0, 49, 200, 1));
-            let keys = app.details.keys(false)[0];
-            assert!(status.contains(keys), "{keys:?} in {status:?}");
+            let keys = app.details.keys(false).remove(0);
+            assert!(status.contains(&keys), "{keys:?} in {status:?}");
             keys_fit(&app, 200, "Esc leave", 0);
         }
         assert!(app.details.pulls.viewing());
@@ -11458,6 +12076,856 @@ mod tests {
         assert!(!text.contains("Loading"), "{text}");
     }
 
+    // ---- lineage ----
+
+    /// Thread `id` in Demo, a fork or a subagent of thread `parent` by `relationship`.
+    fn related(id: &str, parent: &str, relationship: &str) -> Value {
+        let mut thread = bound(id, "p", Value::Null, Value::Null);
+        let lineage = json!({"parentThreadId": parent, "relationshipToParent": relationship});
+        thread["lineage"] = lineage;
+        thread
+    }
+
+    /// An agent thread `t` delegated to, on thread `child`, or on none yet.
+    fn subagent(id: &str, child: Value, status: &str) -> Value {
+        json!({"id": id, "threadId": "t", "childThreadId": child, "status": status,
+            "title": format!("Agent {id}")})
+    }
+
+    /// The TUI with thread `t`, a fork of `up`, open, and its details open as a pane with the
+    /// keyboard. The shell lists `t`'s fork `f` and the thread `a` of its running agent. `t`'s
+    /// projection has agent `s1` on `a`, and `s2`, done, on a thread the shell doesn't list.
+    /// The composer has a draft with its cursor before the last letter.
+    fn lineage_tui() -> App {
+        let mut current = feature_thread();
+        current["lineage"] = json!({"parentThreadId": "up", "relationshipToParent": "fork"});
+        let mut agent = related("a", "t", "subagent");
+        agent["activityRunStatus"] = json!("running");
+        let threads = vec![
+            bound("up", "p", Value::Null, Value::Null),
+            current.clone(),
+            related("f", "t", "fork"),
+            agent,
+        ];
+        let mut app = tui(&Settings::default());
+        app.on_shell_event(details_shell(threads));
+        app.on_shell_event(caught_up());
+        app.open_thread(open_bound(current));
+        let agents = [
+            subagent("s1", json!("a"), "running"),
+            subagent("s2", json!("gone"), "completed"),
+        ];
+        for (sequence, agent) in (2..).zip(agents) {
+            app.on_thread_event(live(sequence, "subagent.updated", agent));
+        }
+        app.composer.insert_str("draft");
+        press(&mut app, KeyCode::Left);
+        cells(&mut app, 200, 50);
+        alt(&mut app, 'b');
+        cells(&mut app, 200, 50);
+        let order = focus_after(&mut app, &[KeyCode::Tab; 2]);
+        assert_eq!(order, [Focus::Transcript, Focus::Details]);
+        app
+    }
+
+    /// The thread open in `app`.
+    fn open_id(app: &App) -> Option<&str> {
+        app.open.as_ref().map(|open| open.id.as_str())
+    }
+
+    /// Draws a frame 200 columns by 50 rows and returns its status line.
+    fn status_after(app: &mut App) -> String {
+        let buffer = cells(app, 200, 50);
+        text_in(&buffer, Rect::new(0, 49, 200, 1))
+    }
+
+    /// Draws a frame `width` columns by `height` rows and returns the cell in the middle of
+    /// the details' row that shows `needle`.
+    fn details_row(app: &mut App, width: u16, height: u16, needle: &str) -> (u16, u16) {
+        let buffer = cells(app, width, height);
+        let area = app.details.drawn.expect("the details").area;
+        let text = text_in(&buffer, area);
+        let line = text
+            .lines()
+            .position(|line| line.contains(needle))
+            .unwrap_or_else(|| panic!("no row shows {needle:?} in {text}"));
+        (area.x + area.width / 2, area.y + line as u16)
+    }
+
+    #[test]
+    fn lineage_rows_open_their_threads_and_the_pane_keeps_the_keyboard_and_the_draft() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = lineage_tui();
+        let started = reads(&runtime);
+        let text = details_after(&mut app, 200, 50);
+        for shown in [
+            "Lineage · 1 running",
+            "↑ Thread up",
+            "↳ Thread f",
+            "◆ Thread a",
+            "› Previous agents (1)",
+        ] {
+            assert!(text.contains(shown), "{shown:?} in {text}");
+        }
+        assert!(!text.contains("Agent s2"), "{text}");
+        let status = status_after(&mut app);
+        assert!(status.contains("↑↓ choose · PgUp"), "{status}");
+
+        // ↓ chooses each row in turn, and the status line says what Enter does with it.
+        for action in [
+            "Enter open parent thread",
+            "Enter open fork",
+            "Enter open subagent",
+            "Enter show previous agents",
+        ] {
+            press(&mut app, KeyCode::Down);
+            let status = status_after(&mut app);
+            assert!(status.contains(action), "{status}");
+        }
+        // Enter opens Previous agents, which shows the agent whose thread the shell doesn't
+        // list. Enter on it only says it can't open.
+        press(&mut app, KeyCode::Enter);
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("◆ Agent s2"), "{text}");
+        press(&mut app, KeyCode::Down);
+        let status = status_after(&mut app);
+        assert!(status.contains("Subagent unavailable"), "{status}");
+        press(&mut app, KeyCode::Enter);
+        let status = status_after(&mut app);
+        assert!(
+            status.contains("This related thread is unavailable."),
+            "{status}"
+        );
+        assert_eq!(open_id(&app), Some("t"));
+        assert_eq!(reads(&runtime), started);
+
+        // ↑ goes back a row, and the wheel leaves none chosen.
+        press(&mut app, KeyCode::Up);
+        let status = status_after(&mut app);
+        assert!(status.contains("Enter hide previous agents"), "{status}");
+        let pane = app.details.drawn.expect("the pane").area;
+        let (x, y) = (pane.x + 2, pane.y + 2);
+        assert!(mouse(&mut app, MouseEventKind::ScrollDown, x, y));
+        assert_eq!(app.details.selected(), None);
+        let status = status_after(&mut app);
+        assert!(status.contains("↑↓ choose · PgUp"), "{status}");
+
+        // ↓ chooses the first row again, and Enter opens the parent with a watch of its own.
+        // The pane keeps the keyboard, the sidebar highlights the parent, and its Lineage
+        // has `t` as its fork and none of `t`'s own.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(open_id(&app), Some("up"));
+        assert_eq!(reads(&runtime), started + 1);
+        assert_eq!(app.focus, Focus::Details);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("up"));
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("↳ Thread t"), "{text}");
+        assert!(!text.contains("Thread f"), "{text}");
+
+        // From the parent, ↓ and Enter open `t` again. Esc gives the keyboard back to the
+        // transcript, which had it before the pane, and the draft kept its cursor.
+        press(&mut app, KeyCode::Down);
+        let status = status_after(&mut app);
+        assert!(status.contains("Enter open fork"), "{status}");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(open_id(&app), Some("t"));
+        assert_eq!(reads(&runtime), started + 2);
+        assert_eq!(app.focus, Focus::Details);
+        press(&mut app, KeyCode::Esc);
+        assert_eq!(app.focus, Focus::Transcript);
+        assert!(app.details.open);
+        app.focus = Focus::Composer;
+        press(&mut app, KeyCode::Char('x'));
+        assert_eq!(app.composer.text(), "drafxt");
+    }
+
+    #[test]
+    fn a_click_on_a_lineage_row_acts_on_the_row_the_last_frame_drew() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = lineage_tui();
+        let started = reads(&runtime);
+        // A click on Previous agents opens the group. A second click before a frame draws it
+        // does nothing, so the group stays open.
+        let (x, y) = details_row(&mut app, 200, 50, "› Previous agents (1)");
+        assert!(mouse(&mut app, CLICK, x, y));
+        assert!(!mouse(&mut app, CLICK, x, y));
+        // A click on the agent whose thread the shell doesn't list only says it can't open.
+        let (x, y) = details_row(&mut app, 200, 50, "◆ Agent s2");
+        assert!(mouse(&mut app, CLICK, x, y));
+        let status = status_after(&mut app);
+        assert!(
+            status.contains("This related thread is unavailable."),
+            "{status}"
+        );
+        assert_eq!(open_id(&app), Some("t"));
+        assert_eq!(reads(&runtime), started);
+        // A click on the fork opens it, and the pane keeps the keyboard.
+        let (x, y) = details_row(&mut app, 200, 50, "↳ Thread f");
+        assert!(mouse(&mut app, CLICK, x, y));
+        assert_eq!(open_id(&app), Some("f"));
+        assert_eq!(app.focus, Focus::Details);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("f"));
+        assert_eq!(reads(&runtime), started + 1);
+
+        // In a dialog, a click on the fork's parent at the end of the text opens it the same
+        // way.
+        app.on_terminal_event(Event::Resize(80, 24));
+        cells(&mut app, 80, 24);
+        assert_eq!(app.details.shown(), Some(details::Layout::Dialog));
+        press(&mut app, KeyCode::End);
+        let (x, y) = details_row(&mut app, 80, 24, "↑ Thread t");
+        assert!(mouse(&mut app, CLICK, x, y));
+        assert_eq!(open_id(&app), Some("t"));
+        assert_eq!(app.focus, Focus::Details);
+        assert_eq!(reads(&runtime), started + 2);
+        assert_eq!(app.composer.text(), "draft");
+    }
+
+    #[test]
+    fn a_hundred_and_twenty_four_agents_page_by_twelve_and_stay_inside_at_every_size() {
+        let mut app = lineage_tui();
+        // 123 more agents finish, 7 of them failed, with titles that try to clear the screen.
+        for i in 0..123_u64 {
+            let failed = i.is_multiple_of(18);
+            let status = if failed { "failed" } else { "completed" };
+            let mut agent = subagent(&format!("p{i}"), json!(format!("c{i}")), status);
+            agent["title"] = json!(format!("\u{1b}[2J\u{9b}31m{}", "名".repeat(300)));
+            app.on_thread_event(live(4 + i, "subagent.updated", agent));
+        }
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("› Previous agents (124)"), "{text}");
+        assert!(text.contains("7 failed"), "{text}");
+        // The 123 events worked Lineage out once, on the frame after them.
+        assert_eq!(app.details.lineage_prepares, 2);
+
+        // ↓ reaches the group's heading, Enter opens it with its first six, and each Enter on
+        // Show more adds twelve, then the last ten.
+        for _ in 0..4 {
+            press(&mut app, KeyCode::Down);
+        }
+        press(&mut app, KeyCode::Enter);
+        cells(&mut app, 200, 50);
+        for _ in 0..7 {
+            press(&mut app, KeyCode::Down);
+        }
+        for _ in 0..9 {
+            let status = status_after(&mut app);
+            assert!(status.contains("Enter show 12 more"), "{status}");
+            press(&mut app, KeyCode::Enter);
+        }
+        let status = status_after(&mut app);
+        assert!(status.contains("Enter show 10 more"), "{status}");
+        press(&mut app, KeyCode::Enter);
+        // With all 124 showing, the choice moved to the last of them.
+        let status = status_after(&mut app);
+        assert!(status.contains("Subagent unavailable"), "{status}");
+        // Opening the group and each of its ten pages worked Lineage out once more.
+        assert_eq!(app.details.lineage_prepares, 13);
+
+        // At every size, with the sidebar and without, the details stay on the screen and no
+        // cell holds a control character.
+        for hide in [false, true] {
+            if hide {
+                ctrl_b(&mut app);
+            }
+            for (width, height) in [(200, 50), (120, 36), (80, 24), (40, 12)] {
+                let buffer = cells(&mut app, width, height);
+                let drawn = app.details.drawn.expect("drawn");
+                assert_eq!(drawn.area.intersection(app.screen), drawn.area);
+                for y in 0..height {
+                    for x in 0..width {
+                        let symbol = buffer[(x, y)].symbol();
+                        assert!(
+                            !symbol.contains(char::is_control),
+                            "{hide} {width}x{height} ({x}, {y}) {symbol:?}"
+                        );
+                    }
+                }
+            }
+        }
+        assert_eq!(app.details.lineage_prepares, 13);
+    }
+
+    #[test]
+    fn lineage_is_worked_out_again_only_after_events_that_can_change_it() {
+        let mut app = lineage_tui();
+        assert_eq!(app.details.lineage_prepares, 1);
+        // Frames, keys, an answer streaming in and news of an unrelated thread or a project
+        // work nothing out again.
+        for _ in 0..3 {
+            cells(&mut app, 200, 50);
+        }
+        for code in [KeyCode::Down, KeyCode::Up, KeyCode::Char('x')] {
+            press(&mut app, code);
+        }
+        let answer = json!({"id": "a20", "type": "assistant_message", "ordinal": 20,
+            "text": "Done"});
+        app.on_thread_event(live(4, "turn-item.updated", answer));
+        let unrelated = bound("v", "q", Value::Null, Value::Null);
+        app.on_shell_event(thread_updated(2, unrelated));
+        let project = json!({"kind": "project.updated", "sequence": 3,
+            "project": {"id": "q", "title": "Other renamed", "workspaceRoot": "/repo/o"}});
+        app.on_shell_event(WatchEvent::Item(project));
+        app.on_shell_event(caught_up());
+        cells(&mut app, 200, 50);
+        assert_eq!(app.details.lineage_prepares, 1);
+
+        // The agent's thread ends its run with a failure, which outranks the agent's own
+        // status, so the agent moves to Previous agents.
+        let mut ended = related("a", "t", "subagent");
+        ended["activityRunStatus"] = json!("failed");
+        app.on_shell_event(thread_updated(4, ended));
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("› Previous agents (2)"), "{text}");
+        assert!(text.contains("1 failed"), "{text}");
+        assert!(!text.contains("1 running"), "{text}");
+        assert_eq!(app.details.lineage_prepares, 2);
+        // A new fork of the thread shows.
+        app.on_shell_event(thread_updated(5, related("g", "t", "fork")));
+        assert!(details_after(&mut app, 200, 50).contains("↳ Thread g"));
+        assert_eq!(app.details.lineage_prepares, 3);
+        // An agent with no thread yet counts as running.
+        let waiting = subagent("s3", Value::Null, "running");
+        app.on_thread_event(live(5, "subagent.updated", waiting));
+        assert!(details_after(&mut app, 200, 50).contains("Lineage · 1 running"));
+        assert_eq!(app.details.lineage_prepares, 4);
+
+        // Closed, the details work nothing out, and they catch up when they open again.
+        alt(&mut app, 'b');
+        app.on_shell_event(thread_updated(6, related("h", "t", "fork")));
+        cells(&mut app, 200, 50);
+        assert_eq!(app.details.lineage_prepares, 4);
+        alt(&mut app, 'b');
+        assert!(details_after(&mut app, 200, 50).contains("↳ Thread h"));
+        assert_eq!(app.details.lineage_prepares, 5);
+    }
+
+    #[test]
+    fn a_closed_watch_leaves_lineage_to_the_shell() {
+        let mut app = lineage_tui();
+        // Another agent with no thread yet runs, and one runs on a thread the shell doesn't
+        // list.
+        let unseen = subagent("s3", Value::Null, "running");
+        app.on_thread_event(live(4, "subagent.updated", unseen));
+        let lost = subagent("s4", json!("lost"), "running");
+        app.on_thread_event(live(5, "subagent.updated", lost));
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Lineage · 3 running"), "{text}");
+        let prepared = app.details.lineage_prepares;
+
+        // The watch closes, and Lineage is worked out again once. The agents only the
+        // projection knows of no longer count as running, since t3term won't hear them end,
+        // and the one on a thread the shell doesn't list has no status.
+        app.on_thread_event(WatchEvent::Failed("The thread's watch closed.".into()));
+        let text = details_after(&mut app, 200, 50);
+        assert_eq!(app.details.lineage_prepares, prepared + 1);
+        assert!(text.contains("Lineage · 1 running"), "{text}");
+        let row = text
+            .lines()
+            .find(|line| line.contains("◆ Agent s4"))
+            .unwrap_or_default();
+        assert!(row.contains("Unavailable"), "{text}");
+
+        // The shell still hears the agent's thread, which goes idle. Its agent still says it
+        // runs, which counted while the watch was open, but now the thread's copy goes first,
+        // so it joins the agent that finished under Previous agents.
+        app.on_shell_event(thread_updated(2, related("a", "t", "subagent")));
+        let text = details_after(&mut app, 200, 50);
+        assert_eq!(app.details.lineage_prepares, prepared + 2);
+        assert!(text.contains("› Previous agents (2)"), "{text}");
+        assert!(!text.contains("Lineage ·"), "{text}");
+        assert!(text.contains("◆ Agent s4"), "{text}");
+    }
+
+    #[test]
+    fn the_parent_still_opens_after_the_shell_drops_the_open_thread() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = lineage_tui();
+        let started = reads(&runtime);
+        // T3 archives `t`, so the shell drops it. Its watch goes on, and its projection still
+        // has it as a fork of `up`, which the shell lists.
+        let removed = json!({"kind": "thread.removed", "sequence": 2, "threadId": "t"});
+        app.on_shell_event(WatchEvent::Item(removed));
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("↑ Thread up"), "{text}");
+        assert!(text.contains("↳ Thread f"), "{text}");
+        // The watch closes too, and the parent stays.
+        app.on_thread_event(WatchEvent::Failed("The thread's watch closed.".into()));
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("↑ Thread up"), "{text}");
+
+        // ↓ chooses the parent, and Enter opens it with a watch of its own. The pane keeps the
+        // keyboard, and the sidebar highlights the parent.
+        press(&mut app, KeyCode::Down);
+        let status = status_after(&mut app);
+        assert!(status.contains("Enter open parent thread"), "{status}");
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(open_id(&app), Some("up"));
+        assert_eq!(reads(&runtime), started + 1);
+        assert_eq!(app.focus, Focus::Details);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("up"));
+    }
+
+    /// The TUI with thread `t` open and highlighted in the sidebar's inbox, and `other`, a
+    /// thread related to `t`, on a server that settles threads. Working, Done and Settled are
+    /// closed, as the saved settings have them. The details are open as a pane with the
+    /// keyboard, and the composer has a draft with its cursor before the last letter.
+    fn closed_shelves_lineage_tui(other: Value) -> App {
+        Settings::update(|saved| *saved = shelves_closed());
+        let mut client = Client::offline();
+        client.runtime.capabilities = json!({"threadSettlement": true});
+        let mut app = App::new(
+            Arc::new(client),
+            Theme::new(Depth::TrueColor),
+            &shelves_closed(),
+            mpsc::unbounded_channel().0,
+        );
+        app.watch_setup = Box::new(|_: &str| mpsc::unbounded_channel().1);
+        // A finished run with no visit keeps `t` in the inbox, which doesn't fold.
+        let mut current = bound("t", "p", Value::Null, Value::Null);
+        current["status"] = json!("completed");
+        app.on_shell_event(details_shell(vec![current.clone(), other]));
+        app.on_shell_event(caught_up());
+        app.open_thread(open_bound(current));
+        assert!(app.sidebar.select("t"));
+        app.composer.insert_str("draft");
+        press(&mut app, KeyCode::Left);
+        cells(&mut app, 200, 50);
+        alt(&mut app, 'b');
+        cells(&mut app, 200, 50);
+        let order = focus_after(&mut app, &[KeyCode::Tab; 2]);
+        assert_eq!(order, [Focus::Transcript, Focus::Details]);
+        app
+    }
+
+    #[test]
+    fn a_related_thread_on_a_closed_shelf_opens_listed_there_and_highlighted() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut working = related("w", "t", "fork");
+        working["status"] = json!("running");
+        let mut done = related("d", "t", "fork");
+        done["status"] = json!("completed");
+        done["latestRunCompletedAt"] = json!("2026-10-08T11:00:00.000Z");
+        done["lastVisitedAt"] = json!("2026-10-08T10:00:00.000Z");
+        let mut settled = related("s", "t", "fork");
+        settled["settledOverride"] = json!("settled");
+        for (shelf, fork) in [("Working", working), ("Done", done), ("Settled", settled)] {
+            let id = str_of(&fork, "id").to_string();
+            let mut app = closed_shelves_lineage_tui(fork);
+            let started = reads(&runtime);
+            // The fork's shelf is closed, so the sidebar lists only its heading.
+            let heading = format!("{shelf} (1) ─");
+            let rows = screen(&mut app, 200, 50);
+            let at = row_showing(&rows, &heading) as usize;
+            assert!(rows[at].contains("─ ›"), "{shelf}: {rows:#?}");
+            assert!(!clickable(&app).contains(&id), "{shelf}: {rows:#?}");
+
+            // ↓ chooses the fork, and Enter opens it with a watch of its own. The shelf lists
+            // it as the open thread, and the sidebar highlights it at once.
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            assert_eq!(open_id(&app), Some(id.as_str()), "{shelf}");
+            assert_eq!(
+                app.sidebar.selected_thread_id(),
+                Some(id.as_str()),
+                "{shelf}"
+            );
+            assert_eq!(reads(&runtime), started + 1, "{shelf}");
+            assert_eq!(app.focus, Focus::Details, "{shelf}");
+
+            // The first frame draws its row under the heading, which stays closed.
+            let rows = screen(&mut app, 200, 50);
+            let at = row_showing(&rows, &heading) as usize;
+            assert!(rows[at].contains("─ ›"), "{shelf}: {rows:#?}");
+            assert!(clickable(&app).contains(&id), "{shelf}: {rows:#?}");
+            assert_eq!(
+                app.sidebar.selected_thread_id(),
+                Some(id.as_str()),
+                "{shelf}"
+            );
+            let saved = crate::settings::saved_in_test();
+            assert!(!saved.sidebar_working_shelf_expanded, "{shelf}");
+            assert!(!saved.sidebar_done_shelf_expanded, "{shelf}");
+            assert!(!saved.sidebar_settled_shelf_expanded, "{shelf}");
+            assert_eq!(reads(&runtime), started + 1, "{shelf}");
+            app.focus = Focus::Composer;
+            press(&mut app, KeyCode::Char('x'));
+            assert_eq!(app.composer.text(), "drafxt", "{shelf}");
+        }
+
+        // The sidebar has no row for an agent's thread, so the highlight stays on `t`.
+        let mut agent = related("a", "t", "subagent");
+        agent["activityRunStatus"] = json!("running");
+        let mut app = closed_shelves_lineage_tui(agent);
+        let started = reads(&runtime);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(open_id(&app), Some("a"));
+        assert_eq!(reads(&runtime), started + 1);
+        assert_eq!(app.focus, Focus::Details);
+        screen(&mut app, 200, 50);
+        assert_eq!(app.sidebar.selected_thread_id(), Some("t"));
+        assert!(!clickable(&app).iter().any(|row| row == "a"));
+        assert_eq!(app.composer.text(), "draft");
+    }
+
+    #[test]
+    fn enter_asks_the_shell_again_before_it_opens_a_related_thread() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = lineage_tui();
+        let started = reads(&runtime);
+        // ↓ chooses the fork, and the frame says Enter opens it.
+        presses(&mut app, KeyCode::Down, 2);
+        let status = status_after(&mut app);
+        assert!(status.contains("Enter open fork"), "{status}");
+        let (x, y) = details_row(&mut app, 200, 50, "↳ Thread f");
+
+        // T3 archives the fork before the next frame. A click on its row does nothing, and
+        // Enter opens nothing and says why.
+        let mut archived = related("f", "t", "fork");
+        archived["archivedAt"] = json!("2026-10-12T00:00:00.000Z");
+        app.on_shell_event(thread_updated(2, archived));
+        assert!(!mouse(&mut app, CLICK, x, y));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!((open_id(&app), reads(&runtime)), (Some("t"), started));
+        let status = status_after(&mut app);
+        assert!(
+            status.contains("This related thread is unavailable."),
+            "{status}"
+        );
+        // From that frame on, its row says it doesn't open.
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Down);
+        let status = status_after(&mut app);
+        assert!(status.contains("Fork unavailable"), "{status}");
+
+        // It comes back, and T3 removes it before the next frame.
+        app.on_shell_event(thread_updated(3, related("f", "t", "fork")));
+        let status = status_after(&mut app);
+        assert!(status.contains("Enter open fork"), "{status}");
+        let (x, y) = details_row(&mut app, 200, 50, "↳ Thread f");
+        let removed = json!({"kind": "thread.removed", "sequence": 4, "threadId": "f"});
+        app.on_shell_event(WatchEvent::Item(removed));
+        assert!(!mouse(&mut app, CLICK, x, y));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!((open_id(&app), reads(&runtime)), (Some("t"), started));
+        let status = status_after(&mut app);
+        assert!(
+            status.contains("This related thread is unavailable."),
+            "{status}"
+        );
+        let text = details_after(&mut app, 200, 50);
+        assert!(!text.contains("Thread f"), "{text}");
+
+        // The agent's thread is renamed and waits, which leaves it a thread that opens, so
+        // Enter before the next frame opens it.
+        presses(&mut app, KeyCode::Down, 2);
+        let status = status_after(&mut app);
+        assert!(status.contains("Enter open subagent"), "{status}");
+        let mut waiting = related("a", "t", "subagent");
+        waiting["title"] = json!("Read the parser");
+        waiting["activityRunStatus"] = json!("waiting");
+        app.on_shell_event(thread_updated(5, waiting));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(open_id(&app), Some("a"));
+        assert_eq!(reads(&runtime), started + 1);
+        assert_eq!(app.focus, Focus::Details);
+    }
+
+    /// Presses `code` `times` times.
+    fn presses(app: &mut App, code: KeyCode, times: usize) {
+        for _ in 0..times {
+            press(app, code);
+        }
+    }
+
+    /// The TUI of `lineage_tui`, with five more forks of `t`, `g0` to `g4`, which come after
+    /// the fork `f`, drawn on a screen 200 columns by 24 rows. Lineage's first group shows six
+    /// of its seven rows and a Show more row.
+    fn long_lineage_tui() -> App {
+        let mut app = lineage_tui();
+        for i in 0..5_u64 {
+            let fork = related(&format!("g{i}"), "t", "fork");
+            app.on_shell_event(thread_updated(2 + i, fork));
+        }
+        cells(&mut app, 200, 24);
+        app
+    }
+
+    /// A move of the details' text, for a click that comes before the frame after it.
+    struct Move {
+        name: &'static str,
+        /// The screen of the frames before the move.
+        screen: (u16, u16),
+        /// What comes before the frame that draws the row clicked.
+        prepare: fn(&mut App),
+        act: fn(&mut App),
+        /// The screen of the frame after the move.
+        after: (u16, u16),
+    }
+
+    /// Scrolls the details a row down with the wheel.
+    fn wheel_down(app: &mut App) {
+        let area = app.details.drawn.expect("the details").area;
+        mouse(app, MouseEventKind::ScrollDown, area.x + 2, area.y + 2);
+    }
+
+    /// Turns the details into a dialog on a screen 80 columns by 24 rows.
+    fn as_dialog(app: &mut App) {
+        app.on_terminal_event(Event::Resize(80, 24));
+        cells(app, 80, 24);
+    }
+
+    /// Makes `step`'s move on a `long_lineage_tui` and clicks before a frame draws the details
+    /// again. The click acts on nothing. The next frame draws another thread's row there, and a
+    /// click on it opens that thread.
+    ///
+    /// The row clicked comes from the layout, not from a count of the rows the details show. A
+    /// second TUI makes the same move with a frame after it, and the row is the first one that
+    /// had a target before the move and has another thread's row after it. The TUI clicked on
+    /// gets no frame between the move and the click.
+    fn click_after(runtime: &tokio::runtime::Runtime, step: &Move) {
+        let name = step.name;
+        let (width, height) = step.screen;
+        let (after_width, after_height) = step.after;
+        let (x, y, was, id) = {
+            let mut framed = long_lineage_tui();
+            (step.prepare)(&mut framed);
+            cells(&mut framed, width, height);
+            let area = framed.details.drawn.expect("the details").area;
+            let x = area.x + area.width / 2;
+            let before: Vec<_> = (area.y..area.bottom())
+                .map(|y| (y, framed.details.target_at(x, y)))
+                .collect();
+            (step.act)(&mut framed);
+            cells(&mut framed, after_width, after_height);
+            before
+                .into_iter()
+                .find_map(|(y, was)| match framed.details.target_at(x, y) {
+                    Some(lineage::Target::Thread(id))
+                        if was.is_some() && was != Some(lineage::Target::Thread(id.clone())) =>
+                    {
+                        Some((x, y, was, id))
+                    }
+                    _ => None,
+                })
+                .unwrap_or_else(|| panic!("{name}: no row has another thread's row after it"))
+        };
+
+        let mut app = long_lineage_tui();
+        let started = reads(runtime);
+        (step.prepare)(&mut app);
+        cells(&mut app, width, height);
+        let before = app.details.target_at(x, y);
+        assert!(before.is_some(), "{name}");
+        assert_eq!(before, was, "{name}");
+        (step.act)(&mut app);
+        let paging = app.details.paging().clone();
+        mouse(&mut app, CLICK, x, y);
+        assert_eq!(open_id(&app), Some("t"), "{name}");
+        assert_eq!(reads(runtime), started, "{name}");
+        assert_eq!(app.details.paging(), &paging, "{name}");
+        assert!(app.message.is_none(), "{name}");
+
+        let buffer = cells(&mut app, after_width, after_height);
+        let now = app.details.target_at(x, y);
+        assert_eq!(now, Some(lineage::Target::Thread(id.clone())), "{name}");
+        assert_ne!(now, before, "{name}");
+        let area = app.details.drawn.expect("the details").area;
+        let row = text_in(&buffer, Rect::new(area.x, y, area.width, 1));
+        assert!(row.contains(&format!("Thread {id}")), "{name}: {row}");
+        assert!(mouse(&mut app, CLICK, x, y), "{name}");
+        assert_eq!(open_id(&app), Some(id.as_str()), "{name}");
+        assert_eq!(reads(runtime), started + 1, "{name}");
+    }
+
+    #[test]
+    fn a_click_before_the_frame_after_the_details_move_acts_on_no_row() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let pane = (200, 24);
+        let dialog = (80, 24);
+        let moves = [
+            Move {
+                name: "the wheel",
+                screen: pane,
+                prepare: |_| {},
+                act: wheel_down,
+                after: pane,
+            },
+            Move {
+                name: "Page Down",
+                screen: pane,
+                prepare: |_| {},
+                act: |app| press(app, KeyCode::PageDown),
+                after: pane,
+            },
+            Move {
+                name: "End",
+                screen: pane,
+                prepare: |_| {},
+                act: |app| press(app, KeyCode::End),
+                after: pane,
+            },
+            Move {
+                name: "Home",
+                screen: pane,
+                prepare: |app| press(app, KeyCode::End),
+                act: |app| press(app, KeyCode::Home),
+                after: pane,
+            },
+            // ↓ chooses the row below the last one the pane shows, which scrolls it into view.
+            Move {
+                name: "↓",
+                screen: pane,
+                prepare: |app| presses(app, KeyCode::Down, 4),
+                act: |app| press(app, KeyCode::Down),
+                after: pane,
+            },
+            // Enter on Show more puts the group's last fork in its place.
+            Move {
+                name: "Show more",
+                screen: pane,
+                prepare: |app| presses(app, KeyCode::Down, 7),
+                act: |app| press(app, KeyCode::Enter),
+                after: pane,
+            },
+            // Previous agents closes at the end of the text, which scrolls back a row.
+            Move {
+                name: "hiding Previous agents",
+                screen: pane,
+                prepare: |app| {
+                    presses(app, KeyCode::Down, 9);
+                    press(app, KeyCode::Enter);
+                    cells(app, 200, 24);
+                    press(app, KeyCode::Down);
+                    cells(app, 200, 24);
+                    press(app, KeyCode::Up);
+                },
+                act: |app| press(app, KeyCode::Enter),
+                after: pane,
+            },
+            // The taller screen shows all of the text, which starts at the top again.
+            Move {
+                name: "a resize",
+                screen: pane,
+                prepare: |app| press(app, KeyCode::End),
+                act: |app| {
+                    app.on_terminal_event(Event::Resize(200, 30));
+                },
+                after: (200, 30),
+            },
+            Move {
+                name: "the wheel on the dialog",
+                screen: dialog,
+                prepare: as_dialog,
+                act: wheel_down,
+                after: dialog,
+            },
+            Move {
+                name: "End on the dialog",
+                screen: dialog,
+                prepare: as_dialog,
+                act: |app| press(app, KeyCode::End),
+                after: dialog,
+            },
+            Move {
+                name: "↓ on the dialog",
+                screen: dialog,
+                prepare: |app| {
+                    as_dialog(app);
+                    presses(app, KeyCode::Down, 5);
+                },
+                act: |app| press(app, KeyCode::Down),
+                after: dialog,
+            },
+        ];
+        for step in &moves {
+            click_after(&runtime, step);
+        }
+    }
+
+    /// A key or a turn of the wheel for the details.
+    type Input = fn(&mut App);
+
+    /// Scrolls the details a row up with the wheel.
+    fn wheel_up(app: &mut App) {
+        let area = app.details.drawn.expect("the details").area;
+        mouse(app, MouseEventKind::ScrollUp, area.x + 2, area.y + 2);
+    }
+
+    #[test]
+    fn keys_before_a_frame_scroll_the_details_as_they_would_with_frames_between() {
+        let end: Input = |app| press(app, KeyCode::End);
+        let home: Input = |app| press(app, KeyCode::Home);
+        let up: Input = |app| press(app, KeyCode::Up);
+        let k: Input = |app| press(app, KeyCode::Char('k'));
+        let down: Input = |app| press(app, KeyCode::Down);
+        let page_up: Input = |app| press(app, KeyCode::PageUp);
+        let page_down: Input = |app| press(app, KeyCode::PageDown);
+        let wheel: Input = wheel_up;
+        let runs: Vec<(&str, Vec<Input>)> = vec![
+            ("End ↑", vec![end, up]),
+            ("End k k", vec![end, k, k]),
+            ("End PageUp", vec![end, page_up]),
+            ("End and the wheel", vec![end, wheel]),
+            ("End Home", vec![end, home]),
+            // Pages past the end, and a row back up.
+            (
+                "PageDown three times and ↑",
+                vec![page_down, page_down, page_down, up],
+            ),
+            // ↓ chooses rows below the last one in view, which scroll into view, and the wheel
+            // scrolls up from there.
+            (
+                "↓ to Previous agents and the wheel",
+                [vec![down; 9], vec![wheel]].concat(),
+            ),
+        ];
+        for dialog in [false, true] {
+            let (width, height) = if dialog { (80, 24) } else { (200, 24) };
+            let start = || {
+                let mut app = long_lineage_tui();
+                if dialog {
+                    as_dialog(&mut app);
+                }
+                app
+            };
+            let top = details_after(&mut start(), width, height);
+            let mut ended = start();
+            press(&mut ended, KeyCode::End);
+            let bottom = details_after(&mut ended, width, height);
+            assert_ne!(top, bottom, "{dialog}: the text scrolls");
+            for (name, inputs) in &runs {
+                let mut framed = start();
+                for input in inputs {
+                    input(&mut framed);
+                    cells(&mut framed, width, height);
+                }
+                let expected = details_after(&mut framed, width, height);
+                let mut batched = start();
+                for input in inputs {
+                    input(&mut batched);
+                }
+                let text = details_after(&mut batched, width, height);
+                assert_eq!(text, expected, "{dialog} {name}");
+                if *name == "End Home" {
+                    assert_eq!(text, top, "{dialog} {name}");
+                } else {
+                    assert_ne!(text, bottom, "{dialog} {name}: it scrolled up from the end");
+                }
+                assert_eq!(open_id(&batched), Some("t"), "{dialog} {name}");
+                assert_eq!(batched.composer.text(), "draft", "{dialog} {name}");
+            }
+        }
+    }
+
     // ---- long titles ----
 
     /// How many times a frame shows a project's badge, two ASCII letters, in `color`.
@@ -11768,7 +13236,6 @@ mod tests {
             app.provider_banner.close,
             app.details.button,
             app.sidebar.list,
-            app.sidebar.footer,
             app.sidebar.border,
         ];
         areas.extend(app.chips.iter().map(|&(area, _)| area));

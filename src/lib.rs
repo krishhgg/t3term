@@ -1,6 +1,7 @@
 pub mod auth;
 pub mod client;
 pub mod discovery;
+pub mod environments;
 pub mod error;
 pub mod http;
 pub mod keychain;

@@ -1,4 +1,4 @@
-//! Drives the RPC client and watcher against a fake Effect RPC server.
+//! Drives the RPC client, its bounded streams and the watcher against a fake Effect RPC server.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -7,7 +7,7 @@ use std::sync::Arc;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::time::Duration;
 
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{SinkExt, StreamExt, poll};
 use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
@@ -15,7 +15,7 @@ use tokio_tungstenite::tungstenite::Message;
 
 use t3term::client::{WatchEvent, spawn_config_watch, spawn_watch, spawn_worktree_setup_watch};
 use t3term::projection::{Applied, ThreadState, apply_config};
-use t3term::rpc::{RpcClient, RpcError};
+use t3term::rpc::{BoundedChunk, BoundedStream, RpcClient, RpcError, StreamLimits};
 
 type Socket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
 
@@ -871,4 +871,413 @@ async fn dropping_the_receiver_stops_a_setup_watch_that_waits_to_retry() {
     let stopped = tokio::time::timeout(Duration::from_secs(5), stopped).await;
     assert!(stopped.expect("the watcher stops").is_err());
     assert_eq!(calls.load(Ordering::SeqCst), 3);
+}
+
+// ---- bounded streams ----
+
+/// The tag of each bounded stream, legacy stream and call below. rpc.rs reads a tag only to
+/// name a request in a failure, and nothing in t3term opens a bounded stream yet, so these
+/// are made up.
+const BOUNDED: &str = "example.bounded";
+const LEGACY: &str = "example.stream";
+const CALL: &str = "example.call";
+
+/// `future`'s output. Fails the test after five seconds.
+async fn within<T>(future: impl Future<Output = T>) -> T {
+    let limit = Duration::from_secs(5);
+    let output = tokio::time::timeout(limit, future).await;
+    output.expect("an answer within five seconds")
+}
+
+/// An RPC client and the fake server's end of its socket.
+async fn connected() -> (RpcClient, Socket) {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    let (rpc, socket) = tokio::join!(RpcClient::connect_url(&url), accept(&listener));
+    (rpc.unwrap(), socket)
+}
+
+fn limits(chunks: usize, bytes: usize) -> StreamLimits {
+    StreamLimits::new(chunks, bytes).expect("limits above zero")
+}
+
+/// Opens a bounded stream, checks the request the server reads, and returns the stream and
+/// its request id.
+async fn open(
+    rpc: &RpcClient,
+    socket: &mut Socket,
+    limits: StreamLimits,
+) -> (BoundedStream, Value) {
+    let opening = rpc.bounded_stream(BOUNDED, json!({}), limits);
+    let stream = opening.await.unwrap();
+    let request = within(recv(socket)).await;
+    let id = request["id"].clone();
+    let expected = json!({"_tag": "Request", "id": id, "tag": BOUNDED,
+        "payload": {}, "headers": []});
+    assert_eq!(request, expected);
+    (stream, id)
+}
+
+/// Sends `text` as it is, for a test that counts its bytes.
+async fn send_text(socket: &mut Socket, text: String) {
+    socket.send(Message::Text(text.into())).await.unwrap();
+}
+
+/// T3's `Exit` for a stream of request `id` that ended normally.
+fn normal_end(id: &Value) -> Value {
+    let exit = json!({"_tag": "Success", "value": null});
+    json!({"_tag": "Exit", "requestId": id, "exit": exit})
+}
+
+/// The stream's next chunk. Fails the test on anything else, or after five seconds.
+async fn next_chunk(stream: &mut BoundedStream) -> BoundedChunk {
+    match within(stream.next()).await {
+        Some(Ok(chunk)) => chunk,
+        Some(Err(error)) => panic!("expected a chunk, got {error:?}"),
+        None => panic!("expected a chunk, got the end"),
+    }
+}
+
+/// Accepts the stream's next chunk and returns its values.
+async fn accept_next(stream: &mut BoundedStream) -> Vec<Value> {
+    next_chunk(stream).await.accept()
+}
+
+/// How the stream ended: its error, or `None` for a normal end. Fails the test on a chunk,
+/// or after five seconds.
+async fn end(stream: &mut BoundedStream) -> Option<RpcError> {
+    match within(stream.next()).await {
+        Some(Ok(chunk)) => panic!("expected the end, got {chunk:?}"),
+        Some(Err(error)) => Some(error),
+        None => None,
+    }
+}
+
+/// The error the stream ended with. Fails the test on a normal end.
+async fn ended_with(stream: &mut BoundedStream) -> RpcError {
+    end(stream).await.expect("an error")
+}
+
+/// The reason t3term gave for stopping the stream. Fails the test on any other end.
+async fn stopped(stream: &mut BoundedStream) -> String {
+    match end(stream).await {
+        Some(RpcError::Stopped(reason)) => reason,
+        other => panic!("expected a stop, got {other:?}"),
+    }
+}
+
+/// Makes a call the server answers, and returns the frames t3term sent before its request.
+/// The answer also shows that the connection's reader still works.
+async fn call(rpc: &RpcClient, socket: &mut Socket) -> Vec<Value> {
+    let calling = rpc.call(CALL, json!({}), Duration::from_secs(5));
+    let answering = async {
+        let mut before = Vec::new();
+        loop {
+            let frame = within(recv(socket)).await;
+            if frame["_tag"] == "Request" && frame["tag"] == CALL {
+                let exit = json!({"_tag": "Success", "value": "answered"});
+                let reply = json!({"_tag": "Exit", "requestId": frame["id"], "exit": exit});
+                send(socket, reply).await;
+                return before;
+            }
+            before.push(frame);
+        }
+    };
+    let (reply, before) = tokio::join!(calling, answering);
+    assert_eq!(reply.unwrap(), json!("answered"));
+    before
+}
+
+/// Every frame t3term sent since the last check. t3term sends frames in the order it queues
+/// them. The first call's answer comes after every frame the server sent before it, so once
+/// that call returns, t3term has handled them all, and anything they made it send goes out
+/// before the second call's request.
+async fn sent(rpc: &RpcClient, socket: &mut Socket) -> Vec<Value> {
+    let mut frames = call(rpc, socket).await;
+    frames.extend(call(rpc, socket).await);
+    frames
+}
+
+async fn nothing_sent(rpc: &RpcClient, socket: &mut Socket) {
+    assert_eq!(sent(rpc, socket).await, Vec::<Value>::new());
+}
+
+/// A Chunk of request `id` as T3's JSON.stringify writes it, with multi-byte and escaped
+/// text. "é" takes two bytes in UTF-8, "漢" three and "🙂" four. An escaped quote, backslash
+/// or line break takes two, and ESC takes six.
+fn wide_chunk(id: &Value) -> String {
+    format!(r#"{{"_tag":"Chunk","requestId":{id},"values":["é漢🙂","a\"b\\c\nd\u001be"]}}"#)
+}
+
+#[tokio::test]
+async fn a_bounded_chunk_is_acked_once_when_accepted_and_never_on_arrival() {
+    let (rpc, mut socket) = connected().await;
+    let (mut stream, id) = open(&rpc, &mut socket, limits(4, 4096)).await;
+    // Two messages in one frame, as Effect may batch: a chunk of two values and one of none.
+    let values = json!(["one", {"two": 2}]);
+    let frame = json!([chunk(&id, values.clone()), chunk(&id, json!([]))]);
+    send(&mut socket, frame).await;
+    let first = next_chunk(&mut stream).await;
+    let empty = next_chunk(&mut stream).await;
+    assert_eq!(json!(first.values()), values);
+    assert!(empty.values().is_empty());
+    // Their arrival acks nothing.
+    nothing_sent(&rpc, &mut socket).await;
+
+    // Each acceptance sends one Ack, in whatever order.
+    assert!(empty.accept().is_empty());
+    assert_eq!(sent(&rpc, &mut socket).await, [ack(&id)]);
+    assert_eq!(json!(first.accept()), values);
+    assert_eq!(sent(&rpc, &mut socket).await, [ack(&id)]);
+
+    // A normal end, and then nothing. Dropping a stream that T3 ended sends no Interrupt.
+    send(&mut socket, normal_end(&id)).await;
+    assert!(end(&mut stream).await.is_none());
+    assert!(end(&mut stream).await.is_none());
+    drop(stream);
+    nothing_sent(&rpc, &mut socket).await;
+}
+
+#[tokio::test]
+async fn chunks_the_caller_holds_count_toward_the_limit_until_it_accepts_them() {
+    let (rpc, mut socket) = connected().await;
+    let (mut stream, id) = open(&rpc, &mut socket, limits(2, 4096)).await;
+    send(&mut socket, chunk(&id, json!(["a"]))).await;
+    send(&mut socket, chunk(&id, json!(["b"]))).await;
+    // Taking both out of the stream makes no room. Accepting one does.
+    let a = next_chunk(&mut stream).await;
+    let b = next_chunk(&mut stream).await;
+    assert_eq!(a.accept(), [json!("a")]);
+    send(&mut socket, chunk(&id, json!(["c"]))).await;
+    // The held b and the queued c make two, so d goes over and t3term interrupts the stream.
+    send(&mut socket, chunk(&id, json!(["d"]))).await;
+    assert_eq!(sent(&rpc, &mut socket).await, [ack(&id), interrupt(&id)]);
+    // c arrived before d, so the stream returns it before the reason it stopped.
+    let c = next_chunk(&mut stream).await;
+    let reason = stopped(&mut stream).await;
+    assert_eq!(reason, "a chunk would go over the 2-chunk limit");
+    assert!(end(&mut stream).await.is_none());
+
+    // Chunks accepted after the stop keep their values and send nothing. Neither does a chunk
+    // T3 sent before it saw the Interrupt, nor T3's Exit for the interrupted stream.
+    assert_eq!(b.accept(), [json!("b")]);
+    assert_eq!(c.accept(), [json!("c")]);
+    send(&mut socket, chunk(&id, json!(["e"]))).await;
+    let interrupted = refusal(&id, json!({"_tag": "Interrupt"}));
+    send(&mut socket, interrupted).await;
+    nothing_sent(&rpc, &mut socket).await;
+}
+
+#[tokio::test]
+async fn a_chunk_counts_the_bytes_of_its_whole_message_as_t3_writes_it() {
+    let (rpc, mut socket) = connected().await;
+    // Each stream's id has one digit, like this one, so each has a chunk of this size.
+    let size = wide_chunk(&json!("0")).len();
+    let values = json!(["é漢🙂", "a\"b\\c\nd\u{1b}e"]);
+
+    // A chunk of exactly the byte limit fits.
+    let (mut exact, exact_id) = open(&rpc, &mut socket, limits(4, size)).await;
+    assert_eq!(wide_chunk(&exact_id).len(), size);
+    send_text(&mut socket, wide_chunk(&exact_id)).await;
+    let held = next_chunk(&mut exact).await;
+    assert_eq!(held.bytes(), size);
+    assert_eq!(json!(held.values()), values);
+    // While it is held, even an empty chunk, 44 bytes as T3 writes it, goes over.
+    send(&mut socket, chunk(&exact_id, json!([]))).await;
+    let over =
+        format!("a 44-byte chunk would take {size} unaccepted bytes past the {size}-byte limit");
+    assert_eq!(stopped(&mut exact).await, over);
+    assert_eq!(within(recv(&mut socket)).await, interrupt(&exact_id));
+
+    // With a byte less, the same chunk is over the limit by itself.
+    let (mut short, short_id) = open(&rpc, &mut socket, limits(4, size - 1)).await;
+    send_text(&mut socket, wide_chunk(&short_id)).await;
+    let alone = format!("a chunk was over the {}-byte limit by itself", size - 1);
+    assert_eq!(stopped(&mut short).await, alone);
+    assert_eq!(within(recv(&mut socket)).await, interrupt(&short_id));
+
+    // The chunk the first stream held keeps its values, and accepting it sends nothing.
+    assert_eq!(json!(held.accept()), values);
+    nothing_sent(&rpc, &mut socket).await;
+}
+
+#[tokio::test]
+async fn dropping_an_unaccepted_chunk_or_the_stream_interrupts_it_and_acks_nothing() {
+    let (rpc, mut socket) = connected().await;
+    let (mut stream, id) = open(&rpc, &mut socket, limits(4, 4096)).await;
+    send(&mut socket, chunk(&id, json!(["a"]))).await;
+    send(&mut socket, chunk(&id, json!(["b"]))).await;
+    let a = next_chunk(&mut stream).await;
+    // Both have arrived, and nothing acked them.
+    nothing_sent(&rpc, &mut socket).await;
+    // Dropping a chunk unaccepted loses its values, so t3term stops the stream.
+    drop(a);
+    assert_eq!(sent(&rpc, &mut socket).await, [interrupt(&id)]);
+    // b was queued before the stop, so it still comes, and then the reason.
+    let b = next_chunk(&mut stream).await;
+    let reason = stopped(&mut stream).await;
+    assert_eq!(reason, "a chunk was dropped before it was accepted");
+    assert!(end(&mut stream).await.is_none());
+    // Accepting b now sends nothing, and neither does a chunk T3 sends after the Interrupt.
+    assert_eq!(b.accept(), [json!("b")]);
+    send(&mut socket, chunk(&id, json!(["c"]))).await;
+    nothing_sent(&rpc, &mut socket).await;
+
+    // Dropping the stream interrupts it. Accepting a chunk the caller still holds sends
+    // nothing, and neither does a late chunk or T3's Exit.
+    let (mut stream, id) = open(&rpc, &mut socket, limits(4, 4096)).await;
+    send(&mut socket, chunk(&id, json!(["x"]))).await;
+    let x = next_chunk(&mut stream).await;
+    drop(stream);
+    assert_eq!(x.accept(), [json!("x")]);
+    send(&mut socket, chunk(&id, json!(["y"]))).await;
+    let interrupted = refusal(&id, json!({"_tag": "Interrupt"}));
+    send(&mut socket, interrupted).await;
+    assert_eq!(sent(&rpc, &mut socket).await, [interrupt(&id)]);
+}
+
+/// Each read below is polled once, with this task's waker, while the stream has nothing for
+/// it, and then dropped, as a `select!` drops the branch that loses. The Box owns the read,
+/// so dropping the Box ends the read and its borrow of the stream.
+#[tokio::test]
+async fn cancelling_a_waiting_read_loses_no_chunk_or_end_and_sends_nothing() {
+    let (rpc, mut socket) = connected().await;
+    let (mut stream, id) = open(&rpc, &mut socket, limits(4, 4096)).await;
+
+    // A read cancelled before a chunk arrives. The next read waits, and the chunk wakes it.
+    let mut read = Box::pin(stream.next());
+    assert!(poll!(&mut read).is_pending());
+    drop(read);
+    let mut read = Box::pin(stream.next());
+    assert!(poll!(&mut read).is_pending());
+    send(&mut socket, chunk(&id, json!(["a"]))).await;
+    let a = within(read).await.unwrap().unwrap();
+    // Neither the cancelled read nor the chunk's arrival sent anything. Accepting sends one Ack.
+    nothing_sent(&rpc, &mut socket).await;
+    assert_eq!(a.accept(), [json!("a")]);
+    assert_eq!(sent(&rpc, &mut socket).await, [ack(&id)]);
+
+    // A read the next chunk wakes, cancelled before it returns the chunk, leaves it queued.
+    let mut read = Box::pin(stream.next());
+    assert!(poll!(&mut read).is_pending());
+    send(&mut socket, chunk(&id, json!(["b"]))).await;
+    // Once nothing_sent returns, the reader has queued b and woken the read.
+    nothing_sent(&rpc, &mut socket).await;
+    drop(read);
+    let b = next_chunk(&mut stream).await;
+    assert_eq!(b.accept(), [json!("b")]);
+    assert_eq!(sent(&rpc, &mut socket).await, [ack(&id)]);
+
+    // A read cancelled before T3 ends the stream. A later read returns the end without
+    // another chunk.
+    let mut read = Box::pin(stream.next());
+    assert!(poll!(&mut read).is_pending());
+    drop(read);
+    send(&mut socket, normal_end(&id)).await;
+    nothing_sent(&rpc, &mut socket).await;
+    assert!(end(&mut stream).await.is_none());
+
+    // A read that T3's failure wakes, cancelled before it returns the failure.
+    let (mut failed, failed_id) = open(&rpc, &mut socket, limits(4, 4096)).await;
+    let mut read = Box::pin(failed.next());
+    assert!(poll!(&mut read).is_pending());
+    let reason = json!({"_tag": "Fail", "error": {"_tag": "ExampleError", "message": "Refused"}});
+    send(&mut socket, refusal(&failed_id, reason)).await;
+    nothing_sent(&rpc, &mut socket).await;
+    drop(read);
+    match ended_with(&mut failed).await {
+        RpcError::Failed { message, .. } => assert_eq!(message, "Refused"),
+        other => panic!("expected the failure, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn an_exit_a_bad_chunk_or_a_defect_reaches_a_full_stream_after_its_queued_chunk() {
+    let (rpc, mut socket) = connected().await;
+    // Four streams with room for one chunk each, and each gets one that nobody reads yet.
+    let one = limits(1, 4096);
+    let (mut failed, failed_id) = open(&rpc, &mut socket, one).await;
+    let (mut ended, ended_id) = open(&rpc, &mut socket, one).await;
+    let (mut bad, bad_id) = open(&rpc, &mut socket, one).await;
+    let (mut cut, cut_id) = open(&rpc, &mut socket, one).await;
+    for id in [&failed_id, &ended_id, &bad_id, &cut_id] {
+        send(&mut socket, chunk(id, json!(["queued"]))).await;
+    }
+    // T3 fails the first and ends the second. The third gets a Chunk without values. A defect
+    // ends every request still open. None of them needs room in its stream.
+    let reason = json!({"_tag": "Fail", "error": {"_tag": "ExampleError", "message": "Refused"}});
+    send(&mut socket, refusal(&failed_id, reason)).await;
+    send(&mut socket, normal_end(&ended_id)).await;
+    let malformed = json!({"_tag": "Chunk", "requestId": bad_id});
+    send(&mut socket, malformed).await;
+    let defect = json!({"_tag": "Defect", "defect": "Example defect"});
+    send(&mut socket, defect).await;
+
+    // Each stream returns its queued chunk, then how it ended, then nothing. The defect came
+    // last, so once the fourth stream has ended, the other three have too.
+    let queued = next_chunk(&mut cut).await;
+    assert!(matches!(ended_with(&mut cut).await, RpcError::Protocol(_)));
+    assert_eq!(queued.accept(), [json!("queued")]);
+    assert_eq!(accept_next(&mut failed).await, [json!("queued")]);
+    match ended_with(&mut failed).await {
+        RpcError::Failed { message, .. } => assert_eq!(message, "Refused"),
+        other => panic!("expected the failure, got {other:?}"),
+    }
+    assert_eq!(accept_next(&mut ended).await, [json!("queued")]);
+    assert!(end(&mut ended).await.is_none());
+    assert_eq!(accept_next(&mut bad).await, [json!("queued")]);
+    assert!(matches!(ended_with(&mut bad).await, RpcError::Protocol(_)));
+    for stream in [&mut failed, &mut ended, &mut bad, &mut cut] {
+        assert!(end(stream).await.is_none());
+    }
+    // t3term interrupted only the stream with the bad chunk, and acked nothing it accepted
+    // after the end. T3 ended the other three itself.
+    assert_eq!(sent(&rpc, &mut socket).await, [interrupt(&bad_id)]);
+}
+
+#[tokio::test]
+async fn a_lost_connection_reaches_a_full_stream_after_its_queued_chunk() {
+    let (rpc, mut socket) = connected().await;
+    let (mut stream, id) = open(&rpc, &mut socket, limits(1, 4096)).await;
+    send(&mut socket, chunk(&id, json!(["queued"]))).await;
+    drop(socket);
+    assert_eq!(accept_next(&mut stream).await, [json!("queued")]);
+    let error = ended_with(&mut stream).await;
+    assert!(matches!(error, RpcError::Disconnected(_)));
+    assert!(end(&mut stream).await.is_none());
+    // A request made after the drop fails at once.
+    assert!(rpc.is_closed());
+    let opening = rpc.bounded_stream(BOUNDED, json!({}), limits(1, 4096));
+    assert!(within(opening).await.is_err());
+}
+
+#[tokio::test]
+async fn a_full_or_stopped_bounded_stream_holds_up_nothing_else_on_its_socket() {
+    let (rpc, mut socket) = connected().await;
+    let (mut bounded, bounded_id) = open(&rpc, &mut socket, limits(1, 4096)).await;
+    let mut legacy = rpc.stream(LEGACY, json!({})).await.unwrap();
+    let legacy_id = within(recv(&mut socket)).await["id"].clone();
+    // The bounded stream fills up and nobody reads it. The legacy stream on the same socket
+    // still gets each item and acks it on arrival, and a call still gets its answer.
+    send(&mut socket, chunk(&bounded_id, json!(["held"]))).await;
+    for n in 0..3 {
+        send(&mut socket, chunk(&legacy_id, json!([n]))).await;
+        assert_eq!(within(recv(&mut socket)).await, ack(&legacy_id));
+        assert_eq!(within(legacy.next()).await.unwrap().unwrap(), json!(n));
+    }
+    nothing_sent(&rpc, &mut socket).await;
+
+    // A chunk over its limit stops the bounded stream alone.
+    send(&mut socket, chunk(&bounded_id, json!(["over"]))).await;
+    send(&mut socket, chunk(&legacy_id, json!(["after"]))).await;
+    assert_eq!(within(recv(&mut socket)).await, interrupt(&bounded_id));
+    assert_eq!(within(recv(&mut socket)).await, ack(&legacy_id));
+    let after = within(legacy.next()).await.unwrap().unwrap();
+    assert_eq!(after, json!("after"));
+    nothing_sent(&rpc, &mut socket).await;
+
+    // The bounded stream still returns the chunk it held, then the reason it stopped.
+    assert_eq!(accept_next(&mut bounded).await, [json!("held")]);
+    let reason = stopped(&mut bounded).await;
+    assert_eq!(reason, "a chunk would go over the 1-chunk limit");
 }
