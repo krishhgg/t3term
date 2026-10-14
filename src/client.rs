@@ -1316,7 +1316,7 @@ mod tests {
     async fn the_checks_before_a_login_keep_their_codes() {
         let elsewhere = serve(descriptor("env-a", 2));
         let location = format!("location: {}/.well-known/t3/environment", elsewhere.origin);
-        let rejected = |code| Some((code, exit::REJECTED));
+        let rejected = |error_code| Some((error_code, exit::REJECTED));
         let cases = [
             (
                 "env-a",
