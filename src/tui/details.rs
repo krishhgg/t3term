@@ -439,6 +439,33 @@ impl Rows {
     }
 }
 
+/// How far the text is scrolled: a row from its top, or a number of rows up from where its
+/// last row shows. End asks for the end before a frame knows how many rows the text takes at
+/// the width it draws, so the keys after it count from there.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Offset {
+    Top(usize),
+    End(usize),
+}
+
+impl Default for Offset {
+    fn default() -> Offset {
+        Offset::Top(0)
+    }
+}
+
+/// The first row in view, scrolled from `top` as little as brings line `line` into the
+/// `visible` rows.
+fn into_view(top: usize, line: usize, visible: usize) -> usize {
+    if line < top {
+        line
+    } else if visible > 0 && line >= top + visible {
+        line + 1 - visible
+    } else {
+        top
+    }
+}
+
 /// Where the last frame drew the details, for the mouse.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(super) struct Drawn {
@@ -459,10 +486,15 @@ pub(super) struct Details {
     /// them out again.
     stale: bool,
     rows: Option<Rows>,
-    /// Rows the card's text is scrolled down. The next frame stops it at the end.
-    scroll: usize,
+    /// How far the card's text is scrolled. A frame turns it into the first row it shows, kept
+    /// within the text.
+    scroll: Offset,
     /// The rows of text the last frame showed, which a page scrolls by.
     page: usize,
+    /// The furthest the last frame let the text scroll: its rows past the ones it showed. The
+    /// keys and the wheel go no further before the next frame, so a scroll back up after one
+    /// past the end counts. None until a frame draws the details.
+    bottom: Option<usize>,
     /// How the last frame drew them. It stays after a resize until a frame draws them again,
     /// so keys still reach a dialog that shows.
     shown: Option<Layout>,
@@ -488,7 +520,8 @@ pub(super) struct Details {
     selected: Option<Target>,
     /// Set when the choice moved, so the next frame scrolls its row into view.
     reveal: bool,
-    /// Where the last frame drew each Lineage row it showed, for the mouse.
+    /// Where the last frame drew each Lineage row it showed, for the mouse. Anything that
+    /// moves the text clears them, so a click acts on no row until the next frame draws them.
     targets: Vec<(Rect, Target)>,
     /// How many times the facts were worked out and wrapped, so the tests can tell what a
     /// frame or an event did.
@@ -505,10 +538,25 @@ impl Details {
     /// Opens or closes the details. They open at the top of their text.
     pub fn toggle(&mut self) {
         self.open = !self.open;
-        self.scroll = 0;
+        self.scroll = Offset::Top(0);
+        self.bottom = None;
         self.selected = None;
         self.shown = None;
         self.moved = true;
+        self.shift();
+    }
+
+    /// Notes that the screen resized, which can move the details and every row in them.
+    pub fn resized(&mut self) {
+        self.moved = true;
+        self.shift();
+    }
+
+    /// Notes that the text moved, or may have, before the next frame draws it. A click then
+    /// acts on no Lineage row, since the row the last frame drew there may be gone or
+    /// elsewhere. ↑, ↓ and Enter still choose and act, by the order of the rows.
+    fn shift(&mut self) {
+        self.targets.clear();
     }
 
     /// Notes that the facts and Lineage may have changed, as a thread's watch reconnecting or
@@ -521,7 +569,10 @@ impl Details {
     fn note(&mut self, facts: bool, links: bool) {
         self.stale |= facts;
         self.lineage_stale |= links;
-        self.moved |= facts || links;
+        if facts || links {
+            self.moved = true;
+            self.shift();
+        }
     }
 
     /// Notes what an item from the shell's feed changed: a snapshot, or an event for the open
@@ -593,7 +644,8 @@ impl Details {
     /// first rows and nothing chosen.
     pub fn follow(&mut self) {
         self.mark();
-        self.scroll = 0;
+        self.scroll = Offset::Top(0);
+        self.bottom = None;
         self.paging = Paging::default();
         self.selected = None;
     }
@@ -735,14 +787,11 @@ impl Details {
         let targets = self.lineage_targets();
         let next = match (self.chosen(&targets), self.rows.as_ref()) {
             (Some(at), _) => Some(at + 1),
-            (None, Some(rows)) => rows.first_from(self.scroll),
+            (None, Some(rows)) => rows.first_from(self.top()),
             (None, None) => Some(0),
         };
         match next.and_then(|at| targets.get(at)) {
-            Some(target) => {
-                self.selected = Some(target.clone());
-                self.reveal = true;
-            }
+            Some(target) => self.step_to(target.clone()),
             None => self.scroll_by(1),
         }
     }
@@ -752,14 +801,35 @@ impl Details {
     pub fn up(&mut self) {
         let targets = self.lineage_targets();
         match self.chosen(&targets) {
-            Some(at) if at > 0 => {
-                self.selected = Some(targets[at - 1].clone());
-                self.reveal = true;
-            }
+            Some(at) if at > 0 => self.step_to(targets[at - 1].clone()),
             _ => {
                 self.selected = None;
                 self.scroll_by(-1);
             }
+        }
+    }
+
+    /// Chooses `target` for ↑ or ↓, and scrolls its row into view where the last frame drew
+    /// it, so a key after it scrolls from there. The next frame scrolls it into view again
+    /// where it draws it.
+    fn step_to(&mut self, target: Target) {
+        self.selected = Some(target);
+        self.reveal = true;
+        if let Some(line) = self.selected_line().filter(|_| self.bottom.is_some()) {
+            let top = self.top();
+            let view = into_view(top, line, self.page);
+            if view != top {
+                self.scroll = Offset::Top(view);
+            }
+        }
+        self.shift();
+    }
+
+    /// The first row of text in view, as the last frame laid it out.
+    fn top(&self) -> usize {
+        match self.scroll {
+            Offset::Top(row) => row,
+            Offset::End(up) => self.bottom.unwrap_or_default().saturating_sub(up),
         }
     }
 
@@ -792,9 +862,20 @@ impl Details {
         self.shown.filter(|_| self.open)
     }
 
-    /// Scrolls the text `delta` rows, down for a positive one.
+    /// Scrolls the text `delta` rows, down for a positive one, no further than the last frame
+    /// let it.
     pub fn scroll_by(&mut self, delta: isize) {
-        self.scroll = self.scroll.saturating_add_signed(delta);
+        let bottom = self.bottom;
+        let within = |rows: usize| bottom.map_or(rows, |bottom| rows.min(bottom));
+        self.scroll = match self.scroll {
+            Offset::Top(row) => Offset::Top(within(row.saturating_add_signed(delta))),
+            Offset::End(up) => {
+                // Down leaves fewer rows under the text in view, and up more.
+                let up = up.saturating_add_signed(delta.saturating_neg());
+                Offset::End(within(up))
+            }
+        };
+        self.shift();
     }
 
     /// Scrolls the text `delta` rows for the wheel, which leaves no Lineage row chosen.
@@ -812,12 +893,16 @@ impl Details {
 
     pub fn scroll_home(&mut self) {
         self.selected = None;
-        self.scroll = 0;
+        self.scroll = Offset::Top(0);
+        self.shift();
     }
 
+    /// Scrolls the text until its last row shows, however many rows the next frame finds it
+    /// takes.
     pub fn scroll_end(&mut self) {
         self.selected = None;
-        self.scroll = usize::MAX / 2;
+        self.scroll = Offset::End(0);
+        self.shift();
     }
 
     /// Forgets where the last frame drew the details, for a frame that doesn't draw them.
@@ -825,6 +910,7 @@ impl Details {
         self.drawn = None;
         self.shown = None;
         self.moved = false;
+        self.bottom = None;
         self.targets.clear();
     }
 
@@ -935,16 +1021,19 @@ impl Details {
         let width = inner.width as usize;
         let visible = (inner.height as usize).saturating_sub(1);
         let total = self.lines(width, environment, theme).len();
+        let bottom = total.saturating_sub(visible);
+        let mut scroll = match self.scroll {
+            Offset::Top(row) => row,
+            Offset::End(up) => bottom - up.min(bottom),
+        };
         // A row ↑ or ↓ chose, or Show more added rows above, comes into view.
         let reveal = std::mem::take(&mut self.reveal);
         if let Some(line) = self.selected_line().filter(|_| reveal) {
-            if line < self.scroll {
-                self.scroll = line;
-            } else if visible > 0 && line >= self.scroll + visible {
-                self.scroll = line + 1 - visible;
-            }
+            scroll = into_view(scroll, line, visible);
         }
-        self.scroll = self.scroll.min(total.saturating_sub(visible));
+        let scroll = scroll.min(bottom);
+        self.scroll = Offset::Top(scroll);
+        self.bottom = Some(bottom);
         self.page = visible;
         let muted = Style::new().fg(theme.muted);
 
@@ -961,7 +1050,6 @@ impl Details {
                 width,
             ));
         }
-        let scroll = self.scroll;
         // The chosen row shows highlighted while the details have the keyboard.
         let chosen = self.selected_line().filter(|_| focused);
         self.targets.clear();
@@ -976,7 +1064,8 @@ impl Details {
             for (line, target) in &rows.targets {
                 if (scroll..scroll + visible).contains(line) {
                     let y = inner.y + 1 + (line - scroll) as u16;
-                    self.targets.push((Rect::new(inner.x, y, inner.width, 1), target.clone()));
+                    let area = Rect::new(inner.x, y, inner.width, 1);
+                    self.targets.push((area, target.clone()));
                 }
             }
         }
@@ -1512,7 +1601,7 @@ mod tests {
         let fork = json!({"id": "f", "lineage": {"parentThreadId": "t"}});
         let threads = [record.clone(), fork];
         let paging = Paging::default();
-        details.set_lineage(Lineage::of(Some("t"), &threads, None, &paging));
+        details.set_lineage(Lineage::of(Some("t"), &threads, None, false, &paging));
         assert!(!details.wants_lineage(Some("t")));
         assert!(details.wants_lineage(Some("u")), "another thread opened");
 
@@ -1541,7 +1630,7 @@ mod tests {
         for (applied, item) in &loud {
             details.note_shell(applied, item, Some("t"));
             assert!(details.wants_lineage(Some("t")), "{applied:?} {item}");
-            details.set_lineage(Lineage::of(Some("t"), &threads, None, &paging));
+            details.set_lineage(Lineage::of(Some("t"), &threads, None, false, &paging));
         }
         for applied in [
             event("turn-item.updated"),
@@ -1561,12 +1650,12 @@ mod tests {
             details.note_thread(&applied);
             assert!(details.wants_lineage(Some("t")), "{applied:?}");
             assert!(!details.wants(Some("t")), "the facts stay: {applied:?}");
-            details.set_lineage(Lineage::of(Some("t"), &threads, None, &paging));
+            details.set_lineage(Lineage::of(Some("t"), &threads, None, false, &paging));
         }
         for applied in [Applied::Snapshot, event("thread.meta-updated")] {
             details.note_thread(&applied);
             assert!(details.wants_lineage(Some("t")), "{applied:?}");
-            details.set_lineage(Lineage::of(Some("t"), &threads, None, &paging));
+            details.set_lineage(Lineage::of(Some("t"), &threads, None, false, &paging));
         }
         // Show more and Previous agents work it out again. Closed details don't.
         details.toggle_previous();
@@ -1588,16 +1677,17 @@ mod tests {
         details.lines(30, &identity, &theme);
         // Without Lineage the arrows scroll, as they always did.
         details.down();
-        assert_eq!((details.selected(), details.scroll), (None, 1));
+        assert_eq!((details.selected(), details.top()), (None, 1));
         assert_eq!(details.lineage_keys(), None);
         details.up();
-        assert_eq!(details.scroll, 0);
+        assert_eq!(details.top(), 0);
 
         let mut lead = record.clone();
         lead["lineage"] = json!({"parentThreadId": "gone"});
         let fork = json!({"id": "f", "title": "Fork", "lineage": {"parentThreadId": "t"}});
         let threads = [lead, fork];
-        details.set_lineage(Lineage::of(Some("t"), &threads, None, &Paging::default()));
+        let lineage = Lineage::of(Some("t"), &threads, None, false, &Paging::default());
+        details.set_lineage(lineage);
         let rows = text(details.lines(30, &identity, &theme));
         let at = rows.iter().position(|row| row == "Lineage").unwrap();
         assert_eq!(rows[at - 1], "", "a blank row before it");
@@ -1615,10 +1705,10 @@ mod tests {
         assert_eq!(details.lineage_keys().as_deref(), Some("Enter open fork"));
         assert!(details.can_open("f"));
         // Past the last row, the text scrolls and the choice stays.
-        let scroll = details.scroll;
+        let scroll = details.top();
         details.down();
         assert_eq!(details.selected(), Some(&Target::Thread("f".into())));
-        assert_eq!(details.scroll, scroll + 1);
+        assert_eq!(details.top(), scroll + 1);
         details.up();
         assert_eq!(details.selected(), Some(&Target::Thread("gone".into())));
         // Up from the first row leaves none chosen.
@@ -1653,7 +1743,10 @@ mod tests {
             let fork = json!({"id": format!("f{i}"), "lineage": {"parentThreadId": "t"}});
             threads.push(fork);
         }
-        let lineage = |details: &Details| Lineage::of(Some("t"), &threads, None, details.paging());
+        let lineage = |details: &Details| {
+            let paging = details.paging();
+            Lineage::of(Some("t"), &threads, None, false, paging)
+        };
         details.set_lineage(lineage(&details));
         details.lines(30, &identity, &theme);
         for _ in 0..7 {

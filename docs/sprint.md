@@ -6,7 +6,7 @@ The sprint builds the feature groups in [parity.md](parity.md), in that order, o
 
 On 2026-10-13 the user changed the sprint's order. UI and UX come first, then Lineage, choosing an agent's environment and T3 Connect, PR reviews and embedded terminals. They go ahead of the group order in [parity.md](parity.md), which stays unedited as the record of the original plan. Nightly sync automation and the legacy context meter stay deferred.
 
-The user also asked about the sidebar's groups on the left. They reported that its header is crowded and that the Active heading is confusing without a Working shelf. They chose separate Working, Done and Settled shelves that each open and close, with Working and Done open by default and Settled closed, in T3 Code's order and with spacing that suits a terminal. That work gets its own pull request, apart from Lineage.
+The user also asked about the sidebar's groups on the left. They reported that its header is crowded and that the Active heading is confusing without a Working shelf. They chose separate Working, Done and Settled shelves that each open and close, with Working and Done open by default and Settled closed, and spacing that suits a terminal. The shelves are their own arrangement, not the desktop's. The pinned desktop has no Done shelf and shows Done as a status word on a card. Which shelf a thread goes on follows the desktop's status words. That work gets its own pull request, apart from Lineage.
 
 ## Audit every ten merged sprint PRs
 
@@ -22,7 +22,7 @@ Maintenance review PRs are listed in their own section. They neither count towar
 
 ## Sprint PRs
 
-Rows are tracked by URL, because GitHub numbers issues and pull requests from one sequence. GitHub is the record of whether a row merged: `gh pr view <url> --json state,mergedAt,mergeCommit`. Each new sprint PR adds its own row and fills in the merge commits of the rows above it.
+Rows are tracked by URL, because GitHub numbers issues and pull requests from one sequence. GitHub is the record of whether a row merged: `gh pr view <url> --json state,mergedAt,mergeCommit`. A sprint PR gets its number when it merges. Until then it is listed under Open sprint PRs, and the next sprint PR moves it to this table with its number and merge commit.
 
 | # | Pull request | What it does | Merge commit |
 |---|---|---|---|
@@ -46,7 +46,14 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 | 18 | https://github.com/krishhgg/t3term/pull/27 | The open thread's worktree setup as a read-only card under its first prompt: stage progress, the setup script's last output and Details. No Cancel, Work locally, terminal or worktree preparation | `194943b5764256bbae6bc9c7a1d34948d33d9ddc` |
 | 19 | https://github.com/krishhgg/t3term/pull/28 | The environment's label, host and port under the sidebar's wordmark, and a dot that follows the sidebar's own feed, not the open thread's watch. The breadcrumb's row shows both while the sidebar is hidden. No environment list or selector | `f210cd8ac137872b95388ac4e11c097d8b0cf159` |
 | 20 | https://github.com/krishhgg/t3term/pull/29 | The open thread's project, workspace, recorded branch and environment, read-only, in a pane beside the conversation or a dialog on a narrow screen, opened with Alt+B or a button in the title row. No Git status, actions, scripts or tabbed right panel | `739cead6795dd0a80151d657c48721c109dea86f` |
-| 21 | https://github.com/krishhgg/t3term/pull/33 | Lineage in the thread details: the parent, forks, context transfers, running agents and a closed Previous agents group with its failed count, 6 rows and then 12 more at a time. ↑, ↓, Enter and clicks open a related thread the shell lists. Read-only, with no Stop, Merge back, Disconnect or new fork. Not merged | |
+
+## Open sprint PRs
+
+These have no number yet. Each takes the next one when it merges.
+
+| Pull request | What it does |
+|---|---|
+| https://github.com/krishhgg/t3term/pull/33 | Lineage in the thread details: the parent, forks, context transfers, running agents and a closed Previous agents group with its failed count, 6 rows and then 12 more at a time. ↑, ↓, Enter and clicks open a related thread the shell lists. Read-only, with no Stop, Merge back, Disconnect or new fork |
 
 ## Maintenance review PRs
 

@@ -1233,11 +1233,13 @@ impl App {
 
     /// Acts on a row of the details' Lineage: opens its thread, shows more of its group, or
     /// opens or closes Previous agents. A thread the shell doesn't list stays closed, and the
-    /// status line says why.
+    /// status line says why. The shell is asked again here, since an event since the last
+    /// frame can have archived or removed a thread whose row still says it opens.
     fn act_on_lineage(&mut self, target: lineage::Target) {
         match target {
             lineage::Target::Thread(id) => {
-                if self.details.can_open(&id) && self.shell_thread(&id).is_some() {
+                let listed = self.shell_thread(&id).is_some_and(lineage::opens);
+                if self.details.can_open(&id) && listed {
                     self.open_related(id);
                 } else {
                     self.message = Some(("This related thread is unavailable.".into(), false));
@@ -1409,7 +1411,9 @@ impl App {
         }
     }
 
-    /// The open thread's Lineage, from the shell's threads and the thread's projection.
+    /// The open thread's Lineage, from the shell's threads and the thread's projection. Once
+    /// the thread's watch closes, the shell's copy of each thread it lists comes first, as it
+    /// does for the record in `details_record`.
     fn details_lineage(&self) -> lineage::Lineage {
         let open = self.open.as_ref();
         let threads = match self.shell.as_ref() {
@@ -1419,10 +1423,12 @@ impl App {
         let projection = open
             .and_then(|open| open.state.as_ref())
             .map(|state| &state.projection);
+        let closed = open.is_some_and(|open| open.connection == "closed");
         lineage::Lineage::of(
             open.map(|open| open.id.as_str()),
             threads,
             projection,
+            closed,
             self.details.paging(),
         )
     }
@@ -1695,7 +1701,7 @@ impl App {
                 self.sidebar.border = Rect::default();
                 // The details' button and the details may have moved too, so they take no
                 // click until then.
-                self.details.moved = true;
+                self.details.resized();
                 true
             }
             _ => false,
@@ -2590,6 +2596,18 @@ impl App {
             Some(details::Layout::Pane) => {}
             None => self.leave_details(),
         }
+        // The details are worked out again only after an event that can change them, or for
+        // another thread, and wrapped again only at another width. That comes before the
+        // status line, which says what Enter does with the Lineage row they keep chosen.
+        let open_id = self.open.as_ref().map(|open| open.id.as_str());
+        if self.details.wants(open_id) {
+            let facts = details::Facts::of(open_id, self.details_record(), self.details_projects());
+            self.details.set(facts);
+        }
+        if self.details.wants_lineage(open_id) {
+            let lineage = self.details_lineage();
+            self.details.set_lineage(lineage);
+        }
         // The wake timer usually moves a woken thread first, but it runs on a clock that
         // stops while the machine sleeps. A hidden sidebar keeps its rows current too, so it
         // comes back as T3 has it.
@@ -2756,17 +2774,6 @@ impl App {
             Paragraph::new(self.status_line(status_area.width as usize)),
             status_area,
         );
-        // The details are worked out again only after an event that can change them, or for
-        // another thread, and wrapped again only at another width.
-        let open_id = self.open.as_ref().map(|open| open.id.as_str());
-        if self.details.wants(open_id) {
-            let facts = details::Facts::of(open_id, self.details_record(), self.details_projects());
-            self.details.set(facts);
-        }
-        if self.details.wants_lineage(open_id) {
-            let lineage = self.details_lineage();
-            self.details.set_lineage(lineage);
-        }
         match shown {
             Some(details::Layout::Pane) => {
                 let pane = details::pane_area(main, body.y, composer_area.bottom());
@@ -10748,7 +10755,7 @@ mod tests {
     fn a_hundred_and_twenty_four_agents_page_by_twelve_and_stay_inside_at_every_size() {
         let mut app = lineage_tui();
         // 123 more agents finish, 7 of them failed, with titles that try to clear the screen.
-        for i in 0..123 {
+        for i in 0..123_u64 {
             let failed = i.is_multiple_of(18);
             let status = if failed { "failed" } else { "completed" };
             let mut agent = subagent(&format!("p{i}"), json!(format!("c{i}")), status);
@@ -10861,6 +10868,374 @@ mod tests {
         alt(&mut app, 'b');
         assert!(details_after(&mut app, 200, 50).contains("↳ Thread h"));
         assert_eq!(app.details.lineage_prepares, 5);
+    }
+
+    #[test]
+    fn a_closed_watch_leaves_lineage_to_the_shell() {
+        let mut app = lineage_tui();
+        // Another agent with no thread yet runs, and one runs on a thread the shell doesn't
+        // list.
+        let unseen = subagent("s3", Value::Null, "running");
+        app.on_thread_event(live(4, "subagent.updated", unseen));
+        let lost = subagent("s4", json!("lost"), "running");
+        app.on_thread_event(live(5, "subagent.updated", lost));
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Lineage · 3 running"), "{text}");
+        let prepared = app.details.lineage_prepares;
+
+        // The watch closes, and Lineage is worked out again once. The agents only the
+        // projection knows of no longer count as running, since t3term won't hear them end,
+        // and the one on a thread the shell doesn't list has no status.
+        app.on_thread_event(WatchEvent::Failed("The thread's watch closed.".into()));
+        let text = details_after(&mut app, 200, 50);
+        assert_eq!(app.details.lineage_prepares, prepared + 1);
+        assert!(text.contains("Lineage · 1 running"), "{text}");
+        let row = text
+            .lines()
+            .find(|line| line.contains("◆ Agent s4"))
+            .unwrap_or_default();
+        assert!(row.contains("Unavailable"), "{text}");
+
+        // The shell still hears the agent's thread, which goes idle. Its agent still says it
+        // runs, which counted while the watch was open, but now the thread's copy goes first,
+        // so it joins the agent that finished under Previous agents.
+        app.on_shell_event(thread_updated(2, related("a", "t", "subagent")));
+        let text = details_after(&mut app, 200, 50);
+        assert_eq!(app.details.lineage_prepares, prepared + 2);
+        assert!(text.contains("› Previous agents (2)"), "{text}");
+        assert!(!text.contains("Lineage ·"), "{text}");
+        assert!(text.contains("◆ Agent s4"), "{text}");
+    }
+
+    #[test]
+    fn enter_asks_the_shell_again_before_it_opens_a_related_thread() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = lineage_tui();
+        let started = reads(&runtime);
+        // ↓ chooses the fork, and the frame says Enter opens it.
+        presses(&mut app, KeyCode::Down, 2);
+        let status = status_after(&mut app);
+        assert!(status.contains("Enter open fork"), "{status}");
+        let (x, y) = details_row(&mut app, 200, 50, "↳ Thread f");
+
+        // T3 archives the fork before the next frame. A click on its row does nothing, and
+        // Enter opens nothing and says why.
+        let mut archived = related("f", "t", "fork");
+        archived["archivedAt"] = json!("2026-10-12T00:00:00.000Z");
+        app.on_shell_event(thread_updated(2, archived));
+        assert!(!mouse(&mut app, CLICK, x, y));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!((open_id(&app), reads(&runtime)), (Some("t"), started));
+        let status = status_after(&mut app);
+        assert!(
+            status.contains("This related thread is unavailable."),
+            "{status}"
+        );
+        // From that frame on, its row says it doesn't open.
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Down);
+        let status = status_after(&mut app);
+        assert!(status.contains("Fork unavailable"), "{status}");
+
+        // It comes back, and T3 removes it before the next frame.
+        app.on_shell_event(thread_updated(3, related("f", "t", "fork")));
+        let status = status_after(&mut app);
+        assert!(status.contains("Enter open fork"), "{status}");
+        let (x, y) = details_row(&mut app, 200, 50, "↳ Thread f");
+        let removed = json!({"kind": "thread.removed", "sequence": 4, "threadId": "f"});
+        app.on_shell_event(WatchEvent::Item(removed));
+        assert!(!mouse(&mut app, CLICK, x, y));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!((open_id(&app), reads(&runtime)), (Some("t"), started));
+        let status = status_after(&mut app);
+        assert!(
+            status.contains("This related thread is unavailable."),
+            "{status}"
+        );
+        let text = details_after(&mut app, 200, 50);
+        assert!(!text.contains("Thread f"), "{text}");
+
+        // The agent's thread is renamed and waits, which leaves it a thread that opens, so
+        // Enter before the next frame opens it.
+        presses(&mut app, KeyCode::Down, 2);
+        let status = status_after(&mut app);
+        assert!(status.contains("Enter open subagent"), "{status}");
+        let mut waiting = related("a", "t", "subagent");
+        waiting["title"] = json!("Read the parser");
+        waiting["activityRunStatus"] = json!("waiting");
+        app.on_shell_event(thread_updated(5, waiting));
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(open_id(&app), Some("a"));
+        assert_eq!(reads(&runtime), started + 1);
+        assert_eq!(app.focus, Focus::Details);
+    }
+
+    /// Presses `code` `times` times.
+    fn presses(app: &mut App, code: KeyCode, times: usize) {
+        for _ in 0..times {
+            press(app, code);
+        }
+    }
+
+    /// The TUI of `lineage_tui`, with five more forks of `t`, `g0` to `g4`, which come after
+    /// the fork `f`, drawn on a screen 200 columns by 24 rows. Lineage's first group shows six
+    /// of its seven rows and a Show more row.
+    fn long_lineage_tui() -> App {
+        let mut app = lineage_tui();
+        for i in 0..5_u64 {
+            let fork = related(&format!("g{i}"), "t", "fork");
+            app.on_shell_event(thread_updated(2 + i, fork));
+        }
+        cells(&mut app, 200, 24);
+        app
+    }
+
+    /// A move of the details' text, for a click that comes before the frame after it.
+    struct Move {
+        name: &'static str,
+        /// The screen of the frames before the move.
+        screen: (u16, u16),
+        /// What comes before the frame that draws the row clicked.
+        prepare: fn(&mut App),
+        /// The row clicked.
+        row: &'static str,
+        act: fn(&mut App),
+        /// The screen of the frame after the move.
+        after: (u16, u16),
+    }
+
+    /// Scrolls the details a row down with the wheel.
+    fn wheel_down(app: &mut App) {
+        let area = app.details.drawn.expect("the details").area;
+        mouse(app, MouseEventKind::ScrollDown, area.x + 2, area.y + 2);
+    }
+
+    /// Turns the details into a dialog on a screen 80 columns by 24 rows.
+    fn as_dialog(app: &mut App) {
+        app.on_terminal_event(Event::Resize(80, 24));
+        cells(app, 80, 24);
+    }
+
+    /// Makes `step`'s move on `app` and clicks where its row was before a frame draws the
+    /// details again. The click acts on nothing. The next frame draws another thread's row
+    /// there, and a click on it opens that thread.
+    fn click_after(runtime: &tokio::runtime::Runtime, mut app: App, step: &Move) {
+        let name = step.name;
+        let started = reads(runtime);
+        (step.prepare)(&mut app);
+        let (width, height) = step.screen;
+        let (x, y) = details_row(&mut app, width, height, step.row);
+        let before = app.details.target_at(x, y);
+        assert!(before.is_some(), "{name}");
+        (step.act)(&mut app);
+        let paging = app.details.paging().clone();
+        mouse(&mut app, CLICK, x, y);
+        assert_eq!(open_id(&app), Some("t"), "{name}");
+        assert_eq!(reads(runtime), started, "{name}");
+        assert_eq!(app.details.paging(), &paging, "{name}");
+        assert!(app.message.is_none(), "{name}");
+
+        let (width, height) = step.after;
+        let buffer = cells(&mut app, width, height);
+        let Some(lineage::Target::Thread(id)) = app.details.target_at(x, y) else {
+            panic!("{name}: no thread's row at ({x}, {y})");
+        };
+        let now = Some(lineage::Target::Thread(id.clone()));
+        assert_ne!(now, before, "{name}");
+        let area = app.details.drawn.expect("the details").area;
+        let row = text_in(&buffer, Rect::new(area.x, y, area.width, 1));
+        assert!(row.contains(&format!("Thread {id}")), "{name}: {row}");
+        assert!(mouse(&mut app, CLICK, x, y), "{name}");
+        assert_eq!(open_id(&app), Some(id.as_str()), "{name}");
+        assert_eq!(reads(runtime), started + 1, "{name}");
+    }
+
+    #[test]
+    fn a_click_before_the_frame_after_the_details_move_acts_on_no_row() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        // The pane shows 18 rows of the text, and the dialog 19.
+        let pane = (200, 24);
+        let dialog = (80, 24);
+        let moves = [
+            Move {
+                name: "the wheel",
+                screen: pane,
+                prepare: |_| {},
+                row: "↳ Thread f",
+                act: wheel_down,
+                after: pane,
+            },
+            Move {
+                name: "Page Down",
+                screen: pane,
+                prepare: |_| {},
+                row: "↑ Thread up",
+                act: |app| press(app, KeyCode::PageDown),
+                after: pane,
+            },
+            Move {
+                name: "End",
+                screen: pane,
+                prepare: |_| {},
+                row: "↳ Thread g0",
+                act: |app| press(app, KeyCode::End),
+                after: pane,
+            },
+            Move {
+                name: "Home",
+                screen: pane,
+                prepare: |app| press(app, KeyCode::End),
+                row: "↳ Thread g3",
+                act: |app| press(app, KeyCode::Home),
+                after: pane,
+            },
+            // ↓ chooses the row below the last one the pane shows, which scrolls it into view.
+            Move {
+                name: "↓",
+                screen: pane,
+                prepare: |app| presses(app, KeyCode::Down, 4),
+                row: "↳ Thread f",
+                act: |app| press(app, KeyCode::Down),
+                after: pane,
+            },
+            // Enter on Show more puts the group's last fork in its place.
+            Move {
+                name: "Show more",
+                screen: pane,
+                prepare: |app| presses(app, KeyCode::Down, 7),
+                row: "+ Show 1 more",
+                act: |app| press(app, KeyCode::Enter),
+                after: pane,
+            },
+            // Previous agents closes at the end of the text, which scrolls back a row.
+            Move {
+                name: "hiding Previous agents",
+                screen: pane,
+                prepare: |app| {
+                    presses(app, KeyCode::Down, 9);
+                    press(app, KeyCode::Enter);
+                    cells(app, 200, 24);
+                    press(app, KeyCode::Down);
+                    cells(app, 200, 24);
+                    press(app, KeyCode::Up);
+                },
+                row: "↳ Thread g3",
+                act: |app| press(app, KeyCode::Enter),
+                after: pane,
+            },
+            // The taller screen shows all of the text, which starts at the top again.
+            Move {
+                name: "a resize",
+                screen: pane,
+                prepare: |app| press(app, KeyCode::End),
+                row: "↳ Thread g3",
+                act: |app| {
+                    app.on_terminal_event(Event::Resize(200, 30));
+                },
+                after: (200, 30),
+            },
+            Move {
+                name: "the wheel on the dialog",
+                screen: dialog,
+                prepare: as_dialog,
+                row: "↳ Thread f",
+                act: wheel_down,
+                after: dialog,
+            },
+            Move {
+                name: "End on the dialog",
+                screen: dialog,
+                prepare: as_dialog,
+                row: "↑ Thread up",
+                act: |app| press(app, KeyCode::End),
+                after: dialog,
+            },
+            Move {
+                name: "↓ on the dialog",
+                screen: dialog,
+                prepare: |app| {
+                    as_dialog(app);
+                    presses(app, KeyCode::Down, 5);
+                },
+                row: "↳ Thread f",
+                act: |app| press(app, KeyCode::Down),
+                after: dialog,
+            },
+        ];
+        for step in &moves {
+            click_after(&runtime, long_lineage_tui(), step);
+        }
+    }
+
+    /// A key or a turn of the wheel for the details.
+    type Input = fn(&mut App);
+
+    /// Scrolls the details a row up with the wheel.
+    fn wheel_up(app: &mut App) {
+        let area = app.details.drawn.expect("the details").area;
+        mouse(app, MouseEventKind::ScrollUp, area.x + 2, area.y + 2);
+    }
+
+    #[test]
+    fn keys_before_a_frame_scroll_the_details_as_they_would_with_frames_between() {
+        let end: Input = |app| press(app, KeyCode::End);
+        let home: Input = |app| press(app, KeyCode::Home);
+        let up: Input = |app| press(app, KeyCode::Up);
+        let k: Input = |app| press(app, KeyCode::Char('k'));
+        let down: Input = |app| press(app, KeyCode::Down);
+        let page_up: Input = |app| press(app, KeyCode::PageUp);
+        let page_down: Input = |app| press(app, KeyCode::PageDown);
+        let wheel: Input = wheel_up;
+        let runs: Vec<(&str, Vec<Input>)> = vec![
+            ("End ↑", vec![end, up]),
+            ("End k k", vec![end, k, k]),
+            ("End PageUp", vec![end, page_up]),
+            ("End and the wheel", vec![end, wheel]),
+            ("End Home", vec![end, home]),
+            // Pages past the end, and a row back up.
+            ("PageDown three times and ↑", vec![page_down, page_down, page_down, up]),
+            // ↓ chooses rows below the last one in view, which scroll into view, and the wheel
+            // scrolls up from there.
+            ("↓ to Previous agents and the wheel", [vec![down; 9], vec![wheel]].concat()),
+        ];
+        for dialog in [false, true] {
+            let (width, height) = if dialog { (80, 24) } else { (200, 24) };
+            let start = || {
+                let mut app = long_lineage_tui();
+                if dialog {
+                    as_dialog(&mut app);
+                }
+                app
+            };
+            let top = details_after(&mut start(), width, height);
+            let mut ended = start();
+            press(&mut ended, KeyCode::End);
+            let bottom = details_after(&mut ended, width, height);
+            assert_ne!(top, bottom, "{dialog}: the text scrolls");
+            for (name, inputs) in &runs {
+                let mut framed = start();
+                for input in inputs {
+                    input(&mut framed);
+                    cells(&mut framed, width, height);
+                }
+                let expected = details_after(&mut framed, width, height);
+                let mut batched = start();
+                for input in inputs {
+                    input(&mut batched);
+                }
+                let text = details_after(&mut batched, width, height);
+                assert_eq!(text, expected, "{dialog} {name}");
+                if *name == "End Home" {
+                    assert_eq!(text, top, "{dialog} {name}");
+                } else {
+                    assert_ne!(text, bottom, "{dialog} {name}: it scrolled up from the end");
+                }
+                assert_eq!(open_id(&batched), Some("t"), "{dialog} {name}");
+                assert_eq!(batched.composer.text(), "draft", "{dialog} {name}");
+            }
+        }
     }
 
     // ---- long titles ----

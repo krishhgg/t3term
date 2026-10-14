@@ -24,6 +24,17 @@
 //! show. Where the desktop shows an agent's elapsed time, t3term shows its status word, and it
 //! has no Stop, Merge back or Disconnect controls.
 //!
+//! The desktop's rules assume a watch that still hears the thread. Once the open thread's
+//! watch closes, its projection is the last t3term heard, while the shell still changes. So
+//! the shell's copy of a thread comes first then, as it does for the facts in details.rs:
+//!
+//! - An agent whose thread the shell lists goes by that thread. Its lineage links it to the
+//!   open thread or doesn't, and its status is the thread's, live or not.
+//! - An agent or a context transfer the shell can't speak for stays as the projection last had
+//!   it, so the agents that finished stay under Previous agents. A status still at work then,
+//!   pending, running or waiting, is unknown, since t3term won't hear how it ends, and an agent
+//!   without a thread no longer counts as running.
+//!
 //! Only the relationships that touch the open thread are worked out, from the shell and the
 //! open thread's projection, once after an event that can change them, and never for a frame.
 //! Only the rows its groups show get a title, so paging decides how many titles are cleaned.
@@ -65,6 +76,9 @@ const SETTLED: [&str; 6] = [
     "interrupted",
     "idle",
 ];
+/// The statuses of an agent or a context transfer still at work, which a closed watch never
+/// hears end.
+const AT_WORK: [&str; 3] = ["pending", "running", "waiting"];
 
 /// The section's groups, in the order they show.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -367,6 +381,12 @@ pub(super) fn parent_of(thread: &Value) -> Option<&str> {
     }
 }
 
+/// Whether the shell's copy of a thread can open. The active shell drops a thread T3 archives,
+/// so a copy that still says it is archived is stale, and the sidebar doesn't list it either.
+pub(super) fn opens(thread: &Value) -> bool {
+    thread["archivedAt"].is_null()
+}
+
 /// A thread's live run status, or else its status.
 fn run_status(thread: &Value) -> Option<&str> {
     thread
@@ -383,6 +403,13 @@ fn list<'a>(projection: Option<&'a Map<String, Value>>, key: &str) -> &'a [Value
         .unwrap_or_default()
 }
 
+/// The status a projection's agent or context transfer last had. A watch that `closed` won't
+/// hear the end of one still at work, so its status is unknown.
+fn last_word(record: &Value, closed: bool) -> Option<&str> {
+    let status = record.get("status").and_then(Value::as_str);
+    status.filter(|status| !closed || !AT_WORK.contains(status))
+}
+
 /// Newest first, and a thread without a time after every thread with one.
 fn newest_first(a: Option<i64>, b: Option<i64>) -> Ordering {
     match (a, b) {
@@ -395,12 +422,14 @@ fn newest_first(a: Option<i64>, b: Option<i64>) -> Ordering {
 
 impl Lineage {
     /// The section for thread `open_id`, from the shell's `threads` and the thread's
-    /// `projection`, which counts only while it is the open thread's. `paging` says how many
-    /// rows of each group get made.
+    /// `projection`, which counts only while it is the open thread's. `closed` says the
+    /// thread's watch closed, which leaves the shell to speak for the threads it lists.
+    /// `paging` says how many rows of each group get made.
     pub(super) fn of(
         open_id: Option<&str>,
         threads: &[Value],
         projection: Option<&Map<String, Value>>,
+        closed: bool,
         paging: &Paging,
     ) -> Lineage {
         let Some(current) = open_id else {
@@ -454,19 +483,24 @@ impl Lineage {
                 continue;
             };
             agents.insert(child, subagent);
-            // A delegated task settles with its first run, but a live run on its thread
-            // outranks that.
-            let live = by_id
-                .get(child)
-                .copied()
-                .and_then(|thread| thread.get("activityRunStatus"))
-                .and_then(Value::as_str);
-            let settled = subagent.get("status").and_then(Value::as_str);
+            let listed = by_id.get(child).copied();
+            let status = match listed {
+                // The shell's copy of the thread speaks for it, through the edge its lineage
+                // made above, if it made one.
+                Some(_) if closed => continue,
+                // A delegated task settles with its first run, but a live run on its thread
+                // outranks that.
+                Some(thread) => thread
+                    .get("activityRunStatus")
+                    .and_then(Value::as_str)
+                    .or_else(|| last_word(subagent, closed)),
+                None => last_word(subagent, closed),
+            };
             edges.add(Edge {
                 source: current,
                 target: child,
                 kind: Kind::Subagent,
-                status: live.or(settled),
+                status,
             });
         }
         for transfer in list(projection, "contextTransfers") {
@@ -482,12 +516,18 @@ impl Lineage {
                 source,
                 target,
                 kind: Kind::Transfer,
-                status: transfer.get("status").and_then(Value::as_str),
+                status: last_word(transfer, closed),
             });
         }
 
-        let merge_target = projection
-            .and_then(|projection| projection.get("thread"))
+        // The thread a fork merges back to, by the projection's copy of the open thread, or by
+        // the shell's once the watch closed.
+        let record = projection.and_then(|projection| projection.get("thread"));
+        let record = match by_id.get(current).copied() {
+            Some(thread) if closed => Some(thread),
+            _ => record,
+        };
+        let merge_target = record
             .filter(|thread| thread["lineage"]["relationshipToParent"] == "fork")
             .and_then(parent_of);
         let is_parent = |edge: &Edge| edge.kind != Kind::Transfer && edge.target == current;
@@ -542,11 +582,12 @@ impl Lineage {
                 Group::Active
             }
         };
-        // Agents without a thread yet have no row, so they count on their own.
+        // Agents without a thread yet have no row, so they count on their own, while the watch
+        // can still hear them end.
         let unseen = subagents
             .iter()
             .filter(|agent| agent.get("childThreadId") == Some(&Value::Null))
-            .filter(|agent| agent["status"] == "running")
+            .filter(|agent| !closed && agent["status"] == "running")
             .count();
         let working = related
             .iter()
@@ -779,9 +820,7 @@ fn row_for(
     if title.is_empty() {
         title = "Untitled".to_string();
     }
-    // The active shell drops a thread T3 archives, so a copy that says it is archived is
-    // stale, and doesn't open either.
-    let available = thread.is_some_and(|thread| thread["archivedAt"].is_null());
+    let available = thread.is_some_and(opens);
     let mut word = status_word(status);
     if !available && word == "Unknown" {
         word = "Unavailable";
@@ -912,6 +951,12 @@ mod tests {
         "─".repeat(columns)
     }
 
+    /// The section for thread `t` while its watch is open, with each group's first rows.
+    fn first_rows(threads: &[Value], projection: &Map<String, Value>) -> Lineage {
+        let paging = Paging::default();
+        Lineage::of(Some("t"), threads, Some(projection), false, &paging)
+    }
+
     /// The section's rows at `width`, each with its runs of spaces made one.
     fn shown(lineage: &Lineage, width: usize) -> Vec<String> {
         let theme = Theme::new(Depth::TrueColor);
@@ -965,7 +1010,7 @@ mod tests {
     #[test]
     fn the_parent_forks_and_agents_come_in_the_desktops_order() {
         let (threads, projection) = family();
-        let lineage = Lineage::of(Some("t"), &threads, Some(&projection), &Paging::default());
+        let lineage = first_rows(&threads, &projection);
         let closed = format!("› Previous agents (1) {}", rule(18));
         assert_eq!(
             shown(&lineage, 40),
@@ -989,7 +1034,7 @@ mod tests {
         // Previous agents opens to its rows.
         let mut paging = Paging::default();
         paging.toggle_previous();
-        let lineage = Lineage::of(Some("t"), &threads, Some(&projection), &paging);
+        let lineage = Lineage::of(Some("t"), &threads, Some(&projection), false, &paging);
         let rows = shown(&lineage, 40);
         let open = format!("⌄ Previous agents {}", rule(22));
         assert_eq!(rows[5..], [open.as_str(), "◆ Read docs Done"]);
@@ -1000,11 +1045,11 @@ mod tests {
     fn a_live_run_outranks_the_settled_task_until_it_ends() {
         let (mut threads, projection) = family();
         let paging = Paging::default();
-        let lineage = Lineage::of(Some("t"), &threads, Some(&projection), &paging);
+        let lineage = Lineage::of(Some("t"), &threads, Some(&projection), false, &paging);
         assert_eq!(lineage.row("a2").map(|row| row.word), Some("Running"));
         // The run ends, and the task's own status stands again.
         threads[5]["activityRunStatus"] = Value::Null;
-        let lineage = Lineage::of(Some("t"), &threads, Some(&projection), &paging);
+        let lineage = Lineage::of(Some("t"), &threads, Some(&projection), false, &paging);
         assert!(lineage.row("a2").is_none(), "Previous agents is closed");
         let rows = shown(&lineage, 40);
         assert_eq!(rows[0], "Lineage · 1 running");
@@ -1013,7 +1058,7 @@ mod tests {
         // A run that waits or starts is live too, under its own word.
         for (live, word) in [("waiting", "Waiting"), ("preparing", "Starting")] {
             threads[5]["activityRunStatus"] = json!(live);
-            let lineage = Lineage::of(Some("t"), &threads, Some(&projection), &paging);
+            let lineage = Lineage::of(Some("t"), &threads, Some(&projection), false, &paging);
             assert_eq!(lineage.row("a2").map(|row| row.word), Some(word));
         }
     }
@@ -1021,7 +1066,7 @@ mod tests {
     #[test]
     fn a_child_thread_shows_its_parent_agent() {
         let (threads, _) = family();
-        let lineage = Lineage::of(Some("a2"), &threads, None, &Paging::default());
+        let lineage = Lineage::of(Some("a2"), &threads, None, false, &Paging::default());
         let rows = shown(&lineage, 40);
         assert_eq!(rows, ["Lineage", "↑ Fix the parser Running"]);
         assert_eq!(lineage.row("t").unwrap().relation, Relation::ParentAgent);
@@ -1041,7 +1086,7 @@ mod tests {
         }
         let projection = projected(threads[0].clone(), agents, Vec::new());
         let mut paging = Paging::default();
-        let lineage = Lineage::of(Some("t"), &threads, Some(&projection), &paging);
+        let lineage = Lineage::of(Some("t"), &threads, Some(&projection), false, &paging);
         let closed = format!("› Previous agents (124) {} 7 failed", rule(7));
         assert_eq!(shown(&lineage, 40), ["Lineage", closed.as_str()]);
         assert_eq!(lineage.targets(), [Target::Previous]);
@@ -1051,7 +1096,7 @@ mod tests {
         assert_eq!(shown(&lineage, 20)[1], "› Previous… 7 failed");
 
         paging.toggle_previous();
-        let lineage = Lineage::of(Some("t"), &threads, Some(&projection), &paging);
+        let lineage = Lineage::of(Some("t"), &threads, Some(&projection), false, &paging);
         let rows = shown(&lineage, 40);
         let open = format!("⌄ Previous agents {} 7 failed", rule(13));
         assert_eq!(rows[1], open);
@@ -1064,7 +1109,7 @@ mod tests {
         while total < 124 {
             paging.show_more(Group::Previous);
             total = (total + PAGE).min(124);
-            let lineage = Lineage::of(Some("t"), &threads, Some(&projection), &paging);
+            let lineage = Lineage::of(Some("t"), &threads, Some(&projection), false, &paging);
             assert_eq!(lineage.parts[0].rows.len(), total);
             assert_eq!(lineage.more(Group::Previous) > 0, total < 124);
             if total == 114 {
@@ -1081,11 +1126,11 @@ mod tests {
             threads.push(under(fork, "t", "fork"));
         }
         let mut paging = Paging::default();
-        let lineage = Lineage::of(Some("t"), &threads, None, &paging);
+        let lineage = Lineage::of(Some("t"), &threads, None, false, &paging);
         assert_eq!(lineage.more(Group::Related), 2);
         assert_eq!(shown(&lineage, 40).last().unwrap(), "+ Show 2 more");
         paging.show_more(Group::Related);
-        let lineage = Lineage::of(Some("t"), &threads, None, &paging);
+        let lineage = Lineage::of(Some("t"), &threads, None, false, &paging);
         assert_eq!(lineage.more(Group::Related), 0);
         assert_eq!(lineage.targets().len(), 8);
     }
@@ -1130,7 +1175,7 @@ mod tests {
         );
         let mut paging = Paging::default();
         paging.toggle_previous();
-        let lineage = Lineage::of(Some("t"), &threads, Some(&projection), &paging);
+        let lineage = Lineage::of(Some("t"), &threads, Some(&projection), false, &paging);
         let u = Target::Thread("u".into());
         let c = Target::Thread("c".into());
         assert_eq!(lineage.targets(), [u, Target::Previous, c]);
@@ -1138,7 +1183,8 @@ mod tests {
         assert_eq!(lineage.row("u").unwrap().relation, Relation::ParentThread);
         // No agent without a thread runs, and a malformed one doesn't count.
         assert_eq!(lineage.running, 0);
-        assert!(!Lineage::of(Some("s"), &threads, None, &paging).shows());
+        let of_itself = Lineage::of(Some("s"), &threads, None, false, &paging);
+        assert!(!of_itself.shows());
     }
 
     #[test]
@@ -1146,12 +1192,12 @@ mod tests {
         let mut archived = under(shell("old", "Old try", "idle", 2), "t", "fork");
         archived["archivedAt"] = json!("2026-10-05T00:00:00.000Z");
         let lead = under(shell("t", "Lead", "idle", 1), "gone", "fork");
-        let threads = vec![lead, archived];
+        let threads = [lead, archived];
         let lost = agent("s1", json!("lost"), "completed", json!("Lost agent"));
         let projection = projected(threads[0].clone(), vec![lost], Vec::new());
         let mut paging = Paging::default();
         paging.toggle_previous();
-        let lineage = Lineage::of(Some("t"), &threads, Some(&projection), &paging);
+        let lineage = Lineage::of(Some("t"), &threads, Some(&projection), false, &paging);
         let open = format!("⌄ Previous agents {}", rule(22));
         assert_eq!(
             shown(&lineage, 40),
@@ -1170,7 +1216,7 @@ mod tests {
 
     #[test]
     fn transfers_that_touch_the_thread_show() {
-        let threads = vec![
+        let threads = [
             shell("t", "Lead", "idle", 1),
             shell("y", "Handed from", "idle", 2),
             shell("z", "Handed to", "idle", 3),
@@ -1182,7 +1228,7 @@ mod tests {
             transfer("t", "t", "pending"),
         ];
         let projection = projected(threads[0].clone(), Vec::new(), transfers);
-        let lineage = Lineage::of(Some("t"), &threads, Some(&projection), &Paging::default());
+        let lineage = first_rows(&threads, &projection);
         assert_eq!(
             shown(&lineage, 40),
             [
@@ -1198,10 +1244,56 @@ mod tests {
     fn another_threads_projection_counts_for_nothing() {
         let (threads, mut projection) = family();
         projection.insert("thread".into(), shell("other", "Other", "idle", 1));
-        let lineage = Lineage::of(Some("t"), &threads, Some(&projection), &Paging::default());
+        let lineage = first_rows(&threads, &projection);
         // The shell's agents still show, but no agent without a thread counts.
         assert_eq!(shown(&lineage, 40)[0], "Lineage · 1 running");
         assert!(lineage.row("a2").is_some());
+    }
+
+    #[test]
+    fn a_closed_watch_leaves_the_threads_the_shell_lists_to_the_shell() {
+        let (mut threads, mut projection) = family();
+        // In the shell, a1 failed on a later run its task never heard of, and e is an agent's
+        // thread under another thread. The projection has an agent on e, an agent on a thread
+        // the shell doesn't list and a transfer to z still pending.
+        threads[4]["status"] = json!("failed");
+        threads.push(under(shell("e", "Elsewhere", "idle", 8), "x", "subagent"));
+        threads.push(shell("z", "Handed to", "idle", 9));
+        let agents = projection["subagents"].as_array_mut().unwrap();
+        agents.push(agent("s5", json!("e"), "completed", Value::Null));
+        agents.push(agent("s6", json!("lost"), "running", json!("Lost agent")));
+        let pending = json!([transfer("t", "z", "pending")]);
+        projection.insert("contextTransfers".into(), pending);
+        let mut paging = Paging::default();
+        paging.toggle_previous();
+        let word = |lineage: &Lineage, id: &str| lineage.row(id).map(|row| row.word);
+
+        // While the watch is open, the projection's agents count as the desktop counts them.
+        let open = Lineage::of(Some("t"), &threads, Some(&projection), false, &paging);
+        assert_eq!(shown(&open, 40)[0], "Lineage · 3 running");
+        assert_eq!(word(&open, "a1"), Some("Done"));
+        assert_eq!(word(&open, "e"), Some("Done"));
+        assert_eq!(word(&open, "lost"), Some("Running"));
+        assert_eq!(word(&open, "z"), Some("Queued"));
+
+        // Once it closes, the shell speaks for a1, a2 and e. The agent and the transfer it can't
+        // speak for keep their last word, but neither was done, so neither has a status.
+        let closed = Lineage::of(Some("t"), &threads, Some(&projection), true, &paging);
+        let rows = shown(&closed, 40);
+        assert_eq!(rows[0], "Lineage · 1 running");
+        assert_eq!(word(&closed, "a1"), Some("Failed"));
+        assert_eq!(word(&closed, "a2"), Some("Running"));
+        assert!(closed.row("e").is_none() && !closed.relates("e"));
+        assert_eq!(word(&closed, "lost"), Some("Unavailable"));
+        assert!(!closed.row("lost").unwrap().available);
+        assert_eq!(word(&closed, "z"), Some("Unknown"));
+        // The agent that settled stays under Previous agents, as the shell has it.
+        let previous = format!("⌄ Previous agents {} 1 failed", rule(13));
+        assert!(rows.contains(&previous), "{rows:?}");
+        let failed = "◆ Read docs Failed".to_string();
+        assert!(rows.contains(&failed), "{rows:?}");
+        // The open thread's parent still comes first.
+        assert_eq!(rows[1], "↑ Plan the release Idle");
     }
 
     #[test]
@@ -1229,11 +1321,11 @@ mod tests {
         task["activityRunStatus"] = json!("running");
         let mut blank = under(shell("\u{1b}[2Jb", "\u{7}", "idle", 3), "t", "fork");
         blank["createdAt"] = json!("9".repeat(1_000_000));
-        let threads = vec![shell("t", "Lead", "idle", 1), task, blank];
+        let threads = [shell("t", "Lead", "idle", 1), task, blank];
         let prompt = "\u{9b}".repeat(2_000_000);
         let quiet = json!({"id": "s", "childThreadId": "d", "status": "running", "prompt": prompt});
         let projection = projected(threads[0].clone(), vec![quiet], Vec::new());
-        let lineage = Lineage::of(Some("t"), &threads, Some(&projection), &Paging::default());
+        let lineage = first_rows(&threads, &projection);
         let title = &lineage.row("c").unwrap().title;
         assert!(title.ends_with('…'));
         assert!(title.chars().count() <= TITLE + 1);
