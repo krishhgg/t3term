@@ -628,7 +628,7 @@ mod tests {
     }
 
     /// Answers the next call, passing over the frames before it.
-    async fn answer(socket: &mut Socket) {
+    async fn answer<S: AsyncRead + AsyncWrite + Unpin>(socket: &mut WebSocketStream<S>) {
         loop {
             let Message::Text(text) = within(socket.next()).await.unwrap().unwrap() else {
                 continue;
@@ -836,5 +836,105 @@ mod tests {
             }
         }
         assert_eq!(closes, 1);
+    }
+
+    /// The frames other than pings that T3 reads before the Close frame. Fails the test if
+    /// the socket ends without one, or after five seconds.
+    async fn before_close<S: AsyncRead + AsyncWrite + Unpin>(
+        socket: &mut WebSocketStream<S>,
+    ) -> Vec<Value> {
+        let mut frames = Vec::new();
+        loop {
+            match within(socket.next()).await {
+                Some(Ok(Message::Text(text))) => {
+                    let frame: Value = serde_json::from_str(&text).unwrap();
+                    if frame["_tag"] != "Ping" {
+                        frames.push(frame);
+                    }
+                }
+                Some(Ok(Message::Close(_))) => return frames,
+                Some(Ok(_)) => {}
+                other => panic!("expected a Close frame, got {other:?}"),
+            }
+        }
+    }
+
+    /// A connection lasts while any clone of its client does, so the clone left after one
+    /// drops still gets its answer. Once the last drops, nothing else does, and no one calls
+    /// `close`. T3 reads the Close frame and nothing else, and the task ends.
+    #[tokio::test]
+    async fn dropping_the_last_clone_closes_an_idle_connection_and_ends_its_task() {
+        let (rpc, task, server) = piped().await;
+        let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        let held = rpc.clone();
+        drop(rpc);
+        let calling = held.call("example.call", json!({}), Duration::from_secs(5));
+        let (reply, ()) = tokio::join!(calling, answer(&mut server));
+        reply.unwrap();
+        assert!(!task.is_finished());
+
+        drop(held);
+        assert_eq!(before_close(&mut server).await, Vec::<Value>::new());
+        within(task).await.unwrap();
+    }
+
+    /// T3 stops reading partway through a large `terminal.write`. The caller stops waiting
+    /// for it, and then drops a bounded stream it opened behind the write, and the client.
+    /// Nothing calls `close`. The stream's route is still in the map and its request and
+    /// Interrupt are still queued, since the task never got past the write. The task still
+    /// cuts the write short and drops the socket at `CLOSE_LIMIT`, and T3 got less than the
+    /// write, so nothing queued after it reached T3.
+    #[tokio::test]
+    async fn dropping_every_handle_ends_a_connection_t3_stopped_reading() {
+        let (rpc, task, mut server) = piped().await;
+        let held = rpc.clone();
+        let writing = tokio::spawn(async move {
+            let data = "x".repeat(WRITE);
+            let write = json!({"threadId": "thread-1", "terminalId": "term-1", "data": data});
+            held.call("terminal.write", write, Duration::from_secs(60))
+                .await
+        });
+        // The write's first bytes arrive, so the task is sending it, and T3 reads no more.
+        let mut head = [0u8; 16];
+        within(server.read_exact(&mut head)).await.unwrap();
+        let limits = StreamLimits::new(1, 1024).unwrap();
+        let opening = rpc.bounded_stream("example.bounded", json!({}), limits);
+        let stream = opening.await.unwrap();
+
+        // Stopping the write's task drops the clone it held.
+        writing.abort();
+        assert!(within(writing).await.unwrap_err().is_cancelled());
+        drop(stream);
+        drop(rpc);
+        let limit = CLOSE_LIMIT + Duration::from_secs(2);
+        let ending = tokio::time::timeout(limit, task).await;
+        ending
+            .expect("the task ended within the close limit")
+            .unwrap();
+        let mut rest = Vec::new();
+        within(server.read_to_end(&mut rest)).await.unwrap();
+        let received = head.len() + rest.len();
+        assert!(received < WRITE, "T3 got {received} bytes");
+    }
+
+    /// A close outranks the last handle dropping, as when the terminal's grant closes its
+    /// client and then drops it. The task sends nothing that was queued, the request and
+    /// Interrupt of a stream dropped after the close included, so T3 reads a Close frame and
+    /// nothing else.
+    #[tokio::test]
+    async fn the_last_handle_dropping_after_a_close_sends_nothing_queued() {
+        let (rpc, task, server) = piped().await;
+        // The test runs on one thread and waits on nothing from here to the last drop, so the
+        // task hasn't run yet.
+        let limits = StreamLimits::new(1, 1024).unwrap();
+        let opening = rpc.bounded_stream("example.bounded", json!({}), limits);
+        let stream = opening.await.unwrap();
+        rpc.close();
+        drop(stream);
+        drop(rpc);
+
+        within(task).await.unwrap();
+        let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        assert_eq!(before_close(&mut server).await, Vec::<Value>::new());
     }
 }

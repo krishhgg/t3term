@@ -295,8 +295,10 @@ async fn config_watch_starts_again_from_a_snapshot_and_never_sends_a_cursor() {
         let snapshot = config_snapshot(json!([provider("cursor")]));
         send(&mut socket, chunk(&id, json!([snapshot]))).await;
         assert_eq!(recv(&mut socket).await, ack(&id));
-        // Dropping the receiver interrupts the stream.
+        // Dropping the receiver interrupts the stream. The watcher held the connection's only
+        // client, so the socket closes after it.
         assert_eq!(recv(&mut socket).await, interrupt(&id));
+        assert_eq!(before_close(&mut socket).await, Vec::<Value>::new());
     });
 
     let mut events = spawn_config_watch(dial(url));
@@ -320,7 +322,7 @@ async fn config_watch_starts_again_from_a_snapshot_and_never_sends_a_cursor() {
     drop(events);
     tokio::time::timeout(Duration::from_secs(5), server)
         .await
-        .expect("the server saw the interrupt")
+        .expect("the server saw the interrupt and the close")
         .unwrap();
 }
 
@@ -1280,4 +1282,107 @@ async fn a_full_or_stopped_bounded_stream_holds_up_nothing_else_on_its_socket() 
     assert_eq!(accept_next(&mut bounded).await, [json!("held")]);
     let reason = stopped(&mut bounded).await;
     assert_eq!(reason, "a chunk would go over the 1-chunk limit");
+}
+
+// ---- how long a connection lasts ----
+
+/// The frames other than pings that the server reads before t3term's Close frame. Then
+/// t3term drops its end, so the socket ends. Fails the test if the socket ends without a
+/// Close frame, if a frame follows it, or after five seconds.
+async fn before_close(socket: &mut Socket) -> Vec<Value> {
+    let mut frames = Vec::new();
+    loop {
+        match within(socket.next()).await {
+            Some(Ok(Message::Text(text))) => {
+                let frame: Value = serde_json::from_str(&text).unwrap();
+                if frame["_tag"] != "Ping" {
+                    frames.push(frame);
+                }
+            }
+            Some(Ok(Message::Close(_))) => break,
+            Some(Ok(_)) => {}
+            other => panic!("expected a Close frame, got {other:?}"),
+        }
+    }
+    loop {
+        match within(socket.next()).await {
+            Some(Ok(Message::Text(text))) => panic!("t3term sent {text} after the Close frame"),
+            Some(Ok(_)) => {}
+            Some(Err(_)) | None => return frames,
+        }
+    }
+}
+
+/// A connection lasts while any clone of its client does. Dropping one leaves the other's
+/// calls working. Once the last drops, t3term sends nothing more but the Close frame and
+/// drops the socket.
+#[tokio::test]
+async fn the_socket_closes_once_the_last_clone_of_its_client_drops() {
+    let (rpc, mut socket) = connected().await;
+    let held = rpc.clone();
+    drop(rpc);
+    nothing_sent(&held, &mut socket).await;
+    drop(held);
+    assert_eq!(before_close(&mut socket).await, Vec::<Value>::new());
+}
+
+/// A call keeps the socket open while it waits, after every other clone has dropped, and gets
+/// T3's answer. Once it returns and its clone drops, the socket closes.
+#[tokio::test]
+async fn a_call_keeps_its_socket_open_until_t3_answers() {
+    let (rpc, mut socket) = connected().await;
+    let held = rpc.clone();
+    let calling =
+        tokio::spawn(async move { held.call(CALL, json!({}), Duration::from_secs(5)).await });
+    let request = within(recv(&mut socket)).await;
+    assert_eq!(request["tag"], CALL);
+    drop(rpc);
+
+    let exit = json!({"_tag": "Success", "value": "answered"});
+    send(
+        &mut socket,
+        json!({"_tag": "Exit", "requestId": request["id"], "exit": exit}),
+    )
+    .await;
+    let reply = within(calling).await.unwrap();
+    assert_eq!(reply.unwrap(), json!("answered"));
+    assert_eq!(before_close(&mut socket).await, Vec::<Value>::new());
+}
+
+/// A stream keeps the socket open after its client drops. T3's chunk still arrives, and
+/// t3term still acks it. Dropping the stream sends its Interrupt, then the Close frame.
+#[tokio::test]
+async fn a_stream_keeps_its_socket_open_after_its_client_drops() {
+    let (rpc, mut socket) = connected().await;
+    let mut stream = rpc.stream(LEGACY, json!({})).await.unwrap();
+    let id = within(recv(&mut socket)).await["id"].clone();
+    drop(rpc);
+
+    send(&mut socket, chunk(&id, json!(["a"]))).await;
+    assert_eq!(within(recv(&mut socket)).await, ack(&id));
+    assert_eq!(within(stream.next()).await.unwrap().unwrap(), json!("a"));
+    drop(stream);
+    assert_eq!(before_close(&mut socket).await, [interrupt(&id)]);
+}
+
+/// A bounded stream keeps the socket open after its client drops, and t3term still acks a
+/// chunk only when the caller accepts it. Dropping the stream sends its Interrupt and closes
+/// the socket, though T3 never ended the stream and the caller still holds a chunk. That
+/// chunk keeps its values.
+#[tokio::test]
+async fn a_bounded_stream_keeps_its_socket_open_and_a_chunk_it_returned_does_not() {
+    let (rpc, mut socket) = connected().await;
+    let (mut stream, id) = open(&rpc, &mut socket, limits(4, 4096)).await;
+    drop(rpc);
+
+    send(&mut socket, chunk(&id, json!(["a"]))).await;
+    send(&mut socket, chunk(&id, json!(["b"]))).await;
+    let a = next_chunk(&mut stream).await;
+    let b = next_chunk(&mut stream).await;
+    assert_eq!(a.accept(), [json!("a")]);
+    assert_eq!(within(recv(&mut socket)).await, ack(&id));
+    drop(stream);
+    // Had t3term acked either chunk on arrival, more Acks would come before the Interrupt.
+    assert_eq!(before_close(&mut socket).await, [interrupt(&id)]);
+    assert_eq!(b.accept(), [json!("b")]);
 }
