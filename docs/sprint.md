@@ -58,6 +58,7 @@ These have no number yet. Each takes the next one when it merges.
 
 | Pull request | What it does |
 |---|---|
+| https://github.com/krishhgg/t3term/pull/38 | Terminal foundation: `terminal.attach`, `terminal.observe` and `subscribeTerminalMetadata` read as typed events over bounded streams, each Effect chunk acked only once the caller accepts it, and write, resize and one-terminal close. No pane, emulator, reconnect or new scope. [Terminal events](terminal-events.md) |
 
 ## Maintenance review PRs
 
