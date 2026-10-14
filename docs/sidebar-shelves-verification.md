@@ -10,7 +10,7 @@ Sol first checked `e3dc6e3`. Clippy and the build passed there, but `cargo fmt -
 
 The commit that adds this page, its image and the links to them changes no source or test. CI and Greptile at the PR's final head are pending, and this page doesn't record them.
 
-A later commit on #35 lets Down and the wheel scroll on past the last thread, so a short list can reach the headings under it. Nothing on this page checked that change.
+Later commits on #35 let Down and the wheel scroll on past the last thread, so a short list can reach the headings under it. Nothing on this page checked those commits or their tests.
 
 ## How it ran
 

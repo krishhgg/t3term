@@ -1089,7 +1089,8 @@ impl Sidebar {
     ///
     /// It returns the first row to draw. That is the top row, unless Down scrolled the list
     /// past the last card. Then it is the row as far under the card as Down took it, short of
-    /// the furthest the list scrolls at this height.
+    /// the furthest the list scrolls at this height. A height that shows the last row without
+    /// scrolling past the card ends the scroll, and that same frame starts at the top row.
     fn scroll_into_view(&mut self, height: usize) -> usize {
         let Some(last) = self.rows.len().checked_sub(1) else {
             self.offset = 0;
@@ -1119,12 +1120,15 @@ impl Sidebar {
         while self.offset > 0 && fits(&self.rows[self.offset - 1..], height) {
             self.offset -= 1;
         }
-        if self.past == 0 {
-            return self.offset;
+        if self.past > 0 {
+            let furthest = deepest(&self.rows, height);
+            self.past = self.past.min(furthest.saturating_sub(selected));
         }
-        let furthest = deepest(&self.rows, height);
-        self.past = self.past.min(furthest.saturating_sub(selected));
-        selected + self.past
+        if self.past == 0 {
+            self.offset
+        } else {
+            selected + self.past
+        }
     }
 
     /// Forgets what the last frame drew, so nothing left from it takes clicks, the wheel or the

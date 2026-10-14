@@ -6114,11 +6114,13 @@ mod tests {
     fn clickable(app: &App) -> Vec<String> {
         let list = app.sidebar.list;
         (list.y..list.bottom())
-            .map(|y| match (app.sidebar.thread_at(y), app.sidebar.shelf_at(y)) {
-                (Some(id), _) => id.to_string(),
-                (None, Some(shelf)) => format!("{shelf:?}"),
-                (None, None) => String::new(),
-            })
+            .map(
+                |y| match (app.sidebar.thread_at(y), app.sidebar.shelf_at(y)) {
+                    (Some(id), _) => id.to_string(),
+                    (None, Some(shelf)) => format!("{shelf:?}"),
+                    (None, None) => String::new(),
+                },
+            )
             .collect()
     }
 
@@ -6287,11 +6289,17 @@ mod tests {
         press(&mut app, KeyCode::Down);
         assert!(mouse(&mut app, MouseEventKind::ScrollDown, 5, 4));
         let rows = screen(&mut app, 80, 8);
-        assert!(rows[2].trim_start().starts_with("No threads yet"), "{rows:#?}");
+        assert!(
+            rows[2].trim_start().starts_with("No threads yet"),
+            "{rows:#?}"
+        );
         assert!(clickable(&app).iter().all(String::is_empty));
         press(&mut app, KeyCode::Up);
         let rows = screen(&mut app, 80, 8);
-        assert!(rows[2].trim_start().starts_with("No threads yet"), "{rows:#?}");
+        assert!(
+            rows[2].trim_start().starts_with("No threads yet"),
+            "{rows:#?}"
+        );
 
         // Delta alone, on closed Done, leaves only the headings. At 80x4 the list has two rows,
         // and Down scrolls on to Settled, whose click opens it.
