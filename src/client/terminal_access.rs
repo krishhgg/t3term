@@ -11,12 +11,14 @@
 //! Each connect first checks that the server at the client's origin is still the client's
 //! environment, so the session goes to no other server. Then it asks `/api/auth/session` about
 //! the session, and opens the socket only when `permissions` lists `terminal:read` and
-//! `terminal:operate` and nothing else. Later calls share the session and the socket, and calls
-//! that come at once wait for one connect. A call after the socket drops opens a new one with
-//! the same session while T3 still accepts it.
+//! `terminal:operate` and nothing else. Later calls share the session and the socket. A client
+//! runs one connect at a time, and every call that comes while it runs gets what it ends with,
+//! the socket or the same error. A call after it ends starts another, so after a failure, or
+//! once the socket drops, the next call connects again with the same session while T3 still
+//! accepts it.
 //!
-//! A call issues at most one session, and a client at most one a minute. Nothing retries on its
-//! own.
+//! A connect issues at most one session, and a client at most one a minute. Nothing retries on
+//! its own.
 //!
 //! T3 sets a socket's scopes once, when it opens, and revoking the session leaves the socket
 //! open with them (apps/server/src/ws.ts:3155-3213 and apps/server/src/auth/SessionStore.ts:
@@ -28,15 +30,15 @@
 //! a connect still running when the client drops ends, and its session is revoked then.
 
 use std::collections::BTreeSet;
-use std::sync::Arc;
+use std::sync::{Arc, PoisonError};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use tokio::sync::Mutex;
+use tokio::sync::{Mutex, watch};
 
 use crate::auth::{self, Checked, Session, TERMINAL_SCOPES};
 use crate::discovery::{self, Runtime, Target};
-use crate::error::{err, err_exit, exit};
+use crate::error::{T3Error, err, err_exit, exit};
 use crate::http::Api;
 use crate::rpc::RpcClient;
 
@@ -55,9 +57,50 @@ pub(super) struct TerminalAccess {
     runtime: Runtime,
     issue_interval: Duration,
     connect_deadline: Duration,
-    /// Held from the start of a connect to its end, so calls that come meanwhile wait and then
-    /// share what it made.
+    /// What a call finds when it comes. A call holds it only to look and to join or start a
+    /// connect, never while a connect runs.
+    link: std::sync::Mutex<Link>,
+    /// Held by the one connect running, from its start to its end.
     state: Mutex<State>,
+}
+
+enum Link {
+    /// No connection, and no connect running.
+    Idle,
+    /// A connect is running. The channel gets its outcome when it ends.
+    Connecting(watch::Receiver<Option<Outcome>>),
+    Open(RpcClient),
+}
+
+/// What a connect ends with.
+type Outcome = Result<RpcClient, Failure>;
+
+/// A connect's error, in a form each call that waited on the connect gets a copy of. A copy
+/// keeps the error's message, and its code and exit code when it has them, which is all t3term
+/// reports. It doesn't keep the causes behind the error.
+#[derive(Clone)]
+enum Failure {
+    T3(T3Error),
+    Other(String),
+}
+
+impl From<&anyhow::Error> for Failure {
+    fn from(error: &anyhow::Error) -> Failure {
+        let message = error.to_string();
+        match error.downcast_ref::<T3Error>() {
+            Some(t3) => Failure::T3(T3Error::new(t3.code, message).exit(t3.exit_code)),
+            None => Failure::Other(message),
+        }
+    }
+}
+
+impl From<Failure> for anyhow::Error {
+    fn from(failure: Failure) -> anyhow::Error {
+        match failure {
+            Failure::T3(t3) => t3.into(),
+            Failure::Other(message) => anyhow::Error::msg(message),
+        }
+    }
 }
 
 #[derive(Default)]
@@ -70,14 +113,6 @@ struct State {
     /// Why the server's terminal session can't be used. Once it is set, the client issues no
     /// other.
     refused: Option<String>,
-}
-
-impl State {
-    /// The terminal connection, while it is open.
-    fn open_rpc(&self) -> Option<RpcClient> {
-        let rpc = self.grant.as_ref()?.rpc.as_ref()?;
-        (!rpc.is_closed()).then(|| rpc.clone())
-    }
 }
 
 /// The terminal session, and the connection it opened.
@@ -115,32 +150,58 @@ impl TerminalAccess {
             runtime,
             issue_interval,
             connect_deadline,
+            link: std::sync::Mutex::new(Link::Idle),
             state: Mutex::default(),
         }
     }
 
     /// The open terminal connection, or a new one, as `Client::terminal_rpc` describes.
     pub(super) async fn rpc(self: &Arc<Self>) -> Result<RpcClient> {
-        if let Some(rpc) = self.state.lock().await.open_rpc() {
-            return Ok(rpc);
-        }
-        // The connect runs on a task of its own, so a caller that stops waiting can't stop it
-        // between issuing a session and keeping it.
-        let access = Arc::clone(self);
-        let connecting = tokio::spawn(async move { access.connect().await });
-        connecting.await.map_err(|stopped| {
-            err(
+        // A call joins or starts a connect before its first wait, so every call that comes
+        // while a connect runs gets that connect's outcome.
+        let mut connecting = {
+            let mut link = self.link.lock().unwrap_or_else(PoisonError::into_inner);
+            match &*link {
+                Link::Open(rpc) if !rpc.is_closed() => return Ok(rpc.clone()),
+                // The channel closes without an outcome only if the connect's task stopped
+                // early, as at a panic, and then this call starts another.
+                Link::Connecting(connecting) if connecting.has_changed().is_ok() => {
+                    connecting.clone()
+                }
+                _ => {
+                    let (outcome, connecting) = watch::channel(None);
+                    *link = Link::Connecting(connecting.clone());
+                    // The connect runs on a task of its own, so a caller that stops waiting
+                    // can't stop it between issuing a session and keeping it.
+                    tokio::spawn(Arc::clone(self).attempt(outcome));
+                    connecting
+                }
+            }
+        };
+        let outcome = connecting.wait_for(Option::is_some).await;
+        match outcome.as_deref() {
+            Ok(Some(Ok(rpc))) => Ok(rpc.clone()),
+            Ok(Some(Err(failure))) => Err(failure.clone().into()),
+            _ => Err(err(
                 "TERMINAL_CONNECT_FAILED",
-                format!("The terminal connection stopped before it opened: {stopped}"),
-            )
-        })?
+                "The terminal connection stopped before it opened.",
+            )),
+        }
+    }
+
+    /// Runs one connect, and gives its outcome to every call waiting on it. A call that comes
+    /// after the connect ends finds the connection open or starts another connect.
+    async fn attempt(self: Arc<Self>, outcome: watch::Sender<Option<Outcome>>) {
+        let ended = self.connect().await.map_err(|error| Failure::from(&error));
+        *self.link.lock().unwrap_or_else(PoisonError::into_inner) = match &ended {
+            Ok(rpc) => Link::Open(rpc.clone()),
+            Err(_) => Link::Idle,
+        };
+        outcome.send_replace(Some(ended));
     }
 
     async fn connect(&self) -> Result<RpcClient> {
         let mut state = self.state.lock().await;
-        if let Some(rpc) = state.open_rpc() {
-            return Ok(rpc);
-        }
         if let Some(reason) = &state.refused {
             return Err(refused(reason));
         }
@@ -273,9 +334,11 @@ fn refused(reason: &str) -> anyhow::Error {
 mod tests {
     use std::collections::HashMap;
     use std::path::Path;
+    use std::pin::Pin;
     use std::sync::Mutex as StdMutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
+    use futures_util::future::join_all;
     use futures_util::{SinkExt, StreamExt};
     use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -675,6 +738,70 @@ mod tests {
         }
     }
 
+    /// A terminal call that hasn't ended.
+    type Call<'a> = Pin<Box<dyn Future<Output = Result<RpcClient>> + 'a>>;
+
+    /// Starts `count` terminal calls and polls each once. A call starts or joins the connect
+    /// before it first waits, so every call has joined the same connect when this returns. The
+    /// test's runtime runs one task at a time and this never yields to it, so the connect
+    /// hasn't started yet.
+    async fn join_calls(client: &Client, count: usize) -> Vec<Call<'_>> {
+        let mut calls = Vec::new();
+        for _ in 0..count {
+            let mut call: Call<'_> = Box::pin(client.terminal_rpc());
+            assert!(futures_util::poll!(call.as_mut()).is_pending());
+            calls.push(call);
+        }
+        calls
+    }
+
+    /// The errors terminal calls ended with. Fails the test if one connected.
+    fn failures(ended: Vec<Result<RpcClient>>) -> Vec<anyhow::Error> {
+        let failed = ended.into_iter().map(|call| match call {
+            Ok(_) => panic!("a terminal call connected"),
+            Err(error) => error,
+        });
+        failed.collect()
+    }
+
+    /// What t3term reports for `error`: its code and exit code, if it has them, and its
+    /// message.
+    fn reported(error: &anyhow::Error) -> (Option<(&'static str, i32)>, String) {
+        let code = error
+            .downcast_ref::<T3Error>()
+            .map(|t3| (t3.code, t3.exit_code));
+        (code, error.to_string())
+    }
+
+    /// How many WebSocket upgrades `server` has seen, answered or not.
+    fn upgrades(server: &FakeServer) -> usize {
+        let seen = server.seen();
+        seen.iter().filter(|r| r.starts_with("GET /ws?")).count()
+    }
+
+    /// A copy of a connect's error reports what the error did, the code and exit code of a
+    /// `T3Error` under context included. Any other error keeps its message and has no code.
+    #[test]
+    fn a_shared_failure_reports_what_the_error_did() {
+        let api = err_exit("T3_API_ERROR", exit::REJECTED, "T3 answered 500.");
+        let lost = err_exit("T3_DISCONNECTED", exit::UNAVAILABLE, "T3 connection lost");
+        let missing = std::io::Error::new(std::io::ErrorKind::NotFound, "no such file");
+        let start = anyhow::Error::new(missing).context("could not start /opt/t3");
+        let errors = [
+            (api, Some(("T3_API_ERROR", exit::REJECTED))),
+            (
+                lost.context("while opening the terminal"),
+                Some(("T3_DISCONNECTED", exit::UNAVAILABLE)),
+            ),
+            (start, None),
+        ];
+        for (error, code) in errors {
+            let copy = anyhow::Error::from(Failure::from(&error));
+            assert_eq!(reported(&copy), reported(&error));
+            assert_eq!(reported(&copy).0, code, "{error}");
+        }
+    }
+
     /// Moves the client's last issue an hour back, as if an hour had passed.
     async fn pass_an_hour(client: &Client) {
         let mut state = client.terminal.state.lock().await;
@@ -852,20 +979,25 @@ mod tests {
     }
 
     /// A caller that stops waiting partway, such as a terminal closed while its session is
-    /// being issued, leaves one session that t3term tracks, and the next call uses it.
+    /// being issued, stops neither the connect it started nor the calls that joined it. They
+    /// get its socket, t3term tracks the one session it issued, and the next call uses both.
     #[tokio::test]
-    async fn a_call_that_stops_waiting_leaves_one_tracked_session() {
+    async fn a_call_that_stops_waiting_leaves_one_connect_and_one_tracked_session() {
         let setup = Setup::start(Duration::ZERO).await;
         let (server, t3, home) = (&setup.server, &setup.t3, setup.home.path());
         server.answer(&FakeT3::token(1), terminal_session());
         t3.hold_issues(true);
-        tokio::select! {
-            _ = setup.client.terminal_rpc() => panic!("the call ended while the issue waited"),
-            () = t3.wait_for_issues(1) => {}
-        }
+        let mut calls = join_calls(&setup.client, 3).await;
+        t3.wait_for_issues(1).await;
+        // The call that started the connect stops waiting.
+        drop(calls.remove(0));
         t3.hold_issues(false);
+        for call in within(join_all(calls)).await {
+            call.unwrap();
+        }
         setup.client.terminal_rpc().await.unwrap();
         assert_eq!(t3.calls(), [issue_call(home)]);
+        assert_eq!(upgrades(server), 1);
         let session = t3.session_id(1);
         assert!(is_live(&session));
 
@@ -922,28 +1054,43 @@ mod tests {
         assert!(!is_live(&t3.session_id(1)));
     }
 
-    /// A T3 that takes the WebSocket upgrade and never answers it can't hold a call. The call
-    /// fails at the connect deadline with exit 5, and t3term keeps the session and issues no
-    /// other. The next call opens the socket with it.
+    /// A T3 that takes the WebSocket upgrade and never answers it can't hold a call. Every call
+    /// waiting on that connect fails at its deadline with the same error and exit 5, after one
+    /// session check, one ticket and one upgrade. t3term keeps the session and issues no other,
+    /// and a later call connects once more, with that session.
     #[tokio::test]
-    async fn a_connection_that_hangs_fails_at_the_deadline_and_keeps_the_session() {
+    async fn calls_waiting_on_a_connection_that_hangs_all_fail_at_its_deadline() {
         let setup = Setup::with_limits(Duration::ZERO, HANG_DEADLINE).await;
         let (server, t3, home) = (&setup.server, &setup.t3, setup.home.path());
         let token = FakeT3::token(1);
         server.answer(&token, terminal_session());
         server.hold_upgrades(true);
-        let error = within(failed(&setup.client)).await;
-        let failure = error.downcast_ref::<T3Error>().unwrap();
-        assert_eq!(failure.code, "TERMINAL_CONNECT_TIMED_OUT");
-        assert_eq!(failure.exit_code, exit::UNAVAILABLE);
+        let before = server.seen().len();
+        let calls = join_calls(&setup.client, 3).await;
+        let errors = failures(within(join_all(calls)).await);
+        let timed_out = reported(&errors[0]);
+        let code = ("TERMINAL_CONNECT_TIMED_OUT", exit::UNAVAILABLE);
+        assert_eq!(timed_out.0, Some(code));
+        for error in &errors {
+            assert_eq!(reported(error), timed_out);
+        }
+        let connect = |ticket: usize| {
+            [
+                DESCRIPTOR.to_string(),
+                format!("GET /api/auth/session {token}"),
+                format!("POST /api/auth/websocket-ticket {token}"),
+                format!("GET /ws?wsTicket=ticket-{ticket}&orchestrationProtocol=2 -"),
+            ]
+        };
+        assert_eq!(&server.seen()[before..], connect(1));
         assert_eq!(t3.calls(), [issue_call(home)]);
         assert!(is_live(&t3.session_id(1)));
 
         server.hold_upgrades(false);
+        let before = server.seen().len();
         setup.client.terminal_rpc().await.unwrap();
+        assert_eq!(&server.seen()[before..], connect(2));
         assert_eq!(t3.calls(), [issue_call(home)]);
-        let ticket = format!("POST /api/auth/websocket-ticket {token}");
-        assert_eq!(server.tickets(), [ticket.clone(), ticket]);
 
         let revoke = revoke_call(t3, 1, home);
         drop(setup.client);
@@ -951,25 +1098,59 @@ mod tests {
         assert!(!is_live(&t3.session_id(1)));
     }
 
-    /// A caller that stops waiting, and a client dropped while T3 holds the upgrade, leave no
-    /// session behind. The connect ends at its deadline and revokes the one session.
+    /// A connect that fails before its socket, here at the ticket, fails every call waiting on
+    /// it with the code, exit code and message the ticket's error has, after one ticket
+    /// request. The next call connects again.
+    #[tokio::test]
+    async fn calls_waiting_on_a_connect_that_fails_all_get_its_error() {
+        let setup = Setup::start(Duration::ZERO).await;
+        let (server, t3, home) = (&setup.server, &setup.t3, setup.home.path());
+        let token = FakeT3::token(1);
+        server.answer(&token, terminal_session());
+        server.answer_tickets(Some(response("500 Internal Server Error", &[], "{}")));
+        let calls = join_calls(&setup.client, 3).await;
+        let errors = failures(within(join_all(calls)).await);
+        let ticket = format!("POST /api/auth/websocket-ticket {token}");
+        assert_eq!(server.tickets(), [ticket.clone()]);
+        assert_eq!(t3.calls(), [issue_call(home)]);
+
+        // The ticket's own error, from the same answer.
+        let api = Api::new(&setup.client.runtime, &token);
+        let direct = api.websocket_ticket().await.unwrap_err();
+        assert_eq!(code(&direct), Some("T3_API_ERROR"));
+        for error in &errors {
+            assert_eq!(reported(error), reported(&direct));
+        }
+
+        server.answer_tickets(None);
+        setup.client.terminal_rpc().await.unwrap();
+        assert_eq!(server.tickets(), [ticket.clone(), ticket.clone(), ticket]);
+        assert_eq!(t3.calls(), [issue_call(home)]);
+    }
+
+    /// Callers that stop waiting, and a client dropped while T3 holds the upgrade, leave no
+    /// session behind and start no other connect. The one connect ends at its deadline, the
+    /// terminal's state drops with it, and that revokes the one session.
     #[tokio::test]
     async fn a_client_dropped_while_its_connection_hangs_revokes_the_session_at_the_deadline() {
         let setup = Setup::with_limits(Duration::ZERO, HANG_DEADLINE).await;
         let (server, t3, home) = (&setup.server, &setup.t3, setup.home.path());
         server.answer(&FakeT3::token(1), terminal_session());
         server.hold_upgrades(true);
+        let access = Arc::downgrade(&setup.client.terminal);
         let client = setup.client;
-        tokio::select! {
-            _ = client.terminal_rpc() => panic!("the call ended while T3 held the upgrade"),
-            () = server.wait_for_upgrades(1) => {}
-        }
+        let calls = join_calls(&client, 3).await;
+        server.wait_for_upgrades(1).await;
+        drop(calls);
         drop(client);
         // The connect still holds it until the deadline.
         assert!(is_live(&t3.session_id(1)));
         t3.wait_for(&revoke_call(t3, 1, home)).await;
         assert!(!is_live(&t3.session_id(1)));
+        assert!(access.upgrade().is_none());
         assert_eq!(t3.issues(), 1);
+        assert_eq!(server.tickets().len(), 1);
+        assert_eq!(upgrades(server), 1);
     }
 
     /// Dropping the client closes the terminal's connection, for every clone a caller still

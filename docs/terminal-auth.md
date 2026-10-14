@@ -34,10 +34,11 @@ What t3term does with the answer in step 3:
 
 ## Sharing and reconnecting
 
-- Calls that come at once wait for one connect and share the session and the socket it makes.
+- A client runs one connect at a time. Every call that comes while it runs waits for it and gets what it ends with: the socket, or the same error with the same code, exit code and message. Each call gets its own copy of the error, without the causes behind it, which t3term doesn't print.
+- A call that comes after a connect ends starts a new one. So the next call after a failure tries again, and t3term keeps no failure.
 - Once the socket drops, the next call checks the server and the session again and opens a new socket with the same session.
 - A ticket request, handshake or socket that fails or runs out of time keeps the session for the next call.
-- A connect runs on a task of its own. A caller that stops waiting can't drop a session between issuing and tracking it, and a client that drops mid-connect revokes the session once the connect ends. Every step of a connect has a time limit, so it does end.
+- A connect runs on a task of its own. A caller that stops waiting can't drop a session between issuing and tracking it, and it starts no other connect. A client that drops mid-connect revokes the session once the connect ends. Every step of a connect has a time limit, so it does end.
 - A client starts at most one issue a minute. A call within the minute fails with `TERMINAL_SESSION_LIMITED` and says why the last issue failed, if it did. Nothing retries in the background.
 
 ## Closing
@@ -64,7 +65,7 @@ The session lasts 12 hours, and nothing renews it. At T3 f570bd21, a socket's se
 | `TERMINAL_SESSION_LIMITED` | 5 | The client tried to issue a terminal session less than a minute ago. |
 | `TERMINAL_CONNECT_TIMED_OUT` | 5 | The ticket and WebSocket handshake took more than 30 seconds. The session stays for the next call. |
 | `T3_ENVIRONMENT_CHANGED` | 4 | The server at the client's origin is another environment now. The next call checks again, and connects if the client's environment is back. |
-| `TERMINAL_CONNECT_FAILED` | 1 | The connect task stopped before it opened the socket. |
+| `TERMINAL_CONNECT_FAILED` | 1 | The connect's task stopped without an outcome, as at a panic. The next call starts another connect. |
 
 ## Known limits
 
