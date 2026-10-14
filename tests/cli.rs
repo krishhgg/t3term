@@ -3286,3 +3286,303 @@ fn launch_into_closed_stdout(json_mode: bool) {
     assert_eq!(tags, ["server.getConfig", LAUNCH]);
     assert_eq!(server.sockets(), 1);
 }
+
+/// Where a fake server holds an answer until the test lets it go. `gate` makes one.
+struct Gate {
+    arrived: std::sync::mpsc::Sender<()>,
+    open: Mutex<Option<std::sync::mpsc::Receiver<()>>>,
+}
+
+impl Gate {
+    /// Holds the first request that reaches the gate: says it arrived, then waits until the
+    /// test opens the gate. Returns false when the test stopped first, and the fake then drops
+    /// the request. Later requests pass at once.
+    fn pass(&self) -> bool {
+        let Some(open) = self.open.lock().unwrap().take() else {
+            return true;
+        };
+        let _ = self.arrived.send(());
+        open.recv_timeout(GUARD).is_ok()
+    }
+}
+
+/// The test's side of a `Gate`.
+struct Keeper {
+    arrived: std::sync::mpsc::Receiver<()>,
+    open: std::sync::mpsc::Sender<()>,
+}
+
+fn gate() -> (Gate, Keeper) {
+    let (arrived, arrivals) = std::sync::mpsc::channel();
+    let (open, opened) = std::sync::mpsc::channel();
+    let gate = Gate {
+        arrived,
+        open: Mutex::new(Some(opened)),
+    };
+    (
+        gate,
+        Keeper {
+            arrived: arrivals,
+            open,
+        },
+    )
+}
+
+/// The stream whose reader a test closes.
+#[derive(Clone, Copy)]
+enum Closed {
+    Stdout,
+    Stderr,
+}
+
+/// `args`, after `--json` when `json_mode` is set.
+fn with_json<'a>(json_mode: bool, args: &[&'a str]) -> Vec<&'a str> {
+    let mut all = if json_mode { vec!["--json"] } else { vec![] };
+    all.extend(args);
+    all
+}
+
+/// Runs t3term with `args` against the fake at `origin`, whose gate `keeper` holds the answer
+/// t3term prints first. Once the request reaches the gate, the reader of `closed` goes away,
+/// and then the fake answers. t3term must stay running while the fake `t3` holds the revoke of
+/// the session it issued with `scopes`, and exit only once the revoke is done, as in
+/// `launch_into_closed_stdout`. Returns the exit code and what t3term wrote on the other stream.
+fn run_into_closed(
+    origin: &str,
+    args: &[&str],
+    scopes: &str,
+    keeper: Keeper,
+    closed: Closed,
+) -> (Option<i32>, String) {
+    use std::io::Read as _;
+    let home = Home::new();
+    home.record_server(origin);
+    let t3 = held_revoke_t3(&home);
+    let mut command = home.command(args, &t3);
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut running = Running {
+        child: command.spawn().expect("run t3term"),
+        release: home.0.path().join("release"),
+    };
+
+    // The reader goes away while T3 holds the answer, and then T3 sends it.
+    keeper
+        .arrived
+        .recv_timeout(GUARD)
+        .expect("the request reached T3");
+    match closed {
+        Closed::Stdout => drop(running.child.stdout.take()),
+        Closed::Stderr => drop(running.child.stderr.take()),
+    }
+    keeper.open.send(()).unwrap();
+
+    // t3term starts the revoke and is still running while the revoke is held.
+    let ambient = home.0.path().join(".t3");
+    let t3_home = ambient.to_str().unwrap();
+    let log_held = format!("issue|{t3_home}|{scopes}\nheld|session-test\n");
+    wait_until("the revoke", || {
+        home.t3_log().contains("held|session-test\n")
+    });
+    assert_eq!(home.t3_log(), log_held, "{args:?}");
+    let exited = running.child.try_wait().unwrap();
+    assert_eq!(exited, None, "{args:?}: t3term didn't wait for its revoke");
+
+    // Once the revoke is let go, it finishes before t3term exits.
+    std::fs::write(&running.release, "").unwrap();
+    wait_until("t3term to exit", || {
+        running.child.try_wait().unwrap().is_some()
+    });
+    let log_revoked = format!("{log_held}revoke|{t3_home}|session-test\n");
+    assert_eq!(home.t3_log(), log_revoked, "{args:?}");
+
+    let status = running.child.wait().unwrap();
+    let mut other = String::new();
+    let child = &mut running.child;
+    let read = match closed {
+        Closed::Stdout => child.stderr.take().unwrap().read_to_string(&mut other),
+        Closed::Stderr => child.stdout.take().unwrap().read_to_string(&mut other),
+    };
+    read.unwrap();
+    (status.code(), other)
+}
+
+/// Checks the stderr of a run whose stdout closed. `--json` sent the error to the closed
+/// stdout, so stderr is empty. Otherwise it holds the error, which starts with `start` and ends
+/// with `end` around the system's words for the failure.
+#[track_caller]
+fn assert_unprinted(json_mode: bool, err: &str, start: &str, end: &str) {
+    if json_mode {
+        assert_eq!(err, "");
+        return;
+    }
+    assert_printable(err);
+    let end = format!("{end} [OUTPUT_FAILED]\n");
+    assert!(err.starts_with(start) && err.ends_with(&end), "{err}");
+}
+
+/// The thread the closed-output tests read, send to, wait on and watch.
+const HELD: &str = "3f9a6c21-7e4b-4d58-9a13-5c2e8b0d7f46";
+
+/// Thread `HELD` with `runs`, as T3's projection holds it.
+fn held_projection(runs: Value) -> Value {
+    json!({"thread": {"id": HELD, "title": "Held"}, "runs": runs, "runtimeRequests": [],
+        "turnItems": []})
+}
+
+/// Serves thread `HELD` to `send`, `wait` and `watch` as `serve_turn` does, with `projection`
+/// in its snapshot, and keeps each request t3term sends on the WebSocket. The first dispatch or
+/// subscription waits at `gate`. T3 then answers a dispatch with sequence 4, and a subscription
+/// with `values` before it closes the socket, as a dropped connection does.
+fn serve_held_thread(
+    projection: Value,
+    values: Value,
+    gate: Gate,
+) -> (String, Arc<Mutex<Vec<Value>>>) {
+    let requests = Arc::new(Mutex::new(Vec::new()));
+    let kept = requests.clone();
+    let on_socket = move |mut socket: Socket| {
+        while let Some(request) = next_request(&mut socket) {
+            kept.lock().unwrap().push(request.clone());
+            let subscription = request["tag"] == "orchestration.subscribeThread";
+            let answer = if subscription {
+                json!({"_tag": "Chunk", "requestId": request["id"], "values": values})
+            } else if request["tag"] == "orchestration.dispatchCommand" {
+                json!({"_tag": "Exit", "requestId": request["id"],
+                    "exit": {"_tag": "Success", "value": {"sequence": 4}}})
+            } else {
+                continue;
+            };
+            if !gate.pass() {
+                return;
+            }
+            reply(&mut socket, answer);
+            if subscription {
+                return;
+            }
+        }
+    };
+    let snapshot = json!({"snapshotSequence": 3, "projection": projection});
+    let thread_path = format!("/api/orchestration/threads/{HELD}/bounded");
+    let (origin, _) = serve_sockets(
+        move |path| match path {
+            "/.well-known/t3/environment" => Some(protocol_2_descriptor()),
+            "/api/orchestration/shell" => Some(json!({"projects": [], "threads": []})),
+            "/api/auth/websocket-ticket" => Some(json!({"ticket": "ticket-test"})),
+            _ if path == thread_path => Some(snapshot.clone()),
+            _ => None,
+        },
+        on_socket,
+    );
+    (origin, requests)
+}
+
+#[test]
+fn a_read_whose_stdout_closed_revokes_its_session_before_t3term_exits() {
+    // T3 holds the thread's snapshot until stdout's reader has gone. t3term then can't print
+    // it, and exits 1 without a panic.
+    for json_mode in [true, false] {
+        let (gate, keeper) = gate();
+        let snapshot = json!({"snapshotSequence": 3, "projection": held_projection(json!([]))});
+        let thread_path = format!("/api/orchestration/threads/{HELD}");
+        let (origin, _) = serve(move |path| match path {
+            "/.well-known/t3/environment" => Some(protocol_2_descriptor()),
+            "/api/orchestration/shell" => Some(json!({"projects": [], "threads": []})),
+            _ if path == thread_path && gate.pass() => Some(snapshot.clone()),
+            _ => None,
+        });
+        let args = with_json(json_mode, &["read", HELD]);
+        let (code, err) = run_into_closed(&origin, &args, READ_SCOPE, keeper, Closed::Stdout);
+        assert_eq!(code, Some(1), "json {json_mode}: {err}");
+        assert_unprinted(json_mode, &err, "t3term: Couldn't write to stdout: ", ".");
+    }
+}
+
+#[test]
+fn a_send_whose_stdout_closed_names_the_message_and_sends_it_once() {
+    // T3 holds its answer to the message until stdout's reader has gone, and then accepts it.
+    for json_mode in [true, false] {
+        let (gate, keeper) = gate();
+        let (origin, requests) = serve_held_thread(held_projection(json!([])), json!([]), gate);
+        let args = with_json(json_mode, &["send", HELD, "Summarize"]);
+        let (code, err) = run_into_closed(&origin, &args, OPERATE_SCOPES, keeper, Closed::Stdout);
+        assert_eq!(code, Some(1), "json {json_mode}: {err}");
+
+        // T3 got the message once, and the error names it and says not to send it again.
+        let requests = requests.lock().unwrap().clone();
+        let tags: Vec<&str> = requests.iter().map(|r| text(&r["tag"])).collect();
+        assert_eq!(tags, ["orchestration.dispatchCommand"], "json {json_mode}");
+        let message = &requests[0]["payload"];
+        assert_eq!(message["type"], "message.dispatch");
+        assert_eq!(message["text"], "Summarize");
+        let start = format!(
+            "t3term: The message was sent ({}), but t3term couldn't write to stdout: ",
+            text(&message["messageId"])
+        );
+        assert_unprinted(json_mode, &err, &start, ". Do not resend it.");
+    }
+}
+
+#[test]
+fn a_wait_whose_stdout_closed_mid_reply_revokes_its_session_before_t3term_exits() {
+    // Run r1 is working on message m1. T3 holds the rest of the turn until stdout's reader has
+    // gone, then sends part of the reply and the end of the run. Plain output fails on the
+    // reply, and `--json` on the result.
+    let running = json!({"id": "r1", "ordinal": 1, "status": "running", "userMessageId": "m1"});
+    let mut completed = running.clone();
+    completed["status"] = json!("completed");
+    let values = json!([{"kind": "synchronized"},
+        stream_event(4, "turn-item.updated", partial_answer("Checking first")),
+        stream_event(5, "run.updated", completed)]);
+    for json_mode in [true, false] {
+        let (gate, keeper) = gate();
+        let projection = held_projection(json!([running]));
+        let (origin, _) = serve_held_thread(projection, values.clone(), gate);
+        let args = with_json(json_mode, &["wait", HELD, "--timeout", "30"]);
+        let (code, err) = run_into_closed(&origin, &args, READ_SCOPE, keeper, Closed::Stdout);
+        assert_eq!(code, Some(1), "json {json_mode}: {err}");
+        let start = "t3term: The message was sent (m1), but t3term couldn't write to stdout: ";
+        assert_unprinted(json_mode, &err, start, ". Do not resend it.");
+    }
+}
+
+#[test]
+fn a_watch_whose_stderr_closed_reports_on_stdout_and_revokes_its_session_first() {
+    // T3 holds the subscription until stderr's reader has gone, then sends a snapshot, an event
+    // and the synchronized marker, and drops the socket.
+    let snapshot = json!({"kind": "snapshot", "snapshotSequence": 3,
+        "projection": held_projection(json!([]))});
+    let event = stream_event(4, "run.updated", json!({}));
+    let synchronized = json!({"kind": "synchronized"});
+    let values = json!([snapshot, event, synchronized]);
+    for json_mode in [true, false] {
+        let (gate, keeper) = gate();
+        let projection = held_projection(json!([]));
+        let (origin, _) = serve_held_thread(projection, values.clone(), gate);
+        let args = with_json(json_mode, &["watch", HELD]);
+        let (code, out) = run_into_closed(&origin, &args, READ_SCOPE, keeper, Closed::Stderr);
+        assert_eq!(code, Some(1), "json {json_mode}: {out}");
+        if !json_mode {
+            // The snapshot's line on stderr is the first thing plain output prints, so nothing
+            // reached stdout, and the error went to the closed stderr.
+            assert_eq!(out, "");
+            continue;
+        }
+        // `--json` printed each item on stdout. The notice of the drop goes to stderr, and the
+        // error for it comes last on stdout.
+        let mut lines: Vec<Value> = out
+            .lines()
+            .map(|line| serde_json::from_str::<Value>(line).expect("one JSON value"))
+            .collect();
+        let failure = lines.pop().expect("the error");
+        let items = [snapshot.clone(), event.clone(), synchronized.clone()];
+        assert_eq!(lines, items);
+        assert_eq!(failure["ok"], false, "{failure}");
+        assert_eq!(failure["error"]["code"], "OUTPUT_FAILED", "{failure}");
+        let message = text(&failure["error"]["message"]);
+        let start = "Couldn't write to stderr: ";
+        assert!(
+            message.starts_with(start) && message.ends_with('.'),
+            "{message}"
+        );
+    }
+}
