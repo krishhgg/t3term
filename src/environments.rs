@@ -146,7 +146,8 @@ pub enum Phase {
     /// t3term can't read.
     Offline,
     /// The check failed any other way, such as an entry this t3term can't use, a redirect,
-    /// another environment's id, an answer that isn't a descriptor or another protocol.
+    /// another environment's id, an answer that isn't a descriptor or is over 256 KiB, or
+    /// another protocol.
     Blocked,
 }
 
@@ -1014,6 +1015,46 @@ mod tests {
                 .find(|line| credential.iter().any(|c| line.starts_with(c)));
             assert_eq!(sent, None, "{head:?}");
         }
+        assert_eq!(crate::keychain::fake::calls(), Vec::<Vec<String>>::new());
+    }
+
+    /// A server whose descriptor is over 256 KiB blocks its own environment, and the one beside
+    /// it is still ready.
+    #[tokio::test]
+    async fn a_descriptor_over_256_kib_blocks_only_its_environment() {
+        crate::keychain::fake::reset(false);
+        let dir = tempfile::tempdir().unwrap();
+        let (a_origin, _) = serve(descriptor("env-a"), || {});
+        // A key t3term ignores makes the body longer than the cap, though it would parse.
+        let mut long = descriptor("env-long");
+        long["padding"] = json!("x".repeat(256 * 1024));
+        let (long_origin, long_heads) = serve(long, || {});
+        let a = t3_home(dir.path(), "a", "env-a");
+        let long_home = t3_home(dir.path(), "long", "env-long");
+        let file = json!({"environments": {
+            "a": {"kind": "local", "t3Home": a, "origin": a_origin},
+            "long": {"kind": "local", "t3Home": long_home, "origin": long_origin},
+        }});
+        let saved: Environments = serde_json::from_value(file).unwrap();
+        let probes = saved.probe_all().await;
+        let found: Vec<_> = probes
+            .iter()
+            .map(|p| (p.name.as_str(), p.phase, p.code, p.exit_code))
+            .collect();
+        let invalid = Some("T3_DESCRIPTOR_INVALID");
+        assert_eq!(
+            found,
+            [
+                ("a", Phase::Ready, None, 0),
+                ("long", Phase::Blocked, invalid, exit::REJECTED)
+            ]
+        );
+        // The message gives the cap and none of the body.
+        let message = probes[1].message.as_deref().unwrap_or_default();
+        assert!(message.contains("longer than 256 KiB"), "{message}");
+        assert!(!message.contains("xxx"), "{message}");
+        assert_eq!(probes[1].label, None);
+        assert_eq!(long_heads.lock().unwrap().len(), 1);
         assert_eq!(crate::keychain::fake::calls(), Vec::<Vec<String>>::new());
     }
 

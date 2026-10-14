@@ -2792,3 +2792,128 @@ fn environment_status_probes_saved_environments_at_the_same_time() {
     assert_eq!(phases, ["ready", "ready"], "{report}");
     assert_eq!(*arrived.0.lock().unwrap(), 2);
 }
+
+/// The longest descriptor body t3term reads, as docs/environment-connections.md gives it.
+const DESCRIPTOR_CAP: usize = 256 * 1024;
+
+/// The descriptor of `environment_id` on protocol 2, with `padding`, a key t3term ignores, long
+/// enough that the JSON is `size` bytes.
+fn padded_descriptor(environment_id: &str, size: usize) -> String {
+    let mut descriptor = protocol_2_descriptor();
+    descriptor["environmentId"] = json!(environment_id);
+    descriptor["padding"] = json!("");
+    let unpadded = descriptor.to_string().len();
+    descriptor["padding"] = json!("x".repeat(size - unpadded));
+    let text = descriptor.to_string();
+    assert_eq!(text.len(), size);
+    text
+}
+
+/// A 200 response that sends `body`, which is ASCII, in chunks of 4 KiB and declares no length.
+fn chunked(body: &str) -> Reply {
+    let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    let mut text = head.to_string();
+    for chunk in body.as_bytes().chunks(4096) {
+        let chunk = std::str::from_utf8(chunk).expect("an ASCII body");
+        text.push_str(&format!("{:x}\r\n{chunk}\r\n", chunk.len()));
+    }
+    text.push_str("0\r\n\r\n");
+    Reply::Raw(text)
+}
+
+#[test]
+fn a_descriptor_over_256_kib_blocks_its_environment_alone_and_gets_no_login() {
+    // A is a working server. Fits sends a descriptor of exactly 256 KiB in chunks, with no
+    // length. Long declares a descriptor one byte longer, and flood sends one in chunks. Each
+    // would parse.
+    let home = Home::new();
+    let t3 = home.logging_t3();
+    let a = serve_environment("env-a", THREAD_A);
+    let a_home = home.t3_home("a/.t3", Some("env-a"), Some(&a.origin));
+    let local = |t3_home: &Path| json!({"kind": "local", "t3Home": t3_home});
+    let mut file = json!({"default": "a", "environments": {"a": local(&a_home)}});
+    let over = DESCRIPTOR_CAP + 1;
+    let answers = [
+        (
+            "fits",
+            chunked(&padded_descriptor("env-fits", DESCRIPTOR_CAP)),
+        ),
+        ("flood", chunked(&padded_descriptor("env-flood", over))),
+        ("long", raw("200 OK", &padded_descriptor("env-long", over))),
+    ];
+    let mut servers = Vec::new();
+    for (name, answer) in answers {
+        let (origin, paths) = serve_replies(move |_| Some(answer.clone()), |_| {});
+        let id = format!("env-{name}");
+        let t3_home = home.t3_home(&format!("{name}/.t3"), Some(&id), Some(&origin));
+        file["environments"][name] = local(&t3_home);
+        servers.push((origin, paths));
+    }
+    home.save_environments(&file);
+    let run = |args: &[&str]| home.run_with(args, &t3);
+
+    // One run finds A and fits ready, and the two over the cap blocked. Each blocked message
+    // gives the cap and none of the body.
+    let status = run(&["--json", "environment", "status"]);
+    assert_eq!(status.status.code(), Some(0), "{status:?}");
+    let report = json_stdout(&status);
+    let probes = report["environments"]
+        .as_array()
+        .expect("environments")
+        .clone();
+    let found: Vec<(&str, &str, Option<&str>)> = probes
+        .iter()
+        .map(|p| (text(&p["name"]), text(&p["phase"]), p["code"].as_str()))
+        .collect();
+    let invalid = Some("T3_DESCRIPTOR_INVALID");
+    let expected = [
+        ("a", "ready", None),
+        ("fits", "ready", None),
+        ("flood", "blocked", invalid),
+        ("long", "blocked", invalid),
+    ];
+    assert_eq!(found, expected);
+    for probe in &probes[2..] {
+        let message = text(&probe["message"]);
+        assert!(message.contains("longer than 256 KiB"), "{message}");
+        assert!(!message.contains("xxx"), "{message}");
+    }
+
+    // Named, each over the cap exits 4 with that error, and a command sent to it stops before
+    // a login.
+    for name in ["flood", "long"] {
+        let status = run(&["--json", "environment", "status", name]);
+        assert_eq!(status.status.code(), Some(4), "{name}: {status:?}");
+        let report = json_stdout(&status);
+        let code = &report["error"]["code"];
+        assert_eq!(*code, "T3_DESCRIPTOR_INVALID", "{name}: {report}");
+        let threads = run(&["--json", "--environment", name, "threads"]);
+        assert_error(&threads, 4, "T3_DESCRIPTOR_INVALID");
+    }
+    assert_eq!(home.t3_log(), "");
+
+    // A is still ready, and a command sent to it logs in and runs.
+    let status = run(&["--json", "environment", "status", "a"]);
+    assert_eq!(status.status.code(), Some(0), "{status:?}");
+    let threads = run(&["--json", "--environment", "a", "threads"]);
+    assert_eq!(listed_ids(&threads), [THREAD_A]);
+    let mut logins = session_log(a_home.to_str().unwrap(), READ_SCOPE);
+    assert_eq!(home.t3_log(), logins);
+
+    // Discovery passes over a server whose descriptor is too long, as it passes over one that
+    // doesn't answer, and goes on to the server T3CODE_HOME records.
+    home.record_server(&a.origin);
+    let mut discover = home.command(&["--json", "threads"], &t3);
+    discover.env("T3TERM_ORIGIN", &servers[2].0);
+    assert_eq!(listed_ids(&discover.output().unwrap()), [THREAD_A]);
+    let ambient = home.0.path().join(".t3");
+    logins += &session_log(ambient.to_str().unwrap(), READ_SCOPE);
+    assert_eq!(home.t3_log(), logins);
+
+    // Fits was asked for its descriptor once. Flood and long were asked for theirs alone, once
+    // by each run that reached them.
+    let descriptor = "/.well-known/t3/environment";
+    assert_eq!(*servers[0].1.lock().unwrap(), [descriptor]);
+    assert_eq!(*servers[1].1.lock().unwrap(), [descriptor; 3]);
+    assert_eq!(*servers[2].1.lock().unwrap(), [descriptor; 4]);
+}
