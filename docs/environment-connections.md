@@ -52,7 +52,7 @@ For a saved environment, in this order:
 
 1. The T3 home is an absolute path, and the origin, saved or recorded, is an http origin on this machine: 127.0.0.0/8, `::1` or `localhost`. t3term logs in by running the server's own `t3` against the T3 home, and it never sends that login off the machine. An https origin on this machine stops the command with `ENVIRONMENT_TLS_UNSUPPORTED`. A program that builds a target with the t3term library gets the same check when it connects, before t3term reads the home.
 2. The T3 home holds `userdata/environment-id`. t3term reaches no server until it has read it.
-3. The server answers `/.well-known/t3/environment` at the origin itself. An answer that redirects stops the command with `T3_REDIRECTED`. An error status, or a body that isn't a whole descriptor, stops it with `T3_DESCRIPTOR_INVALID`. Nothing listening, or no answer within 2.5 seconds, stops it with `T3_SERVER_UNAVAILABLE`.
+3. The server answers `/.well-known/t3/environment` at the origin itself. An answer that redirects stops the command with `T3_REDIRECTED`. An error status, a body that isn't a whole descriptor or a body longer than 256 KiB stops it with `T3_DESCRIPTOR_INVALID`. Nothing listening, or no answer within 2.5 seconds, stops it with `T3_SERVER_UNAVAILABLE`.
 4. The `environmentId` the server reports is the id the T3 home holds. A server that belongs to another home, such as one that took over the port, gets no login.
 5. The server speaks orchestration protocol 2.
 6. t3term runs `t3 auth session issue --base-dir <T3 home>`. It finds `t3` from the pid in `server-runtime.json`, and uses that pid only when the record names the same origin t3term connected to. `T3TERM_T3_COMMAND` replaces the program, and t3term still passes the environment's T3 home as `--base-dir`.
@@ -60,6 +60,8 @@ For a saved environment, in this order:
 T3 writes `environment-id` in the state directory and reports the same id in its descriptor (apps/server/src/environment/ServerEnvironment.ts:89-177 at T3 f570bd21). A server started with `--base-dir` or `T3CODE_HOME` keeps its state in `userdata` under that home, even as a dev server (apps/server/src/cli/config.ts:319-332 and apps/server/src/config.ts:139-142).
 
 t3term reads `environment-id` and `server-runtime.json` once per command, on a blocking thread, so Ctrl-C still works while a slow disk holds the read up. It reads each only as a regular file of at most 16 KiB. A directory, a FIFO or a larger file counts as unreadable, so t3term never waits on a pipe or fills memory. Waiting can't cancel a read that never finishes. That read keeps its thread, and t3term exits without it.
+
+t3term reads at most 256 KiB of a descriptor's body. T3 f570bd21 sends about 1.3 KB from a desktop Mac: an id, a label, the platform, the version and some 40 capability flags (apps/server/src/environment/ServerEnvironment.ts:208-275). A long label or install path adds a few KB at most. A server that declares a longer body stops the command with `T3_DESCRIPTOR_INVALID` before t3term reads any of it. A body sent without a length, in chunks or until the server closes the connection, stops the command as soon as what t3term has read passes 256 KiB. The message gives the cap and none of the body. The cap bounds the body t3term keeps for one descriptor. The HTTP client's read buffer and the JSON parse use memory beyond it. The 2.5 seconds still cover the whole answer, so a body under the cap that stalls is `T3_SERVER_UNAVAILABLE`, as before. Discovery without a saved environment passes over a server whose descriptor is too long, as it passes over any server whose answer isn't a descriptor.
 
 ## Checking which servers answer
 
@@ -74,13 +76,13 @@ t3term environment status lab
 | --- | --- |
 | `ready` | The server answered the descriptor at the origin itself, reported the environment id its T3 home holds, and speaks orchestration protocol 2. |
 | `offline` | A check failed with exit code 5, `T3_SERVER_UNAVAILABLE`: nothing listens at the origin, the server closed the connection or didn't answer within 2.5 seconds, no origin is saved or recorded, or `server-runtime.json` can't be read. |
-| `blocked` | Any other check failed, such as an entry t3term refuses, a home with no environment id, a redirect, another environment's id, a descriptor that doesn't parse or protocol 1. Each keeps its code from [Errors](#errors). |
+| `blocked` | Any other check failed, such as an entry t3term refuses, a home with no environment id, a redirect, another environment's id, a descriptor that doesn't parse or is longer than 256 KiB, or protocol 1. Each keeps its code from [Errors](#errors). |
 
 `ready` means t3term verified the server's environment id and protocol from its descriptor. It doesn't mean a login would succeed or that an agent would start. Status logs in to no server and starts nothing, so a `ready` server can still refuse the login, or stop before the next command reaches it.
 
 Each environment is checked on its own. An entry t3term refuses, or a server that redirects or belongs to another home, doesn't stop the others. No check falls back to `T3TERM_ORIGIN`, `T3CODE_HOME`, the default or another environment's server. An entry saved under a name that breaks the naming rule is `blocked` with `ENVIRONMENT_NAME_INVALID`.
 
-t3term checks at most 8 environments at once and reports them in name order. It checks each once per run, with the 2.5 seconds every command waits for a descriptor, and doesn't retry. Nothing keeps running after the command ends, and status writes no file.
+t3term checks at most 8 environments at once and reports them in name order. It checks each once per run, with the 2.5 seconds every command waits for a descriptor and the same 256 KiB cap on its body, and doesn't retry. Nothing keeps running after the command ends, and status writes no file.
 
 Without a name, status reports every saved environment and exits 0 once the file reads, whatever each check found. With no file, or a file that saves no environment, it prints `No saved environments to check.`, or an empty list with `--json`. With a name, status checks that environment alone. It exits 0 when the environment is ready, and otherwise with its check's exit code, such as 5 when it is offline or 4 for another environment's id.
 
@@ -141,7 +143,7 @@ Every error uses an existing exit code. With `--json` it prints `{"ok": false, "
 | `ENVIRONMENT_UNSUPPORTED` | 4 | A saved environment's kind isn't `local`. |
 | `T3_ENVIRONMENT_UNVERIFIED` | 4 | The T3 home holds no `userdata/environment-id`. |
 | `T3_ENVIRONMENT_MISMATCH` | 4 | The server reports another environment id. |
-| `T3_DESCRIPTOR_INVALID` | 4 | A saved environment's server answered the descriptor with an error status, or with a body that isn't a whole descriptor: one that doesn't parse, lacks a field or stops partway. |
+| `T3_DESCRIPTOR_INVALID` | 4 | A saved environment's server answered the descriptor with an error status, or with a body that isn't a whole descriptor: one that doesn't parse, lacks a field, stops partway or is longer than 256 KiB. |
 | `T3_REDIRECTED` | 4 | A saved environment's server answered the descriptor with a redirect, or a server answered a later request with one, the saved login check included. |
 | `T3_PROTOCOL_UNSUPPORTED` | 4 | The server isn't on orchestration protocol 2. |
 | `T3_SERVER_UNAVAILABLE` | 5 | Nothing listens at the origin, the server closed the connection without an answer or didn't answer within 2.5 seconds, no origin is saved or recorded, or `server-runtime.json` can't be read. |
