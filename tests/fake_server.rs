@@ -13,6 +13,8 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
 
 use t3term::client::{WatchEvent, spawn_config_watch, spawn_watch, spawn_worktree_setup_watch};
 use t3term::projection::{Applied, ThreadState, apply_config};
@@ -1603,6 +1605,78 @@ async fn a_history_over_the_byte_budget_stops_the_attach_and_the_socket_goes_on(
     assert!(terminal_end(&mut stream).await.is_none());
     // Nothing attaches again, and a call still gets its answer.
     nothing_sent(&rpc, &mut socket).await;
+}
+
+/// Sends `message` in one final WebSocket frame, as `ws` sends each message T3 writes.
+async fn send_one_frame(socket: &mut Socket, message: String) {
+    let frame = Frame::message(message, OpCode::Data(Data::Text), true);
+    socket.send(Message::Frame(frame)).await.unwrap();
+}
+
+/// The sequence and history of a batch that holds one snapshot. Fails the test on anything
+/// else.
+fn lone_snapshot(batch: &TerminalBatch) -> (Option<u64>, &str) {
+    let events: Vec<_> = batch.events().collect();
+    match events.as_slice() {
+        [TerminalEvent::Snapshot(snapshot)] => (snapshot.sequence, snapshot.history.as_str()),
+        _ => panic!("expected one snapshot, got {} events", events.len()),
+    }
+}
+
+#[tokio::test]
+async fn a_history_over_16_mib_as_json_arrives_whole_and_a_smaller_budget_stops_only_its_stream() {
+    let (rpc, mut socket) = connected().await;
+    let terminal = terminal(&rpc);
+    let mut whole = terminal
+        .attach(None, None, limits(8, 32 << 20))
+        .await
+        .unwrap();
+    let whole_id = request(&mut socket, TERMINAL_ATTACH, identity()).await;
+    let mut small = terminal.observe(limits(1, 16 << 20)).await.unwrap();
+    let small_id = request(&mut socket, TERMINAL_OBSERVE, identity()).await;
+    // 3 MiB of ESC is well inside the 8 MiB of history T3 keeps, and takes 18 MiB as JSON.
+    // That is past tungstenite's default of 16 MiB in one frame.
+    let history = "\u{1b}".repeat(3 << 20);
+    let snapshot = opening(1, &history).to_string();
+    let message =
+        |id: &Value| format!(r#"{{"_tag":"Chunk","requestId":{id},"values":[{snapshot}]}}"#);
+    let first = message(&whole_id);
+    let size = first.len();
+    assert!(size > 16 << 20, "a {size}-byte message fits in 16 MiB");
+
+    // Within a byte limit that has room for it, the whole history arrives as T3 sent it.
+    send_one_frame(&mut socket, first).await;
+    let batch = next_batch(&mut whole).await;
+    assert_eq!(batch.bytes(), size);
+    let (sequence, received) = lone_snapshot(&batch);
+    assert_eq!(sequence, Some(1));
+    // Not assert_eq!, which would print 3 MiB of ESC on a failure.
+    assert!(received == history, "the history changed on the way");
+    // Its arrival acks nothing, and accepting it sends one Ack.
+    nothing_sent(&rpc, &mut socket).await;
+    batch.accept();
+    assert_eq!(sent(&rpc, &mut socket).await, [ack(&whole_id)]);
+
+    // A 16 MiB byte limit stops the observe alone, with one Interrupt and no Ack.
+    send_one_frame(&mut socket, message(&small_id)).await;
+    assert_eq!(within(recv(&mut socket)).await, interrupt(&small_id));
+    match terminal_end(&mut small).await {
+        Some(RpcError::Stopped(reason)) => {
+            assert_eq!(reason, "a chunk was over the 16777216-byte limit by itself");
+        }
+        other => panic!("expected a stop, got {other:?}"),
+    }
+    assert!(terminal_end(&mut small).await.is_none());
+    // Nothing observes again, and a call still gets its answer.
+    nothing_sent(&rpc, &mut socket).await;
+
+    // The attach goes on.
+    let output = terminal_event("output", 2, json!({"data": "$ "}));
+    send(&mut socket, chunk(&whole_id, json!([output]))).await;
+    let batch = next_batch(&mut whole).await;
+    assert_eq!(described(&batch), [json!(["output", 2, "$ "])]);
+    batch.accept();
+    assert_eq!(sent(&rpc, &mut socket).await, [ack(&whole_id)]);
 }
 
 #[tokio::test]
