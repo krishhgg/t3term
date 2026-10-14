@@ -17,6 +17,13 @@
 //!
 //! A call issues at most one session, and a client at most one a minute. Nothing retries on its
 //! own.
+//!
+//! T3 sets a socket's scopes once, when it opens, and revoking the session leaves the socket
+//! open with them (apps/server/src/ws.ts:3155-3213 and apps/server/src/auth/SessionStore.ts:
+//! 995-1012 at T3 f570bd21). So when the client drops, t3term closes the socket first, for
+//! every clone a caller still holds, and then revokes the session. Each step of a connect has a
+//! time limit, and the ticket and WebSocket handshake get 30 seconds together, so a connect
+//! still running when the client drops ends, and its session is revoked then.
 
 use std::collections::BTreeSet;
 use std::sync::Arc;
@@ -33,6 +40,10 @@ use crate::rpc::RpcClient;
 
 /// The least time between the starts of two terminal session issues by one client.
 const ISSUE_INTERVAL: Duration = Duration::from_secs(60);
+/// The most the WebSocket ticket and handshake may take together. The handshake has no limit
+/// of its own, and a connect that never ended would keep the session alive after the client
+/// dropped.
+const CONNECT_DEADLINE: Duration = Duration::from_secs(30);
 
 pub(super) struct TerminalAccess {
     /// The environment the client chose.
@@ -41,6 +52,7 @@ pub(super) struct TerminalAccess {
     /// or to nothing.
     runtime: Runtime,
     issue_interval: Duration,
+    connect_deadline: Duration,
     /// Held from the start of a connect to its end, so calls that come meanwhile wait and then
     /// share what it made.
     state: Mutex<State>,
@@ -73,16 +85,32 @@ struct Grant {
     rpc: Option<RpcClient>,
 }
 
+impl Drop for Grant {
+    fn drop(&mut self) {
+        // The socket keeps the session's scopes after T3 revokes it, so it closes first, for
+        // every clone. The session drops after this and is revoked.
+        if let Some(rpc) = &self.rpc {
+            rpc.close();
+        }
+    }
+}
+
 impl TerminalAccess {
     pub(super) fn new(target: Target, runtime: Runtime) -> TerminalAccess {
-        TerminalAccess::with_interval(target, runtime, ISSUE_INTERVAL)
+        TerminalAccess::with_limits(target, runtime, ISSUE_INTERVAL, CONNECT_DEADLINE)
     }
 
-    fn with_interval(target: Target, runtime: Runtime, issue_interval: Duration) -> TerminalAccess {
+    fn with_limits(
+        target: Target,
+        runtime: Runtime,
+        issue_interval: Duration,
+        connect_deadline: Duration,
+    ) -> TerminalAccess {
         TerminalAccess {
             target,
             runtime,
             issue_interval,
+            connect_deadline,
             state: Mutex::default(),
         }
     }
@@ -158,11 +186,24 @@ impl TerminalAccess {
                 Checked::Rejected => drop(grant),
             }
         };
-        let connected = RpcClient::connect(&api).await;
+        let connecting = tokio::time::timeout(self.connect_deadline, RpcClient::connect(&api));
+        let connected = match connecting.await {
+            Ok(connected) => connected,
+            Err(_) => Err(err_exit(
+                "TERMINAL_CONNECT_TIMED_OUT",
+                exit::UNAVAILABLE,
+                format!(
+                    "T3 at {} didn't open the terminal connection within {} seconds. t3term kept the terminal session for the next call.",
+                    runtime.origin,
+                    self.connect_deadline.as_secs()
+                ),
+            )),
+        };
         if let Ok(rpc) = &connected {
             grant.rpc = Some(rpc.clone());
         }
-        // After a connection that failed, the session stays for the next call.
+        // After a connection that failed or ran out of time, the session stays for the next
+        // call.
         state.grant = Some(grant);
         connected
     }
@@ -231,11 +272,13 @@ mod tests {
     use std::sync::Mutex as StdMutex;
     use std::time::{SystemTime, UNIX_EPOCH};
 
-    use serde_json::json;
+    use futures_util::{SinkExt, StreamExt};
+    use serde_json::{Value, json};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
     use tokio::net::{TcpListener, TcpStream};
     use tokio::task::JoinHandle;
     use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::Message;
     use tokio_tungstenite::tungstenite::handshake::derive_accept_key;
     use tokio_tungstenite::tungstenite::protocol::Role;
 
@@ -247,15 +290,46 @@ mod tests {
     use crate::error::T3Error;
     use crate::http::fake::response;
     use crate::keychain::{self, SavedLogin};
+    use crate::rpc::RpcError;
 
     type Socket = WebSocketStream<TcpStream>;
 
     /// The token of the saved login every client here starts with.
     const SAVED_TOKEN: &str = "saved-token";
     const DESCRIPTOR: &str = "GET /.well-known/t3/environment -";
+    /// The connect deadline of the tests whose T3 never answers the WebSocket upgrade.
+    const HANG_DEADLINE: Duration = Duration::from_secs(2);
 
     fn code(error: &anyhow::Error) -> Option<&'static str> {
         error.downcast_ref::<T3Error>().map(|e| e.code)
+    }
+
+    async fn within<T>(future: impl Future<Output = T>) -> T {
+        let limit = Duration::from_secs(10);
+        let output = tokio::time::timeout(limit, future).await;
+        output.expect("an answer within ten seconds")
+    }
+
+    /// The next request the client sends on `socket`, passing over its pings.
+    async fn next_request(socket: &mut Socket) -> Value {
+        loop {
+            let Message::Text(text) = within(socket.next()).await.unwrap().unwrap() else {
+                continue;
+            };
+            let frame: Value = serde_json::from_str(&text).unwrap();
+            if frame["_tag"] == "Request" {
+                return frame;
+            }
+        }
+    }
+
+    /// Answers the next request on `socket` with success, as T3 would.
+    async fn answer(socket: &mut Socket) {
+        let request = next_request(socket).await;
+        let success = json!({"_tag": "Success", "value": null});
+        let reply = json!({"_tag": "Exit", "requestId": request["id"], "exit": success});
+        let sent = socket.send(Message::Text(reply.to_string().into()));
+        sent.await.unwrap();
     }
 
     fn ok(body: &str) -> String {
@@ -300,11 +374,13 @@ mod tests {
         sessions: HashMap<String, String>,
         /// A raw answer to ticket requests, in place of a ticket.
         tickets: Option<String>,
+        /// Whether to take each WebSocket upgrade and never answer it.
+        hold_upgrades: bool,
     }
 
     /// A fake T3 on 127.0.0.1 that plays T3's HTTP side and the WebSocket handshake. It records
     /// each request as `METHOD path token`, with `-` for one without a bearer token, and holds
-    /// each WebSocket open until `drop_sockets`.
+    /// each WebSocket open until `drop_sockets` or `take_sockets`.
     struct FakeServer {
         origin: String,
         plan: Arc<StdMutex<Plan>>,
@@ -322,6 +398,7 @@ mod tests {
                 environment_id: environment_id.to_string(),
                 sessions: HashMap::from([(SAVED_TOKEN.to_string(), saved)]),
                 tickets: None,
+                hold_upgrades: false,
             }));
             let seen = Arc::new(StdMutex::new(Vec::new()));
             let sockets = Arc::new(StdMutex::new(Vec::new()));
@@ -364,6 +441,45 @@ mod tests {
             self.plan.lock().unwrap().environment_id = environment_id.to_string();
         }
 
+        /// Takes each WebSocket upgrade from now on and never answers it, as a T3 that hung
+        /// would, until this is called with `false`.
+        fn hold_upgrades(&self, hold: bool) {
+            self.plan.lock().unwrap().hold_upgrades = hold;
+        }
+
+        /// Waits up to five seconds for `count` WebSocket upgrade requests, answered or not.
+        async fn wait_for_upgrades(&self, count: usize) {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                let seen = self.seen();
+                let upgrades = seen.iter().filter(|r| r.starts_with("GET /ws?")).count();
+                if upgrades >= count {
+                    return;
+                }
+                assert!(Instant::now() < deadline, "{seen:?}");
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
+        /// The fake's end of each open WebSocket, in the order they opened, once `count` are
+        /// open. The fake no longer holds them.
+        async fn take_sockets(&self, count: usize) -> Vec<Socket> {
+            let deadline = Instant::now() + Duration::from_secs(5);
+            loop {
+                {
+                    let mut sockets = self.sockets.lock().unwrap();
+                    if sockets.len() >= count {
+                        return std::mem::take(&mut *sockets);
+                    }
+                }
+                assert!(
+                    Instant::now() < deadline,
+                    "fewer than {count} sockets opened"
+                );
+                tokio::time::sleep(Duration::from_millis(10)).await;
+            }
+        }
+
         /// Drops every WebSocket without closing it, as a T3 that went away would, and waits for
         /// `rpc` to see that.
         async fn drop_sockets(&self, rpc: &RpcClient) {
@@ -389,6 +505,8 @@ mod tests {
         sockets: Arc<StdMutex<Vec<Socket>>>,
     ) {
         let mut tickets = 0;
+        // Upgrades taken and never answered, kept open until the fake stops.
+        let mut held = Vec::new();
         while let Ok((mut stream, _)) = listener.accept().await {
             // One byte at a time, so a WebSocket gets every byte after the head.
             let mut head = Vec::new();
@@ -419,6 +537,10 @@ mod tests {
                 .unwrap()
                 .push(format!("{method} {path} {token}"));
             if let Some(key) = header("sec-websocket-key") {
+                if plan.lock().unwrap().hold_upgrades {
+                    held.push(stream);
+                    continue;
+                }
                 let accept = derive_accept_key(key.as_bytes());
                 let reply = format!(
                     "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
@@ -501,6 +623,11 @@ mod tests {
         /// Environment `b` and a client of it whose terminal issues at most one session every
         /// `interval`.
         async fn start(interval: Duration) -> Setup {
+            Setup::with_limits(interval, CONNECT_DEADLINE).await
+        }
+
+        /// The same, with a terminal whose ticket and WebSocket handshake get `deadline`.
+        async fn with_limits(interval: Duration, deadline: Duration) -> Setup {
             keychain::fake::reset(false);
             let t3 = FakeT3::install();
             let id = format!("env-{}", uuid::Uuid::new_v4());
@@ -523,7 +650,8 @@ mod tests {
             let mut client = connected.unwrap();
             let target = client.terminal.target.clone();
             let runtime = client.runtime.clone();
-            client.terminal = Arc::new(TerminalAccess::with_interval(target, runtime, interval));
+            let access = TerminalAccess::with_limits(target, runtime, interval, deadline);
+            client.terminal = Arc::new(access);
             Setup {
                 client: Arc::new(client),
                 server,
@@ -790,6 +918,106 @@ mod tests {
         assert!(!is_live(&t3.session_id(1)));
     }
 
+    /// A T3 that takes the WebSocket upgrade and never answers it can't hold a call. The call
+    /// fails at the connect deadline with exit 5, and t3term keeps the session and issues no
+    /// other. The next call opens the socket with it.
+    #[tokio::test]
+    async fn a_connection_that_hangs_fails_at_the_deadline_and_keeps_the_session() {
+        let setup = Setup::with_limits(Duration::ZERO, HANG_DEADLINE).await;
+        let (server, t3, home) = (&setup.server, &setup.t3, setup.home.path());
+        let token = FakeT3::token(1);
+        server.answer(&token, terminal_session());
+        server.hold_upgrades(true);
+        let error = within(failed(&setup.client)).await;
+        let failure = error.downcast_ref::<T3Error>().unwrap();
+        assert_eq!(failure.code, "TERMINAL_CONNECT_TIMED_OUT");
+        assert_eq!(failure.exit_code, exit::UNAVAILABLE);
+        assert_eq!(t3.calls(), [issue_call(home)]);
+        assert!(is_live(&t3.session_id(1)));
+
+        server.hold_upgrades(false);
+        setup.client.terminal_rpc().await.unwrap();
+        assert_eq!(t3.calls(), [issue_call(home)]);
+        let ticket = format!("POST /api/auth/websocket-ticket {token}");
+        assert_eq!(server.tickets(), [ticket.clone(), ticket]);
+
+        let revoke = revoke_call(t3, 1, home);
+        drop(setup.client);
+        t3.wait_for(&revoke).await;
+        assert!(!is_live(&t3.session_id(1)));
+    }
+
+    /// A caller that stops waiting, and a client dropped while T3 holds the upgrade, leave no
+    /// session behind. The connect ends at its deadline and revokes the one session.
+    #[tokio::test]
+    async fn a_client_dropped_while_its_connection_hangs_revokes_the_session_at_the_deadline() {
+        let setup = Setup::with_limits(Duration::ZERO, HANG_DEADLINE).await;
+        let (server, t3, home) = (&setup.server, &setup.t3, setup.home.path());
+        server.answer(&FakeT3::token(1), terminal_session());
+        server.hold_upgrades(true);
+        let client = setup.client;
+        tokio::select! {
+            _ = client.terminal_rpc() => panic!("the call ended while T3 held the upgrade"),
+            () = server.wait_for_upgrades(1) => {}
+        }
+        drop(client);
+        // The connect still holds it until the deadline.
+        assert!(is_live(&t3.session_id(1)));
+        t3.wait_for(&revoke_call(t3, 1, home)).await;
+        assert!(!is_live(&t3.session_id(1)));
+        assert_eq!(t3.issues(), 1);
+    }
+
+    /// Dropping the client closes the terminal's socket before it revokes the session, for
+    /// every clone a caller still holds. A call waiting on T3 ends, a later call fails at once,
+    /// and T3 gets no request for any of it, such as `terminal.close`. The login's socket stays
+    /// open and still carries calls.
+    #[tokio::test]
+    async fn dropping_the_client_closes_the_terminal_socket_for_every_clone() {
+        let setup = Setup::start(Duration::ZERO).await;
+        let (server, t3, home) = (&setup.server, &setup.t3, setup.home.path());
+        server.answer(&FakeT3::token(1), terminal_session());
+        let login = setup.client.rpc().await.unwrap();
+        let terminal = setup.client.terminal_rpc().await.unwrap();
+        let mut sockets = server.take_sockets(2).await;
+        let mut terminal_socket = sockets.pop().unwrap();
+        let mut login_socket = sockets.pop().unwrap();
+
+        let held = terminal.clone();
+        let waiting = tokio::spawn(async move {
+            let write = json!({"threadId": "thread-1", "terminalId": "term-1", "data": "ls\n"});
+            held.call("terminal.write", write, Duration::from_secs(60))
+                .await
+        });
+        let request = next_request(&mut terminal_socket).await;
+        assert_eq!(request["tag"], "terminal.write");
+
+        drop(setup.client);
+        assert!(terminal.is_closed());
+        let ended = within(waiting).await.unwrap();
+        assert!(matches!(ended, Err(RpcError::Disconnected(_))), "{ended:?}");
+        let later = terminal.call("terminal.write", json!({}), Duration::from_secs(60));
+        assert!(matches!(later.await, Err(RpcError::Disconnected(_))));
+        t3.wait_for(&revoke_call(t3, 1, home)).await;
+        // After the write, T3 gets nothing on the terminal's socket but pings and the Close
+        // frame.
+        loop {
+            match within(terminal_socket.next()).await {
+                Some(Ok(Message::Text(text))) => {
+                    let frame: Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(frame["_tag"], "Ping", "{frame}");
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(_)) => {}
+            }
+        }
+
+        assert!(!login.is_closed());
+        let calling = login.call("orchestration.example", json!({}), Duration::from_secs(5));
+        let (reply, ()) = tokio::join!(calling, answer(&mut login_socket));
+        reply.unwrap();
+    }
+
     /// When T3 no longer accepts the session, such as after it expired, t3term revokes it and
     /// issues one in its place, at most once a call. A replacement T3 doesn't accept either
     /// ends the call.
@@ -882,19 +1110,25 @@ mod tests {
         // b's home was made again with a new id, and its server reports that id.
         setup.server.drop_sockets(&rpc).await;
         let id_file = home.join("userdata").join("environment-id");
-        std::fs::write(id_file, "env-new\n").unwrap();
+        std::fs::write(&id_file, "env-new\n").unwrap();
         setup.server.report("env-new");
         let before = setup.server.seen().len();
         let error = failed(&setup.client).await;
         assert_eq!(code(&error), Some("T3_ENVIRONMENT_CHANGED"));
         assert_eq!(&setup.server.seen()[before..], [DESCRIPTOR]);
 
+        // b's id comes back, and the next call connects with the same session.
+        std::fs::write(&id_file, format!("{}\n", setup.id)).unwrap();
+        setup.server.report(&setup.id);
+        let rpc = setup.client.terminal_rpc().await.unwrap();
+        setup.server.drop_sockets(&rpc).await;
+
         setup.server.stop().await;
         let error = failed(&setup.client).await;
         assert_eq!(code(&error), Some("T3_SERVER_UNAVAILABLE"));
         assert_eq!(setup.t3.calls(), [issue_call(&home)]);
         let ticket = format!("POST /api/auth/websocket-ticket {token}");
-        assert_eq!(setup.server.tickets(), [ticket]);
+        assert_eq!(setup.server.tickets(), [ticket.clone(), ticket]);
         assert_eq!(a.seen(), Vec::<String>::new());
     }
 }

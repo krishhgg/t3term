@@ -114,7 +114,8 @@ impl Client {
     /// connection, later calls share both, and a call after the connection drops opens it
     /// again. Neither `connect` nor `rpc` issues the session, and this opens no terminal and
     /// sends nothing on the connection. Once the client drops and no call is still connecting,
-    /// the session is revoked.
+    /// the connection closes, for every clone a caller holds, and then the session is revoked.
+    /// A connect gets 30 seconds for its ticket and WebSocket handshake.
     pub async fn terminal_rpc(&self) -> Result<RpcClient> {
         self.terminal.rpc().await
     }
