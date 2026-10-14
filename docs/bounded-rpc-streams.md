@@ -1,6 +1,6 @@
 # Bounded RPC streams
 
-`RpcClient::bounded_stream` opens an Effect RPC stream whose caller acks each chunk, within limits the caller sets. An embedded terminal needs it to read terminal output without an unbounded queue. Nothing in t3term opens one yet. The embedded terminal is still missing ([parity.md, group 15](parity.md#15-embedded-terminal)), and the TUI's watches are unchanged: they use `RpcClient::stream`, which acks each chunk as it arrives and queues its values without a bound.
+`RpcClient::bounded_stream` opens an Effect RPC stream whose caller acks each chunk, within limits the caller sets. An embedded terminal needs it to read terminal output without an unbounded queue. src/terminal.rs opens them for a terminal's streams and for terminal metadata ([terminal-events.md](terminal-events.md)), but nothing in the TUI does yet. The embedded terminal is still missing ([parity.md, group 15](parity.md#15-embedded-terminal)), and the TUI's watches are unchanged: they use `RpcClient::stream`, which acks each chunk as it arrives and queues its values without a bound.
 
 ```rust
 let limits = StreamLimits::new(16, 256 * 1024).expect("limits above zero");
@@ -20,8 +20,8 @@ A chunk's size, `BoundedChunk::bytes`, is the length of its whole `Chunk` messag
 
 ## What the limits don't bound
 
-- Memory. A parsed `serde_json::Value` takes more room than its JSON, so the byte limit isn't a limit on the heap or the process.
-- Reading. The connection's reader decodes each WebSocket message whole before it routes the chunks in it. t3term keeps tungstenite 0.28's defaults, which allow a message of up to 64 MiB in frames of up to 16 MiB. A chunk over the byte limit still costs its full decode before t3term refuses it.
+- Memory. The connection's reader holds a whole WebSocket message and the values it parses from it before the limits see any chunk in it. A parsed `serde_json::Value` can take more room than its JSON or less: an object takes more, a string of `\u001b` escapes less. So the byte limit isn't a limit on the heap or the process.
+- Reading. A chunk over the byte limit still costs its full read and parse before t3term refuses it. The reader takes a message of up to 64 MiB, tungstenite 0.28's default, and allows one frame to be just as large ([One frame per message](#one-frame-per-message)). A message over 64 MiB closes the socket and fails every call and stream on it.
 - Accepted values. Once the caller accepts a chunk, bounding its values is up to the caller.
 
 ## Accepting a chunk
@@ -64,6 +64,18 @@ These notes are from T3 Code at commit `f570bd2`, nightly v0.0.46-nightly.202610
 `withTerminalOutputWindow` in `OutputProtocol.ts` covers `terminal.attach` and `subscribeTerminalEvents`. It doesn't cover `terminal.observe`. For those two, T3 acks its own server for each chunk while the client has fewer than 8 chunks and fewer than 64 KiB unacked. Once either is reached, T3 waits for the client's Ack. So T3 leaves at most 8 chunks unacked, and under 64 KiB plus the size of the last one. Limits of at least 8 chunks, and 64 KiB plus the largest chunk the caller expects, won't stop a stream T3 sends normally. T3 doesn't cap the size of a single chunk.
 
 On any other stream, Effect's server waits for an Ack after each chunk, so one chunk at most is unacked.
+
+## One frame per message
+
+T3 Code at `f570bd2` pins Effect 4.0.1, `@effect/platform-node` 4.0.1 and ws 8.22.0 in `pnpm-lock.yaml`. With those, T3 sends every message in one WebSocket frame, however large:
+
+- Effect's RPC server writes each encoded response to the socket whole (`writer.write(parser.encode(response))` in `src/rpc/RpcServer.ts`).
+- `NodeHttpServer` upgrades the request to a ws socket and wraps it with `Socket.fromWebSocket`, whose writer passes each message to `ws.send` with no options (`src/socket/Socket.ts`).
+- ws's `send` sends the message as one frame with `fin` set (`lib/websocket.js`).
+
+T3 turns on `perMessageDeflate` (`apps/server/src/server.ts`), but ws compresses only when the client offers the extension, and tungstenite doesn't. So frames from T3 arrive uncompressed.
+
+tungstenite's default caps a frame at 16 MiB. Under that default, any message from T3 over 16 MiB would close the socket, though the 64 MiB message limit allows it. `socket_config` in `src/rpc.rs` raises the frame limit to 64 MiB, so only the message limit decides. Both limits stay set. Nobody has measured a live T3 for this. It follows from the sources above.
 
 ## Out of scope
 
