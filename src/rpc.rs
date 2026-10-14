@@ -9,13 +9,13 @@ mod bounded;
 
 use std::collections::HashMap;
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
 
 use crate::discovery::{PROTOCOL_QUERY_PARAM, PROTOCOL_VERSION};
@@ -27,6 +27,8 @@ pub use bounded::{BoundedChunk, BoundedStream, StreamLimits};
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 /// No frame at all for this long means the socket is dead even if TCP has not noticed.
 const SILENCE_LIMIT: Duration = Duration::from_secs(30);
+/// Why calls end after `RpcClient::close`.
+const CLOSED: &str = "t3term closed the connection";
 
 #[derive(Debug, Clone)]
 pub enum RpcError {
@@ -90,6 +92,14 @@ pub struct RpcClient {
     outgoing: mpsc::UnboundedSender<Value>,
     pending: PendingMap,
     next_id: Arc<AtomicU64>,
+    closing: Arc<Closing>,
+}
+
+/// How [`RpcClient::close`] reaches every clone and the connection's task.
+#[derive(Default)]
+struct Closing {
+    closed: AtomicBool,
+    wake: Notify,
 }
 
 /// Items from a server stream. Dropping it interrupts the stream on the server.
@@ -136,6 +146,8 @@ impl RpcClient {
 
         let reader_pending = pending.clone();
         let ack = outgoing.clone();
+        let closing = Arc::<Closing>::default();
+        let reader_closing = closing.clone();
         tokio::spawn(async move {
             let mut ping = tokio::time::interval(PING_INTERVAL);
             ping.tick().await;
@@ -177,6 +189,7 @@ impl RpcClient {
                             break "ping failed".to_string();
                         }
                     }
+                    () = reader_closing.wake.notified() => break CLOSED.to_string(),
                 }
             };
             // A request made from here on fails at once, rather than joining the map after the
@@ -192,15 +205,31 @@ impl RpcClient {
             outgoing,
             pending,
             next_id: Arc::new(AtomicU64::new(1)),
+            closing,
         })
     }
 
-    /// True once the connection task has exited.
+    /// True once the connection task has exited, or once [`close`](Self::close) ran.
     pub fn is_closed(&self) -> bool {
-        self.outgoing.is_closed()
+        self.closing.closed.load(Ordering::Acquire) || self.outgoing.is_closed()
+    }
+
+    /// Closes the connection for this client and every clone of it. A call made from now on
+    /// fails at once with [`RpcError::Disconnected`] and sends nothing. The connection's task
+    /// then sends a WebSocket Close frame, ends every call and stream still waiting with
+    /// `Disconnected`, and exits. It sends T3 no request, so T3 sees a client that went away.
+    ///
+    /// Nothing calls it on its own. A connection nobody closes lasts until its socket drops.
+    pub fn close(&self) {
+        self.closing.closed.store(true, Ordering::Release);
+        // A permit, so the task sees it even while it is busy with a frame.
+        self.closing.wake.notify_one();
     }
 
     fn request(&self, id: &str, tag: &str, payload: Value) -> Result<(), RpcError> {
+        if self.closing.closed.load(Ordering::Acquire) {
+            return Err(RpcError::Disconnected(CLOSED.into()));
+        }
         self.outgoing
             .send(
                 json!({"_tag": "Request", "id": id, "tag": tag, "payload": payload, "headers": []}),
@@ -510,5 +539,55 @@ mod tests {
         // ended.
         assert!(rpc.pending.lock().await.is_empty());
         drop((streams, fourth));
+    }
+
+    /// `close` on one clone closes the connection for all of them. The call and the bounded
+    /// stream still waiting end with `Disconnected`, a later call fails at once, and T3 gets
+    /// nothing after the two requests but the Close frame.
+    #[tokio::test]
+    async fn closing_a_connection_ends_the_calls_and_streams_of_every_clone() {
+        let (rpc, mut socket) = connected().await;
+        let limits = StreamLimits::new(1, 1024).unwrap();
+        let opening = rpc.bounded_stream("example.bounded", json!({}), limits);
+        let mut stream = opening.await.unwrap();
+        let held = rpc.clone();
+        let waiting = tokio::spawn(async move {
+            let calling = held.call("example.call", json!({}), Duration::from_secs(60));
+            calling.await
+        });
+        let mut requests = 0;
+        while requests < 2 {
+            let Message::Text(text) = within(socket.next()).await.unwrap().unwrap() else {
+                continue;
+            };
+            let frame: Value = serde_json::from_str(&text).unwrap();
+            if frame["_tag"] == "Request" {
+                requests += 1;
+            }
+        }
+
+        rpc.close();
+        let ended = within(waiting).await.unwrap();
+        assert!(matches!(ended, Err(RpcError::Disconnected(_))), "{ended:?}");
+        let end = within(stream.next()).await;
+        assert!(
+            matches!(end, Some(Err(RpcError::Disconnected(_)))),
+            "{end:?}"
+        );
+        assert!(within(stream.next()).await.is_none());
+        let later = rpc.call("example.call", json!({}), Duration::from_secs(60));
+        assert!(matches!(later.await, Err(RpcError::Disconnected(_))));
+        assert!(rpc.is_closed());
+
+        loop {
+            match within(socket.next()).await {
+                Some(Ok(Message::Text(text))) => {
+                    let frame: Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(frame["_tag"], "Ping", "{frame}");
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(_)) => {}
+            }
+        }
     }
 }
