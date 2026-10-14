@@ -2,6 +2,12 @@
 
 The sprint builds the feature groups in [parity.md](parity.md), in that order, one small pull request at a time. It started on 2026-10-08. AGENTS.md says who does what, and only the user merges.
 
+## Priorities from 2026-10-13
+
+On 2026-10-13 the user changed the sprint's order. UI and UX come first, then Lineage, choosing an agent's environment and T3 Connect, PR reviews and embedded terminals. They go ahead of the group order in [parity.md](parity.md), which stays unedited as the record of the original plan. Nightly sync automation and the legacy context meter stay deferred.
+
+The user also asked about the sidebar's groups on the left. They reported that its header is crowded and that the Active heading is confusing without a Working shelf. They chose separate Working, Done and Settled shelves that each open and close, with Working and Done open by default and Settled closed, and spacing that suits a terminal. The shelves are their own arrangement, not the desktop's. The pinned desktop has no Done shelf and shows Done as a status word on a card. Which shelf a thread goes on follows the desktop's status words. That work gets its own pull request, apart from Lineage.
+
 ## Audit every ten merged sprint PRs
 
 Sprint PRs are the feature and infrastructure pull requests the sprint merges into master. The CI foundation is sprint PR 1. PR #7, which added the parity plan, came before the sprint and does not count.
@@ -16,7 +22,7 @@ Maintenance review PRs are listed in their own section. They neither count towar
 
 ## Sprint PRs
 
-Rows are tracked by URL, because GitHub numbers issues and pull requests from one sequence. GitHub is the record of whether a row merged: `gh pr view <url> --json state,mergedAt,mergeCommit`. Each new sprint PR adds its own row and fills in the merge commits of the rows above it.
+Rows are tracked by URL, because GitHub numbers issues and pull requests from one sequence. GitHub is the record of whether a row merged: `gh pr view <url> --json state,mergedAt,mergeCommit`. A sprint PR gets its number when it merges. Until then it is listed under Open sprint PRs, and the next sprint PR moves it to this table with its number and merge commit.
 
 | # | Pull request | What it does | Merge commit |
 |---|---|---|---|
@@ -40,6 +46,9 @@ Rows are tracked by URL, because GitHub numbers issues and pull requests from on
 | 18 | https://github.com/krishhgg/t3term/pull/27 | The open thread's worktree setup as a read-only card under its first prompt: stage progress, the setup script's last output and Details. No Cancel, Work locally, terminal or worktree preparation | `194943b5764256bbae6bc9c7a1d34948d33d9ddc` |
 | 19 | https://github.com/krishhgg/t3term/pull/28 | The environment's label, host and port under the sidebar's wordmark, and a dot that follows the sidebar's own feed, not the open thread's watch. The breadcrumb's row shows both while the sidebar is hidden. No environment list or selector | `f210cd8ac137872b95388ac4e11c097d8b0cf159` |
 | 20 | https://github.com/krishhgg/t3term/pull/29 | The open thread's project, workspace, recorded branch and environment, read-only, in a pane beside the conversation or a dialog on a narrow screen, opened with Alt+B or a button in the title row. No Git status, actions, scripts or tabbed right panel | `739cead6795dd0a80151d657c48721c109dea86f` |
+| 21 | https://github.com/krishhgg/t3term/pull/32 | Named local environments saved in `~/.config/t3term/environments.json`, and `--environment NAME` to send a command to that T3 home's server and no other. The server must be on loopback and report its home's environment id before t3term issues a session. No redirects followed. [Environment connections](environment-connections.md) | `11aa2bcc4b10b84484999a3f1e4a43c53589410d` |
+| 22 | https://github.com/krishhgg/t3term/pull/36 | Terminal foundation: an opt-in RPC stream whose caller acks each chunk, within chunk and byte limits the caller sets. Existing calls and streams are unchanged, and nothing in t3term opens one yet. [Bounded RPC streams](bounded-rpc-streams.md) | `190a95680262f392c029a3b4cc8da199f34aebeb` |
+| 23 | https://github.com/krishhgg/t3term/pull/35 | A blank row over the sidebar's wordmark, its list and the conversation's breadcrumb on screens at least 20 rows tall. Separate Working, Done and Settled shelves, each with a heading, a count and a chevron, opened and closed with `w`, `d` and `e` or a click and saved. Working and Done start open and Settled closed, and an old settings file gets the Working shelf on once. The inbox has no heading except `Inbox` under pins. Done is t3term's own shelf, not the desktop's. No visits, pins, snoozes or settles sent. [Verification](sidebar-shelves-verification.md) | `0b86d4fac4aa80eaa77c1f8d820ab725701bd607` |
 
 ## Open sprint PRs
 
@@ -47,7 +56,7 @@ These have no number yet. Each takes the next one when it merges.
 
 | Pull request | What it does |
 |---|---|
-| https://github.com/krishhgg/t3term/pull/35 | A blank row over the sidebar's wordmark, its list and the conversation's breadcrumb on screens at least 20 rows tall. Separate Working, Done and Settled shelves, each with a heading, a count and a chevron, opened and closed with `w`, `d` and `e` or a click and saved. Working and Done start open and Settled closed, and an old settings file gets the Working shelf on once. The inbox has no heading except `Inbox` under pins. Done is t3term's own shelf, not the desktop's. No visits, pins, snoozes or settles sent. [Verification](sidebar-shelves-verification.md) |
+| https://github.com/krishhgg/t3term/pull/33 | Lineage in the thread details: the parent, forks, context transfers, running agents and a closed Previous agents group with its failed count, 6 rows and then 12 more at a time. ↑, ↓, Enter and clicks open a related thread the shell lists. Read-only, with no Stop, Merge back, Disconnect or new fork |
 
 ## Maintenance review PRs
 
@@ -56,7 +65,8 @@ These have no number yet. Each takes the next one when it merges.
 | https://github.com/krishhgg/t3term/pull/23 | 1 | A CI concurrency group for each push to master, Greptile rule scopes and context brought up to date, and CLI tests for exit codes 7, 1 and 6 | `cf17b7ac16ccc00272e2c08ce9094e3bf261bc5c` |
 | https://github.com/krishhgg/t3term/pull/24 | 1 | Plain CLI output without control characters from T3 text, ids, names and errors, with `--json` unchanged | `1efb6a3052a5d3448fdd7fbb8dbf2bac694f0b46` |
 | https://github.com/krishhgg/t3term/pull/30 | 2 | Greptile context for the worktree setup stream, the TUI's real wake rules and the verification pages, and tests of one shared connection drop, a crowded thread and control characters across the whole screen | `7bf41aff45d52f1c72f5cf1fc876c3879b08a0de` |
-| https://github.com/krishhgg/t3term/pull/31 | 2 | The breadcrumb and the sidebar's cards read a title, a branch or a project's name only as far as the row shows, and keep each project's badge until the project changes | |
+| https://github.com/krishhgg/t3term/pull/31 | 2 | The breadcrumb and the sidebar's cards read a title, a branch or a project's name only as far as the row shows, and keep each project's badge until the project changes | `f77df53450f54f0cef9906d995a69c4f3616d39d` |
+| https://github.com/krishhgg/t3term/pull/37 | After 2 | The details-layout test's finished setup gets a fixed end, so a second passing between its two frames no longer changes the elapsed label it compares | `e84cd747aa0d75cd0a223a6ad941f76220863906` |
 
 ## Audits
 
@@ -113,6 +123,6 @@ Sol checked #30's source at `24b250a` with Rust 1.95.0. Its one source change si
 
 Sol checked #31 at `e9390bf` with Rust 1.95.0. Clippy over all targets with `-D warnings` passed. `cargo fmt --all -- --check` failed on four lines formatted by hand. `cargo test --locked` stopped in the library with 397 passed and 1 failed, so the later suites didn't run. The failure was in `a_huge_title_and_branch_move_nothing_else_on_the_screen`, at 80x24 with the sidebar hidden. The test expected the breadcrumb to show the whole address or nothing, and it showed the label "Studio Mac" alone, as the short title's frame did. `environment::chip` keeps the label and leaves out an address that doesn't fit whole, and `the_sidebar_and_the_header_keep_the_whole_port` already checks that, so the expectation was wrong and the app needed no change. The test now checks that the environment matches the short title's frame and that any address it shows keeps its whole port. Sol also found that `label::cut` kept a lone combining mark or joiner at zero columns, because neither takes a column. A row of no columns now reads and shows nothing. The docs of `label.rs` now give the exact read bound, which counts the one character read to learn whether the text goes on.
 
-Sol checked #31 again at `3b86aa9` with Rust 1.95.0. `cargo fmt --all -- --check`, Clippy over all targets with `-D warnings`, `cargo test --locked` and `cargo build --locked` passed. The 432 tests are 398 in the library, 2 in main.rs, 18 CLI and 14 fake RPC, with no doctests, so the PR adds 11 to master's 421. That count is for the PR's unmerged source. Sol also ran the builds of `7bf41af` and `3b86aa9` against a fake server on 127.0.0.1 and viewed captures of a long CJK project name and of one with a tab and a line break. [Bounded titles verification](bounded-titles-verification.md) records the runs and four of the captures. CI and Greptile at the PR's final head, and the user's merge, are pending.
+Sol checked #31 again at `3b86aa9` with Rust 1.95.0. `cargo fmt --all -- --check`, Clippy over all targets with `-D warnings`, `cargo test --locked` and `cargo build --locked` passed. The 432 tests are 398 in the library, 2 in main.rs, 18 CLI and 14 fake RPC, with no doctests, so the PR adds 11 to master's 421. That count is for the PR's unmerged source. Sol also ran the builds of `7bf41af` and `3b86aa9` against a fake server on 127.0.0.1 and viewed captures of a long CJK project name and of one with a tab and a line break. [Bounded titles verification](bounded-titles-verification.md) records the runs and four of the captures. The PR's final head, `7987da5`, added only that page and its captures. CI passed there, and Greptile Review gave it 5/5 with no findings. On the user's go-ahead, #31 merged at `f77df53450f54f0cef9906d995a69c4f3616d39d`, whose tree is the same as `7987da5`'s.
 
-20 sprint PRs have merged. The next audit is due when sprint PR 30 merges.
+23 sprint PRs have merged. #37 changed only a test, so it is listed with the maintenance PRs and doesn't count. The next audit is due when sprint PR 30 merges.
