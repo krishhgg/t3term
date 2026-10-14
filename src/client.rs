@@ -43,13 +43,86 @@ pub struct SendReceipt {
     pub dispatch_mode: &'static str,
 }
 
+/// A login in progress, as `Client::connect_with` takes it.
+type Login<'a> = Pin<Box<dyn Future<Output = Result<Session>> + Send + 'a>>;
+
+/// `Session::login`, in the shape `Client::connect_with` takes.
+fn log_in<'a>(runtime: &'a Runtime, scopes: &'a [Scope], ttl: &'a str) -> Login<'a> {
+    Box::pin(Session::login(runtime, scopes, ttl))
+}
+
+/// Stops unless the server discovery found reports `expected` as its environment id.
+fn require_environment(runtime: &Runtime, expected: &str) -> Result<()> {
+    if runtime.environment_id == expected {
+        return Ok(());
+    }
+    Err(err_exit(
+        "ENVIRONMENT_CHANGED",
+        exit::REJECTED,
+        format!(
+            "The server t3term found reports environment id {:?}, but {expected:?} was expected. t3term stopped before logging in. Check the environments again and choose one.",
+            runtime.environment_id
+        ),
+    ))
+}
+
 impl Client {
     /// Finds the server `target` names and logs in to it. The client then talks to that server
     /// alone, and reconnects to the same origin after a drop.
     pub async fn connect(target: &Target, scopes: &[Scope], ttl: &str) -> Result<Client> {
+        Client::connect_with(target, None, scopes, ttl, log_in).await
+    }
+
+    /// `connect`, to the server of environment `environment_id` alone, such as the one a probe
+    /// showed before the user chose it. Discovery runs as it does for `connect`, with every
+    /// check it makes. The id the server's descriptor reports is then compared with
+    /// `environment_id` as given, untrimmed, before the protocol check and before any login.
+    ///
+    /// Another id stops with `ENVIRONMENT_CHANGED`, exit 4. No saved login is looked up, no
+    /// `t3` runs, no session is issued and no other server is tried. A blank `environment_id`
+    /// stops with `ENVIRONMENT_ID_MISSING`, exit 2, before t3term reads a file or reaches a
+    /// server. A match logs in once with `scopes` and `ttl`, as `connect` does.
+    ///
+    /// The check covers the descriptor discovery read. A server that takes over the origin
+    /// after it would get the login, as it would from `connect`. Dropping the future while it
+    /// logs in can kill a `t3` that has issued a session t3term hasn't recorded yet, which then
+    /// stays valid until its TTL ends. A caller that gives up on a connection lets this finish
+    /// and drops the client it returns.
+    pub async fn connect_expected(
+        target: &Target,
+        environment_id: &str,
+        scopes: &[Scope],
+        ttl: &str,
+    ) -> Result<Client> {
+        if environment_id.trim().is_empty() {
+            return Err(err_exit(
+                "ENVIRONMENT_ID_MISSING",
+                exit::USAGE,
+                "The expected environment id is blank, so t3term can't check which server answers. It stopped before reading a T3 home or reaching a server.",
+            ));
+        }
+        Client::connect_with(target, Some(environment_id), scopes, ttl, log_in).await
+    }
+
+    /// `connect` and `connect_expected`. Outside tests `login` is `log_in`. A test passes a
+    /// stand-in that records its calls, so it can count logins without running `t3` or
+    /// reaching the Keychain.
+    async fn connect_with<L>(
+        target: &Target,
+        expected: Option<&str>,
+        scopes: &[Scope],
+        ttl: &str,
+        login: L,
+    ) -> Result<Client>
+    where
+        L: for<'a> FnOnce(&'a Runtime, &'a [Scope], &'a str) -> Login<'a>,
+    {
         let runtime = discovery::discover(target).await?;
+        if let Some(expected) = expected {
+            require_environment(&runtime, expected)?;
+        }
         runtime.require_supported_protocol()?;
-        let session = Session::login(&runtime, scopes, ttl).await?;
+        let session = login(&runtime, scopes, ttl).await?;
         let api = Api::new(&runtime, session.token());
         Ok(Client {
             runtime,
