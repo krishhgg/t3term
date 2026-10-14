@@ -4,7 +4,8 @@
 //! thread has a run going, its worktree setup card on screen shows a setup still running, or a
 //! sidebar card on screen reads Working or Goal, so the elapsed-time labels and spinners
 //! advance, and a one-shot timer for the moment the soonest snooze ends, which no server event
-//! marks. An idle TUI uses no CPU.
+//! marks. The terminal drawer, while it shows, arms one-shot timers only for work it has
+//! waiting (terminal.rs says which). An idle TUI uses no CPU.
 
 mod banner;
 mod composer;
@@ -21,10 +22,12 @@ mod scroll;
 mod setup;
 mod sidebar;
 mod tasks;
+mod terminal;
 mod theme;
 mod unsent;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::rc::Rc;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -33,7 +36,7 @@ use crossterm::event::{
     DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
     EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
-use futures_util::StreamExt;
+use futures_util::{FutureExt, StreamExt};
 use ratatui::Frame;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
@@ -47,6 +50,7 @@ use crate::client::{Client, IfBusy, WatchEvent};
 use crate::models::Choice;
 use crate::projection::{Applied, ShellState, ThreadState, apply_config, is_active_status, status};
 use crate::settings::Settings;
+use crate::terminal::{Launch, TerminalId};
 use crate::transcript::{self, BlockKind, ChangeLine};
 use composer::Composer;
 use details::Details;
@@ -95,6 +99,8 @@ enum Focus {
     /// The thread's details: a dialog of them, which always has the keyboard while it shows,
     /// or their pane, after a click on it or Tab.
     Details,
+    /// The terminal drawer, which sends the shell every key but F4, F6 and Ctrl+Q.
+    Terminal,
 }
 
 /// A drag of the sidebar's right edge, from the left button going down on it until it comes
@@ -517,6 +523,13 @@ struct App {
     sidebar_toggle: Rect,
     /// The open thread's details, which only this window opens and closes.
     details: Details,
+    /// The terminal drawer under the composer, for the open thread's `term-1`, while it shows.
+    /// Only this window opens it, and nothing saves it, so t3term starts without it.
+    terminal: Option<terminal::Pane>,
+    /// Opens the terminal's connection, the first time the drawer shows.
+    connect_terminal: terminal::Connect,
+    /// The button on the title row that shows and hides the terminal drawer.
+    terminal_button: Rect,
     /// The whole screen the last frame drew, which a drag and `[` and `]` work out the
     /// sidebar's width against.
     screen: Rect,
@@ -610,6 +623,14 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
                 None => std::future::pending().await,
             }
         };
+        // The terminal drawer's attach, stream, write, resize and deadlines, which are its own.
+        let pane = app.terminal.as_mut();
+        let pane_update = async move {
+            match pane {
+                Some(pane) => pane.next().await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             event = input.next() => match event {
                 Some(Ok(event)) => dirty |= app.on_terminal_event(event),
@@ -630,6 +651,7 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
             }
             // `None` once the subscription has ended, which closes it for good.
             event = setup_event => dirty |= app.on_setup_event(event),
+            update = pane_update => dirty |= app.on_pane_update(update),
             Some(result) = action_results.recv() => {
                 app.on_action_result(result);
                 dirty = true;
@@ -704,11 +726,19 @@ fn sidebar_width(width: u16, chosen: Option<u16>) -> u16 {
 
 /// The pane Tab moves focus to from `focus`, or BackTab when `forward` is false. A hidden
 /// sidebar is left out of the cycle, and the thread's details are in it while `details` says
-/// they show as a pane.
-fn cycle(focus: Focus, forward: bool, sidebar_hidden: bool, details: bool) -> Focus {
+/// they show as a pane. The terminal drawer is in it while `terminal` says it shows, which
+/// only F6 asks for, since Tab goes to the shell from it.
+fn cycle(
+    focus: Focus,
+    forward: bool,
+    sidebar_hidden: bool,
+    details: bool,
+    terminal: bool,
+) -> Focus {
     let panes: Vec<Focus> = [
         Focus::Sidebar,
         Focus::Composer,
+        Focus::Terminal,
         Focus::Transcript,
         Focus::Details,
     ]
@@ -716,6 +746,7 @@ fn cycle(focus: Focus, forward: bool, sidebar_hidden: bool, details: bool) -> Fo
     .filter(|pane| match pane {
         Focus::Sidebar => !sidebar_hidden,
         Focus::Details => details,
+        Focus::Terminal => terminal,
         Focus::Composer | Focus::Transcript => true,
     })
     .collect();
@@ -765,6 +796,11 @@ impl App {
         actions: mpsc::UnboundedSender<ActionResult>,
     ) -> App {
         let watcher = client.clone();
+        let terminal_client = client.clone();
+        let connect_terminal: terminal::Connect = Rc::new(move || {
+            let client = terminal_client.clone();
+            async move { client.terminal_rpc().await }.boxed_local()
+        });
         let environment = Identity::new(client.runtime.label.as_deref(), &client.runtime.origin);
         App {
             client,
@@ -823,6 +859,9 @@ impl App {
             picker_rows: Vec::new(),
             sidebar_toggle: Rect::default(),
             details: Details::default(),
+            terminal: None,
+            connect_terminal,
+            terminal_button: Rect::default(),
             screen: Rect::default(),
             watch_setup: Box::new(move |thread_id: &str| watcher.watch_worktree_setup(thread_id)),
             setup_refused: false,
@@ -1280,6 +1319,11 @@ impl App {
     /// Shows `open` in place of the thread that was open, as when one is picked in the sidebar.
     fn open_thread(&mut self, open: OpenThread) {
         self.open = Some(open);
+        // The terminal drawer follows the open thread. It drops the last thread's attach, which
+        // leaves that shell running, and attaches to this thread's `term-1`.
+        if self.terminal.take().is_some() {
+            self.show_terminal();
+        }
         self.cache.clear();
         self.outputs.clear();
         self.open_bundles.clear();
@@ -1368,7 +1412,8 @@ impl App {
                 }
             }
             Some(focus @ (Focus::Sidebar | Focus::Transcript | Focus::Composer)) => focus,
-            Some(Focus::Details) | None => Focus::Composer,
+            Some(Focus::Terminal) if self.terminal.is_some() => Focus::Terminal,
+            Some(Focus::Details | Focus::Terminal) | None => Focus::Composer,
         };
     }
 
@@ -1495,6 +1540,7 @@ impl App {
                     }
                     Some(_) => {}
                     None if self.focus == Focus::Composer => self.composer.insert_str(&text),
+                    None if self.focus == Focus::Terminal => self.paste_terminal(&text),
                     None => {}
                 }
                 true
@@ -1605,6 +1651,15 @@ impl App {
                     self.toggle_sidebar();
                     return true;
                 }
+                // The terminal's button shows and hides the drawer. Until a frame draws the
+                // title row after a change, it takes the click and does nothing with it.
+                if click && inside(self.terminal_button) {
+                    if self.layout_changed {
+                        return false;
+                    }
+                    self.toggle_terminal();
+                    return true;
+                }
                 // The details' button opens and closes them. Their pane takes what lands on
                 // it: a click on × closes it, and a click elsewhere on it gives it the keyboard
                 // and acts on the tab, the pull request or the Lineage row under it. The wheel
@@ -1640,6 +1695,33 @@ impl App {
                         }
                         MouseEventKind::ScrollUp => self.details.wheel(-1),
                         MouseEventKind::ScrollDown => self.details.wheel(1),
+                        _ => return false,
+                    }
+                    return true;
+                }
+                // The terminal drawer takes what lands on it: a click gives it the keyboard, and
+                // on Start terminal starts a shell too. The wheel scrolls its history, or sends
+                // arrow keys to a program that asked for them. Until a frame draws it after a
+                // change, it takes events and does nothing with them.
+                let drawer = self.terminal.as_ref().map(|pane| {
+                    (
+                        inside(pane.header) || inside(pane.content),
+                        inside(pane.start),
+                    )
+                });
+                if let Some((true, on_start)) = drawer {
+                    if self.layout_changed {
+                        return false;
+                    }
+                    match mouse.kind {
+                        _ if click => {
+                            self.focus = Focus::Terminal;
+                            if on_start {
+                                self.start_terminal();
+                            }
+                        }
+                        MouseEventKind::ScrollUp => self.wheel_terminal(true),
+                        MouseEventKind::ScrollDown => self.wheel_terminal(false),
                         _ => return false,
                     }
                     return true;
@@ -1736,8 +1818,12 @@ impl App {
                 self.end_drag(false);
                 self.sidebar.border = Rect::default();
                 // The details' button and the details may have moved too, so they take no
-                // click until then.
+                // click until then, and so may the terminal's button and drawer.
                 self.details.resized();
+                self.terminal_button = Rect::default();
+                if let Some(pane) = self.terminal.as_mut() {
+                    pane.forget_drawn();
+                }
                 true
             }
             _ => false,
@@ -1754,6 +1840,12 @@ impl App {
             if key.code == KeyCode::Esc {
                 return;
             }
+        }
+        // While the terminal has the keyboard it takes every key but F4, F6 and Ctrl+Q, so Tab,
+        // Esc, Ctrl+C and the rest reach the shell. An open menu still takes them first.
+        if self.focus == Focus::Terminal && self.picker.is_none() && !self.details_modal() {
+            self.on_terminal_key(key);
+            return;
         }
         let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
         let alt = key.modifiers.contains(KeyModifiers::ALT);
@@ -1781,6 +1873,20 @@ impl App {
             // focus anywhere, and nothing reaches the conversation under it.
             _ if self.details_modal() => {
                 self.on_details_key(key);
+                return;
+            }
+            // The terminal drawer, from any pane, an open menu included. A key held down
+            // repeats neither.
+            KeyCode::F(4) => {
+                if key.kind == KeyEventKind::Press {
+                    self.toggle_terminal();
+                }
+                return;
+            }
+            KeyCode::F(6) => {
+                if key.kind == KeyEventKind::Press {
+                    self.cycle_panes(!key.modifiers.contains(KeyModifiers::SHIFT));
+                }
                 return;
             }
             // Answer approvals from any pane. Terminals report Esc followed quickly by a letter as Alt.
@@ -1842,7 +1948,7 @@ impl App {
             KeyCode::Tab | KeyCode::BackTab => {
                 let forward = key.code == KeyCode::Tab;
                 let pane = self.details.shown() == Some(details::Layout::Pane);
-                match cycle(self.focus, forward, self.sidebar_hidden, pane) {
+                match cycle(self.focus, forward, self.sidebar_hidden, pane, false) {
                     Focus::Details => self.focus_details(false),
                     next => self.focus = next,
                 }
@@ -1929,6 +2035,7 @@ impl App {
                 _ => {}
             },
             Focus::Details => self.on_details_key(key),
+            Focus::Terminal => self.on_terminal_key(key),
         }
     }
 
@@ -2585,6 +2692,197 @@ impl App {
         });
     }
 
+    // ---- the terminal drawer ----
+
+    /// Shows the terminal drawer for the open thread's `term-1`, which attaches to it once the
+    /// event loop runs the drawer. Returns whether it shows.
+    fn show_terminal(&mut self) -> bool {
+        let Some(open) = self.open.as_ref() else {
+            let note = "Open a thread first. F4 shows its terminal.";
+            self.message = Some((note.into(), false));
+            return false;
+        };
+        match TerminalId::new(&open.id, terminal::TERMINAL_ID) {
+            Ok(id) => {
+                let connect = self.connect_terminal.clone();
+                self.terminal = Some(terminal::Pane::open(id, connect));
+                self.layout_changed = true;
+                true
+            }
+            Err(error) => {
+                let note = format!("t3term can't show this thread's terminal: {error}");
+                self.message = Some((note, true));
+                false
+            }
+        }
+    }
+
+    /// Shows or hides the terminal drawer, as F4 and its button do. Showing it gives it the
+    /// keyboard and closes an open menu. Hiding it drops its attach, which leaves the shell
+    /// running, and gives the keyboard to the composer if the drawer had it.
+    fn toggle_terminal(&mut self) {
+        if self.terminal.take().is_some() {
+            if self.focus == Focus::Terminal {
+                self.focus = Focus::Composer;
+            }
+            self.layout_changed = true;
+            return;
+        }
+        if self.show_terminal() {
+            self.picker = None;
+            self.focus = Focus::Terminal;
+        }
+    }
+
+    /// Moves focus to the next pane that shows, or the one before, as F6 and Shift+F6 do. The
+    /// terminal drawer is among them while the last frame drew it. An open menu closes.
+    fn cycle_panes(&mut self, forward: bool) {
+        let details = self.details.shown() == Some(details::Layout::Pane);
+        let terminal = self
+            .terminal
+            .as_ref()
+            .is_some_and(|pane| !pane.header.is_empty());
+        self.picker = None;
+        match cycle(self.focus, forward, self.sidebar_hidden, details, terminal) {
+            Focus::Details => self.focus_details(false),
+            next => self.focus = next,
+        }
+    }
+
+    /// A key for the terminal drawer while it has the keyboard. F4 hides it, F6 and Shift+F6
+    /// move focus on and Ctrl+Q quits. Shift+PgUp and Shift+PgDn scroll its history. Enter
+    /// starts a missing terminal or attaches a stopped one again. Every other key goes to the
+    /// shell, a key held down too.
+    fn on_terminal_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let shift = key.modifiers.contains(KeyModifiers::SHIFT);
+        let press = key.kind == KeyEventKind::Press;
+        match key.code {
+            KeyCode::Char('q' | 'Q') if ctrl => self.quit = true,
+            KeyCode::F(4) => {
+                if press {
+                    self.toggle_terminal();
+                }
+            }
+            KeyCode::F(6) => {
+                if press {
+                    self.cycle_panes(!shift);
+                }
+            }
+            _ => {
+                let Some(pane) = self.terminal.as_mut() else {
+                    self.focus = Focus::Composer;
+                    return;
+                };
+                let page = pane.page();
+                match key.code {
+                    KeyCode::PageUp if shift => pane.scroll(page),
+                    KeyCode::PageDown if shift => pane.scroll(-page),
+                    KeyCode::Enter if pane.missing() => {
+                        if press {
+                            self.start_terminal();
+                        }
+                    }
+                    KeyCode::Enter if pane.stopped() => {
+                        if press {
+                            pane.reconnect();
+                        }
+                    }
+                    _ => pane.key(&key),
+                }
+            }
+        }
+        self.take_terminal_notice();
+    }
+
+    /// Start terminal, from Enter or a click: asks T3 for the thread's `term-1` with the shell
+    /// the desktop starts for the thread, only while T3 has none. Says why when the thread
+    /// doesn't name the directory for it.
+    fn start_terminal(&mut self) {
+        let launch = self.terminal_launch();
+        let Some(pane) = self.terminal.as_mut().filter(|pane| pane.missing()) else {
+            return;
+        };
+        match launch {
+            Ok(launch) => pane.start(launch),
+            Err(reason) => {
+                pane.cannot_start(&reason);
+                self.message = Some((reason, true));
+            }
+        }
+    }
+
+    /// The shell Start terminal asks for: in the open thread's worktree if it has one, or else
+    /// in its project's workspace root, as the shell lists them. t3term never guesses a
+    /// directory, so a thread or project that doesn't name one gets the reason instead.
+    fn terminal_launch(&self) -> Result<Launch, String> {
+        let thread = self
+            .open_thread_json()
+            .ok_or("t3term hasn't loaded this thread yet, so it can't start its terminal.")?;
+        // T3 trims both paths, and t3term sends them trimmed.
+        let worktree = match thread.get("worktreePath") {
+            Some(Value::String(path)) if !path.trim().is_empty() => Some(path.trim()),
+            Some(Value::Null) => None,
+            _ => {
+                return Err(
+                    "T3 hasn't said where this thread's worktree is, so t3term can't start its terminal."
+                        .into(),
+                );
+            }
+        };
+        let project_id = str_of(thread, "projectId");
+        let root = self
+            .shell
+            .as_ref()
+            .and_then(|shell| {
+                shell
+                    .projects
+                    .iter()
+                    .find(|project| str_of(project, "id") == project_id)
+            })
+            .map(|project| str_of(project, "workspaceRoot").trim())
+            .filter(|root| !root.is_empty())
+            .ok_or("T3 hasn't said where this thread's project is, so t3term can't start its terminal.")?;
+        Launch::for_thread(root, worktree)
+            .map_err(|error| format!("t3term can't start this thread's terminal: {error}"))
+    }
+
+    /// A paste while the terminal has the keyboard, which goes to the shell whole or not at all.
+    fn paste_terminal(&mut self, text: &str) {
+        if let Some(pane) = self.terminal.as_mut() {
+            pane.paste(text);
+        }
+        self.take_terminal_notice();
+    }
+
+    /// A turn of the wheel over the terminal drawer.
+    fn wheel_terminal(&mut self, up: bool) {
+        if let Some(pane) = self.terminal.as_mut() {
+            pane.wheel(up);
+        }
+        self.take_terminal_notice();
+    }
+
+    /// Applies what the terminal drawer's work came to. Returns whether to draw again.
+    fn on_pane_update(&mut self, update: terminal::Update) -> bool {
+        let Some(pane) = self.terminal.as_mut() else {
+            return false;
+        };
+        let redraw = pane.on_update(update);
+        self.take_terminal_notice() || redraw
+    }
+
+    /// Puts what the terminal drawer has to say on the status line. Returns whether it had
+    /// anything.
+    fn take_terminal_notice(&mut self) -> bool {
+        let notice = self.terminal.as_mut().and_then(terminal::Pane::take_notice);
+        let Some(notice) = notice else {
+            return false;
+        };
+        self.message = Some((notice, true));
+        true
+    }
+
     // ---- drawing ----
 
     fn spinner(&self) -> &'static str {
@@ -2689,12 +2987,18 @@ impl App {
         // screen with room, level with the sidebar's over the wordmark.
         let inset = top_inset(area.height);
         let header_height = 2 + inset;
-        // The panel leaves the header, three transcript rows, the composer and the status line
-        // their space, less its own two borders.
+        // The terminal drawer wants its share of what the header, a one-row composer and the
+        // status line leave, so it keeps its size while the composer grows.
+        let terminal_wanted = match self.terminal {
+            Some(_) => terminal::height(main.height.saturating_sub(header_height + 5 + 1)),
+            None => 0,
+        };
+        // The panel leaves the header, three transcript rows, the composer, the terminal
+        // drawer and the status line their space, less its own two borders.
         let panel_width = conversation.width.saturating_sub(4) as usize;
         let panel_room = main
             .height
-            .saturating_sub(header_height + 3 + composer_height + 1 + 2);
+            .saturating_sub(header_height + 3 + composer_height + terminal_wanted + 1 + 2);
         let panel = match self.request_panel(panel_width) {
             Some(panel) => self.panel_rows(panel, panel_width, panel_room as usize),
             None => Vec::new(),
@@ -2704,23 +3008,38 @@ impl App {
         } else {
             panel.len() as u16 + 2
         };
-        // The tasks drawer takes what room the panel leaves. A waiting request hides it, so the
-        // two never show together.
-        let tasks_room = main
-            .height
-            .saturating_sub(header_height + 3 + composer_height + 1 + panel_height);
+        // A waiting request's panel always shows its title and choices, so the terminal drawer
+        // gives up rows it needs, and the transcript keeps three.
+        let terminal_height = terminal_wanted.min(
+            main.height
+                .saturating_sub(header_height + 3 + panel_height + composer_height + 1),
+        );
+        // The tasks drawer takes what room the panel and the terminal leave. A waiting request
+        // hides it, so the two never show together.
+        let tasks_room = main.height.saturating_sub(
+            header_height + 3 + composer_height + terminal_height + 1 + panel_height,
+        );
         let tasks = self.tasks.lay_out(
             conversation.width.saturating_sub(4) as usize,
             tasks_room as usize,
             area.height as usize,
             &self.theme,
         );
-        let [header, body, panel_area, drawer, composer_area, status_area] = Layout::vertical([
+        let [
+            header,
+            body,
+            panel_area,
+            drawer,
+            composer_area,
+            terminal_area,
+            status_area,
+        ] = Layout::vertical([
             Constraint::Length(header_height),
             Constraint::Min(3),
             Constraint::Length(panel_height),
             Constraint::Length(tasks.len() as u16),
             Constraint::Length(composer_height),
+            Constraint::Length(terminal_height),
             Constraint::Length(1),
         ])
         .areas(conversation);
@@ -2734,6 +3053,16 @@ impl App {
             width: main.width,
             ..status_area
         };
+        // The terminal drawer spans the main column under the composer, below the details'
+        // pane too.
+        let terminal_area = Rect {
+            width: main.width,
+            ..terminal_area
+        };
+        // A drawer with no room on the screen can't have the keyboard.
+        if terminal_area.is_empty() && self.focus == Focus::Terminal {
+            self.focus = Focus::Composer;
+        }
 
         // The toggle leads the header, where the desktop's sits in its title bar, so a hidden
         // sidebar always has a way back. The breadcrumb follows it.
@@ -2767,10 +3096,35 @@ impl App {
             Paragraph::new(Line::styled(details::BUTTON, button_style)),
             self.details.button,
         );
-        let taken = if self.details.button.width > 0 {
-            button_room
+        // The terminal's button comes before the details' button while a thread is open and
+        // the breadcrumb keeps `KEPT_TITLE` columns beside both.
+        let terminal_width = terminal::BUTTON.width() as u16;
+        let terminal_room = terminal_width + 1;
+        let terminal_fits = header.width
+            >= self.sidebar_toggle.width + 1 + KEPT_TITLE as u16 + terminal_room + button_room;
+        self.terminal_button =
+            if self.open.is_some() && self.details.button.width > 0 && terminal_fits {
+                let x = self.details.button.x - terminal_room;
+                Rect::new(x, header.y, terminal_width, 1)
+            } else {
+                Rect::default()
+            };
+        let terminal_style = if self.terminal.is_some() {
+            Style::new()
+                .fg(self.theme.primary)
+                .bg(self.theme.chip_bg)
+                .add_modifier(Modifier::BOLD)
         } else {
-            0
+            Style::new().fg(self.theme.muted).bg(self.theme.chip_bg)
+        };
+        frame.render_widget(
+            Paragraph::new(Line::styled(terminal::BUTTON, terminal_style)),
+            self.terminal_button,
+        );
+        let taken = match (self.details.button.width, self.terminal_button.width) {
+            (0, _) => 0,
+            (_, 0) => button_room,
+            _ => button_room + terminal_room,
         };
         let breadcrumb = Rect {
             x: header.x + self.sidebar_toggle.width + 1,
@@ -2813,6 +3167,13 @@ impl App {
         }
         self.composer_area = composer_area;
         self.draw_composer(frame, composer_area, &composer_rows, cursor);
+        // The drawer draws even with no rows, which forgets where it was for clicks.
+        if let Some(pane) = self.terminal.as_mut() {
+            let focused = self.focus == Focus::Terminal;
+            if let Some(cursor) = pane.draw(frame, terminal_area, focused, &self.theme) {
+                frame.set_cursor_position(cursor);
+            }
+        }
         self.picker_area = Rect::default();
         self.picker_rows.clear();
         if self.picker.is_some() {
@@ -3745,12 +4106,14 @@ impl App {
             .open
             .as_ref()
             .is_some_and(|o| self.unsent.has_saved(&o.id));
-        // Only Ctrl+B and the toggle bring a hidden sidebar back, so the keys lead with it.
-        let restore = if self.sidebar_hidden && self.picker.is_none() {
-            "Ctrl+B sidebar · "
-        } else {
-            ""
-        };
+        // Only Ctrl+B and the toggle bring a hidden sidebar back, so the keys lead with it,
+        // except in the terminal, which sends Ctrl+B to the shell.
+        let restore =
+            if self.sidebar_hidden && self.picker.is_none() && self.focus != Focus::Terminal {
+                "Ctrl+B sidebar · "
+            } else {
+                ""
+            };
         let head = fit(&format!("{connection}  ·  "), width.saturating_sub(2));
         let mut room = width.saturating_sub(2 + head.width());
         let mut spans = vec![
@@ -3783,8 +4146,19 @@ impl App {
                 hint.as_str()
             }
             (Focus::Composer, None) => {
-                "Enter send · Alt+Enter newline · Alt+M model · Alt+E effort · Alt+P mode · Ctrl+X interrupt"
+                "Enter send · Alt+Enter newline · Alt+M model · Alt+E effort · Alt+P mode · Ctrl+X interrupt · F4 terminal"
             }
+            (Focus::Terminal, None) => match self.terminal.as_ref() {
+                Some(pane) if pane.missing() => {
+                    "Enter start terminal · F4 hide · F6 next pane · Ctrl+Q quit"
+                }
+                Some(pane) if pane.stopped() => {
+                    "Enter attach again · F4 hide · F6 next pane · Ctrl+Q quit"
+                }
+                _ => {
+                    "Keys go to the shell · Shift+PgUp/PgDn scroll · F4 hide · F6 next pane · Ctrl+Q quit"
+                }
+            },
             // The details' keys shorten to the room there is, so Esc still shows. Esc closes
             // details this frame draws as a dialog and leaves a pane.
             (Focus::Details, None) => {
@@ -4475,6 +4849,8 @@ fn render_block(
 
 #[cfg(test)]
 mod tests {
+    mod terminal_drawer;
+
     use super::*;
     use theme::Depth;
 
@@ -5800,7 +6176,16 @@ mod tests {
         );
         // A thread with a worktree subscribes to its setup, which here sends nothing.
         app.watch_setup = Box::new(|_: &str| mpsc::unbounded_channel().1);
+        app.connect_terminal = no_terminal();
         app
+    }
+
+    /// The terminal drawer's connection in tests, which reaches no server.
+    fn no_terminal() -> terminal::Connect {
+        Rc::new(|| {
+            let refused = anyhow::anyhow!("tests reach no terminal");
+            async move { Err::<crate::rpc::RpcClient, _>(refused) }.boxed_local()
+        })
     }
 
     /// Draws one frame of `app` on a screen `width` columns by `height` rows, as the event loop
@@ -9929,6 +10314,7 @@ mod tests {
             mpsc::unbounded_channel().0,
         );
         app.watch_setup = Box::new(|_: &str| mpsc::unbounded_channel().1);
+        app.connect_terminal = no_terminal();
         app
     }
 
@@ -9954,8 +10340,8 @@ mod tests {
         environment: String,
         /// The sidebar's list.
         list: String,
-        /// The main column's title row, with the toggle and the breadcrumb, up to the details'
-        /// button.
+        /// The main column's title row, with the toggle and the breadcrumb, up to the
+        /// terminal's button or the details' button.
         header: String,
         /// The main column's bottom row.
         status: String,
@@ -9970,10 +10356,12 @@ mod tests {
         let buffer = cells(app, width, height);
         // The main column starts after the sidebar's edge, at 0 with the sidebar hidden.
         let main = app.sidebar.border.right();
-        let end = match app.details.button {
-            button if button.width > 0 => button.x,
-            _ => width,
-        };
+        let end = [app.terminal_button, app.details.button]
+            .into_iter()
+            .filter(|button| button.width > 0)
+            .map(|button| button.x)
+            .min()
+            .unwrap_or(width);
         // A screen with room has a blank row over the wordmark and the title row.
         let top = top_inset(height);
         let dot = |columns: std::ops::Range<u16>| {
