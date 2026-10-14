@@ -2,7 +2,7 @@
 
 The thread details' Pull requests tab lists the pull requests T3 linked to the open thread. This first slice only reads: it shows what T3 already sent with the thread and asks T3 for nothing. This page cites the T3 code each part follows and plans the reads that come next. The README's [Linked pull requests](../README.md#linked-pull-requests) section describes the keys and what each row shows.
 
-Every T3 path below is in the T3 Code nightly v0.0.46-nightly.20261007.2787, commit `f570bd21663f56ce94c41829d3b7d72886e25a34`, built on October 7, 2026. Later nightlies may differ. No screenshots are here yet, because the tab has no approved captures.
+Every T3 path below is in the T3 Code nightly v0.0.46-nightly.20261007.2787, commit `f570bd21663f56ce94c41829d3b7d72886e25a34`, built on October 7, 2026. Later nightlies may differ. [Linked pull requests verification](pull-request-panel-verification.md) records what Sol checked at `407566d`, with two captures.
 
 ## Where the links come from
 
@@ -47,7 +47,7 @@ The snapshot's `state`, `title`, `headBranch`, `baseBranch` and `isDraft` are re
 - A link's details show in the list's place and wrap each value to every row it takes, so the reader scrolls to all of it. They are worked out again only for another link, width or minute. A frame scrolls them no further than their last row shows.
 - End asks for the details' last row, wherever the next frame finds it, and a key or the wheel after End counts from there before that frame comes. Once a frame has drawn the details, a scroll past their end stops at the last row it showed, so a scroll back up moves at once. Each key does this with numbers the last frame kept, and nothing is wrapped again until the next frame.
 - A click acts on the rows the last frame drew. After a change that the next frame hasn't drawn yet, a click does nothing. That covers a selection or scroll moved by a key or the wheel, a resize, a tab switch and the details opening or closing.
-- The status line shows the longest of the details' hints that fits, and each shorter one keeps Esc, so Esc shows whole wherever there are 9 columns for the keys.
+- The status line shows the longest of the details' hints that fits, and each shorter one keeps Esc, so Esc shows whole wherever there are 9 columns for the keys. The hint follows the layout the same frame draws the details in, which `App::draw` works out before the status line, so the first frame after a resize from a pane to a dialog, or back, names what Esc does there.
 
 ## Next slices
 
@@ -102,6 +102,7 @@ Linking, unlinking, watching, reviewing, commenting, merging and every other wri
 - Links match on their trimmed, lowercased host, repository and number. The desktop's key also takes the authority from the link's URL, which keeps a Forgejo port, and puts the repository in canonical form (threadPullRequests.ts:19-37). Two links the desktop counts as one can show as two here.
 - The legacy link's host is read from its URL's scheme and authority. The desktop's parser also recovers a Forgejo port or an Azure DevOps path, and this doesn't.
 - There is no key that copies the URL and no opener, so you select the URL in the terminal. A URL longer than a row wraps across rows, so a selection in the terminal can also pick up the line breaks and the text beside the card.
-- While a link's details show, a click on the Pull requests tab's name doesn't go back to the list. `← List`, Enter, ← or `h` do.
+- While a link's details show, a click on the Pull requests tab's name doesn't go back to the list. `← List`, Enter, ← or `h` do. Esc from the details closes the dialog or leaves the pane, as it does from the list.
+- Text loses its control characters, but the printable rest of an escape sequence, such as `[31m` or `]52;c;`, still shows as text.
 - Until a frame has drawn a link's details, as between Enter and the next frame or after T3 changes the links, t3term doesn't know how many rows they take. A ↓ pressed in that moment isn't held at their end, and PgUp or PgDn moves one row. End, Home and ↑ after End work as they do after the frame.
 - The desktop's linking from a URL, unlinking, watch toggle, row menu and pull request page aren't here.

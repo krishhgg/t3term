@@ -2705,7 +2705,7 @@ impl App {
             self.draw_picker(frame, above);
         }
         frame.render_widget(
-            Paragraph::new(self.status_line(status_area.width as usize)),
+            Paragraph::new(self.status_line(status_area.width as usize, shown)),
             status_area,
         );
         // The details and the pull requests linked to the thread are worked out again only after
@@ -3621,7 +3621,9 @@ impl App {
         frame.render_widget(Paragraph::new(lines), list);
     }
 
-    fn status_line(&self, width: usize) -> Line<'static> {
+    /// The status line, `width` columns wide, for a frame that draws the details as `shown`.
+    /// The details draw after it, so the last frame's layout may be another one after a resize.
+    fn status_line(&self, width: usize, shown: Option<details::Layout>) -> Line<'static> {
         let t = &self.theme;
         if let Some((text, error)) = &self.message {
             let color = if *error { t.error_fg } else { t.success };
@@ -3662,9 +3664,11 @@ impl App {
             (Focus::Composer, None) => {
                 "Enter send · Alt+Enter newline · Alt+M model · Alt+E effort · Alt+P mode · Ctrl+X interrupt"
             }
-            // The details' keys shorten to the room there is, so Esc still shows.
+            // The details' keys shorten to the room there is, so Esc still shows. Esc closes
+            // details this frame draws as a dialog and leaves a pane.
             (Focus::Details, None) => {
-                let keys = self.details.keys(self.details_modal());
+                let modal = shown != Some(details::Layout::Pane);
+                let keys = self.details.keys(modal);
                 fitting(keys, room.saturating_sub(restore.width()))
             }
             (Focus::Transcript, None) => {
@@ -10579,10 +10583,30 @@ mod tests {
     fn keys_fit(app: &App, widest: usize, esc: &str, restore: usize) {
         let least = "● live  ·  ".width() + restore + esc.width();
         for width in 3..=widest {
-            let text = app.status_line(width).to_string();
+            let text = app.status_line(width, app.details.shown()).to_string();
             assert!(text.width() <= width, "{width}: {text:?}");
             if width >= least {
                 assert!(text.contains(esc), "{width}: {text:?}");
+            }
+        }
+    }
+
+    /// Draws two frames `width` columns by `height` rows and checks the status line. The first
+    /// frame draws it as the second does, so its keys follow how that frame draws the details,
+    /// not how the frame before it did. With `esc`, the details' keys show it. Without, the
+    /// line offers no keys of theirs.
+    fn first_status(app: &mut App, width: u16, height: u16, esc: Option<&str>) {
+        let row = Rect::new(0, height - 1, width, 1);
+        let first = text_in(&cells(app, width, height), row);
+        let layout = app.details.shown();
+        let second = text_in(&cells(app, width, height), row);
+        assert_eq!(first, second, "{width}x{height}, {layout:?}");
+        match esc {
+            Some(esc) => assert!(first.contains(esc), "{width}x{height}: {first:?}"),
+            None => {
+                for keys in ["Esc close", "Esc leave"] {
+                    assert!(!first.contains(keys), "{width}x{height}: {first:?}");
+                }
             }
         }
     }
@@ -10846,6 +10870,69 @@ mod tests {
             keys_fit(&app, 200, "Esc leave", 0);
         }
         assert!(app.details.pulls.viewing());
+    }
+
+    #[test]
+    fn the_first_frame_at_a_new_size_offers_the_keys_for_how_it_draws_the_details() {
+        for sidebar_hidden in [false, true] {
+            // Beside the sidebar at 40 columns, the keys are cut a little after Esc.
+            let narrow = if sidebar_hidden { "Esc close" } else { "Esc" };
+            // On the thread's tab, on the list and on a link's details.
+            for view in 0..3 {
+                let mut app = pulls_tui(vec![linked(31, "Bound titles")], sidebar_hidden);
+                app.focus = Focus::Transcript;
+                cells(&mut app, 200, 50);
+                // Alt+B opens a pane, which leaves the keyboard where it was.
+                alt(&mut app, 'b');
+                first_status(&mut app, 200, 50, None);
+                // A click on the pane gives it the keyboard, and its keys say Esc leaves it.
+                let drawn = app.details.drawn.expect("the pane");
+                assert!(mouse(&mut app, CLICK, drawn.tabs[0].x, drawn.tabs[0].y));
+                for code in [KeyCode::Right, KeyCode::Enter].into_iter().take(view) {
+                    press(&mut app, code);
+                }
+                first_status(&mut app, 200, 50, Some("Esc leave"));
+                assert_eq!(app.details.pulls.viewing(), view == 2);
+
+                // The pane turns into a dialog at 80 and 40 columns, and into a pane again at
+                // 200, with the keyboard all along. The first frame at each size offers the
+                // keys for what it draws.
+                for (width, height, esc) in [
+                    (80, 24, "Esc close"),
+                    (200, 50, "Esc leave"),
+                    (40, 12, narrow),
+                    (200, 50, "Esc leave"),
+                    (80, 24, "Esc close"),
+                ] {
+                    assert!(app.on_terminal_event(Event::Resize(width, height)));
+                    first_status(&mut app, width, height, Some(esc));
+                    assert_eq!(app.focus, Focus::Details, "{width}x{height}");
+                }
+                // Esc closes the dialog and gives the keyboard back to the transcript, which had
+                // it before the click.
+                press(&mut app, KeyCode::Esc);
+                assert!(!app.details.open);
+                assert_eq!(app.focus, Focus::Transcript);
+                first_status(&mut app, 80, 24, None);
+
+                // Alt+B opens a dialog that takes the keyboard. A pane it turns into gives it
+                // back on its first frame, and a dialog takes it again.
+                alt(&mut app, 'b');
+                assert_eq!(app.focus, Focus::Details);
+                first_status(&mut app, 80, 24, Some("Esc close"));
+                assert!(app.on_terminal_event(Event::Resize(200, 50)));
+                first_status(&mut app, 200, 50, None);
+                assert_eq!(app.focus, Focus::Transcript);
+                assert!(app.on_terminal_event(Event::Resize(40, 12)));
+                first_status(&mut app, 40, 12, Some(narrow));
+                assert_eq!(app.focus, Focus::Details);
+                // Alt+B closes it, and the first frame after offers the transcript's keys.
+                alt(&mut app, 'b');
+                assert_eq!(app.focus, Focus::Transcript);
+                first_status(&mut app, 40, 12, None);
+                assert_eq!(app.composer.text(), "draft");
+            }
+        }
     }
 
     #[test]
