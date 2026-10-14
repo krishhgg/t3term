@@ -20,9 +20,10 @@
 //! The desktop reads the shells of every environment it knows and the archived threads it has
 //! fetched. t3term has one server's live shell and fetches no archive. A related thread the
 //! shell doesn't list, such as an archived one, shows only when the open thread or its
-//! projection names it, as a parent or an agent, and it doesn't open. An archived fork doesn't
-//! show. Where the desktop shows an agent's elapsed time, t3term shows its status word, and it
-//! has no Stop, Merge back or Disconnect controls.
+//! projection names it, as a parent, an agent or a context transfer, and it doesn't open. So an
+//! archived fork shows only as the fork transfer T3 recorded when it made the fork, under the
+//! fork's id. Where the desktop shows an agent's elapsed time, t3term shows its status word,
+//! and it has no Stop, Merge back or Disconnect controls.
 //!
 //! The desktop's rules assume a watch that still hears the thread. Once the open thread's
 //! watch closes, its projection is the last t3term heard, while the shell still changes. So
@@ -1238,6 +1239,24 @@ mod tests {
             ]
         );
         assert_eq!(lineage.row("y").unwrap().relation, Relation::Transfer);
+    }
+
+    #[test]
+    fn an_archived_fork_shows_only_by_the_transfer_that_made_it() {
+        // T3 records a fork transfer from the parent to each fork it makes. The shell drops
+        // the fork once it is archived, and only that transfer still names it.
+        let threads = [shell("t", "Lead", "idle", 1)];
+        let mut fork = transfer("t", "old", "consumed");
+        fork["type"] = json!("fork");
+        let projection = projected(threads[0].clone(), Vec::new(), vec![fork]);
+        let lineage = first_rows(&threads, &projection);
+        assert_eq!(shown(&lineage, 40), ["Lineage", "↳ old Consumed"]);
+        let row = lineage.row("old").unwrap();
+        assert_eq!(row.relation, Relation::Transfer);
+        assert!(!row.available);
+        // Without the transfer nothing names it, and the section doesn't show.
+        let projection = projected(threads[0].clone(), Vec::new(), Vec::new());
+        assert!(!first_rows(&threads, &projection).shows());
     }
 
     #[test]
