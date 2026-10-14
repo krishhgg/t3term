@@ -299,9 +299,15 @@ impl Pane {
         self.start = Rect::default();
     }
 
-    /// What happens next: the attach opening or failing, a batch from the stream, a write or a
-    /// resize ending, or a deadline coming. Cancel-safe: the work lives in the pane, and
-    /// dropping this future loses none of it.
+    /// What happens next: the attach opening or failing, a write or a resize ending, a
+    /// deadline coming, or a batch from the stream. Cancel-safe: the work lives in the pane,
+    /// and dropping this future loses none of it.
+    ///
+    /// A batch comes last, so a stream that always has one ready holds nothing else back. The
+    /// write and the resize on their way are polled first, which sends their requests, and a
+    /// deadline that has passed is due at once. Each of the others ends: an attach, a write
+    /// and a resize end once, and handling a deadline disarms it. So between two batches the
+    /// drawer does only the few things that were waiting, and a batch waits on no timer.
     pub(super) async fn next(&mut self) -> Update {
         let deadline = self.deadline();
         let Pane {
@@ -314,10 +320,10 @@ impl Pane {
         Update(tokio::select! {
             biased;
             attached = finish(attaching) => Happened::Attached(attached),
-            batch = next_batch(stream) => Happened::Batch(batch),
             wrote = finish(writing) => Happened::Wrote(wrote),
             resized = finish(resizing) => Happened::Resized(resized),
             () = sleep(deadline) => Happened::Due,
+            batch = next_batch(stream) => Happened::Batch(batch),
         })
     }
 
@@ -348,6 +354,8 @@ impl Pane {
                 true
             }
             Happened::Wrote(Ok(())) => false,
+            // The stream sees the connection drop too, and attaches again.
+            Happened::Wrote(Err(TerminalError::Rpc(RpcError::Disconnected(_)))) => false,
             Happened::Wrote(Err(error)) => {
                 self.input_failed = true;
                 self.refresh_access();
@@ -974,8 +982,11 @@ async fn next_batch(
     }
 }
 
+/// Waits until `deadline`. One that has passed is ready on the first poll, which a timer
+/// doesn't promise.
 async fn sleep(deadline: Option<Instant>) {
     match deadline {
+        Some(at) if at <= Instant::now() => {}
         Some(at) => tokio::time::sleep_until(at).await,
         None => std::future::pending().await,
     }

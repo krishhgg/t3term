@@ -166,7 +166,7 @@ async fn step(pane: &mut Pane) -> &'static str {
 /// Polls the drawer's work once, as a pass of the event loop does, so a write or a resize the
 /// drawer started goes out. Nothing may end in it.
 async fn poll_once(pane: &mut Pane) {
-    let mut next = std::pin::pin!(pane.next());
+    let next = std::pin::pin!(pane.next());
     assert!(futures_util::poll!(next).is_pending());
 }
 
@@ -596,7 +596,7 @@ async fn a_dropped_connection_attaches_again_with_backoff_and_resends_no_input()
         "{rows:?}"
     );
 
-    // The first try waits 250ms, then attaches by name on a new connection.
+    // The first try waits 250ms, then attaches by name on a new connection, with no launch.
     let (mut socket, request) = first_attach(&fake, &mut pane).await;
     assert!(dropped.elapsed() >= FIRST_RETRY);
     let id = expect_request(&request, ATTACH, identity());
@@ -605,9 +605,17 @@ async fn a_dropped_connection_attaches_again_with_backoff_and_resends_no_input()
     assert_eq!(pane.retries, 0);
     assert!(pane.writable());
     assert_eq!(screen(&pane)[0], "$ b");
-    // The write that was on its way never goes again.
+    // The attach sent no size, so the new snapshot sends the size drawn while it waited. The
+    // write that was on its way never goes again: the Ack and the resize are all there is.
     poll_once(&mut pane).await;
-    assert_eq!(fake.sent(&mut socket).await, [ack(&id)]);
+    let sent = fake.sent(&mut socket).await;
+    assert_eq!(sent.len(), 2, "{sent:?}");
+    assert_eq!(sent[0], ack(&id));
+    let resize = expect_request(&sent[1], RESIZE, with(json!({"cols": 80, "rows": 24})));
+    send(&mut socket, done(&resize)).await;
+    assert_eq!(step(&mut pane).await, "resized");
+    assert_eq!(fake.sent(&mut socket).await, Vec::<Value>::new());
+    assert_eq!(fake.dials(), 2);
 }
 
 #[tokio::test]
@@ -800,6 +808,87 @@ async fn a_synchronized_update_shows_at_its_deadline_and_arms_nothing_after() {
     assert!(pane.on_update(update));
     assert_eq!(screen(&pane)[0], "$ held");
     assert!(pane.deadline().is_none());
+}
+
+#[tokio::test]
+async fn a_key_and_a_resize_go_out_while_batches_keep_coming() {
+    let fake = Fake::new().await;
+    let mut pane = fake.pane();
+    let (mut socket, request) = first_attach(&fake, &mut pane).await;
+    let id = expect_request(&request, ATTACH, identity());
+    draw(&mut pane, 80, 25);
+    // The snapshot and three chunks of output wait in the stream before the drawer reads one.
+    for event in [
+        snapshot(1, "$ "),
+        output(2, "x"),
+        output(3, "x"),
+        output(4, "x"),
+    ] {
+        send(&mut socket, chunk(&id, json!([event]))).await;
+    }
+    assert_eq!(fake.sent(&mut socket).await, Vec::<Value>::new());
+    assert_eq!(step(&mut pane).await, "batch");
+    pane.key(&key(KeyCode::Char('a')));
+    // The next pass sends the key and the snapshot's resize, then takes one batch.
+    assert_eq!(step(&mut pane).await, "batch");
+    let sent = fake.sent(&mut socket).await;
+    assert_eq!(sent.len(), 4, "{sent:?}");
+    assert_eq!(sent[0], ack(&id));
+    let write = expect_request(&sent[1], WRITE, with(json!({"data": "a"})));
+    let resize = expect_request(&sent[2], RESIZE, with(json!({"cols": 80, "rows": 24})));
+    assert_eq!(sent[3], ack(&id));
+    // Their answers come before the two batches still waiting.
+    send(&mut socket, done(&write)).await;
+    send(&mut socket, done(&resize)).await;
+    assert_eq!(fake.sent(&mut socket).await, Vec::<Value>::new());
+    assert_eq!(step(&mut pane).await, "wrote");
+    assert_eq!(step(&mut pane).await, "resized");
+    assert_eq!(step(&mut pane).await, "batch");
+    assert_eq!(step(&mut pane).await, "batch");
+    assert_eq!(screen(&pane)[0], "$ xxx");
+    assert_eq!(fake.sent(&mut socket).await, [ack(&id), ack(&id)]);
+}
+
+#[tokio::test]
+async fn a_due_synchronized_update_and_resize_come_before_the_batches_waiting() {
+    let fake = Fake::new().await;
+    let mut pane = fake.pane();
+    let (mut socket, id) = running(&fake, &mut pane, "$ ").await;
+    for event in [
+        output(2, "\u{1b}[?2026hheld"),
+        output(3, "a"),
+        output(4, "b"),
+    ] {
+        send(&mut socket, chunk(&id, json!([event]))).await;
+    }
+    assert_eq!(fake.sent(&mut socket).await, Vec::<Value>::new());
+    // The first chunk opens a synchronized update, and then a frame draws a new size.
+    assert_eq!(step(&mut pane).await, "batch");
+    assert_eq!(screen(&pane)[0], "$");
+    draw(&mut pane, 80, 25);
+    let sync = pane
+        .emulator
+        .sync_deadline()
+        .expect("a synchronized update");
+    let resize_at = pane.resize_at.expect("a resize waiting");
+    tokio::time::sleep_until(Instant::from_std(sync).max(resize_at)).await;
+    // Both deadlines have passed, so they come before the two batches waiting.
+    let update = within(pane.next()).await;
+    assert_eq!(kind(&update), "due");
+    assert!(pane.on_update(update));
+    assert_eq!(screen(&pane)[0], "$ held");
+    assert_eq!(step(&mut pane).await, "batch");
+    let sent = fake.sent(&mut socket).await;
+    assert_eq!(sent.len(), 3, "{sent:?}");
+    assert_eq!(sent[0], ack(&id));
+    let resize = expect_request(&sent[1], RESIZE, with(json!({"cols": 80, "rows": 24})));
+    assert_eq!(sent[2], ack(&id));
+    send(&mut socket, done(&resize)).await;
+    assert_eq!(fake.sent(&mut socket).await, Vec::<Value>::new());
+    assert_eq!(step(&mut pane).await, "resized");
+    assert_eq!(step(&mut pane).await, "batch");
+    assert_eq!(screen(&pane)[0], "$ heldab");
+    assert_eq!(fake.sent(&mut socket).await, [ack(&id)]);
 }
 
 #[tokio::test]
