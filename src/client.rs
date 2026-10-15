@@ -15,6 +15,7 @@ use crate::error::{err, err_exit, exit};
 use crate::http::Api;
 use crate::models::Plan;
 use crate::projection::{ShellState, ThreadState};
+use crate::pull_request;
 use crate::rpc::{RpcClient, RpcError};
 
 const DISPATCH_TIMEOUT: Duration = Duration::from_secs(60);
@@ -451,6 +452,16 @@ impl Client {
         })
     }
 
+    /// Streams the numbers that say when T3's pull request reads may have changed, as
+    /// `spawn_pull_request_refresh_watch` describes.
+    pub fn watch_pull_request_refreshes(self: &Arc<Self>) -> mpsc::UnboundedReceiver<WatchEvent> {
+        let client = self.clone();
+        spawn_pull_request_refresh_watch(move || {
+            let client = client.clone();
+            Box::pin(async move { client.rpc().await })
+        })
+    }
+
     /// Streams one thread's worktree setup, as `spawn_worktree_setup_watch` describes.
     pub fn watch_worktree_setup(
         self: &Arc<Self>,
@@ -511,6 +522,9 @@ enum Resume {
     /// The snapshot's `sequence` counts the setup's changes. It is not a cursor, and the
     /// watcher doesn't track it.
     WorktreeSetup,
+    /// From the number as it stands. `pullRequests.subscribeRefreshes` has no cursor, and each
+    /// item is the whole state: one number.
+    Refreshes,
 }
 
 impl Resume {
@@ -523,6 +537,7 @@ impl Resume {
             Resume::Snapshot => item.get("type").and_then(Value::as_str) == Some("snapshot"),
             // T3 sends the current state, null or a snapshot, as soon as it subscribes.
             Resume::WorktreeSetup => item.is_null() || is_worktree_setup(item),
+            Resume::Refreshes => pull_request::refresh_revision(item).is_some(),
         }
     }
 }
@@ -601,6 +616,25 @@ where
     )
 }
 
+/// Runs T3's `pullRequests.subscribeRefreshes` until its receiver is dropped. The payload is
+/// `{}`, and T3 asks only for the session's `orchestration:read` scope
+/// (apps/server/src/auth/RpcAuthorization.ts). Each item is a number, which T3 moves on each
+/// time its pull request reads may have changed, as `pull_request::refresh_revision` says.
+/// A subscription opens with the number as it stands, unless it is still 0, so the first item
+/// after a reconnect says whether anything changed while the connection was down. The stream
+/// has no cursor, so a resubscribe sends the same payload. Items pass through as T3 sent them.
+pub fn spawn_pull_request_refresh_watch<F>(connect: F) -> mpsc::UnboundedReceiver<WatchEvent>
+where
+    F: Fn() -> Pin<Box<dyn Future<Output = Result<RpcClient>> + Send>> + Send + Sync + 'static,
+{
+    watch(
+        Box::new(connect),
+        pull_request::SUBSCRIBE_REFRESHES,
+        json!({}),
+        Resume::Refreshes,
+    )
+}
+
 fn watch(
     connect: Box<Connect>,
     tag: &'static str,
@@ -611,7 +645,7 @@ fn watch(
     tokio::spawn(async move {
         let mut last_sequence = match resume {
             Resume::AfterSequence(sequence) => sequence,
-            Resume::Snapshot | Resume::WorktreeSetup => None,
+            Resume::Snapshot | Resume::WorktreeSetup | Resume::Refreshes => None,
         };
         let mut backoff = Duration::from_millis(250);
         loop {

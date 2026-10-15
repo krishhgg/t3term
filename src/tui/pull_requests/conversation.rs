@@ -69,9 +69,8 @@ pub(super) struct Shown {
     /// The finished remarks open, by id.
     opened: HashSet<String>,
     timeline_oldest_first: bool,
-    /// The Timeline's runs of remarks that are open, by their place among the runs newest
-    /// first, which the order doesn't change.
-    runs_open: HashSet<usize>,
+    /// The Timeline's runs of remarks that are open, by `Timeline::key`.
+    runs_open: HashSet<String>,
 }
 
 impl Default for Shown {
@@ -109,8 +108,11 @@ impl Shown {
             }
             Control::TimelineOrder => self.timeline_oldest_first = !self.timeline_oldest_first,
             Control::Run(at) => {
-                if !self.runs_open.remove(&at) {
-                    self.runs_open.insert(at);
+                let timeline = conversation.timeline.as_ref();
+                if let Some(key) = timeline.and_then(|timeline| timeline.key(at))
+                    && !self.runs_open.remove(key)
+                {
+                    self.runs_open.insert(key.to_string());
                 }
             }
         }
@@ -548,7 +550,10 @@ impl Conversation {
             }
             Control::TimelineOrder if shown.timeline_oldest_first => "newest first".to_string(),
             Control::TimelineOrder => "oldest first".to_string(),
-            Control::Run(at) => toggle(shown.runs_open.contains(&at), "comments"),
+            Control::Run(at) => {
+                let open = self.timeline.as_ref().is_some_and(|t| t.open(at, shown));
+                toggle(open, "comments")
+            }
         }
     }
 }

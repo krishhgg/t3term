@@ -124,7 +124,8 @@ enum Row {
 pub(super) struct Timeline {
     events: Vec<Event>,
     rows: Vec<Row>,
-    runs: usize,
+    /// Each run's newest remark's id, which the run is known by while the reader opens it.
+    keys: Vec<String>,
     /// Who opened the pull request: the conversation's author, else the detail's.
     opener: Option<String>,
     /// When the newest commit came. A verdict given before it is on earlier changes.
@@ -171,24 +172,24 @@ impl Timeline {
 
         // Each run of remarks between two other events is one row.
         let mut rows = Vec::new();
-        let mut runs = 0;
+        let mut keys = Vec::new();
         for (at, event) in events.iter().enumerate() {
-            if !matches!(event.what, What::Remark(_)) {
+            let What::Remark(place) = event.what else {
                 rows.push(Row::Event(at));
                 continue;
-            }
+            };
             match rows.last_mut() {
                 Some(Row::Run(_, run)) => run.end = at + 1,
                 _ => {
-                    rows.push(Row::Run(runs, at..at + 1));
-                    runs += 1;
+                    rows.push(Row::Run(keys.len(), at..at + 1));
+                    keys.push(conversation.remark(place).id.clone());
                 }
             }
         }
         Timeline {
             events,
             rows,
-            runs,
+            keys,
             opener: conversation.author.clone().or(lifecycle.author.clone()),
             newest: conversation.commits.iter().filter_map(|c| c.at).max(),
         }
@@ -196,7 +197,20 @@ impl Timeline {
 
     /// How many runs of remarks it has.
     pub(super) fn runs(&self) -> usize {
-        self.runs
+        self.keys.len()
+    }
+
+    /// What run `run` is known by while the reader opens it: its newest remark's id. A run
+    /// that a newer remark joins is another run, which starts closed, as the desktop keys a
+    /// run by its first remark (PullRequestTimelineTab.tsx:588). The order doesn't change it.
+    pub(super) fn key(&self, run: usize) -> Option<&str> {
+        self.keys.get(run).map(String::as_str)
+    }
+
+    /// Whether the reader opened run `run`.
+    pub(super) fn open(&self, run: usize, shown: &Shown) -> bool {
+        self.key(run)
+            .is_some_and(|key| shown.runs_open.contains(key))
     }
 
     /// The remarks whose text shows while the reader opened what `shown` says: each verdict's,
@@ -206,9 +220,7 @@ impl Timeline {
         for row in &self.rows {
             let events = match row {
                 Row::Event(at) => &self.events[*at..*at + 1],
-                Row::Run(run, events) if shown.runs_open.contains(run) => {
-                    &self.events[events.clone()]
-                }
+                Row::Run(run, events) if self.open(*run, shown) => &self.events[events.clone()],
                 Row::Run(..) => continue,
             };
             places.extend(events.iter().filter_map(|event| match event.what {
@@ -356,7 +368,7 @@ pub(in crate::tui::pull_requests) fn section(
                 if oldest_first {
                     events.reverse();
                 }
-                let open = shown.runs_open.contains(run);
+                let open = timeline.open(*run, shown);
                 let lines = run_lines(conversation, &events, open, width, now, theme);
                 rows.control(lines, Control::Run(*run));
                 if !open {
