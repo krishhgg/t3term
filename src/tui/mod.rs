@@ -12083,7 +12083,7 @@ mod tests {
                     let whole = text_in(&buffer, buffer.area);
                     assert!(!whole.contains("evil"), "{whole}");
                 }
-                app.details.toggle_pull();
+                assert_eq!(app.details.enter(), None);
                 assert_eq!(app.details.pulls.viewing(), !viewing);
             }
             // The links were read once for every frame at every size, a thousand of them.
@@ -13161,6 +13161,69 @@ mod tests {
         assert!(mouse(&mut app, CLICK, tab.x, tab.y));
         cells(&mut app, 200, 50);
         app
+    }
+
+    #[test]
+    fn the_arrows_enter_and_a_click_open_a_links_bot_comments_and_the_keys_say_so() {
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        let _asked = note_reads(&mut app);
+        press(&mut app, KeyCode::Enter);
+        let activity = json!({
+            "comments": [
+                {"id": "c1", "kind": "issue-comment", "author": {"login": "mona",
+                    "name": null}, "body": "Looks close.", "createdAt": "2026-10-13T09:00:00Z",
+                    "url": null, "path": null, "reviewState": null},
+                {"id": "b1", "kind": "issue-comment", "author": {"login": "ci[bot]",
+                    "name": null}, "body": "Beep.", "createdAt": "2026-10-13T10:00:00Z",
+                    "url": null, "path": null, "reviewState": null}
+            ],
+            "commentCount": 2, "commentsTruncated": false, "reviewThreads": [], "commits": []
+        });
+        let activity = pull_request::Activity::read(&activity).unwrap();
+        let parts = vec![
+            Part::Detail(Ok(Box::new(host_detail()))),
+            Part::Activity(Ok(Box::new(activity))),
+            Part::Done,
+        ];
+        hear(&mut app, 1, parts);
+        cells(&mut app, 200, 50);
+        let status = |app: &mut App| {
+            let buffer = cells(app, 200, 50);
+            text_in(&buffer, Rect::new(0, 49, 200, 1))
+        };
+        assert!(!status(&mut app).contains("Enter "));
+
+        // From the end, ↑ chooses the bots' group, and the keys lead with what Enter does.
+        press(&mut app, KeyCode::End);
+        cells(&mut app, 200, 50);
+        press(&mut app, KeyCode::Up);
+        let shown = status(&mut app);
+        assert!(shown.contains("Enter show bot comments · "), "{shown}");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.details.pulls.viewing());
+        let shown = status(&mut app);
+        assert!(shown.contains("Enter hide bot comments · "), "{shown}");
+        let rows = body_after(&mut app, 200, 50);
+        let group = rows
+            .iter()
+            .position(|row| row.trim() == "⌄ 1 bot comment")
+            .expect("the open group");
+        assert!(
+            rows[group..].iter().any(|row| row.trim() == "Beep."),
+            "{rows:#?}"
+        );
+
+        // A click on the group closes it.
+        let body = app.details.drawn.expect("the pane").body;
+        let y = body.y + group as u16;
+        assert!(mouse(&mut app, CLICK, body.x + 2, y));
+        let rows = body_after(&mut app, 200, 50);
+        assert_eq!(rows[group].trim(), "› 1 bot comment");
+        assert!(!rows.iter().any(|row| row.trim() == "Beep."), "{rows:#?}");
+        // ← shows the list, and its keys say nothing of Enter's control.
+        press(&mut app, KeyCode::Left);
+        assert!(!app.details.pulls.viewing());
+        assert!(!status(&mut app).contains("Enter hide"));
     }
 
     #[test]

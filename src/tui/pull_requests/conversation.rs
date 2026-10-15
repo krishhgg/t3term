@@ -6,22 +6,28 @@
 //! The remarks split as the desktop splits them. One in a resolved review thread, or a
 //! dismissed review, is finished. Otherwise one whose author is a bot, or whose login ends in
 //! `[bot]`, is a bot's. The rest are active, and the 10 most recent of those show, newest
-//! first. The others are counted. Each reviewer shows their last verdict, read from the whole
-//! conversation, and a verdict older than the newest commit reads as given on earlier changes.
+//! first. Each reviewer shows their last verdict, read from the whole conversation, and a
+//! verdict older than the newest commit reads as given on earlier changes.
+//!
+//! The section's controls do what the desktop's buttons do: they show 10 older remarks at a
+//! time and go back to the 10 most recent, switch between newest and oldest first, and open
+//! the bots' remarks, the finished ones and each finished one. A finished remark shows on one
+//! row until it opens. `Shown` keeps what the reader opened until the details open again.
 //!
 //! What shows is cleaned and bounded once, when the answer arrives. Each remark's Markdown is
-//! laid out once for each width.
+//! laid out once for each width, and only while it shows.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use unicode_width::UnicodeWidthStr;
 
 use super::super::markdown::{self, Styles};
-use super::super::row;
 use super::super::setup::bounded;
 use super::super::theme::{Theme, age, parse_iso_ms};
+use super::super::{clip, row};
 use super::{Answer, NAME, grouped, whole};
 use crate::pull_request::{self, Actor, Comment, Commit, ReviewThread};
 use crate::transcript::without_controls;
@@ -36,6 +42,99 @@ const PATH: usize = 1024;
 const MARGIN: usize = 2;
 /// The narrowest details a remark's text is set in at.
 const INDENTED: usize = 20;
+/// The most characters kept of a finished remark's row.
+const PREVIEW: usize = 1024;
+
+/// What the reader opened of a pull request's conversation, which the desktop keeps for one
+/// pull request at a time: the order, how many active and bots' remarks show, and which
+/// groups and finished remarks are open.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Shown {
+    oldest_first: bool,
+    /// How many of the most recent active remarks show.
+    active: usize,
+    bots_open: bool,
+    /// How many of the most recent bots' remarks show while their group is open.
+    bots: usize,
+    finished_open: bool,
+    /// The finished remarks open, by id.
+    opened: HashSet<String>,
+}
+
+impl Default for Shown {
+    fn default() -> Shown {
+        Shown {
+            oldest_first: false,
+            active: COMMENT_PAGE,
+            bots_open: false,
+            bots: COMMENT_PAGE,
+            finished_open: false,
+            opened: HashSet::new(),
+        }
+    }
+}
+
+impl Shown {
+    /// Does what `control` does to what shows of `conversation`.
+    pub(super) fn act(&mut self, control: Control, conversation: &Conversation) {
+        match control {
+            Control::Order => self.oldest_first = !self.oldest_first,
+            Control::Older => self.active = more(self.active, conversation.active.len()),
+            Control::Recent => self.active = COMMENT_PAGE,
+            Control::Bots => self.bots_open = !self.bots_open,
+            Control::OlderBots => self.bots = more(self.bots, conversation.bots.len()),
+            Control::RecentBots => self.bots = COMMENT_PAGE,
+            Control::Finished => self.finished_open = !self.finished_open,
+            Control::Remark(at) => {
+                if let Some(remark) = conversation.finished.get(at)
+                    && !self.opened.remove(&remark.id)
+                {
+                    self.opened.insert(remark.id.clone());
+                }
+            }
+        }
+    }
+}
+
+/// `shown` and a page more, no more than `total` or a page.
+fn more(shown: usize, total: usize) -> usize {
+    shown
+        .saturating_add(COMMENT_PAGE)
+        .min(total.max(COMMENT_PAGE))
+}
+
+/// A row of the Comments section that does something when it is chosen or clicked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub(super) enum Control {
+    /// The switch between newest and oldest first, at the end of the section's heading.
+    Order,
+    /// Shows up to 10 older active remarks.
+    Older,
+    /// Shows only the 10 most recent active remarks again.
+    Recent,
+    /// Opens or closes the bots' remarks.
+    Bots,
+    OlderBots,
+    RecentBots,
+    /// Opens or closes the resolved and dismissed remarks.
+    Finished,
+    /// Opens or closes one finished remark, by its place among them as T3 sent them.
+    Remark(usize),
+}
+
+impl Control {
+    /// The control that takes this one's place when it goes: Show only 10 recent once every
+    /// older remark shows, and Show older once only 10 do.
+    pub(super) fn partner(self) -> Option<Control> {
+        match self {
+            Control::Older => Some(Control::Recent),
+            Control::Recent => Some(Control::Older),
+            Control::OlderBots => Some(Control::RecentBots),
+            Control::RecentBots => Some(Control::OlderBots),
+            _ => None,
+        }
+    }
+}
 
 /// A verdict a review gives. `PullRequestReviewOutcome`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -136,8 +235,9 @@ enum Said {
     State(String),
 }
 
-/// One remark that shows, cleaned and bounded.
+/// One remark, cleaned and bounded.
 struct Remark {
+    id: String,
     /// The author's login, or `ghost` for a deleted account.
     author: String,
     /// When it was written, in milliseconds. None where the host's time doesn't parse.
@@ -152,8 +252,63 @@ struct Remark {
     body: Option<String>,
     /// Whether T3 sent a longer remark than t3term keeps.
     body_cut: bool,
+    /// Its review thread is resolved, so a finished remark reads Resolved rather than Review
+    /// dismissed.
+    resolved: bool,
+    /// A finished remark's text on one row, as the desktop shows it until the remark opens.
+    preview: String,
     /// The text laid out at one width.
     laid_out: Option<(usize, Vec<Line<'static>>)>,
+}
+
+/// What a group of remarks says of them while it is closed, as the desktop's `CommentGroup`
+/// does: how many people wrote them, on how many files, and when the latest came.
+struct Group {
+    authors: usize,
+    files: usize,
+    latest: Option<i64>,
+}
+
+impl Group {
+    fn of(remarks: &[(&Comment, Option<&ReviewThread>)]) -> Group {
+        // A deleted account is `ghost`, and one login in two casings is one person.
+        let authors: HashSet<String> = remarks
+            .iter()
+            .map(|(comment, _)| {
+                let author = comment.author.as_ref();
+                author.map_or_else(|| "ghost".to_string(), |actor| actor.login.to_lowercase())
+            })
+            .collect();
+        let files: HashSet<&str> = remarks
+            .iter()
+            .filter_map(|(comment, _)| comment.path.as_deref().filter(|path| !path.is_empty()))
+            .collect();
+        let latest = remarks
+            .iter()
+            .filter_map(|(comment, _)| instant(&comment.created_at))
+            .max();
+        Group {
+            authors: authors.len(),
+            files: files.len(),
+            latest,
+        }
+    }
+
+    /// Its second row: `2 authors · 1 file · Latest 5m ago`.
+    fn line(&self, now: i64) -> String {
+        let plural = |count: usize, what: &str| {
+            let s = if count == 1 { "" } else { "s" };
+            format!("{} {what}{s}", grouped(count as u64))
+        };
+        let mut parts = vec![plural(self.authors, "author")];
+        if self.files > 0 {
+            parts.push(plural(self.files, "file"));
+        }
+        if let Some(latest) = self.latest {
+            parts.push(format!("Latest {}", ago(latest, now)));
+        }
+        parts.join(" · ")
+    }
 }
 
 /// What the details show of a pull request's conversation.
@@ -164,12 +319,12 @@ pub(super) struct Conversation {
     truncated: bool,
     /// How many remarks T3 sent.
     sent: usize,
-    /// The most recent active remarks, newest first.
-    recent: Vec<Remark>,
-    /// Active remarks older than those.
-    older: usize,
-    bots: usize,
-    finished: usize,
+    /// Each group's remarks in the order T3 sent them, the oldest first.
+    active: Vec<Remark>,
+    bots: Vec<Remark>,
+    bots_group: Group,
+    finished: Vec<Remark>,
+    finished_group: Group,
     /// The reviewers, where the host gave them with the conversation. They take the place of
     /// the detail's.
     reviewers: Option<Vec<Reviewer>>,
@@ -187,27 +342,25 @@ impl Conversation {
             .iter()
             .flat_map(|thread| thread.comments.iter().map(move |c| (c.id.as_str(), thread)))
             .collect();
-        let mut active = Vec::new();
-        let (mut bots, mut finished) = (0, 0);
+        let (mut active, mut bots, mut finished) = (Vec::new(), Vec::new(), Vec::new());
         for comment in &activity.comments {
             let thread = threads.get(comment.id.as_str()).copied();
             let outcome = comment.review_state.as_deref().and_then(Outcome::of);
             let author = comment.author.as_ref();
             if thread.is_some_and(|thread| thread.resolved) || outcome == Some(Outcome::Dismissed) {
-                finished += 1;
+                finished.push((comment, thread));
             } else if author.is_some_and(|actor| actor.is_bot || actor.login.ends_with("[bot]")) {
-                bots += 1;
+                bots.push((comment, thread));
             } else {
                 active.push((comment, thread));
             }
         }
-        // The window is the most recent remarks in the order T3 sent them, shown newest first.
-        let older = active.len().saturating_sub(COMMENT_PAGE);
-        let recent = active[older..]
-            .iter()
-            .rev()
-            .map(|(comment, thread)| Remark::of(comment, *thread))
-            .collect();
+        let remarks = |group: &[(&Comment, Option<&ReviewThread>)], finished: bool| {
+            group
+                .iter()
+                .map(|(comment, thread)| Remark::of(comment, *thread, finished))
+                .collect()
+        };
         let reviewers = activity
             .reviewers
             .as_ref()
@@ -216,26 +369,88 @@ impl Conversation {
             count: activity.comment_count,
             truncated: activity.comments_truncated,
             sent: activity.comments.len(),
-            recent,
-            older,
-            bots,
-            finished,
+            active: remarks(&active, false),
+            bots: remarks(&bots, false),
+            bots_group: Group::of(&bots),
+            finished: remarks(&finished, true),
+            finished_group: Group::of(&finished),
             reviewers,
             verdicts: verdicts(&activity.comments, &activity.commits),
             cut: activity.cut,
         }
     }
 
-    /// Lays each remark's text out at `width`, unless it already is.
-    pub(super) fn lay_out(&mut self, width: usize, theme: &Theme) {
-        for remark in &mut self.recent {
+    /// Lays the text of each remark that shows out at `width`, unless it already is.
+    pub(super) fn lay_out(&mut self, width: usize, theme: &Theme, shown: &Shown) {
+        let from = self.active.len().saturating_sub(shown.active);
+        for remark in &mut self.active[from..] {
             remark.lay_out(width, theme);
+        }
+        if shown.bots_open {
+            let from = self.bots.len().saturating_sub(shown.bots);
+            for remark in &mut self.bots[from..] {
+                remark.lay_out(width, theme);
+            }
+        }
+        if shown.finished_open {
+            for remark in &mut self.finished {
+                if shown.opened.contains(&remark.id) {
+                    remark.lay_out(width, theme);
+                }
+            }
+        }
+    }
+
+    /// Whether `control` shows while the reader opened what `shown` says.
+    pub(super) fn has(&self, control: Control, shown: &Shown) -> bool {
+        let some = self.sent > 0;
+        match control {
+            Control::Order => some,
+            Control::Older => self.active.len() > shown.active,
+            Control::Recent => some && shown.active > COMMENT_PAGE,
+            Control::Bots => !self.bots.is_empty(),
+            Control::OlderBots => shown.bots_open && self.bots.len() > shown.bots,
+            Control::RecentBots => {
+                shown.bots_open && !self.bots.is_empty() && shown.bots > COMMENT_PAGE
+            }
+            Control::Finished => !self.finished.is_empty(),
+            Control::Remark(at) => shown.finished_open && at < self.finished.len(),
+        }
+    }
+
+    /// What Enter does with `control`, for the status line: `show 10 older`.
+    pub(super) fn action(&self, control: Control, shown: &Shown) -> String {
+        let older = |total: usize, showing: usize| {
+            let hidden = total.saturating_sub(showing);
+            format!("show {} older", grouped(hidden.min(COMMENT_PAGE) as u64))
+        };
+        let toggle = |open: bool, what: &str| match open {
+            true => format!("hide {what}"),
+            false => format!("show {what}"),
+        };
+        match control {
+            Control::Order if shown.oldest_first => "newest first".to_string(),
+            Control::Order => "oldest first".to_string(),
+            Control::Older => older(self.active.len(), shown.active),
+            Control::OlderBots => older(self.bots.len(), shown.bots),
+            Control::Recent | Control::RecentBots => format!("show only {COMMENT_PAGE} recent"),
+            Control::Bots => toggle(shown.bots_open, "bot comments"),
+            Control::Finished => toggle(shown.finished_open, "resolved"),
+            Control::Remark(at) => {
+                let open = self
+                    .finished
+                    .get(at)
+                    .is_some_and(|remark| shown.opened.contains(&remark.id));
+                toggle(open, "comment")
+            }
         }
     }
 }
 
 impl Remark {
-    fn of(comment: &Comment, thread: Option<&ReviewThread>) -> Remark {
+    /// The remark `comment`, on review thread `thread` where it is on one. Only a `finished`
+    /// one keeps its text on one row as well.
+    fn of(comment: &Comment, thread: Option<&ReviewThread>, finished: bool) -> Remark {
         let said = comment.review_state.as_deref().and_then(|state| {
             if let Some(outcome) = Outcome::of(state) {
                 return Some(Said::Verdict(outcome));
@@ -254,9 +469,15 @@ impl Remark {
                 None => path,
             }
         });
-        let text = without_controls(&without_html_comments(&comment.body.text));
+        let clean = without_controls(&comment.body.text);
+        let text = without_html_comments(&clean);
         let text = text.trim();
+        let preview = match finished {
+            true => bounded(&preview(&clean), PREVIEW),
+            false => String::new(),
+        };
         Remark {
+            id: comment.id.clone(),
             author: comment
                 .author
                 .as_ref()
@@ -267,6 +488,8 @@ impl Remark {
             outdated: thread.is_some_and(|thread| thread.outdated),
             body: (!text.is_empty()).then(|| text.to_string()),
             body_cut: comment.body.cut,
+            resolved: thread.is_some_and(|thread| thread.resolved),
+            preview,
             laid_out: None,
         }
     }
@@ -286,29 +509,87 @@ impl Remark {
         self.laid_out = Some((width, lines));
     }
 
+    /// Its rows: its header, the file and line it is on, and its text.
     fn lines(&self, width: usize, now: i64, theme: &Theme) -> Vec<Line<'static>> {
+        let muted = Style::new().fg(theme.muted);
+        let said = match &self.said {
+            Some(Said::Verdict(outcome)) => Some((
+                outcome.label().to_string(),
+                Style::new().fg(outcome.color(theme)),
+            )),
+            Some(Said::State(state)) => Some((state.clone(), muted)),
+            None => None,
+        };
+        let mut lines = self.header(said, width, now, theme);
+        lines.extend(self.place(width, theme));
+        lines.extend(self.text(width, theme));
+        lines
+    }
+
+    /// A finished remark's rows, as the desktop's `CollapsedComment` shows it: its header with
+    /// why it is finished, the file and line it is on, then its text on one row while it is
+    /// closed and its whole text once it opens. The second number is how many of the rows
+    /// open and close it: all of them while it is closed, and its header once it opens.
+    fn finished_lines(
+        &self,
+        open: bool,
+        width: usize,
+        now: i64,
+        theme: &Theme,
+    ) -> (Vec<Line<'static>>, usize) {
+        let muted = Style::new().fg(theme.muted);
+        let why = if self.resolved {
+            "Resolved"
+        } else {
+            "Review dismissed"
+        };
+        let chevron = if open { "⌄" } else { "›" };
+        let mut lines = self.header(Some((format!("{chevron} {why}"), muted)), width, now, theme);
+        let header = lines.len();
+        lines.extend(self.place(width, theme));
+        if open {
+            lines.extend(self.text(width, theme));
+            return (lines, header);
+        }
+        if !self.preview.is_empty() && width > 0 {
+            lines.push(Line::styled(clip(&self.preview, width), muted));
+        }
+        let rows = lines.len();
+        (lines, rows)
+    }
+
+    /// The author, `said` after them, and how long ago at the end.
+    fn header(
+        &self,
+        said: Option<(String, Style)>,
+        width: usize,
+        now: i64,
+        theme: &Theme,
+    ) -> Vec<Line<'static>> {
         let muted = Style::new().fg(theme.muted);
         let author = Style::new().fg(theme.fg).add_modifier(Modifier::BOLD);
         let mut left = vec![(self.author.clone(), author)];
-        match &self.said {
-            Some(Said::Verdict(outcome)) => {
-                left.push((
-                    outcome.label().to_string(),
-                    Style::new().fg(outcome.color(theme)),
-                ));
-            }
-            Some(Said::State(state)) => left.push((state.clone(), muted)),
-            None => {}
-        }
+        left.extend(said);
         let at = self.at.map(|at| (ago(at, now), muted));
-        let mut lines = fitted(left, at, width);
-        if let Some(location) = &self.location {
-            let text = match self.outdated {
-                true => format!("{location} · Outdated"),
-                false => location.clone(),
-            };
-            lines.extend(whole(&text, width, muted));
-        }
+        fitted(left, at, width)
+    }
+
+    /// The file and line it is on, and whether that line is still in the diff.
+    fn place(&self, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+        let Some(location) = &self.location else {
+            return Vec::new();
+        };
+        let text = match self.outdated {
+            true => format!("{location} · Outdated"),
+            false => location.clone(),
+        };
+        whole(&text, width, Style::new().fg(theme.muted))
+    }
+
+    /// Its text as laid out at `width`, and a note where T3 cut it short.
+    fn text(&self, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+        let muted = Style::new().fg(theme.muted);
+        let mut lines = Vec::new();
         if let Some((at, laid_out)) = &self.laid_out
             && *at == width
         {
@@ -428,69 +709,234 @@ pub(super) fn reviewer_lines(
     lines
 }
 
-/// The Comments section's label and rows, as the conversation's read stands.
-pub(super) fn lines(
+/// The rows of each control among some lines, in the order they show.
+pub(super) type Targets = Vec<(Range<usize>, Control)>;
+
+/// The Comments section: its heading, then its rows as the conversation's read stands, and
+/// the rows of each control among them, counted from the heading's.
+pub(super) struct Section {
+    pub(super) lines: Vec<Line<'static>>,
+    pub(super) targets: Targets,
+}
+
+/// Builds a section's rows: items with a blank row between each two, and the rows of each
+/// control.
+struct Rows {
+    lines: Vec<Line<'static>>,
+    targets: Targets,
+    /// Where the first item goes, under the heading.
+    first: usize,
+}
+
+impl Rows {
+    /// Adds an item, the first `active` of whose rows do what `control` does.
+    fn item(&mut self, lines: Vec<Line<'static>>, control: Option<(Control, usize)>) {
+        if lines.is_empty() {
+            return;
+        }
+        if self.lines.len() > self.first {
+            self.lines.push(Line::default());
+        }
+        let start = self.lines.len();
+        if let Some((control, active)) = control {
+            self.targets
+                .push((start..start + active.min(lines.len()), control));
+        }
+        self.lines.extend(lines);
+    }
+
+    /// Adds an item whose every row does what `control` does.
+    fn control(&mut self, lines: Vec<Line<'static>>, control: Control) {
+        let rows = lines.len();
+        self.item(lines, Some((control, rows)));
+    }
+}
+
+/// The Comments section as the conversation's read stands and the reader opened it. Its
+/// heading holds the switch between newest and oldest first once there are remarks.
+pub(super) fn section(
     answer: &Answer<Conversation>,
+    shown: &Shown,
     width: usize,
     now: i64,
     theme: &Theme,
-) -> (String, Vec<Line<'static>>) {
+) -> Section {
     let muted = Style::new().fg(theme.muted);
     let value = Style::new().fg(theme.fg);
+    let heading = |label: &str| vec![Line::styled(clip(label, width), muted)];
     let conversation = match answer {
         Answer::Reading => {
-            let rows = whole("Reading the conversation…", width, muted);
-            return ("Comments".to_string(), rows);
+            let mut lines = heading("Comments");
+            lines.extend(whole("Reading the conversation…", width, muted));
+            return Section {
+                lines,
+                targets: Vec::new(),
+            };
         }
         Answer::Failed(failure) => {
-            let mut rows = whole("Could not load pull request activity", width, value);
-            rows.extend(whole(failure, width, muted));
-            return ("Comments".to_string(), rows);
+            let mut lines = heading("Comments");
+            lines.extend(whole("Could not load pull request activity", width, value));
+            lines.extend(whole(failure, width, muted));
+            return Section {
+                lines,
+                targets: Vec::new(),
+            };
         }
         Answer::Read(conversation) => conversation,
     };
-    let mut rows = Vec::new();
+    let label = format!("Comments ({})", grouped(conversation.count));
+    let mut rows = Rows {
+        lines: heading(&label),
+        targets: Vec::new(),
+        first: 0,
+    };
+    if conversation.has(Control::Order, shown) && width > 0 {
+        let order = match shown.oldest_first {
+            true => "Oldest first",
+            false => "Newest first",
+        };
+        if label.width() + 1 + order.width() <= width {
+            let left = vec![Span::styled(label.clone(), muted)];
+            rows.lines = vec![row(left, vec![Span::styled(order, muted)], width)];
+            rows.targets.push((0..1, Control::Order));
+        } else {
+            let at = rows.lines.len();
+            rows.lines.extend(whole(order, width, muted));
+            rows.targets.push((at..rows.lines.len(), Control::Order));
+        }
+    }
+    rows.first = rows.lines.len();
     if conversation.truncated {
         let note = format!(
             "This conversation is longer than this page reads in one go. The most recent {} \
              are here; open it on the host to read the rest.",
             grouped(conversation.sent as u64)
         );
-        rows.extend(whole(&note, width, Style::new().fg(theme.warning_fg)));
+        rows.item(whole(&note, width, Style::new().fg(theme.warning_fg)), None);
     }
     if conversation.sent == 0 {
-        rows.extend(whole("No comments yet.", width, muted));
+        rows.item(whole("No comments yet.", width, muted), None);
     }
-    for (at, remark) in conversation.recent.iter().enumerate() {
-        if at > 0 {
-            rows.push(Line::default());
+    let in_order = |remarks: &'_ [Remark]| -> Vec<usize> {
+        let mut places: Vec<usize> = (0..remarks.len()).collect();
+        if !shown.oldest_first {
+            places.reverse();
         }
-        rows.extend(remark.lines(width, now, theme));
+        places
+    };
+
+    // The 10 most recent active remarks, with Show older on the side the older ones are on.
+    let active = &conversation.active;
+    let from = active.len().saturating_sub(shown.active);
+    let older = button("", from, "comment", width, theme);
+    if shown.oldest_first && conversation.has(Control::Older, shown) {
+        rows.control(older.clone(), Control::Older);
     }
-    let counts = [
-        (conversation.older, "older comment"),
-        (conversation.bots, "bot comment"),
-        (conversation.finished, "resolved or dismissed comment"),
-    ];
-    let mut first = true;
-    for (count, what) in counts {
-        if count == 0 {
-            continue;
+    for at in in_order(&active[from..]) {
+        rows.item(active[from + at].lines(width, now, theme), None);
+    }
+    if !shown.oldest_first && conversation.has(Control::Older, shown) {
+        rows.control(older, Control::Older);
+    }
+    if conversation.has(Control::Recent, shown) {
+        let text = format!("Show only {COMMENT_PAGE} recent comments");
+        rows.control(whole(&text, width, muted), Control::Recent);
+    }
+
+    // The bots' remarks, as a group that opens to its 10 most recent.
+    if conversation.has(Control::Bots, shown) {
+        let group = group_lines(
+            &conversation.bots_group,
+            conversation.bots.len(),
+            "bot comment",
+            shown.bots_open,
+            width,
+            now,
+            theme,
+        );
+        rows.control(group, Control::Bots);
+    }
+    if shown.bots_open {
+        let bots = &conversation.bots;
+        let from = bots.len().saturating_sub(shown.bots);
+        for at in in_order(&bots[from..]) {
+            rows.item(bots[from + at].lines(width, now, theme), None);
         }
-        if first && !conversation.recent.is_empty() {
-            rows.push(Line::default());
+        if conversation.has(Control::OlderBots, shown) {
+            let older = button("bot ", from, "comment", width, theme);
+            rows.control(older, Control::OlderBots);
         }
-        first = false;
-        let plural = if count == 1 { "" } else { "s" };
-        let text = format!("{} {what}{plural} not shown.", grouped(count as u64));
-        rows.extend(whole(&text, width, muted));
+        if conversation.has(Control::RecentBots, shown) {
+            let text = format!("Show only {COMMENT_PAGE} recent bot comments");
+            rows.control(whole(&text, width, muted), Control::RecentBots);
+        }
+    }
+
+    // The resolved and dismissed remarks, as a group whose remarks each open.
+    if conversation.has(Control::Finished, shown) {
+        let group = group_lines(
+            &conversation.finished_group,
+            conversation.finished.len(),
+            "resolved or dismissed comment",
+            shown.finished_open,
+            width,
+            now,
+            theme,
+        );
+        rows.control(group, Control::Finished);
+    }
+    if shown.finished_open {
+        for at in in_order(&conversation.finished) {
+            let remark = &conversation.finished[at];
+            let open = shown.opened.contains(&remark.id);
+            let (lines, active) = remark.finished_lines(open, width, now, theme);
+            rows.item(lines, Some((Control::Remark(at), active)));
+        }
     }
     if conversation.cut {
         let note = "T3 sent more comments, review threads, commits or reviewers than t3term keeps.";
-        rows.extend(whole(note, width, muted));
+        rows.item(whole(note, width, muted), None);
     }
-    let label = format!("Comments ({})", grouped(conversation.count));
-    (label, rows)
+    Section {
+        lines: rows.lines,
+        targets: rows.targets,
+    }
+}
+
+/// `+ Show 10 older comments (12 hidden)`, of the `hidden` remarks older than those that show.
+fn button(
+    kind: &str,
+    hidden: usize,
+    what: &str,
+    width: usize,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let plural = if hidden == 1 { "" } else { "s" };
+    let text = format!(
+        "+ Show {} older {kind}{what}{plural} ({} hidden)",
+        grouped(hidden.min(COMMENT_PAGE) as u64),
+        grouped(hidden as u64)
+    );
+    whole(&text, width, Style::new().fg(theme.muted))
+}
+
+/// A group's rows: a chevron and `2 bot comments`, then who wrote them, on how many files and
+/// when the latest came.
+fn group_lines(
+    group: &Group,
+    count: usize,
+    what: &str,
+    open: bool,
+    width: usize,
+    now: i64,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let chevron = if open { "⌄" } else { "›" };
+    let plural = if count == 1 { "" } else { "s" };
+    let label = format!("{chevron} {} {what}{plural}", grouped(count as u64));
+    let mut lines = whole(&label, width, Style::new().fg(theme.fg));
+    lines.extend(whole(&group.line(now), width, Style::new().fg(theme.muted)));
+    lines
 }
 
 /// `left`'s pieces two columns apart with `right` at the end of the row, when they fit in
@@ -564,6 +1010,97 @@ fn instant(text: &str) -> Option<i64> {
     };
     let (hours, minutes): (i64, i64) = (hours.parse().ok()?, minutes.parse().ok()?);
     Some(base - sign * (hours * 60 + minutes) * 60_000)
+}
+
+/// A finished remark's text on one row, as the desktop's `CollapsedComment` writes it: without
+/// HTML comments, even in code, or an alert's `[!NOTE]` row, with each link and image as its
+/// text, without the marks that start a quote, heading or list item or any `*` or backtick,
+/// and each run of whitespace one space. Each step takes time in proportion to the text, as
+/// the remark can be a quarter of a megabyte.
+fn preview(text: &str) -> String {
+    let text = uncommented(text);
+    let kept: Vec<&str> = text
+        .split('\n')
+        .map(|line| if is_alert(line) { "" } else { line })
+        .collect();
+    let text = unlinked(&kept.join("\n"));
+    let mut out = String::new();
+    for line in text.split('\n') {
+        let line = line.trim_start_matches(|c: char| c.is_whitespace() || ">#*-".contains(c));
+        for c in line.chars() {
+            match c {
+                '*' | '`' => {}
+                c if c.is_whitespace() => {
+                    if !out.ends_with(' ') {
+                        out.push(' ');
+                    }
+                }
+                c => out.push(c),
+            }
+        }
+        if !out.ends_with(' ') {
+            out.push(' ');
+        }
+    }
+    out.trim().to_string()
+}
+
+/// `text` without anything from `<!--` to the next `-->`. One never closed stays.
+fn uncommented(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find("<!--") {
+        let Some(close) = rest[open + 4..].find("-->") else {
+            break;
+        };
+        out.push_str(&rest[..open]);
+        rest = &rest[open + 4 + close + 3..];
+    }
+    out.push_str(rest);
+    out
+}
+
+/// Whether `line` is an alert's marker row, such as `> [!NOTE]`.
+fn is_alert(line: &str) -> bool {
+    let line = line.trim();
+    let line = line.strip_prefix('>').unwrap_or(line).trim();
+    line.strip_prefix("[!")
+        .and_then(|rest| rest.strip_suffix(']'))
+        .is_some_and(|kind| {
+            !kind.is_empty() && kind.chars().all(|c| c.is_ascii_alphanumeric() || c == '_')
+        })
+}
+
+/// `text` with each `[text](url)` and `![text](url)` as its text, as the desktop's
+/// `!?(\[([^\]]+)\])\([^)]*\)` finds them. A link's text and target may span rows.
+fn unlinked(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut rest = text;
+    while let Some(open) = rest.find('[') {
+        let after = &rest[open + 1..];
+        // Every `[` before the first `]` closes there, so where one fails they all do.
+        let Some(close) = after.find(']') else {
+            break;
+        };
+        let target = after[close + 1..].strip_prefix('(');
+        let end = target.map(|target| target.find(')'));
+        match (target, end) {
+            (Some(target), Some(Some(end))) if close > 0 => {
+                let before = &rest[..open];
+                out.push_str(before.strip_suffix('!').unwrap_or(before));
+                out.push_str(&after[..close]);
+                rest = &target[end + 1..];
+            }
+            // With no `)` left, no link is.
+            (Some(_), Some(None)) => break,
+            _ => {
+                out.push_str(&rest[..open + 1 + close + 1]);
+                rest = &after[close + 1..];
+            }
+        }
+    }
+    out.push_str(rest);
+    out
 }
 
 /// `text` without its HTML comments, which review bots keep their bookkeeping in and the
