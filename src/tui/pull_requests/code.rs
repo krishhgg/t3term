@@ -1132,8 +1132,8 @@ impl Code {
 
     /// The tree of the files shown.
     fn tree(&self) -> Tree {
-        let files = (0..self.files.len()).filter_map(|at| self.file(at));
-        Tree::new(files.map(|(_, file)| (file.path(), file.status)))
+        let files = (0..self.files.len()).filter_map(|at| Some((at, self.file(at)?.1)));
+        Tree::new(files.map(|(at, file)| (at, file.path(), file.status)))
     }
 
     /// The rows of the file tree that show, or none while it doesn't.

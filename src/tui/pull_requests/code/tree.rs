@@ -74,11 +74,12 @@ pub(super) enum Kind {
 }
 
 impl Tree {
-    /// The tree of `files`, each file's path and how it changed, in the order the files show.
-    pub(super) fn new<'a>(files: impl IntoIterator<Item = (&'a str, Status)>) -> Tree {
+    /// The tree of `files`, each file's place among the files, its path and how it changed, in
+    /// the order the files show.
+    pub(super) fn new<'a>(files: impl IntoIterator<Item = (usize, &'a str, Status)>) -> Tree {
         let mut entries: Vec<(&str, usize, Status)> = Vec::new();
         let mut places: HashMap<&str, usize> = HashMap::new();
-        for (at, (path, status)) in files.into_iter().enumerate() {
+        for (at, path, status) in files {
             match places.get(path) {
                 Some(&place) if entries[place].2 != status => entries[place].2 = Status::Modified,
                 Some(_) => {}
@@ -222,7 +223,8 @@ fn joined(path: &str, name: &str) -> String {
 /// The rows `row` takes at `width`: two columns for each folder it is under, at most half the
 /// width, then a folder's chevron or a file's letter in the color of how it changed, then its
 /// name, cleaned and bounded, on as many rows as it takes. A file's name has the color of how
-/// it changed, as pierre colors it.
+/// it changed, as pierre colors it. Where the name has less than two columns, room for a wide
+/// character, the row shows what fits of it on one row.
 pub(super) fn lines(row: &Row, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     let indent = (2 * row.depth).min(width / 2);
     let (lead, lead_color, name_color) = match &row.kind {
@@ -237,11 +239,12 @@ pub(super) fn lines(row: &Row, width: usize, theme: &Theme) -> Vec<Line<'static>
     };
     let name = bounded(&row.name, PATH);
     let pad = indent + 2;
-    if width <= pad {
+    if width < pad + 2 {
         let text = format!("{}{lead} {name}", " ".repeat(indent));
         return vec![Line::from(Span::raw(clip(&text, width)))];
     }
-    let rows = broken(&name, width - pad).into_iter().enumerate();
+    let room = width - pad;
+    let rows = broken(&name, room).into_iter().enumerate();
     rows.map(|(at, piece)| {
         let mut spans = match at {
             0 => vec![
@@ -251,8 +254,12 @@ pub(super) fn lines(row: &Row, width: usize, theme: &Theme) -> Vec<Line<'static>
             ],
             _ => vec![Span::raw(" ".repeat(pad))],
         };
+        let piece = clip(&piece, room);
         spans.push(Span::styled(piece, Style::new().fg(name_color)));
         Line::from(spans)
     })
     .collect()
 }
+
+#[cfg(test)]
+mod tests;
