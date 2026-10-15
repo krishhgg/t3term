@@ -887,7 +887,9 @@ impl Default for Offset {
 /// number as T3 sent them, and the ticket its answer comes back with. `invalidate` says a
 /// person asked to read it from the host, so the read sends `pullRequests.invalidate` first.
 /// `updated` is the `updatedAt` of the detail the details show, for a read that only keeps
-/// them current: it reads the conversation only when the new detail's differs.
+/// them current: it reads the conversation only when the new detail's differs. `stack` says
+/// to read the stack once the detail says the host keeps stacks: every read but one that only
+/// keeps the details current does, and so does that one when the stack shown is stale.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Ask {
     pub ticket: u64,
@@ -896,6 +898,7 @@ pub(super) struct Ask {
     pub number: u64,
     pub invalidate: bool,
     pub updated: Option<String>,
+    pub stack: bool,
 }
 
 /// Part of what a host said of a pull request. A read sends its detail, its conversation and,
@@ -955,8 +958,11 @@ struct Read {
     /// date, as the desktop keeps the stack it last read (pullRequestStackSnapshot.ts:51-73),
     /// and opening the details again reads again.
     stack_failed: bool,
-    /// Set once a read of the stack came. Until then, the stack saved on the link stands in.
-    stack_came: bool,
+    /// When the last read of the stack came, finding one or none. None until one came.
+    stack_at: Option<i64>,
+    /// Set when the read again that `again` wants reads the stack too, though it only keeps
+    /// the details current.
+    stack_due: bool,
 }
 
 /// A read under way to replace a read's answers. It holds each answer until both came, so the
@@ -972,15 +978,15 @@ struct Next {
 
 /// What a read of the stack found.
 enum StackRead {
-    /// The stack, or None where the pull request is in none.
-    Read(Option<Box<StackView>>),
+    /// The stack, or None where the pull request is in none, and when it came.
+    Read(Option<Box<StackView>>, i64),
     Failed,
 }
 
 impl StackRead {
-    fn of(answer: Result<Option<Box<pull_request::Stack>>, String>) -> StackRead {
+    fn of(answer: Result<Option<Box<pull_request::Stack>>, String>, now: i64) -> StackRead {
         match answer {
-            Ok(stack) => StackRead::Read(stack.map(|stack| Box::new(StackView::of(&stack)))),
+            Ok(stack) => StackRead::Read(stack.map(|stack| Box::new(StackView::of(&stack))), now),
             Err(_) => StackRead::Failed,
         }
     }
@@ -1014,7 +1020,8 @@ impl Read {
             live: false,
             stack: None,
             stack_failed: false,
-            stack_came: false,
+            stack_at: None,
+            stack_due: false,
         }
     }
 
@@ -1077,10 +1084,10 @@ impl Read {
     /// does finding the pull request in none. A failure keeps the one shown.
     fn take_stack(&mut self, read: StackRead) {
         match read {
-            StackRead::Read(stack) => {
+            StackRead::Read(stack, at) => {
                 self.stack = stack;
                 self.stack_failed = false;
-                self.stack_came = true;
+                self.stack_at = Some(at);
             }
             StackRead::Failed => self.stack_failed = true,
         }
@@ -1735,6 +1742,7 @@ impl PullRequests {
         read.asked = now;
         let invalidate = std::mem::take(&mut read.invalidate);
         read.echo = invalidate;
+        let stack = std::mem::take(&mut read.stack_due) || updated.is_none();
         Some(Ask {
             ticket,
             host: read.host.clone(),
@@ -1742,6 +1750,7 @@ impl PullRequests {
             number: read.number,
             invalidate,
             updated,
+            stack,
         })
     }
 
@@ -1755,8 +1764,16 @@ impl PullRequests {
         };
         if let Some(read) = self.read.as_mut().filter(|read| read.key == entry.key) {
             if read.stands(now) {
-                // Its answers show, and the detail is read again unless it just came.
-                self.arrive(now);
+                // Its answers show, and the detail is read again unless it just came. A stack
+                // that came `FRESH` or more ago is read again with it, though the detail just
+                // came, as the desktop's stack query reads again when the details mount once
+                // it is stale (`Atom.swr` in packages/client-runtime/src/state/runtime.ts).
+                if self.stack_stale(now) {
+                    self.read.as_mut().expect("the shown read").stack_due = true;
+                    self.read_live(now);
+                } else {
+                    self.arrive(now);
+                }
                 return;
             }
             if read.answered() {
@@ -1889,6 +1906,14 @@ impl PullRequests {
         }
     }
 
+    /// Whether the details show a read that is done whose stack came `FRESH` or more before
+    /// `now`.
+    fn stack_stale(&self, now: i64) -> bool {
+        let read = self.read.as_ref().filter(|_| self.live_at().is_some());
+        let at = read.and_then(|read| read.stack_at);
+        at.is_some_and(|at| now.saturating_sub(at) >= FRESH)
+    }
+
     /// Wants the shown read again to keep it current, as `live` and `arrive` say: the detail,
     /// and the conversation only once it changed. A read that failed reads both, as a first
     /// read does, as the desktop's live refresh reads a detail it couldn't read.
@@ -1964,7 +1989,7 @@ impl PullRequests {
                     return false;
                 }
                 Part::Stack(answer) => {
-                    next.stack = Some(StackRead::of(answer));
+                    next.stack = Some(StackRead::of(answer, now));
                     return false;
                 }
                 Part::Done => {
@@ -1989,7 +2014,7 @@ impl PullRequests {
                 Part::Activity(Err(failure)) => {
                     read.conversation = Answer::Failed(bounded(&failure, FAILURE));
                 }
-                Part::Stack(answer) => read.take_stack(StackRead::of(answer)),
+                Part::Stack(answer) => read.take_stack(StackRead::of(answer, now)),
                 Part::Done => {}
             }
         }
@@ -2854,7 +2879,7 @@ fn host_lines(
     // The desktop shows the stack in the details' header, beside the merge controls. Until a
     // read of it came, and after a read failed with none to keep, it shows the one saved on
     // the link where the host keeps stacks (pullRequestStackSnapshot.ts:51-73).
-    let saved = summary.stacks && (!read.stack_came || read.stack_failed);
+    let saved = summary.stacks && (read.stack_at.is_none() || read.stack_failed);
     let stack = match (read.stack.as_deref(), entry.saved.as_deref()) {
         (Some(stack), _) => Some((stack, read.stack_failed.then_some(STACK_STALE))),
         (None, Some(stack)) if saved => {
@@ -4602,6 +4627,49 @@ mod tests {
         // A host without stacks shows none, saved or not.
         let (mut pulls, _) = open(&bare_detail());
         assert_eq!(stack_rows(&mut pulls, 44), Vec::<String>::new());
+    }
+
+    /// The desktop's stack query reads again when the details mount once it is stale, while
+    /// its live refresh and focus read the detail alone.
+    #[test]
+    fn opening_the_details_again_reads_a_stack_that_came_a_minute_ago() {
+        let mut pulls = read_with_stack(Some(stack_part(&stack_sent())));
+        let reopen = |pulls: &mut PullRequests, at: i64| {
+            pulls.back();
+            pulls.toggle();
+            pulls.take_ask(true, at)
+        };
+        let detail_only = |pulls: &mut PullRequests, ask: &Ask, at: i64| {
+            let detail = Part::Detail(Ok(read_detail(&bare_detail())));
+            pulls.answer(ask.ticket, detail, at);
+            pulls.answer(ask.ticket, Part::Done, at);
+        };
+        // Within the minute, opening the details again reads the detail alone.
+        let at = now() + SOONEST;
+        let ask = reopen(&mut pulls, at).expect("a read on arrival");
+        assert!(ask.updated.is_some() && !ask.stack, "{ask:?}");
+        detail_only(&mut pulls, &ask, at);
+        // So does coming back to t3term, as the stack comes to a minute old.
+        let at = now() + FRESH - 1;
+        assert!(pulls.arrive(at));
+        let ask = pulls.take_ask(true, at).expect("a read on focus");
+        assert!(ask.updated.is_some() && !ask.stack, "{ask:?}");
+        detail_only(&mut pulls, &ask, at);
+        // Opening them once it is a minute old reads the stack too, though the detail just
+        // came. Opening them again while that read is under way asks for nothing more.
+        let at = at + 1;
+        let ask = reopen(&mut pulls, at).expect("a read with the stack");
+        assert!(ask.updated.is_some() && ask.stack, "{ask:?}");
+        assert_eq!(reopen(&mut pulls, at), None);
+        let mut moved = stack_sent();
+        moved["layers"][1]["state"] = json!("merged");
+        let detail = Part::Detail(Ok(read_detail(&bare_detail())));
+        for part in [detail, stack_part(&moved), Part::Done] {
+            pulls.answer(ask.ticket, part, at);
+        }
+        assert_eq!(stack_rows(&mut pulls, 44)[4], "  #31 · feature · Merged");
+        // Then the stack is fresh and the detail just came, so nothing is read.
+        assert_eq!(reopen(&mut pulls, at + 1), None);
     }
 
     #[test]
