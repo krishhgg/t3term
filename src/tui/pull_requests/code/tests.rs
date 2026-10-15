@@ -431,6 +431,217 @@ fn the_whitespace_shown_stays_through_reads_and_commits() {
     assert_eq!(rows(&code, 40)[5], "› M z");
 }
 
+/// A file with an unchanged run before its hunk and a line longer than most rows.
+const LONG: &str = "diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -9,3 +9,3 @@
+ fn keep() {}
+-let short = 1;
++let long = \"a line that runs on well past forty columns\";
+ fn end() {}
+";
+
+#[test]
+fn lines_wrap_at_first_and_one_row_lets_them_run_on() {
+    // Nothing to wrap before a slice comes, nor in a diff with no files.
+    assert!(!Code::new().has(Control::Wrap, &[]));
+    for empty in [slice("", None), slice("", Some("2"))] {
+        let code = read(empty, 0);
+        assert!(!code.has(Control::Wrap, &[]));
+        let (lines, targets, slid) = sideways(&code, 40);
+        assert!(!rows_of(&lines).iter().any(|row| row.contains("wrapping")));
+        assert!(targets.iter().all(|(_, control)| *control != Control::Wrap));
+        assert_eq!(slid, Sideways::default());
+    }
+
+    // At first a line wraps under itself, after its number and mark, and no row scrolls.
+    let mut code = read(slice(LONG, None), 0);
+    assert!(code.has(Control::Wrap, &[]));
+    code.act(Control::Folds, &[]);
+    let (lines, targets, slid) = sideways(&code, 40);
+    let wrapped = [
+        "1 file",
+        "¶ Show whitespace changes",
+        "⇈ Collapse all files",
+        "↵ Disable line wrapping",
+        "",
+        "⌄ M src/lib.rs +1 -1",
+        "⋯ 8 unmodified lines",
+        " 9   fn keep() {}",
+        "10 - let short = 1;",
+        "10 + let long = \"a line that runs on wel",
+        "     l past forty columns\";",
+        "11   fn end() {}",
+        "⋯ More unchanged context may be",
+        "available",
+    ];
+    assert_eq!(rows_of(&lines), wrapped);
+    assert_eq!(targets[2], (3..4, Control::Wrap));
+    assert_eq!(color_of(&lines, WRAPPED), Some(theme().fg));
+    assert_eq!(code.action(Control::Wrap, &[]), "disable line wrapping");
+    assert_eq!(slid, Sideways::default());
+    // At a narrow width the row takes as many rows as it needs, and every one leads to it.
+    let (lines, targets) = laid(&code, 8);
+    assert_eq!(
+        rows_of(&lines)[..13],
+        [
+            "1 file", "¶ Show", "whitespa", "ce", "changes", "⇈", "Collapse", "all", "files", "↵",
+            "Disable", "line", "wrapping",
+        ]
+    );
+    assert_eq!(targets[2], (9..13, Control::Wrap));
+
+    // The row lets each line take one row as long as its text, laid out again. Those rows
+    // scroll sideways past the number and mark, and the others don't.
+    code.prepare(40, &theme());
+    let builds = code.builds;
+    assert!(!code.act(Control::Wrap, &[]), "the diff is the same");
+    assert!(code.bodies.is_empty());
+    assert_eq!(code.action(Control::Wrap, &[]), "enable line wrapping");
+    let (lines, targets, slid) = sideways(&code, 40);
+    let long = "10 + let long = \"a line that runs on well past forty columns\";";
+    assert_eq!(
+        rows_of(&lines)[3..],
+        [
+            "↵ Enable line wrapping",
+            "",
+            "⌄ M src/lib.rs +1 -1",
+            "⋯ 8 unmodified lines",
+            " 9   fn keep() {}",
+            "10 - let short = 1;",
+            long,
+            "11   fn end() {}",
+            "⋯ More unchanged context may be",
+            "available",
+        ]
+    );
+    assert_eq!(targets[2], (3..4, Control::Wrap));
+    assert_eq!(color_of(&lines, UNWRAPPED), Some(theme().fg));
+    assert_eq!(lines[9].width(), long.width());
+    assert_eq!(
+        slid,
+        Sideways {
+            runs: vec![(7..11, 5)],
+            widest: long.width(),
+        }
+    );
+    code.prepare(40, &theme());
+    assert_eq!(code.builds, builds + 1);
+    // Where there is no room for numbers, each line leads with its mark alone.
+    let (lines, _, slid) = sideways(&code, 8);
+    let at = rows_of(&lines)
+        .iter()
+        .position(|row| row == "+let long = \"a line that runs on well past forty columns\";")
+        .unwrap();
+    assert_eq!(
+        rows_of(&lines)[at - 2..at],
+        [" fn keep() {}", "-let short = 1;"]
+    );
+    assert_eq!(slid.runs, [(at - 2..at + 2, 1)]);
+    assert_eq!(slid.widest, lines[at].width());
+
+    // The row wraps the lines again.
+    code.act(Control::Wrap, &[]);
+    let (lines, _, slid) = sideways(&code, 40);
+    assert_eq!(rows_of(&lines), wrapped);
+    assert_eq!(slid, Sideways::default());
+}
+
+#[test]
+fn rows_that_scroll_sideways_part_around_review_threads() {
+    let mut conversation = conversation(vec![
+        thread("on", "src/lib.rs", Some(10), "left", false, &["Why short?"]),
+        thread("end", "src/lib.rs", Some(11), "right", false, &["Last."]),
+    ]);
+    let mut code = read(slice(LONG, None), 0);
+    code.act(Control::Folds, &[]);
+    code.act(Control::Wrap, &[]);
+    let shown = Shown::default();
+    let showing = code.threads_shown(conversation.threads(), &shown);
+    conversation.lay_out_threads(&showing, 40, &theme());
+    let (lines, _, slid) = code.lay_out(
+        threads_of(conversation.threads()),
+        &shown,
+        40,
+        NOW,
+        &theme(),
+    );
+    let rows = rows_of(&lines);
+    let at = |text: &str| rows.iter().position(|row| row == text).unwrap();
+    let removed = at("10 - let short = 1;");
+    let first = rows
+        .iter()
+        .position(|row| row.contains("Why short?"))
+        .unwrap();
+    let last = rows.iter().position(|row| row.contains("Last.")).unwrap();
+    // The cards keep their rows still: the runs stop at a card and go on after it.
+    assert!(
+        removed < first
+            && first < at("10 + let long = \"a line that runs on well past forty columns\";")
+    );
+    assert_eq!(
+        slid.runs,
+        [
+            (at(" 9   fn keep() {}")..removed + 1, 5),
+            (
+                at("10 + let long = \"a line that runs on well past forty columns\";")
+                    ..at("11   fn end() {}") + 1,
+                5
+            ),
+        ]
+    );
+    assert!(last > at("11   fn end() {}"));
+    assert!(
+        slid.runs
+            .iter()
+            .all(|(run, _)| !run.contains(&first) && !run.contains(&last))
+    );
+}
+
+#[test]
+fn the_lines_left_unwrapped_stay_so_through_reads_and_commits() {
+    let mut code = read(slice(LONG, Some("2")), 0);
+    code.act(Control::Wrap, &[]);
+    code.act(Control::Folds, &[]);
+    let raw =
+        "diff --git a/z b/z\n--- a/z\n+++ b/z\n@@ -1 +1 @@\n-a\n+a line longer than its row\n";
+    code.near_end();
+    assert_eq!(code.ask(2), Some(Some("2".to_string())));
+    assert_eq!(code.take(2, Ok(slice(raw, None)), 0), Some(false));
+    // A slice read later runs on too, and its rows join those that scroll.
+    let (lines, _, slid) = sideways(&code, 20);
+    let shown = rows_of(&lines);
+    let at = shown
+        .iter()
+        .position(|row| row == "1 + a line longer than its row")
+        .unwrap();
+    assert_eq!(shown[at - 1], "1 - a");
+    assert_eq!(slid.runs.last(), Some(&(at - 1..at + 1, 4)));
+    assert_eq!(slid.runs.len(), 2);
+
+    // A read again and another diff picked from the commits keep it, as the desktop's toggle
+    // lives in the tab and not in the diff picked.
+    code.again();
+    assert_eq!(code.ask(3), Some(None));
+    assert_eq!(code.take(3, Ok(slice(raw, None)), 0), Some(true));
+    assert_eq!(rows(&code, 40)[3], "↵ Enable line wrapping");
+    assert!(code.show("abc1234".into()));
+    assert_eq!(code.ask(4), Some(None));
+    assert_eq!(code.take(4, Ok(slice(raw, None)), 0), Some(true));
+    assert_eq!(rows(&code, 40)[3], "↵ Enable line wrapping");
+    code.act(Control::File(0), &[]);
+    let (lines, _, slid) = sideways(&code, 40);
+    assert_eq!(
+        rows_of(&lines)[5..8],
+        ["⌄ M z +1 -1", "1 - a", "1 + a line longer than its row"]
+    );
+    assert_eq!(slid.runs, [(6..8, 4)]);
+    code.act(Control::Wrap, &[]);
+    assert_eq!(rows(&code, 40)[3], "↵ Disable line wrapping");
+    assert_eq!(sideways(&code, 20).2, Sideways::default());
+}
+
 /// A file whose hunk removes `count` lines and adds `count` others, none the same.
 fn rewritten(path: &str, count: usize) -> String {
     let mut patch = format!(

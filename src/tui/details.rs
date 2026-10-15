@@ -1294,6 +1294,12 @@ impl Details {
         }
     }
 
+    /// Whether a pull request's Code tab shows, where Shift+← and Shift+→ scroll its lines
+    /// sideways rather than show another tab.
+    pub fn on_code(&self) -> bool {
+        self.tab == Tab::PullRequests && self.pulls.tabs() == Some(PullTab::Code)
+    }
+
     /// Scrolls the Code tab's lines that don't wrap half the details' width sideways, right or
     /// left where `right` is false, as Shift+→, `L`, Shift+← and `H` do. Elsewhere it does
     /// nothing.

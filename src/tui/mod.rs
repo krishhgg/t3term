@@ -1879,8 +1879,8 @@ impl App {
     /// acts on the chosen row. On the pull requests' tab they move along the pull requests, or
     /// scroll the selected one's details, which Enter shows in the list's place and hides
     /// again. The page keys, Home, End, `g` and `G` scroll the text, the list or the details.
-    /// Shift+← and Shift+→, `H` and `L`, scroll the Code tab's lines sideways while they don't
-    /// wrap.
+    /// `H` and `L` scroll the Code tab's lines sideways while they don't wrap, as Shift+← and
+    /// Shift+→ do on that tab. On the others those act as ← and →.
     fn on_details_key(&mut self, key: KeyEvent) {
         let plain = !key
             .modifiers
@@ -1890,11 +1890,10 @@ impl App {
                 self.leave_details()
             }
             KeyCode::Esc => self.close_details(),
-            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.details.sideways(false)
-            }
-            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
-                self.details.sideways(true)
+            KeyCode::Left | KeyCode::Right
+                if key.modifiers.contains(KeyModifiers::SHIFT) && self.details.on_code() =>
+            {
+                self.details.sideways(key.code == KeyCode::Right)
             }
             KeyCode::Char('H') if plain => self.details.sideways(false),
             KeyCode::Char('L') if plain => self.details.sideways(true),
@@ -3387,10 +3386,6 @@ impl App {
             };
             self.draw_picker(frame, above);
         }
-        frame.render_widget(
-            Paragraph::new(self.status_line(status_area.width as usize, shown)),
-            status_area,
-        );
         let now = self.now;
         match shown {
             Some(details::Layout::Pane) => {
@@ -3411,6 +3406,11 @@ impl App {
             }
             None => self.details.forget_drawn(),
         }
+        // After the details, whose frame decides whether the Code tab's lines run past them.
+        frame.render_widget(
+            Paragraph::new(self.status_line(status_area.width as usize, shown)),
+            status_area,
+        );
     }
 
     /// The GUI's breadcrumb: project, a slash, the thread title, and the open thread's watch at
@@ -14094,6 +14094,148 @@ mod tests {
             (diffs.borrow().len(), next),
             (2, Some((3, Some("c2".into()))))
         );
+    }
+
+    #[test]
+    fn shift_and_the_arrows_h_l_and_the_wheel_scroll_the_codes_lines_sideways() {
+        use pull_requests::Tab;
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        let _asked = note_reads(&mut app);
+        let _diffs = note_diffs(&mut app);
+        press(&mut app, KeyCode::Enter);
+        let parts = vec![
+            Part::Detail(Ok(Box::new(host_detail()))),
+            Part::Activity(Ok(Box::new(host_activity()))),
+            Part::Done,
+        ];
+        hear(&mut app, 1, parts);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        // A line of numbers, no stretch of which repeats.
+        let long = (0..100)
+            .map(|n| n.to_string())
+            .collect::<Vec<_>>()
+            .join(" ");
+        let diff = pull_request::Diff {
+            patch: format!("diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+{long}\n"),
+            truncated: false,
+            next_cursor: None,
+            omitted: Vec::new(),
+            omitted_cut: false,
+        };
+        let answer = Ok(Box::new(diff));
+        app.on_action_result(ActionResult::PullRequestDiff { ticket: 2, answer });
+        let shift = |app: &mut App, code| {
+            let key = KeyEvent::new(code, KeyModifiers::SHIFT);
+            app.on_terminal_event(Event::Key(key));
+        };
+        let status = |app: &mut App| {
+            let buffer = cells(app, 200, 50);
+            text_in(&buffer, Rect::new(0, 49, 200, 1))
+        };
+        // How far in the added line's row starts, on a frame of the pane, or of the dialog
+        // on a smaller screen.
+        let across_at = |app: &mut App, (width, height)| {
+            let rows = body_after(app, width, height);
+            let row = rows
+                .iter()
+                .find_map(|row| row.trim_start().strip_prefix("1 + "));
+            let row = row.expect("the added line");
+            long.find(row).expect("a stretch of the line")
+        };
+        let across = |app: &mut App| across_at(app, (200, 50));
+        // Unfolded and wrapped, the lines don't scroll, and the status line doesn't offer to.
+        cells(&mut app, 200, 50);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        let shown = status(&mut app);
+        assert!(shown.contains("Enter collapse all files · "), "{shown}");
+        assert!(!shown.contains("H/L sideways"), "{shown}");
+        shift(&mut app, KeyCode::Right);
+        shift(&mut app, KeyCode::Left);
+        assert_eq!(app.details.pulls.tabs(), Some(Tab::Code));
+
+        // Once they don't wrap, Shift and the arrows, `H` and `L` scroll them half the pane,
+        // and the wheel 4 columns.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        let shown = status(&mut app);
+        assert!(shown.contains("Enter enable line wrapping · "), "{shown}");
+        assert!(
+            shown.contains("H/L sideways · r refresh · Esc leave"),
+            "{shown}"
+        );
+        // A narrower status line drops `r`, then `H/L`, before the other keys.
+        let keys = app.details.keys(false);
+        let lead = "Enter enable line wrapping · ↑↓/PgUp scroll · ← timeline · ";
+        let tail = "Esc leave · Alt+B close · Tab focus";
+        assert_eq!(
+            keys[..3],
+            [
+                format!("{lead}H/L sideways · r refresh · {tail}"),
+                format!("{lead}H/L sideways · {tail}"),
+                format!("{lead}{tail}"),
+            ]
+        );
+        keys_fit(&app, 200, "Esc leave", 0);
+        assert_eq!(across(&mut app), 0);
+        shift(&mut app, KeyCode::Right);
+        let half = across(&mut app);
+        assert!(half > 10, "{half}");
+        press(&mut app, KeyCode::Char('L'));
+        assert_eq!(across(&mut app), 2 * half);
+        press(&mut app, KeyCode::Char('H'));
+        assert_eq!(across(&mut app), half);
+        shift(&mut app, KeyCode::Left);
+        assert_eq!(across(&mut app), 0);
+        cells(&mut app, 200, 50);
+        let body = app.details.drawn.expect("the pane").body;
+        assert!(mouse(
+            &mut app,
+            MouseEventKind::ScrollRight,
+            body.x + 2,
+            body.y + 2
+        ));
+        assert_eq!(across(&mut app), 4);
+        assert!(mouse(
+            &mut app,
+            MouseEventKind::ScrollLeft,
+            body.x + 2,
+            body.y + 2
+        ));
+        assert_eq!(across(&mut app), 0);
+        assert_eq!(app.details.pulls.tabs(), Some(Tab::Code));
+
+        // On the other tabs Shift and the arrows act as the arrows do.
+        press(&mut app, KeyCode::Left);
+        assert_eq!(app.details.pulls.tabs(), Some(Tab::Timeline));
+        shift(&mut app, KeyCode::Left);
+        assert_eq!(app.details.pulls.tabs(), Some(Tab::Summary));
+        shift(&mut app, KeyCode::Right);
+        assert_eq!(app.details.pulls.tabs(), Some(Tab::Timeline));
+        shift(&mut app, KeyCode::Right);
+        assert_eq!(app.details.pulls.tabs(), Some(Tab::Code));
+        cells(&mut app, 200, 50);
+        assert!(mouse(
+            &mut app,
+            MouseEventKind::ScrollRight,
+            body.x + 2,
+            body.y + 2
+        ));
+        assert_eq!(across(&mut app), 4);
+
+        // In a dialog the wheel scrolls them where it turns over the dialog.
+        cells(&mut app, 80, 24);
+        let drawn = app.details.drawn.expect("the dialog");
+        assert_eq!(drawn.layout, details::Layout::Dialog);
+        assert_eq!(across_at(&mut app, (80, 24)), 4);
+        let (x, y) = (drawn.body.x + 2, drawn.body.y + 2);
+        assert!(mouse(&mut app, MouseEventKind::ScrollRight, x, y));
+        assert_eq!(across_at(&mut app, (80, 24)), 8);
+        assert!(!mouse(&mut app, MouseEventKind::ScrollRight, 0, 0));
+        assert!(mouse(&mut app, MouseEventKind::ScrollLeft, x, y));
+        assert_eq!(across_at(&mut app, (80, 24)), 4);
     }
 
     #[test]

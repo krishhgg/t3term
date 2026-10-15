@@ -6865,6 +6865,176 @@ mod tests {
     }
 
     #[test]
+    fn lines_that_dont_wrap_scroll_sideways_and_keep_their_numbers() {
+        let theme = theme();
+        let mut activity = remarks(1);
+        activity["commits"] = json!([{"oid": "0000001abc", "messageHeadline": "Commit 1",
+            "committedDate": "2026-10-13T00:01:00Z"}]);
+        let mut pulls = conversing(activity);
+        assert!(!pulls.answer(1, Part::Done, now()));
+        assert!(pulls.forward() && pulls.forward());
+        // 60 letters, which no 20 columns of repeat.
+        let long: String = "abcdefghijklmnopqrstuvwxyz".repeat(3)[..60].to_string();
+        let diff = || {
+            let patch = format!(
+                "diff --git a/f.rs b/f.rs\n--- a/f.rs\n+++ b/f.rs\n@@ -1 +1 @@\n-a\n+{long}\n"
+            );
+            Box::new(pull_request::Diff {
+                patch,
+                truncated: false,
+                next_cursor: None,
+                omitted: Vec::new(),
+                omitted_cut: false,
+            })
+        };
+        let ask = pulls.take_diff_ask(true, now()).expect("the first slice");
+        assert!(pulls.answer_diff(ask.ticket, Ok(diff()), now()));
+        // The rows of the file's lines on a page 40 columns wide.
+        let lines = |pulls: &mut PullRequests| {
+            let page = pulls.page(40, 30, now(), true, &theme);
+            let rows = rows_of(&page.lines);
+            let header = rows.iter().position(|row| row.starts_with("⌄ M f.rs"));
+            let header = header.expect("the file unfolded");
+            rows[header + 1..]
+                .iter()
+                .take_while(|row| !row.starts_with('⋯'))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        pulls.pick = Some(Control::Folds);
+        pulls.enter();
+        // While the lines wrap, nothing scrolls sideways.
+        assert_eq!(
+            lines(&mut pulls),
+            [
+                "1 - a",
+                "1 + abcdefghijklmnopqrstuvwxyzabcdefghij",
+                "    klmnopqrstuvwxyzabcdefgh"
+            ]
+        );
+        assert!(!pulls.slides());
+        pulls.sideways(true);
+        pulls.wheel_sideways(true);
+        assert_eq!(pulls.across, 0);
+
+        // Once they don't, the text past the numbers and marks scrolls half the width at a
+        // time, until the end of the widest line shows.
+        pulls.pick = Some(Control::Wrap);
+        pulls.enter();
+        assert_eq!(pulls.pick, Some(Control::Wrap));
+        assert_eq!(
+            lines(&mut pulls),
+            ["1 - a", "1 + abcdefghijklmnopqrstuvwxyzabcdefghij"]
+        );
+        assert!(pulls.slides());
+        assert_eq!(pulls.take_diff_ask(true, now()), None, "nothing to read");
+        pulls.sideways(true);
+        assert_eq!(pulls.across, 20);
+        assert_eq!(
+            lines(&mut pulls),
+            ["1 -", "1 + uvwxyzabcdefghijklmnopqrstuvwxyzabcd"]
+        );
+        pulls.sideways(true);
+        assert_eq!(pulls.across, 24);
+        assert_eq!(
+            lines(&mut pulls),
+            ["1 -", "1 + yzabcdefghijklmnopqrstuvwxyzabcdefgh"]
+        );
+        pulls.sideways(false);
+        assert_eq!(pulls.across, 4);
+        // The wheel turns 4 columns at a time.
+        pulls.wheel_sideways(false);
+        assert_eq!(pulls.across, 0);
+        pulls.wheel_sideways(false);
+        assert_eq!(pulls.across, 0);
+        pulls.wheel_sideways(true);
+        assert_eq!(pulls.across, 4);
+        assert_eq!(
+            lines(&mut pulls),
+            ["1 -", "1 + efghijklmnopqrstuvwxyzabcdefghijklmn"]
+        );
+
+        // The other tabs neither scroll it nor lose it.
+        assert!(pulls.back() && pulls.back());
+        assert!(!pulls.slides());
+        pulls.sideways(true);
+        pulls.wheel_sideways(true);
+        assert_eq!(pulls.across, 4);
+        assert!(pulls.forward() && pulls.forward());
+        assert_eq!(pulls.across, 4);
+
+        // A wider page shows more of the line, and scrolls back as far as it must.
+        pulls.page(60, 30, now(), true, &theme);
+        assert_eq!(pulls.across, 4);
+        pulls.page(70, 30, now(), true, &theme);
+        assert_eq!(pulls.across, 0);
+        assert!(!pulls.slides());
+        pulls.wheel_sideways(true);
+        pulls.page(40, 30, now(), true, &theme);
+        assert_eq!(pulls.across, 0, "nothing was wider than the details");
+        pulls.wheel_sideways(true);
+        assert_eq!(pulls.across, 4);
+
+        // Wrapping the lines again takes them back.
+        pulls.pick = Some(Control::Wrap);
+        pulls.enter();
+        lines(&mut pulls);
+        assert_eq!(pulls.across, 0);
+        pulls.enter();
+        lines(&mut pulls);
+        pulls.wheel_sideways(true);
+        assert_eq!(pulls.across, 4);
+
+        // So does another diff picked from the commits, and the details shown again.
+        pulls.pick = Some(Control::Commits);
+        pulls.enter();
+        pulls.page(40, 30, now(), true, &theme);
+        pulls.pick = Some(Control::Commit(0));
+        pulls.enter();
+        assert_eq!(pulls.across, 0);
+        let ask = pulls
+            .take_diff_ask(true, now())
+            .expect("the commit's slice");
+        assert!(pulls.answer_diff(ask.ticket, Ok(diff()), now()));
+        pulls.pick = Some(Control::Folds);
+        pulls.enter();
+        lines(&mut pulls);
+        pulls.sideways(true);
+        assert_eq!(pulls.across, 20);
+        pulls.toggle();
+        pulls.toggle();
+        assert_eq!(pulls.across, 0);
+    }
+
+    #[test]
+    fn a_row_slid_sideways_keeps_its_lead_and_styles_and_cuts_wide_characters() {
+        let red = Style::new().fg(Color::Red);
+        let line = Line::from(vec![Span::raw("1 + "), Span::styled("ab日本cd", red)])
+            .style(Style::new().bg(Color::Blue));
+        // The lead takes columns 0 to 4, then a, b, 日 from 6 to 8, 本 from 8 to 10, c and d.
+        let row = |across, width| slid(&line, 4, across, width).to_string();
+        assert_eq!(row(0, 12), "1 + ab日本cd");
+        assert_eq!(row(0, 40), "1 + ab日本cd");
+        // One the right edge cuts doesn't show.
+        assert_eq!(row(0, 9), "1 + ab日");
+        assert_eq!(row(0, 3), "1 +");
+        assert_eq!(row(2, 12), "1 + 日本cd");
+        // One the left edge cuts shows as spaces where its right part was.
+        assert_eq!(row(3, 12), "1 +  本cd");
+        assert_eq!(row(4, 12), "1 + 本cd");
+        assert_eq!(row(5, 12), "1 +  cd");
+        assert_eq!(row(5, 5), "1 +  ");
+        assert_eq!(row(8, 12), "1 + ");
+        assert_eq!(row(30, 12), "1 + ");
+        // Each span keeps its style, and the row its own.
+        let slid = slid(&line, 4, 3, 12);
+        assert_eq!(slid.style, Style::new().bg(Color::Blue));
+        assert_eq!(slid.spans, [Span::raw("1 + "), Span::styled(" 本cd", red)]);
+        // A span the edge hides whole leaves no empty span.
+        assert_eq!(super::slid(&line, 4, 10, 12).spans, [Span::raw("1 + ")]);
+    }
+
+    #[test]
     fn enter_or_a_click_unfolds_a_file_and_a_slice_that_failed_reads_again() {
         let theme = theme();
         let mut pulls = on_code();
