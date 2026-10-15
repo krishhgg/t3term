@@ -13975,8 +13975,20 @@ mod tests {
         let rows = body_after(&mut app, 200, 50);
         let text: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
         assert_eq!(
-            text[4..8],
-            ["1 file", "⇊ Expand all files", "", "› M src/lib.rs +1 -1"]
+            text[4..9],
+            [
+                "1 file",
+                "¶ Show whitespace changes",
+                "⇊ Expand all files",
+                "",
+                "› M src/lib.rs +1 -1"
+            ]
+        );
+        press(&mut app, KeyCode::Down);
+        let shown = status(&mut app);
+        assert!(
+            shown.contains("Enter show whitespace changes · "),
+            "{shown}"
         );
         press(&mut app, KeyCode::Down);
         let shown = status(&mut app);
@@ -13987,7 +13999,7 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         let rows = body_after(&mut app, 200, 50);
         let text: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
-        assert_eq!(text[7..10], ["⌄ M src/lib.rs +1 -1", "1 - old", "1 + new"]);
+        assert_eq!(text[8..11], ["⌄ M src/lib.rs +1 -1", "1 - old", "1 + new"]);
         press(&mut app, KeyCode::Right);
         assert_eq!(app.details.pulls.tabs(), Some(Tab::Code));
         assert_eq!(*diffs.borrow(), [named, again]);
@@ -14517,7 +14529,7 @@ mod tests {
             .unwrap_or_else(|| panic!("{rows:#?}"));
         let notes = rows[at + 1..]
             .iter()
-            .take_while(|row| !row.starts_with('⇊'));
+            .take_while(|row| !row.starts_with('¶'));
         let notes: Vec<&str> = notes.copied().collect();
         let says = format!("t3term couldn't read which files you viewed. {reason}");
         assert_eq!(notes.join(" "), says);

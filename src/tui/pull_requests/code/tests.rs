@@ -113,6 +113,7 @@ fn files_show_folded_and_each_unfolds_into_its_hunks() {
         rows(&code, 40),
         [
             "5 files",
+            "¶ Show whitespace changes",
             "⇊ Expand all files",
             "",
             "› A docs/new.md +2 -0",
@@ -127,10 +128,10 @@ fn files_show_folded_and_each_unfolds_into_its_hunks() {
         ]
     );
     let (_, targets) = laid(&code, 40);
-    let files = [3..4, 5..6, 7..8, 9..10, 11..12]
+    let files = [4..5, 6..7, 8..9, 10..11, 12..13]
         .into_iter()
         .zip((0..5).map(Control::File));
-    let folds = [(1..2, Control::Folds)];
+    let folds = [(1..2, Control::Whitespace), (2..3, Control::Folds)];
     assert_eq!(targets, folds.into_iter().chain(files).collect::<Vec<_>>());
     assert_eq!(code.action(Control::File(0), &[]), "expand file");
 
@@ -144,6 +145,7 @@ fn files_show_folded_and_each_unfolds_into_its_hunks() {
         rows(&code, 40),
         [
             "5 files",
+            "¶ Show whitespace changes",
             "⇈ Collapse all files",
             "",
             "⌄ A docs/new.md +2 -0",
@@ -175,9 +177,9 @@ fn files_show_folded_and_each_unfolds_into_its_hunks() {
         ]
     );
     let (_, targets) = laid(&code, 40);
-    assert_eq!(targets[2], (8..9, Control::File(1)));
+    assert_eq!(targets[3], (9..10, Control::File(1)));
     code.act(Control::File(0), &[]);
-    assert_eq!(rows(&code, 40)[3..5], ["› A docs/new.md +2 -0", ""]);
+    assert_eq!(rows(&code, 40)[4..6], ["› A docs/new.md +2 -0", ""]);
 }
 
 #[test]
@@ -206,25 +208,25 @@ fn one_row_unfolds_every_file_and_folds_them_all_again() {
     // them all, as the desktop's toolbar button does.
     let mut code = read(slice(PATCH, Some("2")), 0);
     assert!(code.has(Control::Folds, &[]));
-    assert_eq!(rows(&code, 40)[1], "⇊ Expand all files");
+    assert_eq!(rows(&code, 40)[2], "⇊ Expand all files");
     let (lines, targets) = laid(&code, 40);
-    assert_eq!(targets[0], (1..2, Control::Folds));
+    assert_eq!(targets[1], (2..3, Control::Folds));
     assert_eq!(color_of(&lines, "⇊ Expand all files"), Some(theme().fg));
     assert_eq!(code.action(Control::Folds, &[]), "expand all files");
     code.act(Control::File(2), &[]);
-    assert_eq!(rows(&code, 40)[1], "⇈ Collapse all files");
+    assert_eq!(rows(&code, 40)[2], "⇈ Collapse all files");
     assert_eq!(code.action(Control::Folds, &[]), "collapse all files");
     assert!(!code.act(Control::Folds, &[]), "the diff is the same");
     assert_eq!(unfolded(&code), [false; 5]);
-    assert_eq!(rows(&code, 40)[1], "⇊ Expand all files");
+    assert_eq!(rows(&code, 40)[2], "⇊ Expand all files");
     code.act(Control::Folds, &[]);
     assert_eq!(unfolded(&code), [true; 5]);
-    assert_eq!(rows(&code, 40)[1], "⇈ Collapse all files");
+    assert_eq!(rows(&code, 40)[2], "⇈ Collapse all files");
     assert!(rows(&code, 40).contains(&"1 + # New".to_string()));
 
     // A file folded after stays so, and one read later shows unfolded.
     code.act(Control::File(0), &[]);
-    assert_eq!(rows(&code, 40)[1], "⇈ Collapse all files");
+    assert_eq!(rows(&code, 40)[2], "⇈ Collapse all files");
     let later = "diff --git a/z b/z\n--- a/z\n+++ b/z\n@@ -1 +1 @@\n-a\n+b\n";
     code.near_end();
     assert_eq!(code.ask(2), Some(Some("2".to_string())));
@@ -239,7 +241,7 @@ fn one_row_unfolds_every_file_and_folds_them_all_again() {
         code.act(Control::File(at), &[]);
     }
     assert_eq!(unfolded(&code), [false; 6]);
-    assert_eq!(rows(&code, 40)[1], "⇊ Expand all files");
+    assert_eq!(rows(&code, 40)[2], "⇊ Expand all files");
     code.act(Control::Folds, &[]);
     assert_eq!(unfolded(&code), [true; 6]);
 
@@ -253,12 +255,12 @@ fn one_row_unfolds_every_file_and_folds_them_all_again() {
     assert_eq!(code.ask(4), Some(None));
     assert_eq!(code.take(4, Ok(slice(PATCH, None)), 0), Some(true));
     assert_eq!(unfolded(&code), [false; 5]);
-    assert_eq!(rows(&code, 40)[1], "⇊ Expand all files");
+    assert_eq!(rows(&code, 40)[2], "⇊ Expand all files");
 
     // The row wraps whole at a narrow width, and every row leads to it.
     let (lines, targets) = laid(&code, 8);
-    assert_eq!(rows_of(&lines)[1..4], ["⇊ Expand", "all", "files"]);
-    assert_eq!(targets[0], (1..4, Control::Folds));
+    assert_eq!(rows_of(&lines)[5..8], ["⇊ Expand", "all", "files"]);
+    assert_eq!(targets[1], (5..8, Control::Folds));
 }
 
 #[test]
@@ -282,6 +284,7 @@ fn the_unchanged_lines_before_a_hunk_count_from_the_line_git_names() {
         rows(&code, 40),
         [
             "1 file",
+            "¶ Show whitespace changes",
             "⇈ Collapse all files",
             "",
             "⌄ M a +2 -2",
@@ -303,7 +306,7 @@ fn the_unchanged_lines_before_a_hunk_count_from_the_line_git_names() {
 ";
     let mut code = read(slice(patch, None), 0);
     code.act(Control::File(0), &[]);
-    assert_eq!(rows(&code, 40)[4], "⋯ 1 unmodified line");
+    assert_eq!(rows(&code, 40)[5], "⋯ 1 unmodified line");
 }
 
 #[test]
@@ -333,6 +336,7 @@ fn the_first_slice_is_read_once_and_the_next_as_the_end_comes_near() {
         rows(&code, 40),
         [
             "1 file+",
+            "¶ Show whitespace changes",
             "⇊ Expand all files",
             "",
             "› M one +1 -1",
@@ -356,6 +360,7 @@ fn the_first_slice_is_read_once_and_the_next_as_the_end_comes_near() {
         rows(&code, 40),
         [
             "2 files",
+            "¶ Show whitespace changes",
             "⇊ Expand all files",
             "",
             "› M one +1 -1",
@@ -404,6 +409,7 @@ fn a_failure_says_why_and_a_later_slice_s_offers_retry() {
         rows(&code, 40),
         [
             "1 file+",
+            "¶ Show whitespace changes",
             "⇊ Expand all files",
             "",
             "› M one +1 -1",
@@ -415,7 +421,7 @@ fn a_failure_says_why_and_a_later_slice_s_offers_retry() {
         ]
     );
     let (_, targets) = laid(&code, 40);
-    assert_eq!(targets[2], (8..9, Control::Retry));
+    assert_eq!(targets[3], (9..10, Control::Retry));
     assert!(code.has(Control::Retry, &[]));
     assert_eq!(code.action(Control::Retry, &[]), "retry");
     code.act(Control::Retry, &[]);
@@ -434,6 +440,7 @@ fn a_failure_says_why_and_a_later_slice_s_offers_retry() {
         "May be out of date: t3term couldn't read",
         "the diff again.",
         "Gone.",
+        "¶ Show whitespace changes",
         "⇊ Expand all files",
         "",
         "› M one +1 -1",
@@ -488,6 +495,7 @@ diff --git a/two b/two
         rows(&code, 80),
         [
             "1 file",
+            "¶ Show whitespace changes",
             "⇈ Collapse all files",
             "",
             "⌄ M two +1 -1",
@@ -621,6 +629,7 @@ diff --git a/small b/small
             "2 files",
             "The host withheld part of this diff, such as a binary file",
             "or a change too large to show.",
+            "¶ Show whitespace changes",
             "⇈ Collapse all files",
             "",
             "⌄ M big.json +12,000 -3",
@@ -664,6 +673,7 @@ fn an_empty_or_unreadable_diff_says_so() {
         rows(&code, 60),
         [
             "2 files",
+            "¶ Show whitespace changes",
             "⇈ Collapse all files",
             "",
             "⌄ M a",
@@ -721,6 +731,7 @@ diff --git a/other b/other
         rows(&code, 40),
         [
             "2 files",
+            "¶ Show whitespace changes",
             "⇊ Expand all files",
             "",
             "› A link +1 -0",
@@ -774,10 +785,12 @@ fn every_row_fits_its_width_and_hostile_text_is_cleaned() {
         }
         assert!(targets.iter().all(|(rows, _)| rows.end <= lines.len()));
     }
-    // Every row of a header leads to the file, after the row that folds them all.
+    // Every row of a header leads to the file, after the rows for the whitespace and that fold
+    // them all.
     let (lines, targets) = laid(&code, 12);
-    assert_eq!(targets[0], (1..3, Control::Folds));
-    let (header, _) = &targets[1];
+    assert_eq!(targets[0], (1..4, Control::Whitespace));
+    assert_eq!(targets[1], (4..6, Control::Folds));
+    let (header, _) = &targets[2];
     assert!(header.len() > 1, "{:?}", rows_of(&lines));
     assert_eq!(rows_of(&lines)[header.start], "⌄ M src/]8;;");
     // A line's rows after its first leave its number and mark blank.
@@ -949,15 +962,16 @@ fn review_threads_show_under_their_lines() {
     // The rest show above the files in a list that starts closed: one on a line no hunk has,
     // one on the file, and one on a file not in the diff.
     assert_eq!(
-        rows[1..5],
+        rows[1..6],
         [
+            "¶ Show whitespace changes",
             "⇈ Collapse all files",
             "",
             "› 3 conversations not on the current",
             "diff"
         ]
     );
-    assert_eq!(targets[1], (3..5, Control::OffDiff));
+    assert_eq!(targets[2], (4..6, Control::OffDiff));
     assert!(code.shows(Control::OffDiff, conversation.threads(), &shown));
     assert!(!code.shows(Control::Thread(4), conversation.threads(), &shown));
     shown.act(Control::OffDiff, &conversation);
@@ -976,8 +990,8 @@ fn review_threads_show_under_their_lines() {
     expected.extend([String::new(), "gone.rs".into(), "Line 1".into()]);
     expected.extend(open("Gone."));
     expected.push(String::new());
-    assert_eq!(rows[3..3 + expected.len()], expected);
-    assert_eq!(rows[3 + expected.len()], "› A docs/new.md +2 -0");
+    assert_eq!(rows[4..4 + expected.len()], expected);
+    assert_eq!(rows[4 + expected.len()], "› A docs/new.md +2 -0");
 
     // Opening the resolved thread shows its remark, and closing an open one hides its own.
     shown.act(Control::Thread(7), &conversation);
@@ -1048,6 +1062,7 @@ diff --git a/b b/b
     };
     let mut expected = vec![
         "2 files".to_string(),
+        "¶ Show whitespace changes".into(),
         "⇈ Collapse all files".into(),
         String::new(),
         "› 1 conversation not on the current diff".into(),
@@ -1632,10 +1647,11 @@ fn the_list_of_commits_picks_the_diff_the_tab_reads() {
     assert_eq!(code.take(3, Ok(slice(PATCH, None)), 10), Some(true));
     let (rows, _) = scoped(&code, &conversation, &shown, 40);
     assert_eq!(
-        rows[..5],
+        rows[..6],
         [
             "› Zone · bbbbbbb",
             "5 files",
+            "¶ Show whitespace changes",
             "⇊ Expand all files",
             "",
             "› 1 conversation not on the current diff"
@@ -1754,10 +1770,23 @@ fn the_list_shows_10_commits_at_a_time_and_a_rebase_takes_it_back_to_all() {
     assert_eq!(code.take(3, Ok(slice(ONE, None)), 10), Some(true));
     let (rows, targets) = scoped(&code, &none, &shown, 40);
     assert_eq!(
-        rows[..4],
-        ["1 file", "⇊ Expand all files", "", "› M a +1 -1"]
+        rows[..5],
+        [
+            "1 file",
+            "¶ Show whitespace changes",
+            "⇊ Expand all files",
+            "",
+            "› M a +1 -1"
+        ]
     );
-    assert_eq!(targets, [(1..2, Control::Folds), (3..4, Control::File(0))]);
+    assert_eq!(
+        targets,
+        [
+            (1..2, Control::Whitespace),
+            (2..3, Control::Folds),
+            (4..5, Control::File(0))
+        ]
+    );
 }
 
 #[test]
@@ -1889,9 +1918,15 @@ fn the_unchanged_lines_around_hunks_show_a_run_at_a_time() {
     let mut code = read(slice(STRETCHED, None), 0);
     assert!(!code.has(Control::Stretch(0, 1), &[]), "folded");
     code.act(Control::File(0), &[]);
-    let header = ["1 file", "⇈ Collapse all files", "", "⌄ M f.rs +3 -3"]
-        .map(String::from)
-        .to_vec();
+    let header = [
+        "1 file",
+        "¶ Show whitespace changes",
+        "⇈ Collapse all files",
+        "",
+        "⌄ M f.rs +3 -3",
+    ]
+    .map(String::from)
+    .to_vec();
     let mut rows_before = header.clone();
     rows_before.extend(
         [
@@ -1913,7 +1948,7 @@ fn the_unchanged_lines_around_hunks_show_a_run_at_a_time() {
         .into_iter()
         .map(|(place, row, _)| (place, row))
         .collect();
-    assert_eq!(counted, [(0, 4), (1, 7), (2, 10), (3, 13)]);
+    assert_eq!(counted, [(0, 5), (1, 8), (2, 11), (3, 14)]);
     for place in 0..4 {
         assert!(code.has(Control::Stretch(0, place), &[]), "{place}");
     }
@@ -1929,8 +1964,8 @@ fn the_unchanged_lines_around_hunks_show_a_run_at_a_time() {
     // rows laid out before go.
     code.prepare(80, &theme());
     assert!(!code.act(Control::Stretch(0, 1), &[]));
-    assert_eq!(rows(&code, 80)[7], "⋯ 250 unmodified lines · Reading…");
-    assert_eq!(rows(&code, 80)[4], "⋯ 2 unmodified lines");
+    assert_eq!(rows(&code, 80)[8], "⋯ 250 unmodified lines · Reading…");
+    assert_eq!(rows(&code, 80)[5], "⋯ 2 unmodified lines");
     let asked = code.ask_text(5);
     assert_eq!(
         asked,
@@ -1960,7 +1995,7 @@ fn the_unchanged_lines_around_hunks_show_a_run_at_a_time() {
         .into_iter()
         .map(|(place, row, _)| (place, row))
         .collect();
-    assert_eq!(counted, [(0, 4), (1, 107), (3, 213)]);
+    assert_eq!(counted, [(0, 5), (1, 108), (3, 214)]);
 
     // Before the first hunk, the lines nearest it show, and after the last, those nearest it.
     // With the text read, Enter shows them at once.
@@ -1968,7 +2003,7 @@ fn the_unchanged_lines_around_hunks_show_a_run_at_a_time() {
     code.act(Control::Stretch(0, 0), &[]);
     assert_eq!(code.ask_text(7), None);
     let rows_now = rows(&code, 80);
-    assert_eq!(rows_now[4..7], ["  1   l1", "  2   l2", "  3 - o3"]);
+    assert_eq!(rows_now[5..8], ["  1   l1", "  2   l2", "  3 - o3"]);
     assert!(!code.has(Control::Stretch(0, 0), &[]));
     code.prepare(80, &theme());
     code.act(Control::Stretch(0, 3), &[]);
@@ -2001,7 +2036,7 @@ fn the_unchanged_lines_around_hunks_show_a_run_at_a_time() {
     code.act(Control::File(0), &[]);
     assert!(!code.has(Control::Stretch(0, 1), &[]));
     code.act(Control::File(0), &[]);
-    assert_eq!(rows(&code, 80).len(), 4 + 403);
+    assert_eq!(rows(&code, 80).len(), 5 + 403);
 }
 
 #[test]
@@ -2033,10 +2068,10 @@ fn a_failed_read_says_why_and_enter_reads_again() {
         rows_now.last().unwrap(),
         "⋯ More unchanged context may be available"
     );
-    assert_eq!(rows_now[7], "⋯ 250 unmodified lines · Reading…");
+    assert_eq!(rows_now[8], "⋯ 250 unmodified lines · Reading…");
     assert!(code.ask_text(3).is_some());
     assert!(code.take_text(3, text(numbered(400))));
-    assert_eq!(rows(&code, 80)[107], "⋯ 50 unmodified lines");
+    assert_eq!(rows(&code, 80)[108], "⋯ 50 unmodified lines");
 }
 
 #[test]
@@ -2048,9 +2083,9 @@ fn text_that_doesnt_match_the_diff_shows_nothing_of_it() {
         assert!(code.ask_text(2).is_some());
         assert!(code.take_text(2, text(new)));
         let rows_now = rows(&code, 80);
-        let failed = rows_now[8].starts_with("This file's text doesn't match");
+        let failed = rows_now[9].starts_with("This file's text doesn't match");
         if failed {
-            assert_eq!(rows_now[7], "⋯ 250 unmodified lines");
+            assert_eq!(rows_now[8], "⋯ 250 unmodified lines");
         }
         failed
     };
@@ -2079,6 +2114,7 @@ fn text_that_doesnt_match_the_diff_shows_nothing_of_it() {
         rows(&code, 80),
         [
             "1 file",
+            "¶ Show whitespace changes",
             "⇈ Collapse all files",
             "",
             "⌄ M g +0 -2",
@@ -2092,11 +2128,11 @@ fn text_that_doesnt_match_the_diff_shows_nothing_of_it() {
     assert!(code.ask_text(2).is_some());
     assert!(code.take_text(2, text("a\nb\n".into())));
     assert_eq!(
-        rows(&code, 80)[4..],
+        rows(&code, 80)[5..],
         ["⋯ 2 unmodified lines", "3 - x", "4 - y"]
     );
     code.act(Control::Stretch(0, 0), &[]);
-    assert_eq!(rows(&code, 80)[4..6], ["1   a", "2   b"]);
+    assert_eq!(rows(&code, 80)[5..7], ["1   a", "2   b"]);
     assert!(fits("a\n", removal, &patch::Patch::read(removal).files[0]).is_none());
 }
 
@@ -2210,7 +2246,7 @@ fn the_text_stays_while_the_hunks_do_and_goes_with_another_diff() {
         code.act(Control::Stretch(0, 1), &[]);
         assert!(code.ask_text(ticket).is_some());
         assert!(code.take_text(ticket, text(numbered(400))));
-        assert_eq!(rows(code, 80)[107], "⋯ 50 unmodified lines");
+        assert_eq!(rows(code, 80)[108], "⋯ 50 unmodified lines");
     };
     let mut code = read(slice(STRETCHED, None), 0);
     code.act(Control::File(0), &[]);
@@ -2220,14 +2256,14 @@ fn the_text_stays_while_the_hunks_do_and_goes_with_another_diff() {
     code.again();
     assert_eq!(code.ask(3), Some(None));
     assert_eq!(code.take(3, Ok(slice(STRETCHED, None)), 1), Some(true));
-    assert_eq!(rows(&code, 80)[107], "⋯ 50 unmodified lines");
+    assert_eq!(rows(&code, 80)[108], "⋯ 50 unmodified lines");
 
     // A change to a hunk takes the file back to its rows before the text came.
     let changed = STRETCHED.replace("-o256", "-p256");
     code.again();
     assert_eq!(code.ask(4), Some(None));
     assert_eq!(code.take(4, Ok(slice(&changed, None)), 2), Some(true));
-    assert_eq!(rows(&code, 80)[7], "⋯ 250 unmodified lines");
+    assert_eq!(rows(&code, 80)[8], "⋯ 250 unmodified lines");
     shown_after_read(&mut code, 5);
 
     // A file the first slice of a read again doesn't have keeps its text while slices are
@@ -2254,7 +2290,7 @@ fn the_text_stays_while_the_hunks_do_and_goes_with_another_diff() {
     code.again();
     assert_eq!(code.ask(9), Some(None));
     assert_eq!(code.take(9, Ok(slice(&changed, None)), 5), Some(true));
-    assert_eq!(rows(&code, 80)[7], "⋯ 250 unmodified lines");
+    assert_eq!(rows(&code, 80)[8], "⋯ 250 unmodified lines");
 
     // An answer for a file the diff no longer shows is dropped.
     code.act(Control::Stretch(0, 1), &[]);
@@ -2273,7 +2309,7 @@ fn the_text_stays_while_the_hunks_do_and_goes_with_another_diff() {
     assert_eq!(code.ask(3), Some(None));
     assert_eq!(code.take(3, Ok(slice(STRETCHED, None)), 1), Some(true));
     code.act(Control::File(0), &[]);
-    assert_eq!(rows(&code, 80)[7], "⋯ 250 unmodified lines");
+    assert_eq!(rows(&code, 80)[8], "⋯ 250 unmodified lines");
 }
 
 #[test]
@@ -2291,7 +2327,7 @@ fn a_files_text_goes_when_its_hunks_or_paths_change() {
     };
     let unread = |code: &Code, before: &str, between: &str| {
         let rows_now = rows(code, 80);
-        assert_eq!(rows_now[4], before, "{rows_now:#?}");
+        assert_eq!(rows_now[5], before, "{rows_now:#?}");
         assert!(rows_now.contains(&between.to_string()), "{rows_now:#?}");
         assert!(
             !rows_now.iter().any(|row| row.ends_with("   l4")),
@@ -2367,10 +2403,10 @@ fn a_run_shows_the_lines_nearest_its_hunk_and_widens_the_numbers() {
     assert!(code.ask_text(2).is_some());
     assert!(code.take_text(2, text(numbered(260))));
     let rows_now = rows(&code, 80);
-    assert_eq!(rows_now[4], "⋯ 150 unmodified lines");
-    assert_eq!(rows_now[5..105], unchanged(151..=250, 3));
+    assert_eq!(rows_now[5], "⋯ 150 unmodified lines");
+    assert_eq!(rows_now[6..106], unchanged(151..=250, 3));
     assert_eq!(
-        rows_now[105..],
+        rows_now[106..],
         ["251 - o251", "251 + l251", "⋯ 9 unmodified lines"]
     );
 
@@ -2378,16 +2414,16 @@ fn a_run_shows_the_lines_nearest_its_hunk_and_widens_the_numbers() {
     let early = "diff --git a/g.rs b/g.rs\n--- a/g.rs\n+++ b/g.rs\n@@ -98 +98 @@\n-o98\n+l98\n";
     let mut code = read(slice(early, None), 0);
     code.act(Control::File(0), &[]);
-    assert_eq!(rows(&code, 80)[5..7], ["98 - o98", "98 + l98"]);
+    assert_eq!(rows(&code, 80)[6..8], ["98 - o98", "98 + l98"]);
     code.act(Control::Stretch(0, 1), &[]);
     assert!(code.ask_text(2).is_some());
     assert!(code.take_text(2, text(numbered(150))));
     let rows_now = rows(&code, 80);
     assert_eq!(
-        rows_now[4..7],
+        rows_now[5..8],
         ["⋯ 97 unmodified lines", " 98 - o98", " 98 + l98"]
     );
-    assert_eq!(rows_now[7..], unchanged(99..=150, 3));
+    assert_eq!(rows_now[8..], unchanged(99..=150, 3));
 }
 
 #[test]
@@ -2573,6 +2609,7 @@ fn the_count_and_each_header_say_which_files_are_viewed() {
     );
     assert!(code.take_viewed(2, answer, 1_000));
     let marked = [
+        "¶ Show whitespace changes",
         "⇊ Expand all files",
         "",
         "› A docs/new.md +2 -0",
@@ -2610,7 +2647,7 @@ fn the_count_and_each_header_say_which_files_are_viewed() {
 
     // An unfolded file keeps its mark, and the count counts the slices read so far.
     code.act(Control::File(3), &[]);
-    assert_eq!(kept(&code, host, 60)[9], "⌄ M src/lib.rs +2 -1 · ✓ Viewed");
+    assert_eq!(kept(&code, host, 60)[10], "⌄ M src/lib.rs +2 -1 · ✓ Viewed");
     let mut more = read(slice(PATCH, Some("2")), 0);
     assert!(more.ask_viewed(2));
     assert!(more.take_viewed(2, marks(&[("old.txt", Viewed)], false, false), 0));
@@ -2661,8 +2698,13 @@ fn the_marks_keep_through_a_commits_diff_and_a_failure() {
     let answer = marks(&[("src/lib.rs", Viewed)], false, false);
     assert!(code.take_viewed(3, answer, 0));
     assert_eq!(
-        kept(&code, host, 60)[..3],
-        ["5 files · 1 / 5 viewed", "⇊ Expand all files", ""]
+        kept(&code, host, 60)[..4],
+        [
+            "5 files · 1 / 5 viewed",
+            "¶ Show whitespace changes",
+            "⇊ Expand all files",
+            ""
+        ]
     );
     // A failure after keeps the marks read and says they may be out of date.
     code.again();
@@ -2707,11 +2749,12 @@ fn a_short_read_of_the_marks_says_the_count_is_short() {
     assert!(code.ask_viewed(2));
     assert!(code.take_viewed(2, marks(&[], true, false), 0));
     assert_eq!(
-        kept(&code, host, 60)[..4],
+        kept(&code, host, 60)[..5],
         [
             "5 files · 0 / 5 viewed",
             "This change has more files than the host reports viewed",
             "marks for in one read, so the count is short.",
+            "¶ Show whitespace changes",
             "⇊ Expand all files",
         ]
     );
@@ -2734,8 +2777,12 @@ fn a_short_read_of_the_marks_says_the_count_is_short() {
     assert!(code.ask_viewed(4));
     assert!(code.take_viewed(4, marks(&[], false, false), 0));
     assert_eq!(
-        kept(&code, host, 80)[..2],
-        ["5 files · 0 / 5 viewed", "⇊ Expand all files"]
+        kept(&code, host, 80)[..3],
+        [
+            "5 files · 0 / 5 viewed",
+            "¶ Show whitespace changes",
+            "⇊ Expand all files"
+        ]
     );
 }
 
@@ -2816,7 +2863,7 @@ diff --git a/b.rs b/b.rs
     // Where the counts and the mark don't fit after the path, each takes a row of its own,
     // and a mark too long for one is cut.
     assert_eq!(
-        kept(&code, host, 24)[6..10],
+        kept(&code, host, 24)[8..12],
         [
             "› M src/a/rather/long/pa",
             "    th/to/a/file.rs",
