@@ -247,14 +247,14 @@ impl Control {
     /// Whether the Code tab's own state, rather than the conversation's, says what it does:
     /// a file, Retry and the list of commits.
     pub(super) fn on_code(self) -> bool {
+        matches!(self, Control::File(_) | Control::Retry) || self.on_commits()
+    }
+
+    /// Whether it is the list of commits, which stays above the files when a diff comes.
+    pub(super) fn on_commits(self) -> bool {
         matches!(
             self,
-            Control::File(_)
-                | Control::Retry
-                | Control::Commits
-                | Control::AllCommits
-                | Control::Commit(_)
-                | Control::MoreCommits
+            Control::Commits | Control::AllCommits | Control::Commit(_) | Control::MoreCommits
         )
     }
 

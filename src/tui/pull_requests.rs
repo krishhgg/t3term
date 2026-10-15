@@ -2298,7 +2298,9 @@ impl PullRequests {
 
     /// Takes the answer to read `ticket` of a slice of the diff, which came at `now`, or why it
     /// failed. Says whether what the details show changed. A first slice replaces the files
-    /// shown, so no control stays chosen. An answer to another read is dropped.
+    /// shown, so no control on them stays chosen. The list of commits above them keeps its
+    /// own, as the desktop's menu gives its button the focus back after a pick. An answer to
+    /// another read is dropped.
     pub fn answer_diff(
         &mut self,
         ticket: u64,
@@ -2309,7 +2311,7 @@ impl PullRequests {
         let Some(first) = code.and_then(|code| code.take(ticket, answer, now)) else {
             return false;
         };
-        if first {
+        if first && !self.pick.is_some_and(Control::on_commits) {
             self.pick = None;
         }
         self.relay();
@@ -6738,7 +6740,10 @@ mod tests {
 
         // A commit's diff places no thread, and picking another closes the list of those
         // off the diff.
+        // The diff that comes keeps the row that picked it chosen, where it chooses nothing
+        // on the files it replaced.
         assert!(pulls.answer_diff(3, Ok(added(0, 1, None)), now()));
+        assert_eq!(pulls.pick, Some(Control::Commits));
         pulls.page(60, 40, now(), true, &theme);
         let rows = detail_rows(&pulls);
         assert_eq!(
@@ -6762,7 +6767,9 @@ mod tests {
             pulls.take_diff_ask(true, now()),
             Some(scoped(4, Some("0000020abc")))
         );
+        pulls.pick = Some(Control::File(0));
         assert!(pulls.answer_diff(4, Ok(added(0, 1, None)), now()));
+        assert_eq!(pulls.pick, None);
         pulls.pick = Some(Control::OffDiff);
         pulls.enter();
         assert!(pulls.shown.off_diff_open());
