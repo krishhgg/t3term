@@ -41,12 +41,12 @@ use super::tasks::wrap;
 use super::theme::{Theme, age, parse_iso_ms, relative_time};
 use super::{clip, row, with_bg};
 use crate::pull_request::{self, BaseComparison, CheckStatus, Mergeability, ViewedFilesStore};
-use crate::transcript::without_controls;
+use crate::transcript::{clusters, without_controls};
 
 mod code;
 mod conversation;
 
-use code::{Code, Reads};
+use code::{Code, Reads, Sideways};
 use conversation::{Control, Conversation, Lifecycle, Reviewer, Shown, Targets};
 
 /// The most links read from a thread's record. The rest are counted and left unread.
@@ -66,6 +66,9 @@ const STAMP: usize = 64;
 const ENTRY_ROWS: usize = 3;
 /// The most rows each sentence of a list without links wraps to.
 const VALUE_ROWS: usize = 3;
+/// The columns a turn of the wheel sideways scrolls the Code tab's lines that don't wrap, a
+/// tab stop's.
+const WHEEL_COLUMNS: usize = 4;
 /// What a GitHub stack does, as the desktop's tooltip says it.
 const NATIVE_STACK: &str = "merging a layer lands the ones below it.";
 /// The note over a stack whose last read failed, as the desktop's `Stack data may be stale`.
@@ -802,6 +805,8 @@ struct Shape {
     viewing: bool,
     /// The first row of the details shown.
     scroll: usize,
+    /// How many columns the Code tab's lines that don't wrap are scrolled sideways.
+    across: usize,
     /// The minute the relative times read from.
     minute: i64,
     /// The control ↑ and ↓ chose in the details, which shows highlighted while they have the
@@ -890,6 +895,8 @@ struct Detail {
     lines: Vec<Line<'static>>,
     /// The rows of each control among the lines, in the order they show.
     targets: Targets,
+    /// The rows of the Code tab's lines that don't wrap, which scroll sideways.
+    sideways: Sideways,
 }
 
 /// How far the details are scrolled: a row from their top, or a number of rows up from where
@@ -1410,6 +1417,9 @@ pub(super) struct PullRequests {
     /// How far the details are scrolled. A frame turns it into the first row it shows, kept
     /// within the details.
     scroll: Offset,
+    /// How many columns the Code tab's lines are scrolled sideways while they don't wrap. A
+    /// frame of the Code tab keeps it within the widest line, so it is 0 while they wrap.
+    across: usize,
     /// The first link the last frame showed.
     top: usize,
     page: Option<Page>,
@@ -1472,6 +1482,7 @@ impl PullRequests {
         self.chosen = None;
         self.viewing = false;
         self.scroll = Offset::Top(0);
+        self.across = 0;
         self.top = 0;
         self.page = None;
         self.detail = None;
@@ -1601,6 +1612,48 @@ impl PullRequests {
         }
     }
 
+    /// Whether the Code tab shows lines that don't wrap and are wider than the details, as the
+    /// last frame laid them out, so they scroll sideways.
+    pub fn slides(&self) -> bool {
+        self.tabs() == Some(Tab::Code)
+            && self
+                .detail
+                .as_ref()
+                .is_some_and(|detail| detail.sideways.widest > detail.at.0)
+    }
+
+    /// Shift+→ or `L`, or Shift+← or `H` where `right` is false: scrolls the text of the Code
+    /// tab's lines that don't wrap half the details' width sideways, no further than the end
+    /// of the widest shows.
+    pub fn sideways(&mut self, right: bool) {
+        let half = self.detail.as_ref().map_or(1, |detail| detail.at.0 / 2);
+        self.slide(half.max(1), right);
+    }
+
+    /// A turn of the wheel sideways, as a trackpad sends it: scrolls the text of the Code tab's
+    /// lines that don't wrap `WHEEL_COLUMNS` columns, as `sideways` does.
+    pub fn wheel_sideways(&mut self, right: bool) {
+        self.slide(WHEEL_COLUMNS, right);
+    }
+
+    /// Scrolls the Code tab's lines that don't wrap `columns` sideways, right or left, no
+    /// further than the last frame showed they go.
+    fn slide(&mut self, columns: usize, right: bool) {
+        if !self.viewing || self.tabs() != Some(Tab::Code) {
+            return;
+        }
+        let across = match right {
+            true => self.across.saturating_add(columns),
+            false => self.across.saturating_sub(columns),
+        };
+        let most = self
+            .detail
+            .as_ref()
+            .filter(|detail| detail.index == self.selected)
+            .map(|detail| detail.sideways.widest.saturating_sub(detail.at.0));
+        self.across = most.map_or(across, |most| across.min(most));
+    }
+
     /// Scrolls a link's details `delta` rows, no further than the last frame showed they go.
     fn scroll_rows(&mut self, delta: isize) {
         {
@@ -1723,6 +1776,7 @@ impl PullRequests {
             let listed = code.listed(&commits);
             if code.act(control, &commits) {
                 self.shown.close_off_diff();
+                self.across = 0;
             }
             self.pick = match control {
                 // The list closes on the row that opened it, as a menu gives its button the
@@ -1808,6 +1862,7 @@ impl PullRequests {
         if code.show(oid) {
             self.shown.close_off_diff();
             self.kept[Tab::Code.place()] = Offset::Top(0);
+            self.across = 0;
         }
         self.switch(Tab::Code);
     }
@@ -1909,6 +1964,7 @@ impl PullRequests {
         } else if !entries_of(self.list.as_ref()).is_empty() {
             self.viewing = true;
             self.scroll = Offset::Top(0);
+            self.across = 0;
             self.tab = Tab::Summary;
             self.kept = Default::default();
             self.mounted = false;
@@ -2599,14 +2655,15 @@ impl PullRequests {
                     let read = self.read.as_ref().filter(|read| read.key == entry.key);
                     detail_lines(entry, read, &self.shown, tab, width, now, theme)
                 }
-                None => (Vec::new(), Vec::new()),
+                None => (Vec::new(), Vec::new(), Sideways::default()),
             };
-            let (lines, targets) = lines;
+            let (lines, targets, sideways) = lines;
             self.detail = Some(Detail {
                 index,
                 at,
                 lines,
                 targets,
+                sideways,
             });
         }
         self.detail.as_ref().map_or(0, |detail| detail.lines.len())
@@ -2624,7 +2681,7 @@ impl PullRequests {
         focused: bool,
         theme: &Theme,
     ) -> &Page {
-        let mut scroll = 0;
+        let (mut scroll, mut across) = (0, 0);
         if self.viewing {
             let total = self.prepare_detail(width, now, theme);
             // The row back to the list comes first.
@@ -2641,6 +2698,13 @@ impl PullRequests {
             if near && let Some(code) = self.read.as_mut().and_then(|read| read.code.as_mut()) {
                 code.near_end();
             }
+            // The Code tab's lines that don't wrap scroll sideways until the end of the widest
+            // shows, and the other tabs leave them where they were.
+            if self.tabs() == Some(Tab::Code) {
+                let widest = self.detail.as_ref().map_or(0, |d| d.sideways.widest);
+                across = self.across.min(widest.saturating_sub(width));
+                self.across = across;
+            }
         }
         let shape = Shape {
             width,
@@ -2649,6 +2713,7 @@ impl PullRequests {
             selected: self.selected,
             viewing: self.viewing,
             scroll,
+            across,
             minute: now.div_euclid(60_000),
             pick: self.pick.filter(|_| self.viewing),
             focused,
@@ -2795,12 +2860,24 @@ fn view(list: Option<&List>, detail: Option<&Detail>, shape: Shape, theme: &Them
     let mut targets = targets[targets.partition_point(|(rows, _)| rows.end <= shape.scroll)..]
         .iter()
         .peekable();
+    let runs: &[(Range<usize>, usize)] = match detail {
+        Some(detail) if detail.index == shape.selected => &detail.sideways.runs,
+        _ => &[],
+    };
+    let mut runs = runs[runs.partition_point(|(rows, _)| rows.end <= shape.scroll)..]
+        .iter()
+        .peekable();
     for (at, line) in lines.iter().enumerate().skip(shape.scroll).take(room) {
         while targets.next_if(|(rows, _)| rows.end <= at).is_some() {}
         let control = targets
             .peek()
             .filter(|(rows, _)| rows.contains(&at))
             .map(|(_, control)| *control);
+        while runs.next_if(|(rows, _)| rows.end <= at).is_some() {}
+        let lead = runs
+            .peek()
+            .filter(|(rows, _)| rows.contains(&at))
+            .map(|(_, lead)| *lead);
         // The chosen control shows highlighted across the row while the details have the
         // keyboard.
         if control.is_some() && control == shape.pick && shape.focused {
@@ -2810,6 +2887,8 @@ fn view(list: Option<&List>, detail: Option<&Detail>, shape: Shape, theme: &Them
                 spans.push(Span::raw(" ".repeat(pad)));
             }
             page.lines.push(Line::from(with_bg(spans, theme.highlight)));
+        } else if let Some(lead) = lead {
+            page.lines.push(slid(line, lead, shape.across, width));
         } else {
             page.lines.push(line.clone());
         }
@@ -2896,6 +2975,45 @@ fn time_ago(at: Option<&str>, now: i64) -> Option<String> {
         "now" => Some("just now".to_string()),
         ago => Some(format!("{ago} ago")),
     }
+}
+
+/// A row of a line of the Code tab that doesn't wrap, scrolled `across` columns sideways: its
+/// first `lead` columns, its number and mark, then its text from `across` columns in, in at
+/// most `width` columns. A wide character the left edge cuts shows as spaces where its right
+/// part was, and one the right edge cuts doesn't show.
+fn slid(line: &Line<'static>, lead: usize, across: usize, width: usize) -> Line<'static> {
+    let hidden = lead..lead + across;
+    let mut spans = Vec::with_capacity(line.spans.len());
+    // The column of the row as laid out, and of the row as it shows.
+    let (mut column, mut shown) = (0, 0);
+    'spans: for span in &line.spans {
+        let mut text = String::new();
+        for piece in clusters(&span.content) {
+            let columns = piece.width();
+            let (start, end) = (column, column + columns);
+            column = end;
+            if hidden.contains(&start) && end <= hidden.end {
+                continue;
+            }
+            // Of one the left edge cuts, the columns past it.
+            let (piece, columns) = match hidden.contains(&start) {
+                true => (" ".repeat(end - hidden.end), end - hidden.end),
+                false => (piece.to_string(), columns),
+            };
+            if shown + columns > width {
+                if !text.is_empty() {
+                    spans.push(Span::styled(text, span.style));
+                }
+                break 'spans;
+            }
+            text.push_str(&piece);
+            shown += columns;
+        }
+        if !text.is_empty() {
+            spans.push(Span::styled(text, span.style));
+        }
+    }
+    Line::from(spans).style(line.style)
 }
 
 /// The columns `spans` take.
@@ -3203,9 +3321,9 @@ fn detail_lines(
     width: usize,
     now: i64,
     theme: &Theme,
-) -> (Vec<Line<'static>>, Targets) {
+) -> (Vec<Line<'static>>, Targets, Sideways) {
     if width == 0 {
-        return (Vec::new(), Vec::new());
+        return (Vec::new(), Vec::new(), Sideways::default());
     }
     let muted = Style::new().fg(theme.muted);
     let value = Style::new().fg(theme.fg);
@@ -3231,7 +3349,7 @@ fn detail_lines(
                 .into_iter()
                 .map(|(rows, c)| (moved(rows), c)),
         );
-        return (lines, targets);
+        return (lines, targets, Sideways::default());
     }
     if let (Tab::Code, Some(read)) = (tab, read) {
         lines.push(Line::default());
@@ -3252,14 +3370,17 @@ fn detail_lines(
             viewed,
         };
         // Until the tab asks for its first slice, it shows as it does while that read runs.
-        let (code, controls) = match &read.code {
+        let (code, controls, mut sideways) = match &read.code {
             Some(code) => code.lay_out(reads, shown, width, now, theme),
             None => Code::new().lay_out(reads, shown, width, now, theme),
         };
         lines.extend(code);
         let moved = |rows: Range<usize>| rows.start + at..rows.end + at;
         targets.extend(controls.into_iter().map(|(rows, c)| (moved(rows), c)));
-        return (lines, targets);
+        for (rows, _) in &mut sideways.runs {
+            *rows = moved(rows.clone());
+        }
+        return (lines, targets, sideways);
     }
     if let Some(read) = read {
         let at = lines.len();
@@ -3327,7 +3448,7 @@ fn detail_lines(
         };
         section(None, &[(text, muted)]);
     }
-    (lines, targets)
+    (lines, targets, Sideways::default())
 }
 
 /// What the link's host said of its pull request, as the desktop's Summary tab shows it: that
@@ -6567,6 +6688,8 @@ mod tests {
         pulls.step(true);
         assert_eq!(pulls.action().as_deref(), Some("expand all files"));
         pulls.step(true);
+        assert_eq!(pulls.action().as_deref(), Some("disable line wrapping"));
+        pulls.step(true);
         assert_eq!(pulls.action().as_deref(), Some("expand file"));
         pulls.enter();
         let unfolded = |pulls: &mut PullRequests| {
@@ -6742,6 +6865,238 @@ mod tests {
     }
 
     #[test]
+    fn lines_that_dont_wrap_scroll_sideways_and_keep_their_numbers() {
+        let theme = theme();
+        let mut activity = remarks(1);
+        activity["commits"] = json!([{"oid": "0000001abc", "messageHeadline": "Commit 1",
+            "committedDate": "2026-10-13T00:01:00Z"}]);
+        let mut pulls = conversing(activity);
+        assert!(!pulls.answer(1, Part::Done, now()));
+        assert!(pulls.forward() && pulls.forward());
+        // 60 letters, which no 20 columns of repeat.
+        let long: String = "abcdefghijklmnopqrstuvwxyz".repeat(3)[..60].to_string();
+        let diff = || {
+            let patch = format!(
+                "diff --git a/f.rs b/f.rs\n--- a/f.rs\n+++ b/f.rs\n@@ -1 +1 @@\n-a\n+{long}\n"
+            );
+            Box::new(pull_request::Diff {
+                patch,
+                truncated: false,
+                next_cursor: None,
+                omitted: Vec::new(),
+                omitted_cut: false,
+            })
+        };
+        let ask = pulls.take_diff_ask(true, now()).expect("the first slice");
+        assert!(pulls.answer_diff(ask.ticket, Ok(diff()), now()));
+        // The rows of the file's lines on a page 40 columns wide.
+        let lines = |pulls: &mut PullRequests| {
+            let page = pulls.page(40, 30, now(), true, &theme);
+            let rows = rows_of(&page.lines);
+            let header = rows.iter().position(|row| row.starts_with("⌄ M f.rs"));
+            let header = header.expect("the file unfolded");
+            rows[header + 1..]
+                .iter()
+                .take_while(|row| !row.starts_with('⋯'))
+                .cloned()
+                .collect::<Vec<_>>()
+        };
+        pulls.pick = Some(Control::Folds);
+        pulls.enter();
+        // While the lines wrap, nothing scrolls sideways.
+        assert_eq!(
+            lines(&mut pulls),
+            [
+                "1 - a",
+                "1 + abcdefghijklmnopqrstuvwxyzabcdefghij",
+                "    klmnopqrstuvwxyzabcdefgh"
+            ]
+        );
+        assert!(!pulls.slides());
+        pulls.sideways(true);
+        pulls.wheel_sideways(true);
+        assert_eq!(pulls.across, 0);
+
+        // Once they don't, the text past the numbers and marks scrolls half the width at a
+        // time, until the end of the widest line shows.
+        pulls.pick = Some(Control::Wrap);
+        pulls.enter();
+        assert_eq!(pulls.pick, Some(Control::Wrap));
+        assert_eq!(
+            lines(&mut pulls),
+            ["1 - a", "1 + abcdefghijklmnopqrstuvwxyzabcdefghij"]
+        );
+        assert!(pulls.slides());
+        assert_eq!(pulls.take_diff_ask(true, now()), None, "nothing to read");
+        pulls.sideways(true);
+        assert_eq!(pulls.across, 20);
+        assert_eq!(
+            lines(&mut pulls),
+            ["1 -", "1 + uvwxyzabcdefghijklmnopqrstuvwxyzabcd"]
+        );
+        pulls.sideways(true);
+        assert_eq!(pulls.across, 24);
+        assert_eq!(
+            lines(&mut pulls),
+            ["1 -", "1 + yzabcdefghijklmnopqrstuvwxyzabcdefgh"]
+        );
+        pulls.sideways(false);
+        assert_eq!(pulls.across, 4);
+        // The wheel turns 4 columns at a time.
+        pulls.wheel_sideways(false);
+        assert_eq!(pulls.across, 0);
+        pulls.wheel_sideways(false);
+        assert_eq!(pulls.across, 0);
+        pulls.wheel_sideways(true);
+        assert_eq!(pulls.across, 4);
+        assert_eq!(
+            lines(&mut pulls),
+            ["1 -", "1 + efghijklmnopqrstuvwxyzabcdefghijklmn"]
+        );
+        // Where the last frame showed another link's details, their lines don't hold it back,
+        // and the next frame of this link's does.
+        pulls.detail.as_mut().expect("the details").index = 1;
+        pulls.sideways(true);
+        pulls.sideways(true);
+        assert_eq!(pulls.across, 44);
+        pulls.page(40, 30, now(), true, &theme);
+        assert_eq!(pulls.across, 24);
+        // On a page one column wide, a step is a column.
+        pulls.page(1, 30, now(), true, &theme);
+        pulls.sideways(false);
+        assert_eq!(pulls.across, 23);
+        pulls.page(40, 30, now(), true, &theme);
+        pulls.wheel_sideways(false);
+        pulls.wheel_sideways(false);
+        pulls.wheel_sideways(false);
+        pulls.wheel_sideways(false);
+        pulls.wheel_sideways(false);
+        assert_eq!(pulls.across, 3);
+        pulls.sideways(false);
+        pulls.wheel_sideways(true);
+        assert_eq!(pulls.across, 4);
+
+        // The other tabs neither scroll it nor lose it.
+        assert!(pulls.back() && pulls.back());
+        assert!(!pulls.slides());
+        pulls.sideways(true);
+        pulls.wheel_sideways(true);
+        assert_eq!(pulls.across, 4);
+        assert!(pulls.forward() && pulls.forward());
+        assert_eq!(pulls.across, 4);
+
+        // A wider page shows more of the line, and scrolls back as far as it must.
+        pulls.page(60, 30, now(), true, &theme);
+        assert_eq!(pulls.across, 4);
+        pulls.page(70, 30, now(), true, &theme);
+        assert_eq!(pulls.across, 0);
+        assert!(!pulls.slides());
+        // The line's row is 64 columns wide, so it scrolls on a page of 63 and not of 64.
+        pulls.page(63, 30, now(), true, &theme);
+        assert!(pulls.slides());
+        pulls.page(64, 30, now(), true, &theme);
+        assert!(!pulls.slides());
+        pulls.wheel_sideways(true);
+        pulls.page(40, 30, now(), true, &theme);
+        assert_eq!(pulls.across, 0, "nothing was wider than the details");
+        pulls.wheel_sideways(true);
+        assert_eq!(pulls.across, 4);
+
+        // Wrapping the lines again takes them back.
+        pulls.pick = Some(Control::Wrap);
+        pulls.enter();
+        lines(&mut pulls);
+        assert_eq!(pulls.across, 0);
+        pulls.enter();
+        lines(&mut pulls);
+        pulls.wheel_sideways(true);
+        assert_eq!(pulls.across, 4);
+
+        // So does another diff picked from the commits, and the details shown again.
+        pulls.pick = Some(Control::Commits);
+        pulls.enter();
+        pulls.page(40, 30, now(), true, &theme);
+        pulls.pick = Some(Control::Commit(0));
+        pulls.enter();
+        assert_eq!(pulls.across, 0);
+        let ask = pulls
+            .take_diff_ask(true, now())
+            .expect("the commit's slice");
+        assert!(pulls.answer_diff(ask.ticket, Ok(diff()), now()));
+        pulls.pick = Some(Control::Folds);
+        pulls.enter();
+        lines(&mut pulls);
+        pulls.sideways(true);
+        assert_eq!(pulls.across, 20);
+        // The same commit opened from the Timeline keeps it, as it keeps the Code's place.
+        assert!(pulls.back());
+        pulls.pick = Some(Control::TimelineCommit(0));
+        pulls.enter();
+        assert_eq!(pulls.tabs(), Some(Tab::Code));
+        assert_eq!(pulls.across, 20);
+        // Opened while the Code shows the whole change, the commit's diff starts at the left.
+        pulls.pick = Some(Control::Commits);
+        pulls.enter();
+        pulls.page(40, 30, now(), true, &theme);
+        pulls.pick = Some(Control::AllCommits);
+        pulls.enter();
+        let ask = pulls
+            .take_diff_ask(true, now())
+            .expect("the whole change's slice");
+        assert!(pulls.answer_diff(ask.ticket, Ok(diff()), now()));
+        pulls.pick = Some(Control::Folds);
+        pulls.enter();
+        lines(&mut pulls);
+        pulls.sideways(true);
+        assert_eq!(pulls.across, 20);
+        assert!(pulls.back());
+        pulls.pick = Some(Control::TimelineCommit(0));
+        pulls.enter();
+        assert_eq!(pulls.tabs(), Some(Tab::Code));
+        assert_eq!(pulls.across, 0);
+        let ask = pulls
+            .take_diff_ask(true, now())
+            .expect("the commit's slice");
+        assert!(pulls.answer_diff(ask.ticket, Ok(diff()), now()));
+        pulls.pick = Some(Control::Folds);
+        pulls.enter();
+        lines(&mut pulls);
+        pulls.sideways(true);
+        assert_eq!(pulls.across, 20);
+        pulls.toggle();
+        pulls.toggle();
+        assert_eq!(pulls.across, 0);
+    }
+
+    #[test]
+    fn a_row_slid_sideways_keeps_its_lead_and_styles_and_cuts_wide_characters() {
+        let red = Style::new().fg(Color::Red);
+        let line = Line::from(vec![Span::raw("1 + "), Span::styled("ab日本cd", red)])
+            .style(Style::new().bg(Color::Blue));
+        // The lead takes columns 0 to 4, then a, b, 日 from 6 to 8, 本 from 8 to 10, c and d.
+        let row = |across, width| slid(&line, 4, across, width).to_string();
+        assert_eq!(row(0, 12), "1 + ab日本cd");
+        assert_eq!(row(0, 40), "1 + ab日本cd");
+        // One the right edge cuts doesn't show.
+        assert_eq!(row(0, 9), "1 + ab日");
+        assert_eq!(row(0, 3), "1 +");
+        assert_eq!(row(2, 12), "1 + 日本cd");
+        // One the left edge cuts shows as spaces where its right part was.
+        assert_eq!(row(3, 12), "1 +  本cd");
+        assert_eq!(row(4, 12), "1 + 本cd");
+        assert_eq!(row(5, 12), "1 +  cd");
+        assert_eq!(row(5, 5), "1 +  ");
+        assert_eq!(row(8, 12), "1 + ");
+        assert_eq!(row(30, 12), "1 + ");
+        // Each span keeps its style, and the row its own.
+        let slid = slid(&line, 4, 3, 12);
+        assert_eq!(slid.style, Style::new().bg(Color::Blue));
+        assert_eq!(slid.spans, [Span::raw("1 + "), Span::styled(" 本cd", red)]);
+        // A span the edge hides whole leaves no empty span.
+        assert_eq!(super::slid(&line, 4, 10, 12).spans, [Span::raw("1 + ")]);
+    }
+
+    #[test]
     fn enter_or_a_click_unfolds_a_file_and_a_slice_that_failed_reads_again() {
         let theme = theme();
         let mut pulls = on_code();
@@ -6776,6 +7131,8 @@ mod tests {
         assert_eq!(pulls.pick, Some(Control::Whitespace));
         pulls.step(true);
         assert_eq!(pulls.pick, Some(Control::Folds));
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::Wrap));
         pulls.step(true);
         assert_eq!(pulls.pick, Some(Control::File(0)));
         assert_eq!(pulls.action().as_deref(), Some("expand file"));
@@ -6868,6 +7225,8 @@ mod tests {
         assert_eq!(pulls.pick, Some(Control::Whitespace));
         pulls.step(true);
         assert_eq!(pulls.pick, Some(Control::Folds));
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::Wrap));
         pulls.step(true);
         assert_eq!(pulls.pick, Some(Control::OffDiff));
         assert_eq!(
@@ -7014,12 +7373,13 @@ mod tests {
         pulls.page(60, 40, now(), true, &theme);
         let rows = detail_rows(&pulls);
         assert_eq!(
-            rows[at..at + 6],
+            rows[at..at + 7],
             [
                 "› Commit 0 · 0000000",
                 "1 file",
                 "¶ Show whitespace changes",
                 "⇊ Expand all files",
+                "↵ Disable line wrapping",
                 "",
                 "› 1 conversation not on the current diff"
             ]
@@ -7094,9 +7454,9 @@ mod tests {
         assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
         assert!(pulls.answer_diff(2, Ok(added(0, 1, None)), now()));
         pulls.page(60, 40, now(), true, &theme);
-        pulls.step(true);
-        pulls.step(true);
-        pulls.step(true);
+        for _ in 0..4 {
+            pulls.step(true);
+        }
         assert_eq!(pulls.pick, Some(Control::File(0)));
         pulls.enter();
         pulls.page(60, 40, now(), true, &theme);
@@ -7381,9 +7741,9 @@ mod tests {
         assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
         assert!(pulls.answer_diff(2, Ok(diff()), now()));
         pulls.page(60, 40, now(), true, &theme);
-        pulls.step(true);
-        pulls.step(true);
-        pulls.step(true);
+        for _ in 0..4 {
+            pulls.step(true);
+        }
         assert_eq!(pulls.pick, Some(Control::File(0)));
         pulls.enter();
         pulls.page(60, 40, now(), true, &theme);

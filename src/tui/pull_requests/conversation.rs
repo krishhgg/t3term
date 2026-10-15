@@ -142,6 +142,7 @@ impl Shown {
             Control::File(_)
             | Control::Whitespace
             | Control::Folds
+            | Control::Wrap
             | Control::Stretch(..)
             | Control::Retry
             | Control::More(_)
@@ -230,6 +231,8 @@ pub(super) enum Control {
     Whitespace,
     /// Unfolds every file of the Code tab, or folds them all once one shows unfolded.
     Folds,
+    /// Lets the lines of the Code tab run on past the end of their rows, or wraps them again.
+    Wrap,
     /// Reads again the slice of the diff whose read failed, at the end of the Code tab.
     Retry,
     /// Opens or closes a review thread on the Code tab, by its place among the threads as T3
@@ -260,14 +263,15 @@ pub(super) enum Control {
 
 impl Control {
     /// Whether the Code tab's own state, rather than the conversation's, says what it does:
-    /// a file, the toggle for the whitespace, the button that folds or unfolds every file, a
-    /// run of unchanged lines, Retry and the list of commits.
+    /// a file, the toggles for the whitespace and the wrapping, the button that folds or
+    /// unfolds every file, a run of unchanged lines, Retry and the list of commits.
     pub(super) fn on_code(self) -> bool {
         matches!(
             self,
             Control::File(_)
                 | Control::Whitespace
                 | Control::Folds
+                | Control::Wrap
                 | Control::Stretch(..)
                 | Control::Retry
         ) || self.on_commits()
@@ -845,6 +849,7 @@ impl Conversation {
             Control::File(_)
             | Control::Whitespace
             | Control::Folds
+            | Control::Wrap
             | Control::Stretch(..)
             | Control::Retry
             | Control::Thread(_)
@@ -904,6 +909,7 @@ impl Conversation {
             Control::File(_)
             | Control::Whitespace
             | Control::Folds
+            | Control::Wrap
             | Control::Stretch(..)
             | Control::Retry
             | Control::Commits
