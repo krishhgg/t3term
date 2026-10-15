@@ -328,7 +328,10 @@ impl Pill {
 }
 
 /// A reaction's emoji, as the desktop's `REACTION_EMOJI` gives them
-/// (pullRequestReactions.logic.ts).
+/// (pullRequestReactions.logic.ts), but for the heart. The desktop's ❤️ is ❤ and U+FE0F, which
+/// some terminals draw a column wide and others two, and ratatui 0.30 writes the cell after it
+/// without moving the cursor. Where the terminal draws it two wide, the rest of the row then
+/// lands a column to the right. ❤ alone is a column wide in every terminal.
 fn emoji(content: ReactionContent) -> &'static str {
     match content {
         ReactionContent::ThumbsUp => "👍",
@@ -336,7 +339,7 @@ fn emoji(content: ReactionContent) -> &'static str {
         ReactionContent::Laugh => "😄",
         ReactionContent::Hooray => "🎉",
         ReactionContent::Confused => "😕",
-        ReactionContent::Heart => "❤️",
+        ReactionContent::Heart => "❤",
         ReactionContent::Rocket => "🚀",
         ReactionContent::Eyes => "👀",
     }

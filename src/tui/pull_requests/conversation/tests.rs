@@ -836,6 +836,41 @@ fn reactions(of: &[(&str, u64, bool)]) -> Value {
 }
 
 #[test]
+fn each_reactions_emoji_is_as_wide_in_every_terminal() {
+    // An emoji with U+FE0F is a column wide in some terminals and two in others, and ratatui
+    // writes the cell after it without moving the cursor, so the row would move in one or the
+    // other. Each of these is wide in every terminal but the heart, which is narrow in every one.
+    let contents = [
+        ("thumbs-up", 2),
+        ("thumbs-down", 2),
+        ("laugh", 2),
+        ("hooray", 2),
+        ("confused", 2),
+        ("heart", 1),
+        ("rocket", 2),
+        ("eyes", 2),
+    ];
+    let mut each = remark("k1", actor("mona"), &ago_at(5), None, "All of them.");
+    each["reactions"] = reactions(&contents.map(|(content, _)| (content, 1, false)));
+    let value = activity(vec![each], vec![], vec![]);
+    let mut answer = Answer::Read(Box::new(conversation_of(&value)));
+    let (rows, _) = opened(&mut answer, &Shown::default(), 100);
+    let pills = rows.iter().find(|row| row.starts_with('👍')).unwrap();
+    let pills: Vec<&str> = pills.split("  ").collect();
+    assert_eq!(
+        pills,
+        [
+            "👍 1", "👎 1", "😄 1", "🎉 1", "😕 1", "❤ 1", "🚀 1", "👀 1"
+        ]
+    );
+    for (pill, (content, width)) in pills.iter().zip(contents) {
+        let emoji = pill.strip_suffix(" 1").unwrap();
+        assert!(!emoji.contains('\u{fe0f}'), "{content}");
+        assert_eq!(emoji.width(), width, "{content}");
+    }
+}
+
+#[test]
 fn a_remarks_reactions_show_under_its_header_wherever_it_shows() {
     let mut reacted = remark("k1", actor("mona"), &ago_at(5), None, "Looks close.");
     reacted["reactions"] = reactions(&[
@@ -865,7 +900,7 @@ fn a_remarks_reactions_show_under_its_header_wherever_it_shows() {
     let (rows, _) = at(&shown, 40);
     let expected = [
         ends("mona", "5m ago", 40),
-        "👍 3  ❤️ 1  👀 12".to_string(),
+        "👍 3  ❤ 1  👀 12".to_string(),
         "  Looks close.".to_string(),
         String::new(),
         ends("lee", "10m ago", 40),
@@ -897,18 +932,18 @@ fn a_remarks_reactions_show_under_its_header_wherever_it_shows() {
     let (grey, primary) = (Some(theme().muted), Some(theme().primary));
     let expected = [
         ("👍 3".to_string(), grey),
-        ("❤️ 1".to_string(), primary),
+        ("❤ 1".to_string(), primary),
         ("👀 12".to_string(), grey),
     ];
     assert_eq!(colors, expected);
 
     // Too narrow for all of them, each keeps its emoji and count together.
-    let (rows, _) = at(&shown, 10);
-    let first = rows.iter().position(|row| row.starts_with('👍')).unwrap();
-    assert_eq!(rows[first..first + 2], ["👍 3  ❤️ 1", "👀 12"]);
     let (rows, _) = at(&shown, 9);
     let first = rows.iter().position(|row| row.starts_with('👍')).unwrap();
-    assert_eq!(rows[first..first + 3], ["👍 3", "❤️ 1", "👀 12"]);
+    assert_eq!(rows[first..first + 2], ["👍 3  ❤ 1", "👀 12"]);
+    let (rows, _) = at(&shown, 8);
+    let first = rows.iter().position(|row| row.starts_with('👍')).unwrap();
+    assert_eq!(rows[first..first + 3], ["👍 3", "❤ 1", "👀 12"]);
 
     // A finished remark shows them closed and open, as the desktop's does, and only its header
     // closes it once it is open.
@@ -950,7 +985,7 @@ fn a_remarks_reactions_show_under_its_header_wherever_it_shows() {
     let expected = [
         "  mona commented",
         "  5m ago",
-        "  👍 3  ❤️ 1  👀 12",
+        "  👍 3  ❤ 1  👀 12",
         "  Looks close.",
     ];
     assert_eq!(rows[card..card + 4], expected);
