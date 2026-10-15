@@ -200,8 +200,8 @@ rename to \"caf\\303\\251 \\\"menu\\\".txt\"
 -x
 +y
 diff --git a/a b/c b/a b/c
---- a/a b/c
-+++ b/a b/c
+old mode 100644
+new mode 100755
 ";
     let read = Patch::read(patch);
     let paths: Vec<_> = read
@@ -221,6 +221,14 @@ diff --git a/a b/c b/a b/c
     // A byte that isn't UTF-8 reads as U+FFFD.
     assert_eq!(quoted("\"a/\\377x\" rest").0, "a/\u{FFFD}x");
     assert_eq!(quoted("\"a/\\377x\" rest").1, " rest");
+    assert_eq!(quoted("\"a\\tb\\\\c\\\"\"").0, "a\tb\\c\"");
+    // A quoted path past `PATH` bytes is cut, and the path after it still reads.
+    let long = "\\303\\251".repeat(PATH);
+    let patch = format!("diff --git \"a/{long}\" \"b/{long}\"\n");
+    let read = Patch::read(&patch);
+    let (old, new) = (&read.files[0].old_path, &read.files[0].new_path);
+    assert_eq!(old.as_deref().map(str::len), Some(PATH));
+    assert_eq!(old, new);
 }
 
 #[test]

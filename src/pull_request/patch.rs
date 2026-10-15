@@ -109,8 +109,6 @@ struct Reading {
     new_at: u64,
     /// Whether the file being read is past `MOST_FILES`, so its lines are skipped.
     skipping: bool,
-    /// Inside a binary patch's data, which runs to the next file.
-    binary_data: bool,
     /// Whether the open file has had its `+++` line, so another `---` starts a file.
     new_side: bool,
 }
@@ -128,7 +126,6 @@ impl Patch {
             old_at: 0,
             new_at: 0,
             skipping: false,
-            binary_data: false,
             new_side: false,
         };
         let mut at = 0;
@@ -186,9 +183,6 @@ impl Reading {
             self.hunk_line(Kind::NoNewline, line, start);
             return;
         }
-        if self.binary_data {
-            return;
-        }
         if let Some(rest) = line.strip_prefix("@@ ") {
             self.start_hunk(rest, start + 3);
             return;
@@ -240,13 +234,13 @@ impl Reading {
         } else if let Some(path) = line.strip_prefix("copy to ") {
             file.status = Status::Renamed;
             file.new_path = Some(unquoted(path));
-        } else if line.starts_with("Binary files ") && line.ends_with(" differ") {
+        } else if line.starts_with("Binary files ") && line.ends_with(" differ")
+            || line == "GIT binary patch"
+        {
             file.binary = true;
-        } else if line == "GIT binary patch" {
-            file.binary = true;
-            self.binary_data = true;
         }
-        // `index`, `similarity index`, `old mode`, `new mode` and the like say nothing shown.
+        // `index`, `similarity index`, `old mode`, `new mode` and the like say nothing shown. So
+        // do the lines of a binary patch, which start with a letter and have no space.
     }
 
     fn file(&mut self) -> Option<&mut File> {
@@ -259,7 +253,6 @@ impl Reading {
     fn start_file(&mut self, (old_path, new_path): (Option<String>, Option<String>)) {
         self.old_left = 0;
         self.new_left = 0;
-        self.binary_data = false;
         self.new_side = false;
         if self.files.len() == MOST_FILES {
             self.files_cut = true;
@@ -403,13 +396,14 @@ fn strip(path: &str, prefix: &str) -> Option<String> {
 /// A path from a rename or copy line, which git quotes as it quotes the others.
 fn unquoted(text: &str) -> String {
     match text.starts_with('"') {
-        true => quoted(text).0,
+        true => bounded(&quoted(text).0),
         false => bounded(text),
     }
 }
 
 /// A string git quoted, as C quotes one, and what follows it. Git writes a byte outside ASCII
-/// as three octal digits, and the bytes are read as UTF-8, any that aren't as U+FFFD.
+/// as three octal digits, and the bytes are read as UTF-8, any that aren't as U+FFFD. The
+/// caller bounds the string.
 fn quoted(text: &str) -> (String, &str) {
     let mut bytes = Vec::new();
     let mut chars = text.char_indices().skip(1).peekable();
@@ -419,9 +413,6 @@ fn quoted(text: &str) -> (String, &str) {
         bytes.extend_from_slice(c.encode_utf8(&mut buffer).as_bytes());
     };
     while let Some((at, c)) = chars.next() {
-        if bytes.len() > PATH {
-            break;
-        }
         if c == '"' {
             end = at + 1;
             break;
@@ -457,8 +448,7 @@ fn quoted(text: &str) -> (String, &str) {
             other => push(&mut bytes, other),
         }
     }
-    let path = String::from_utf8_lossy(&bytes);
-    (bounded(&path), &text[end..])
+    (String::from_utf8_lossy(&bytes).into_owned(), &text[end..])
 }
 
 /// `path` cut to `PATH` bytes on a character boundary.
