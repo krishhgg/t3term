@@ -1,6 +1,6 @@
 # Pull request reads
 
-`src/pull_request.rs` reads one pull request from T3's server: its detail, its checks, its conversation, the stack it is in, its diff and the rest of a review thread's remarks. It is the first part of PR reviews in the TUI ([parity.md, group 12](parity.md#12-pull-requests)). The thread details call `detail` and `activity` at once when a link's details open, then `stack` once the detail says its host keeps stacks, and `r` there sends `invalidate` first, as [linked pull requests](pull-request-panel.md#what-a-links-details-read-from-its-host) says. Their Code tab calls `diff` once it shows, and `thread_comments` when you ask for a thread's next page, as [the Code tab](pull-request-panel.md#the-code-tab) says. Nothing calls `checks` yet.
+`src/pull_request.rs` reads one pull request from T3's server: its detail, its checks, its conversation, the stack it is in, its diff, the rest of a review thread's remarks and a file's whole text. It is the first part of PR reviews in the TUI ([parity.md, group 12](parity.md#12-pull-requests)). The thread details call `detail` and `activity` at once when a link's details open, then `stack` once the detail says its host keeps stacks, and `r` there sends `invalidate` first, as [linked pull requests](pull-request-panel.md#what-a-links-details-read-from-its-host) says. Their Code tab calls `diff` once it shows, `thread_comments` when you ask for a thread's next page, and `diff_file_contents` when you ask for the unchanged lines around a file's hunks, as [the Code tab](pull-request-panel.md#the-code-tab) says. Nothing calls `checks` yet.
 
 ```rust
 let reference = Reference::new(&thread_project_id, Some(&link.host), &link.repository, link.number)?;
@@ -9,6 +9,7 @@ let checks = pull_request::checks(&rpc, &reference).await?; // None where the ho
 let activity = pull_request::activity(&rpc, &reference).await?;
 let stack = pull_request::stack(&rpc, &reference).await?; // None where it is in no stack
 let page = pull_request::thread_comments(&rpc, &reference, &thread.id, &cursor).await?;
+let text = pull_request::diff_file_contents(&rpc, &reference, None, ChangeType::Change, "src/a.rs", "src/a.rs").await?;
 pull_request::invalidate(&rpc, &reference).await?; // T3's next read asks the host again
 let diff = pull_request::diff(&api, &reference, None).await?; // the first slice, over HTTP
 let files = pull_request::patch::Patch::read(&diff.patch).files;
@@ -27,8 +28,9 @@ Each function but `diff` is one RPC call with a 60-second timeout. `diff` is one
 | `invalidate` | `pullRequests.invalidate` | `{"reference": PullRequestRef}` | nothing |
 | `diff` | `POST /api/pull-requests/diff` | `PullRequestDiffInput` | `PullRequestDiffResult` |
 | `thread_comments` | `pullRequests.threadComments` | `PullRequestRef` with `threadId` and `cursor` | `PullRequestThreadCommentsResult` |
+| `diff_file_contents` | `pullRequests.diffFileContents` | `PullRequestRef` with an optional `commit`, `changeType`, `oldPath` and `newPath` | `PullRequestDiffFileContentsResult` |
 
-T3 checks all seven against `orchestration:read`, which a saved login carries. `pullRequests.invalidate` takes read access too, because T3 counts refreshing as reading. The writes, such as comments, reviews and merges, need `source-control:write`, which t3term's logins don't have. They come later.
+T3 checks all eight against `orchestration:read`, which a saved login carries. `pullRequests.invalidate` takes read access too, because T3 counts refreshing as reading. The writes, such as comments, reviews and merges, need `source-control:write`, which t3term's logins don't have. They come later.
 
 A `PullRequestRef` is `{"projectId", "repository", "number"}` with an optional `"host"`. T3 reads through the project's checkout and credentials. With a host, T3 routes a pull request from another repository on that host through the same project, so a thread's link can be read through the thread's own project. The desktop does that when no project matches the link's repository. `Reference::new` trims each string and refuses a blank one, one over 1,024 bytes, and a number below 1 or past 2^53 - 1, so t3term sends nothing T3's schema would refuse.
 
@@ -55,6 +57,14 @@ With a `commit`, the diff is that commit's own changes rather than the whole cha
 The activity sends each review thread with its first remarks, the count the host gives and, where the host has more, `nextCommentsCursor`. `thread_comments` reads the page of remarks that starts at such a cursor (packages/contracts/src/rpc.ts:519, 986-990). It sends the `PullRequestRef` with the thread's `threadId` and the `cursor`, and gets `{"comments", "nextCursor"}` back, the remarks oldest first and `nextCursor` null once the thread is whole (pullRequest.ts:1184-1195). Each page's cursor reads the page after it. A remark is the same `ThreadComment` the activity sends.
 
 Only GitHub's provider pages a thread's remarks at f570bd2, 100 at a time (apps/server/src/pullRequest/GitHubPullRequestProvider.ts:515-516, gitHubPullRequestJson.ts:1092). On any other host T3 fails with `PullRequestOperationError` and "This host does not page review thread comments." (PullRequestService.ts:1853-1865), which reads as an `Rpc` failure with T3's words.
+
+## A file's text
+
+`diff_file_contents` reads a file's whole text, as the desktop's diff viewer does to show the unchanged lines its hunks leave out (packages/contracts/src/pullRequest.ts:990-1005, rpc.ts:520 and 992-995). It sends the `PullRequestRef`, the `commit` whose own diff shows if any, how the file changed as `changeType`, and its `oldPath` and `newPath`. It gets `{"oldContents", "newContents"}` back. The desktop reads it only for a file changed in place, `change`, or renamed and changed, `rename-changed` (@pierre/diffs 1.5.2, dist/renderers/DiffHunksRenderer.js:1287-1289), so `ChangeType` has only those two. T3 trims both paths, so `diff_file_contents` refuses a path that is blank or starts or ends with a space, which T3 would read as another file.
+
+t3term keeps only `newContents`. The lines a diff leaves out between its hunks are the same on both sides, and the desktop's diff library counts a file's lines by its text after the change (dist/utils/hydratePartialDiff.js:28-41). `oldContents` is checked to be text and dropped.
+
+GitHub's, Forgejo's and Azure DevOps's providers read a file's text at f570bd2. GitLab's and Bitbucket's don't, and T3 fails with `PullRequestOperationError` and "This host cannot expand unchanged pull request lines." (apps/server/src/pullRequest/PullRequestService.ts:1901-1922). GitHub's provider reads each side through its contents API at the pull request's or the commit's revisions, and fails on a side past 1 MiB, binary or not UTF-8 (GitHubPullRequestCli.ts:1410-1478).
 
 ## What an answer holds
 
@@ -83,6 +93,7 @@ Text is cut on a character boundary before anything else reads it, and lists are
 | Commits | 1,000 |
 | Layers of a stack | 1,000 |
 | A diff's answer | 16 MiB, twice the most T3 reads from GitHub at once |
+| A file's text after the change | 2 MiB, twice the most T3 reads from GitHub for one side |
 | Files a diff left out | 3,000 |
 | Files of one patch | 3,000 |
 | Hunks of one patch and their lines | 200,000, in all its files, a hunk's header counting as a line |
@@ -98,6 +109,7 @@ A body that lost text says so with `Body::cut`, and a detail, an activity, a lis
 | `Invalid` | nothing, the reference broke T3's schema | t3term's |
 | `Unavailable` | `PullRequestUnavailableError` with a reason t3term knows | The sentence T3's desktop shows for that host and reason, such as "No GitHub credential on the server. Set GH_TOKEN, or install the GitHub CLI (https://cli.github.com/) and run `gh auth login`." |
 | `NotFound` | `PullRequestOperationError` with the reason `not-found` | T3's `detail` |
+| `TooLong` | a file's text past 2 MiB | t3term's |
 | `Malformed` | an answer that breaks T3's schema | "T3 sent a pull request answer t3term can't read:" and what broke |
 | `Rpc` | anything else, such as a host's failure, a refused scope or a lost connection | the RPC client's |
 | `Http` | a diff's answer that is none of the above: a refused token or scope, T3's own failure, another status, a redirect, an answer past 16 MiB or no answer | t3term's, with the reason T3 sent where it sent one |
@@ -108,13 +120,13 @@ T3 doesn't send `PullRequestUnavailableError`'s message, only its reason and pro
 
 ## Tests
 
-The unit tests read a detail with every field filled in, then without each optional field and without each required one. They check values this version doesn't know, text cut on a character boundary at each bound, lists past their bound whose extra entries are never read, an activity's remarks, threads and commits, a page of a thread's remarks with and without a next cursor, past its bound and without each required field, a stack's layers in order and without each required field, and the failures' messages for every host and reason. They read a diff's answer, a diff left out past its bound and each broken field, and run `diff` against a fake T3 on 127.0.0.1. That checks the exact request with and without a cursor, every failure the route encodes, an error that isn't JSON, a redirect, no answer, and an answer one byte past its bound with and without its length up front. The patch tests read hunks with every line numbered, added, deleted, renamed, binary and header-only files, quoted and spaced paths, Windows line ends, broken and short hunks, a plain unified diff and each bound. `tests/fake_server.rs` checks the exact request for each of the six methods with and without a host, a host with no checks, a pull request in no stack, an unavailable host, a pull request the host can't find, a host that pages no thread's remarks and an answer that breaks T3's schema.
+The unit tests read a detail with every field filled in, then without each optional field and without each required one. They check values this version doesn't know, text cut on a character boundary at each bound, lists past their bound whose extra entries are never read, an activity's remarks, threads and commits, a page of a thread's remarks with and without a next cursor, past its bound and without each required field, a file's text up to its bound and past it, each change type's name, a stack's layers in order and without each required field, and the failures' messages for every host and reason. They read a diff's answer, a diff left out past its bound and each broken field, and run `diff` against a fake T3 on 127.0.0.1. That checks the exact request with and without a cursor, every failure the route encodes, an error that isn't JSON, a redirect, no answer, and an answer one byte past its bound with and without its length up front. The patch tests read hunks with every line numbered, added, deleted, renamed, binary and header-only files, quoted and spaced paths, Windows line ends, broken and short hunks, a plain unified diff and each bound. `tests/fake_server.rs` checks the exact request for each of the seven methods with and without a host, a file's text with and without a commit, a path T3 would trim, a host with no checks, a pull request in no stack, an unavailable host, a pull request the host can't find, a host that pages no thread's remarks, a host that can't read a file's text and an answer that breaks T3's schema.
 
 ## Not done yet
 
-- The TUI calls `detail`, `activity`, `stack`, `invalidate`, `diff` and `thread_comments`, and follows `pullRequests.subscribeRefreshes` through `client::spawn_pull_request_refresh_watch`. It shows the activity's remarks, verdicts, commits, reactions and review threads. It never reads `checks`.
+- The TUI calls `detail`, `activity`, `stack`, `invalidate`, `diff`, `thread_comments` and `diff_file_contents`, and follows `pullRequests.subscribeRefreshes` through `client::spawn_pull_request_refresh_watch`. It shows the activity's remarks, verdicts, commits, reactions and review threads. It never reads `checks`.
 - There is no CLI command for a pull request.
-- The list of pull requests, a file's whole contents, viewed files, review thread replies, and reviewer and label candidates aren't read.
+- The list of pull requests, viewed files, review thread replies, and reviewer and label candidates aren't read.
 - `diff` doesn't ask for compression, as T3 runs on the same machine.
 - Nothing writes: no comment, review, reaction, resolution, label, reviewer or action. Those need `source-control:write`.
 - A project whose repository matches the link isn't looked for. The TUI passes the thread's project and the link's host, and T3 routes the ref by host.

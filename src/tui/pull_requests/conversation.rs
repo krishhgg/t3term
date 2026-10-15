@@ -140,6 +140,7 @@ impl Shown {
             }
             Control::OffDiff => self.off_diff_open = !self.off_diff_open,
             Control::File(_)
+            | Control::Stretch(..)
             | Control::Retry
             | Control::More(_)
             | Control::Commits
@@ -245,13 +246,20 @@ pub(super) enum Control {
     /// Shows a commit's own diff on the Code tab, from its row on the Timeline, by its place
     /// among the commits as T3 sent them.
     TimelineCommit(usize),
+    /// Shows more of a run of unchanged lines on the Code tab, by its file's place as for
+    /// `File` and its place among the file's runs: one before each hunk, then one after the
+    /// last.
+    Stretch(usize, usize),
 }
 
 impl Control {
     /// Whether the Code tab's own state, rather than the conversation's, says what it does:
-    /// a file, Retry and the list of commits.
+    /// a file, a run of unchanged lines, Retry and the list of commits.
     pub(super) fn on_code(self) -> bool {
-        matches!(self, Control::File(_) | Control::Retry) || self.on_commits()
+        matches!(
+            self,
+            Control::File(_) | Control::Stretch(..) | Control::Retry
+        ) || self.on_commits()
     }
 
     /// Whether it is the list of commits, which stays above the files when a diff comes.
@@ -824,6 +832,7 @@ impl Conversation {
             Control::Run(at) => self.timeline.as_ref().is_some_and(|t| at < t.runs()),
             Control::TimelineCommit(at) => self.timeline.is_some() && at < self.commits.len(),
             Control::File(_)
+            | Control::Stretch(..)
             | Control::Retry
             | Control::Thread(_)
             | Control::OffDiff
@@ -880,6 +889,7 @@ impl Conversation {
                 None => "view commit".to_string(),
             },
             Control::File(_)
+            | Control::Stretch(..)
             | Control::Retry
             | Control::Commits
             | Control::AllCommits
