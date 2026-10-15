@@ -98,9 +98,9 @@ const PATH: usize = 1024;
 const EXPANSION: u64 = 100;
 /// The most files whose text the tab keeps. Reading one more forgets the first read.
 const MOST_TEXTS: usize = 64;
-/// The spans of each side of a row of the lines side by side while they don't wrap: the
-/// number, the mark and the text. The left side's are followed by one that pads it to its
-/// columns and one of `BETWEEN`, then come the right side's.
+/// The spans a side of a row of the lines side by side takes: the number, the mark and the
+/// text. The left side's, with empty ones in front where it has fewer, are followed by one
+/// that pads it to its columns and one of `BETWEEN`, then come the right side's.
 pub(super) const SIDE: usize = 3;
 /// The columns between the two sides of a row of the lines side by side: a bar, then a space
 /// so the right side's numbers stand apart from it as the left side's stand apart from the
@@ -232,28 +232,23 @@ impl Body {
 /// The rows a file's lines take while they don't wrap, one each, as `Body` keeps them.
 #[derive(Default)]
 struct Slides {
-    /// Each run of rows that are lines, in order, with the sides of those that show the lines
-    /// side by side.
-    runs: Vec<(Range<usize>, Option<Halves>)>,
+    /// The sides of the rows where the file shows its lines side by side.
+    halves: Option<Halves>,
+    /// Each run of rows that are lines, in order.
+    runs: Vec<Range<usize>>,
     /// The columns of the widest of those rows, where each side of one side by side counts
     /// as wide as the row would be with that side's text whole.
     widest: usize,
 }
 
 impl Slides {
-    /// Adds the rows of a line, or of two side by side in `halves`, to `lines`, and where they
-    /// don't wrap, to the runs.
-    fn add(
-        &mut self,
-        lines: &mut Vec<Line<'static>>,
-        rows: Vec<Line<'static>>,
-        wrap: bool,
-        halves: Option<Halves>,
-    ) {
+    /// Adds the rows of a line, or of two side by side, to `lines`, and where they don't wrap,
+    /// to the runs.
+    fn add(&mut self, lines: &mut Vec<Line<'static>>, rows: Vec<Line<'static>>, wrap: bool) {
         if !wrap {
             let (start, end) = (lines.len(), lines.len() + rows.len());
             let width = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>();
-            let widest = rows.iter().map(|row| match halves {
+            let widest = rows.iter().map(|row| match self.halves {
                 None => row.width(),
                 Some(halves) => {
                     let (left, right) = row.spans.split_at(SIDE.min(row.spans.len()));
@@ -264,8 +259,8 @@ impl Slides {
             });
             self.widest = self.widest.max(widest.max().unwrap_or_default());
             match self.runs.last_mut() {
-                Some((run, sides)) if run.end == start && *sides == halves => run.end = end,
-                _ => self.runs.push((start..end, halves)),
+                Some(run) if run.end == start => run.end = end,
+                _ => self.runs.push(start..end),
             }
         }
         lines.extend(rows);
@@ -1399,11 +1394,9 @@ impl Code {
                 let mut slides = laid.slides.runs.iter().cloned().peekable();
                 let mut copy = |lines: &mut Vec<Line<'static>>, rows: Range<usize>| {
                     let shift = lines.len() - rows.start;
-                    while let Some((run, halves)) =
-                        slides.peek_mut().filter(|(run, _)| run.start < rows.end)
-                    {
+                    while let Some(run) = slides.peek_mut().filter(|run| run.start < rows.end) {
                         let end = run.end.min(rows.end);
-                        let left = halves.map(|halves| halves.left);
+                        let left = laid.slides.halves.map(|halves| halves.left);
                         let rows = run.start + shift..end + shift;
                         sideways.runs.push((rows, laid.lead, left));
                         match end == run.end {
@@ -1714,7 +1707,6 @@ fn body(
     let Layout { wrap, split } = layout;
     let muted = Style::new().fg(theme.muted);
     let mut lines = Vec::new();
-    let mut slides = Slides::default();
     let mut marks: Vec<Mark> = Vec::new();
     let mut counted = Vec::new();
     // A file past the bound or with a broken hunk header can have no hunks, and its notes
@@ -1731,7 +1723,7 @@ fn body(
             width,
             withheld,
             lines: whole(note, width, muted),
-            slides,
+            slides: Slides::default(),
             lead: 0,
             marks,
             stretches: counted,
@@ -1770,6 +1762,10 @@ fn body(
     // Side by side, each side has its own numbers and marks, as the narrower left one has room
     // for them.
     let halves = split.then(|| Halves::of(width)).flatten();
+    let mut slides = Slides {
+        halves,
+        ..Slides::default()
+    };
     let side = halves.map_or(width, |halves| halves.left);
     // The number, a space, the mark and a space, while the text keeps a few columns.
     let gutter = if side >= digits + 3 + 8 {
@@ -1802,7 +1798,7 @@ fn body(
                     }
                     None => line_rows(contents, &line, gutter, width, wrap, theme),
                 };
-                slides.add(lines, rows, wrap, halves);
+                slides.add(lines, rows, wrap);
             }
         };
         let end = stretch.first + showing.head + showing.tail + rest(showing.rest);
@@ -1849,7 +1845,7 @@ fn body(
         let Some(halves) = halves else {
             for line in &hunk.lines {
                 let rows = line_rows(text, line, gutter, width, wrap, theme);
-                slides.add(&mut lines, rows, wrap, None);
+                slides.add(&mut lines, rows, wrap);
                 let end = lines.len();
                 match (line.kind, marks.last_mut()) {
                     (patch::Kind::NoNewline, Some(last)) => last.end = end,
@@ -1865,7 +1861,7 @@ fn body(
         };
         for pair in pairs(&hunk.lines) {
             let rows = beside(text, pair, gutter, halves, wrap, theme);
-            slides.add(&mut lines, rows, wrap, Some(halves));
+            slides.add(&mut lines, rows, wrap);
             marks.push(Mark {
                 old: pair.0.and_then(|line| line.old),
                 new: pair.1.and_then(|line| line.new),
@@ -1884,7 +1880,7 @@ fn body(
             };
             let pair = (old_end.then_some(&note), new_end.then_some(&note));
             let rows = beside(text, pair, gutter, halves, wrap, theme);
-            slides.add(&mut lines, rows, wrap, Some(halves));
+            slides.add(&mut lines, rows, wrap);
             if let Some(last) = marks.last_mut() {
                 last.end = lines.len();
             }
@@ -1974,7 +1970,7 @@ fn ends(lines: &[patch::Line]) -> (bool, bool) {
 /// The rows of a pair of lines side by side in `halves`, for as many as the taller side takes:
 /// each line in its side with its number on that side, its mark and its text, as `line_rows`
 /// lays it out, and a side with no line blank. Where the lines don't wrap, each side keeps the
-/// whole of its text, in `SIDE` spans, so `Sideways` scrolls each within its columns.
+/// whole of its text, so `Sideways` scrolls each within its columns.
 fn beside(
     text: &str,
     (old, new): Pair,
@@ -1987,9 +1983,9 @@ fn beside(
         let Some(line) = line else {
             return Vec::new();
         };
-        // With only this side's number, which `line_rows` shows.
+        // `line_rows` shows the number after the change where a line has one, so the left
+        // side drops it to show the number before.
         let line = patch::Line {
-            old: line.old.filter(|_| before),
             new: line.new.filter(|_| !before),
             ..line.clone()
         };
@@ -2003,10 +1999,8 @@ fn beside(
     (0..count)
         .map(|_| {
             let mut spans = left.next().map(|row| row.spans).unwrap_or_default();
-            if !wrap {
-                while spans.len() < SIDE {
-                    spans.insert(0, Span::raw(""));
-                }
+            while spans.len() < SIDE {
+                spans.insert(0, Span::raw(""));
             }
             let used: usize = spans.iter().map(Span::width).sum();
             spans.push(Span::raw(" ".repeat(halves.left.saturating_sub(used))));

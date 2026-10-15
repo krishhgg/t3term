@@ -3701,7 +3701,7 @@ fn unchanged_lines_side_by_side_show_their_number_on_each_side() {
 }
 
 #[test]
-fn a_file_added_or_deleted_keeps_one_column_side_by_side() {
+fn only_a_file_added_or_deleted_keeps_one_column_side_by_side() {
     let mut code = read(slice(PATCH, None), 0);
     code.act(Control::Folds, &[]);
     code.act(Control::Layout, &[]);
@@ -3759,6 +3759,25 @@ fn a_file_added_or_deleted_keeps_one_column_side_by_side() {
         slid.widest,
         " 1   use std::fmt;".width() + BETWEEN.width() + 24
     );
+
+    // A file renamed and changed has lines on both sides, so they show side by side.
+    let renamed = "diff --git a/old.rs b/new.rs
+similarity index 80%
+rename from old.rs
+rename to new.rs
+--- a/old.rs
++++ b/new.rs
+@@ -1 +1 @@
+-a
++b
+";
+    let mut code = read(slice(renamed, None), 0);
+    code.act(Control::Folds, &[]);
+    code.act(Control::Layout, &[]);
+    assert_eq!(
+        rows(&code, 40)[6..8],
+        ["⌄ R old.rs → new.rs +1 -1", "1 - a              │ 1 + b"]
+    );
 }
 
 #[test]
@@ -3794,4 +3813,80 @@ fn the_lines_side_by_side_stay_so_through_reads_and_commits() {
     );
     code.act(Control::Layout, &[]);
     assert_eq!(rows(&code, 40)[6..9], ["⌄ M z +1 -1", "1 - a", "1 + b"]);
+}
+
+#[test]
+fn the_note_that_a_line_has_no_end_shows_on_its_side_side_by_side() {
+    let patch = "diff --git a/a.rs b/a.rs
+--- a/a.rs
++++ b/a.rs
+@@ -1,2 +1,2 @@
+-x
++y
+ end
+\\ No newline at end of file
+diff --git a/b.rs b/b.rs
+--- a/b.rs
++++ b/b.rs
+@@ -1 +1 @@
+-x
++y
+\\ No newline at end of file
+";
+    let mut code = read(slice(patch, None), 0);
+    code.act(Control::Folds, &[]);
+    code.act(Control::Layout, &[]);
+    // After a line in context the note is both sides', and after a line added the right
+    // side's, as pierre reads it.
+    let shown = rows(&code, 40);
+    assert_eq!(
+        shown[7..11],
+        [
+            "1 - x              │ 1 + y",
+            "2   end            │ 2   end",
+            "    No newline at e│     No newline at e",
+            "    nd of file     │     nd of file",
+        ]
+    );
+    assert_eq!(
+        shown[15..18],
+        [
+            "1 - x              │ 1 + y",
+            "                   │     No newline at e",
+            "                   │     nd of file",
+        ]
+    );
+}
+
+#[test]
+fn the_side_whose_text_runs_furthest_sets_how_far_the_rows_scroll() {
+    let patch = "diff --git a/f.rs b/f.rs
+--- a/f.rs
++++ b/f.rs
+@@ -1 +1 @@
+-a line removed that runs on well past its side
++short
+";
+    let mut code = read(slice(patch, None), 0);
+    code.act(Control::File(0), &[]);
+    code.act(Control::Layout, &[]);
+    // At 41 columns, the right side takes the column the two can't share.
+    assert_eq!(
+        rows(&code, 41)[7..11],
+        [
+            "1 - a line removed │ 1 + short",
+            "    that runs on we│",
+            "    ll past its sid│",
+            "    e              │",
+        ]
+    );
+
+    // Unwrapped, the left side's text runs further than the right side's, so the widest row
+    // is as wide as that text with the right side's columns after it.
+    code.act(Control::Wrap, &[]);
+    let (lines, _, slid) = sideways(&code, 41);
+    let long = "1 - a line removed that runs on well past its side";
+    assert_eq!(rows_of(&lines)[7], format!("{long}│ 1 + short"));
+    assert_eq!(slid.runs, [(7..8, 4, Some(19))]);
+    assert_eq!(slid.widest, long.width() + BETWEEN.width() + 20);
 }
