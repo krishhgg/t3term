@@ -39,6 +39,11 @@ pub(super) fn hide(patch: &str, files: &[File]) -> Hidden {
         .collect();
     let mut left = MOST_STEPS;
     for (at, hunk) in order {
+        // Once the steps run out, `compare` fails on its first step, so the larger hunks
+        // after it aren't read.
+        if left == 0 {
+            break;
+        }
         compared[at][hunk] = rebuilt(patch, &files[at].hunks[hunk], &mut left);
     }
     let mut kept = 0;
