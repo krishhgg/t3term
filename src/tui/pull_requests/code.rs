@@ -1789,8 +1789,8 @@ fn entry(
 /// A file's header: a chevron that says whether it is unfolded, a letter for how it changed,
 /// its path, or both paths of a rename, then the lines it adds and removes unless both are 0,
 /// as the desktop's `PullRequestDiffStat` leaves out, and `mark`: `✓ Viewed`, or `Changed since
-/// viewed` for a file pushed to since. The path wraps under itself. Where it has less than two
-/// columns, room for a wide character, the header shows what fits on one row.
+/// viewed` for a file pushed to since. The path wraps under itself, and a character wider than
+/// the room past the lead shows as `…`, as a line's text does.
 fn header(
     file: &patch::File,
     open: bool,
@@ -1831,7 +1831,7 @@ fn header(
             Style::new().fg(theme.error_fg),
         ));
     }
-    if width < indent + 2 {
+    if width <= indent {
         return vec![Line::from(Span::raw(clip(
             &format!("{chevron} {letter} {name}"),
             width,

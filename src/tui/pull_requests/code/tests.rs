@@ -3377,12 +3377,14 @@ fn a_header_of_wide_characters_fits_every_width() {
             assert!(row.width() <= width, "{width}: {row:?}");
         }
     }
-    // A path with two columns past its lead wraps a character to a row, and one with less
-    // shows what fits on one row.
+    // A path with two columns past its lead wraps a character to a row, and with one, a wide
+    // character shows as `…`.
     let narrow = rows(&code, 6);
     let at = narrow.iter().position(|row| row == "› M 漢").unwrap();
     assert_eq!(narrow[at..], ["› M 漢", "    字", "    漢", "    字"]);
-    assert_eq!(rows(&code, 5).last().unwrap(), "› M …");
+    let narrow = rows(&code, 5);
+    let at = narrow.iter().position(|row| row == "› M …").unwrap();
+    assert_eq!(narrow[at..], ["› M …", "    …", "    …", "    …"]);
 }
 
 #[test]

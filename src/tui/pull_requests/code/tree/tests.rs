@@ -182,10 +182,19 @@ fn rows_fit_every_width_and_hostile_names_are_cleaned() {
             "  A 漢", "    字", "    漢", "    字", "    漢", "    字", "    .r", "    s"
         ]
     );
-    // Where the name has less than two columns past its lead, the row shows what fits.
-    assert_eq!(text(&rows[1], 5), ["  A …"]);
+    // With one column past its lead, a wide character shows as `…`, and with none, the row
+    // shows what fits.
+    assert_eq!(
+        text(&rows[1], 5),
+        [
+            "  A …", "    …", "    …", "    …", "    …", "    …", "    .", "    r", "    s"
+        ]
+    );
+    let folder = text(&rows[0], 3);
+    assert_eq!(folder[..2], ["⌄ s", "  r"]);
+    assert_eq!(folder.len(), 11);
     assert_eq!(text(&rows[1], 4), ["  A…"]);
-    assert_eq!(text(&rows[0], 3), ["⌄ …"]);
+    assert_eq!(text(&rows[0], 2), ["⌄…"]);
     assert_eq!(text(&rows[0], 1), ["…"]);
 }
 

@@ -223,8 +223,8 @@ fn joined(path: &str, name: &str) -> String {
 /// The rows `row` takes at `width`: two columns for each folder it is under, at most half the
 /// width, then a folder's chevron or a file's letter in the color of how it changed, then its
 /// name, cleaned and bounded, on as many rows as it takes. A file's name has the color of how
-/// it changed, as pierre colors it. Where the name has less than two columns, room for a wide
-/// character, the row shows what fits of it on one row.
+/// it changed, as pierre colors it. A character wider than the room past the lead shows as `…`,
+/// as a line's text does.
 pub(super) fn lines(row: &Row, width: usize, theme: &Theme) -> Vec<Line<'static>> {
     let indent = (2 * row.depth).min(width / 2);
     let (lead, lead_color, name_color) = match &row.kind {
@@ -239,7 +239,7 @@ pub(super) fn lines(row: &Row, width: usize, theme: &Theme) -> Vec<Line<'static>
     };
     let name = bounded(&row.name, PATH);
     let pad = indent + 2;
-    if width < pad + 2 {
+    if width <= pad {
         let text = format!("{}{lead} {name}", " ".repeat(indent));
         return vec![Line::from(Span::raw(clip(&text, width)))];
     }
