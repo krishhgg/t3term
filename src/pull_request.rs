@@ -735,7 +735,7 @@ impl CommentKind {
 
 /// Which version of a file a diff line belongs to: left before the change, right after it.
 /// `PullRequestDiffSide`.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
 pub enum Side {
     Left,
     Right,
