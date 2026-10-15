@@ -14035,6 +14035,9 @@ mod tests {
                 .collect::<Vec<_>>()
         };
         let shown = Some("2026-10-13T11:00:00Z".to_string());
+        // The key and the read it asks for each read the clock, which can tick between them.
+        // A time ahead of the clock stops it for both.
+        app.now = now_ms() + 60 * 60_000;
         press(&mut app, KeyCode::Enter);
         assert_eq!(app.live_at(), None);
         let detail = Part::Detail(Ok(Box::new(host_detail())));
@@ -14046,7 +14049,7 @@ mod tests {
         let due = app
             .live_at()
             .expect("a read that keeps the details current");
-        assert!(due - app.input_at <= 5 * 60_000);
+        assert_eq!(due - app.input_at, 5 * 60_000);
         app.now = due - 1;
         app.read_opened_pull();
         assert_eq!(reads(&asked).len(), 1);
