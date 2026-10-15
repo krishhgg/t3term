@@ -288,6 +288,26 @@ diff --git a/e.txt b/e.txt
         assert!(read.files[0].unreadable, "{broken}");
         assert_eq!(read.files[0].hunks, [], "{broken}");
     }
+
+    // So do a patch that ends inside a hunk and a hunk with more lines on a side than its
+    // header counts. The lines that fit stay.
+    for (patch, kept) in [
+        ("diff --git a/a b/a\n@@ -1,3 +1,3 @@\n same\n", 1),
+        ("diff --git a/a b/a\n@@ -1 +1,2 @@\n-a\n-b\n+c\n+d\n", 1),
+        ("diff --git a/a b/a\n@@ -1,2 +1 @@\n-a\n+b\n+c\n-d\n", 2),
+        ("diff --git a/a b/a\n@@ -1 +1 @@\n same\n more\n", 1),
+        ("diff --git a/a b/a\n@@ -1 +1 @@\n-a\n+b\n+c\n", 2),
+    ] {
+        let read = Patch::read(patch);
+        assert!(read.files[0].unreadable, "{patch:?}");
+        assert_eq!(read.files[0].hunks[0].lines.len(), kept, "{patch:?}");
+    }
+    // A hunk that ends with its header's counts, or with the last line's missing line end,
+    // reads whole before the next file.
+    let patch = "diff --git a/a b/a\n@@ -1 +1 @@\n-a\n\\ No newline at end of file\n+b\n\\ No newline at end of file\ndiff --git a/b b/b\n@@ -1 +1 @@\n-c\n+d\n";
+    let read = Patch::read(patch);
+    assert!(read.files.iter().all(|file| !file.unreadable));
+    assert_eq!(read.files[0].hunks[0].lines.len(), 4);
 }
 
 #[test]
@@ -316,12 +336,20 @@ fn a_patch_past_its_bounds_keeps_what_fits() {
     let read = Patch::read(&patch);
     let big = &read.files[0];
     assert!(big.lines_cut);
-    assert_eq!(big.hunks[0].lines.len(), MOST_LINES);
+    // Its header counts as the first line.
+    assert_eq!(big.hunks[0].lines.len(), MOST_LINES - 1);
     // The counts take in every line, kept or not.
     assert_eq!(big.additions, MOST_LINES as u64 + 2);
-    assert!(read.files[1].lines_cut);
-    assert_eq!(read.files[1].hunks[0].lines, []);
+    assert!(read.files[1].lines_cut && !read.files[1].unreadable);
+    assert_eq!(read.files[1].hunks, []);
     assert_eq!((read.files[1].additions, read.files[1].deletions), (1, 1));
+
+    // A patch of hunk headers alone stops keeping hunks at the bound too.
+    let mut patch = String::from("diff --git a/h b/h\n");
+    patch.push_str(&"@@ -1,0 +1,0 @@\n".repeat(MOST_LINES + 2));
+    let read = Patch::read(&patch);
+    assert_eq!(read.files[0].hunks.len(), MOST_LINES);
+    assert!(read.files[0].lines_cut && !read.files[0].unreadable);
 
     // A path past `PATH` bytes is cut on a character boundary.
     let long = "é".repeat(PATH);

@@ -10,7 +10,8 @@ use std::ops::Range;
 /// The most files read from one patch. GitHub's diff holds at most 300 and a page of its files
 /// 100, so a patch past this isn't a pull request's.
 pub const MOST_FILES: usize = 3000;
-/// The most lines of hunks read from one patch, in all its files.
+/// The most hunks and lines of hunks read from one patch, in all its files. A hunk's header
+/// counts as a line, so a patch of headers alone can't pass it.
 pub const MOST_LINES: usize = 200_000;
 /// The longest path kept, in bytes, as T3's `FilePath` (packages/contracts/src/pullRequest.ts).
 const PATH: usize = 4096;
@@ -37,9 +38,10 @@ pub struct File {
     /// The lines the hunks add and remove.
     pub additions: u64,
     pub deletions: u64,
-    /// Whether lines of its hunks are left out, because the patch passed `MOST_LINES`.
+    /// Whether hunks or their lines are left out, because the patch passed `MOST_LINES`.
     pub lines_cut: bool,
-    /// Whether a line in it couldn't be read, such as a hunk header that isn't one.
+    /// Whether a line in it couldn't be read, such as a hunk header that isn't one, or a hunk
+    /// has fewer or more lines than its header says.
     pub unreadable: bool,
 }
 
@@ -111,6 +113,9 @@ struct Reading {
     skipping: bool,
     /// Whether the open file has had its `+++` line, so another `---` starts a file.
     new_side: bool,
+    /// Whether the open file has had a hunk, so a line like a hunk's outside one is one more
+    /// than the last header counted.
+    hunked: bool,
 }
 
 impl Patch {
@@ -127,6 +132,7 @@ impl Patch {
             new_at: 0,
             skipping: false,
             new_side: false,
+            hunked: false,
         };
         let mut at = 0;
         for raw in patch.split_inclusive('\n') {
@@ -135,6 +141,10 @@ impl Patch {
             let line = raw.strip_suffix('\n').unwrap_or(raw);
             let line = line.strip_suffix('\r').unwrap_or(line);
             reading.line(line, start);
+        }
+        if reading.in_hunk() {
+            // The patch ends before the last hunk's lines do.
+            reading.cut_short();
         }
         Patch {
             files: reading.files,
@@ -160,16 +170,20 @@ impl Reading {
                 None => Some(Kind::Context),
                 Some(_) => None,
             };
-            if let Some(kind) = kind {
+            // A line belongs to the hunk only where each side it is on has lines left.
+            let fits = |kind: &Kind| match kind {
+                Kind::Context => self.old_left > 0 && self.new_left > 0,
+                Kind::Removed => self.old_left > 0,
+                Kind::Added => self.new_left > 0,
+                Kind::NoNewline => true,
+            };
+            if let Some(kind) = kind.filter(fits) {
                 self.hunk_line(kind, line, start);
                 return;
             }
-            // The hunk ends sooner than its header said.
-            self.old_left = 0;
-            self.new_left = 0;
-            if let Some(file) = self.file() {
-                file.unreadable = true;
-            }
+            // The hunk ends sooner than its header said, or has more lines on one side. The
+            // line is read as one outside a hunk, as git reads it.
+            self.cut_short();
         }
         if let Some(rest) = line.strip_prefix("diff --git ") {
             self.start_file(git_paths(rest));
@@ -213,10 +227,13 @@ impl Reading {
             }
             return;
         }
+        let hunked = self.hunked;
         let Some(file) = self.file() else {
             return;
         };
-        if line.starts_with("new file mode ") {
+        if hunked && matches!(line.as_bytes().first(), Some(b' ' | b'+' | b'-')) {
+            file.unreadable = true;
+        } else if line.starts_with("new file mode ") {
             file.status = Status::Added;
             file.old_path = None;
         } else if line.starts_with("deleted file mode ") {
@@ -243,6 +260,15 @@ impl Reading {
         // do the lines of a binary patch, which start with a letter and have no space.
     }
 
+    /// Ends the open hunk before its header's counts are used up, which marks its file.
+    fn cut_short(&mut self) {
+        self.old_left = 0;
+        self.new_left = 0;
+        if let Some(file) = self.file() {
+            file.unreadable = true;
+        }
+    }
+
     fn file(&mut self) -> Option<&mut File> {
         if self.skipping {
             return None;
@@ -254,6 +280,7 @@ impl Reading {
         self.old_left = 0;
         self.new_left = 0;
         self.new_side = false;
+        self.hunked = false;
         if self.files.len() == MOST_FILES {
             self.files_cut = true;
             self.skipping = true;
@@ -274,6 +301,7 @@ impl Reading {
 
     /// Starts a hunk from its header after `@@ `, which starts at byte `start`.
     fn start_hunk(&mut self, header: &str, start: usize) {
+        let full = self.lines >= MOST_LINES;
         let Some(file) = self.file() else {
             return;
         };
@@ -281,15 +309,22 @@ impl Reading {
             file.unreadable = true;
             return;
         };
-        let section_at = start + (header.len() - section.len());
-        file.hunks.push(Hunk {
-            old_start: old.0,
-            old_count: old.1,
-            new_start: new.0,
-            new_count: new.1,
-            section: section_at..section_at + section.len(),
-            lines: Vec::new(),
-        });
+        if full {
+            // Its lines are still read for the counts, as a kept hunk's past the bound are.
+            file.lines_cut = true;
+        } else {
+            let section_at = start + (header.len() - section.len());
+            file.hunks.push(Hunk {
+                old_start: old.0,
+                old_count: old.1,
+                new_start: new.0,
+                new_count: new.1,
+                section: section_at..section_at + section.len(),
+                lines: Vec::new(),
+            });
+            self.lines += 1;
+        }
+        self.hunked = true;
         self.old_left = old.1;
         self.new_left = new.1;
         self.old_at = old.0;
@@ -303,13 +338,14 @@ impl Reading {
             Kind::Added => (None, Some(self.new_at)),
             Kind::NoNewline => (None, None),
         };
+        // `line` passes a line on a side only while that side has lines left.
         if old.is_some() {
             self.old_at += 1;
-            self.old_left = self.old_left.saturating_sub(1);
+            self.old_left -= 1;
         }
         if new.is_some() {
             self.new_at += 1;
-            self.new_left = self.new_left.saturating_sub(1);
+            self.new_left -= 1;
         }
         let full = self.lines >= MOST_LINES;
         let Some(file) = self.file() else {
