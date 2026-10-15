@@ -18,7 +18,7 @@ use t3term::client::{
     spawn_worktree_setup_watch,
 };
 use t3term::projection::{Applied, ThreadState, apply_config};
-use t3term::pull_request::{self, PullRequestError, Reference, State, Unavailable};
+use t3term::pull_request::{self, ChangeType, PullRequestError, Reference, State, Unavailable};
 use t3term::rpc::{BoundedChunk, BoundedStream, RpcClient, RpcError, StreamLimits};
 
 type Socket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
@@ -1418,6 +1418,68 @@ async fn pull_request_reads_send_t3s_reference_and_read_its_answers() {
         ("PRRC_2", None)
     );
 
+    // A file's text names how it changed and both its paths, and a commit where one is read.
+    let mut contents = payload.clone();
+    contents["changeType"] = json!("change");
+    contents["oldPath"] = json!("src/main.rs");
+    contents["newPath"] = json!("src/main.rs");
+    let text = json!({"oldContents": "fn main() {}\n", "newContents": "fn main() {\n}\n"});
+    let (read, ()) = tokio::join!(
+        pull_request::diff_file_contents(
+            &rpc,
+            &reference,
+            None,
+            ChangeType::Change,
+            "src/main.rs",
+            "src/main.rs"
+        ),
+        answer_request(
+            &mut socket,
+            "pullRequests.diffFileContents",
+            &contents,
+            success(text.clone())
+        ),
+    );
+    assert_eq!(read.unwrap().new, "fn main() {\n}\n");
+    let mut renamed = payload.clone();
+    renamed["commit"] = json!("9dc565a");
+    renamed["changeType"] = json!("rename-changed");
+    renamed["oldPath"] = json!("src/old.rs");
+    renamed["newPath"] = json!("src/new.rs");
+    let (read, ()) = tokio::join!(
+        pull_request::diff_file_contents(
+            &rpc,
+            &reference,
+            Some("9dc565a"),
+            ChangeType::RenameChanged,
+            "src/old.rs",
+            "src/new.rs"
+        ),
+        answer_request(
+            &mut socket,
+            "pullRequests.diffFileContents",
+            &renamed,
+            success(text)
+        ),
+    );
+    assert!(read.is_ok());
+    // T3 trims a path, so one it would change goes unsent. The next call still finds the
+    // socket in step.
+    for (old, new) in [
+        (" a.rs", "a.rs"),
+        ("a.rs", "a.rs\n"),
+        ("", "a.rs"),
+        ("a.rs", ""),
+    ] {
+        let refused =
+            pull_request::diff_file_contents(&rpc, &reference, None, ChangeType::Change, old, new)
+                .await;
+        assert!(
+            matches!(refused, Err(PullRequestError::Invalid(_))),
+            "{old:?} {new:?}"
+        );
+    }
+
     // Invalidating names the one pull request, so T3 keeps its listings.
     let named = json!({"reference": payload});
     let (invalidated, ()) = tokio::join!(
@@ -1537,6 +1599,36 @@ async fn a_pull_request_read_names_what_failed() {
     assert_eq!(
         error.unwrap_err().to_string(),
         "This host does not page review thread comments."
+    );
+
+    // A host that can't read a file's text says so in T3's words
+    // (apps/server/src/pullRequest/PullRequestService.ts:1901-1922 at f570bd2).
+    let unexpandable = fail(json!({"_tag": "PullRequestOperationError",
+        "operation": "diffFileContents",
+        "detail": "This host cannot expand unchanged pull request lines."}));
+    let mut contents = payload.clone();
+    contents["changeType"] = json!("change");
+    contents["oldPath"] = json!("a.rs");
+    contents["newPath"] = json!("a.rs");
+    let (error, ()) = tokio::join!(
+        pull_request::diff_file_contents(
+            &rpc,
+            &reference,
+            None,
+            ChangeType::Change,
+            "a.rs",
+            "a.rs"
+        ),
+        answer_request(
+            &mut socket,
+            "pullRequests.diffFileContents",
+            &contents,
+            unexpandable
+        ),
+    );
+    assert_eq!(
+        error.unwrap_err().to_string(),
+        "This host cannot expand unchanged pull request lines."
     );
 }
 
