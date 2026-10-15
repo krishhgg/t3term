@@ -434,6 +434,36 @@ fn an_empty_or_unreadable_diff_says_so() {
             "t3term couldn't split this patch into files.",
         ]
     );
+
+    // A file whose hunk header isn't one, or whose hunk ends short, says so under its lines.
+    let text =
+        "diff --git a/a b/a\n@@ -x +1 @@\n+lost\ndiff --git a/b b/b\n@@ -1,2 +1,2 @@\n kept\n";
+    let mut code = read(slice(text, None), 0);
+    code.act(Control::File(0));
+    code.act(Control::File(1));
+    let note = "t3term couldn't read some lines of this file's patch.";
+    assert_eq!(
+        rows(&code, 60),
+        ["2 files", "", "⌄ M a", note, "", "⌄ M b", "1   kept", note]
+    );
+
+    // A file past the bound on lines has no hunk, and says why rather than that nothing changed.
+    let mut text = format!(
+        "diff --git a/big b/big\n@@ -0,0 +1,{0} @@\n",
+        patch::MOST_LINES
+    );
+    text.push_str(&"+x\n".repeat(patch::MOST_LINES));
+    text.push_str("diff --git a/next b/next\n@@ -1 +1 @@\n-a\n+b\n");
+    let mut code = read(slice(&text, None), 0);
+    code.act(Control::File(1));
+    let rows = rows(&code, 100);
+    assert_eq!(
+        rows[rows.len() - 2..],
+        [
+            "⌄ M next +1 -1",
+            "t3term reads at most 200,000 lines of a slice, so the rest of this file doesn't show.",
+        ]
+    );
 }
 
 #[test]

@@ -457,7 +457,9 @@ fn body(
 ) -> Vec<Line<'static>> {
     let muted = Style::new().fg(theme.muted);
     let mut lines = Vec::new();
-    if file.hunks.is_empty() {
+    // A file past the bound or with a broken hunk header can have no hunks, and its notes
+    // below say why.
+    if file.hunks.is_empty() && !file.lines_cut && !file.unreadable {
         let note = if file.binary {
             "A binary file, whose changes have no lines to show."
         } else if withheld {
