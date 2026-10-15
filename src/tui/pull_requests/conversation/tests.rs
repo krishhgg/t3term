@@ -152,7 +152,7 @@ fn a_hosts_times_read_with_their_offsets() {
 }
 
 #[test]
-fn html_comments_go_except_in_fenced_code() {
+fn html_comments_go_except_in_code() {
     let cases = [
         ("Looks good.<!-- greptile_comment -->", "Looks good."),
         ("a<!-- one\ntwo -->b", "ab"),
@@ -179,6 +179,20 @@ fn html_comments_go_except_in_fenced_code() {
         ("```a`b```<!--x-->y", "```a`b```y"),
         ("<!-- never closed\nmore", ""),
         ("no comment <!- here", "no comment <!- here"),
+        // A code span keeps a comment, as it is text there, but only one that closes.
+        ("Use `<!-- marker -->` here", "Use `<!-- marker -->` here"),
+        ("``a ` <!-- b --> c``<!--x-->y", "``a ` <!-- b --> c``y"),
+        ("`open <!--x-->y", "`open y"),
+        ("`a\n<!-- b -->`<!--x-->", "`a\n<!-- b -->`"),
+        // A blank line or a fence ends the paragraph a code span can close in.
+        ("`a\n\n<!-- b -->`", "`a\n\n`"),
+        (
+            "`a\n```\nb`\n<!-- kept -->\n```",
+            "`a\n```\nb`\n<!-- kept -->\n```",
+        ),
+        // A comment that comes first holds its backticks, and an escaped one opens nothing.
+        ("<!-- `x` -->y", "y"),
+        ("\\`<!--x-->`y", "\\``y"),
     ];
     for (text, kept) in cases {
         assert_eq!(without_html_comments(text), kept, "{text:?}");
