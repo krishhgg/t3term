@@ -953,10 +953,16 @@ impl Details {
         self.open && self.pulls.wants(open_id, supported)
     }
 
+    /// Whether the details show the pull requests' tab.
+    pub fn shows_pulls(&self) -> bool {
+        self.open && self.tab == Tab::PullRequests
+    }
+
     /// Takes part of what a host said of the pull request whose details asked with `ticket`,
-    /// or why the read failed. The details lay out again when it is the read they wait for.
-    pub fn answer_pull(&mut self, ticket: u64, part: Part) {
-        if self.pulls.answer(ticket, part) {
+    /// or why the read failed, which came at `now`. The details lay out again when it is the
+    /// read they wait for.
+    pub fn answer_pull(&mut self, ticket: u64, part: Part, now: i64) {
+        if self.pulls.answer(ticket, part, now) {
             self.moved = true;
         }
     }
