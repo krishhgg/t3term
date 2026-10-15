@@ -1019,8 +1019,8 @@ fn read_reaction(value: &Value) -> Result<Option<Reaction>, PullRequestError> {
     };
     let count = object.positive("count")?;
     let (actors, _) = object.entries("actors", MOST_PEOPLE, |actor| {
-        match actor.as_str().filter(|login| !login.trim().is_empty()) {
-            Some(login) => Ok(cut(login, NAME).0),
+        match actor.as_str().and_then(|login| filled(login, NAME)) {
+            Some(login) => Ok(login),
             None => Err(object.wrong("actors")),
         }
     })?;
@@ -1160,14 +1160,29 @@ fn read_permissions(object: &Object) -> Result<Permissions, PullRequestError> {
 
 /// `text` cut to at most `limit` bytes on a character boundary, and whether it was longer.
 fn cut(text: &str, limit: usize) -> (String, bool) {
+    let (kept, cut) = prefix(text, limit);
+    (kept.to_string(), cut)
+}
+
+/// The first `limit` bytes of `text` or fewer, ending on a character boundary, and whether
+/// `text` was longer.
+fn prefix(text: &str, limit: usize) -> (&str, bool) {
     if text.len() <= limit {
-        return (text.to_string(), false);
+        return (text, false);
     }
     let mut end = limit;
     while !text.is_char_boundary(end) {
         end -= 1;
     }
-    (text[..end].to_string(), true)
+    (&text[..end], true)
+}
+
+/// `text` cut to `limit`, or `None` where the part kept is blank. Only the part kept is
+/// scanned, so whitespace past the bound costs nothing. T3 trims these strings, so a string
+/// it sends is blank only when it is all whitespace.
+fn filled(text: &str, limit: usize) -> Option<String> {
+    let (kept, _) = prefix(text, limit);
+    (!kept.trim().is_empty()).then(|| kept.to_string())
 }
 
 fn malformed(what: String) -> PullRequestError {
@@ -1219,10 +1234,16 @@ impl<'a> Object<'a> {
     }
 
     /// A string that is not blank once trimmed, as `TrimmedNonEmptyString` is, cut to `limit`.
+    /// It is blank when the part kept is.
     fn trimmed(&self, key: &str, limit: usize) -> Result<String, PullRequestError> {
-        match self.map.get(key).and_then(Value::as_str) {
-            Some(text) if !text.trim().is_empty() => Ok(cut(text, limit).0),
-            _ => Err(self.wrong(key)),
+        match self
+            .map
+            .get(key)
+            .and_then(Value::as_str)
+            .and_then(|text| filled(text, limit))
+        {
+            Some(text) => Ok(text),
+            None => Err(self.wrong(key)),
         }
     }
 
