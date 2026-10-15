@@ -1879,6 +1879,8 @@ impl App {
     /// acts on the chosen row. On the pull requests' tab they move along the pull requests, or
     /// scroll the selected one's details, which Enter shows in the list's place and hides
     /// again. The page keys, Home, End, `g` and `G` scroll the text, the list or the details.
+    /// Shift+← and Shift+→, `H` and `L`, scroll the Code tab's lines sideways while they don't
+    /// wrap.
     fn on_details_key(&mut self, key: KeyEvent) {
         let plain = !key
             .modifiers
@@ -1888,6 +1890,14 @@ impl App {
                 self.leave_details()
             }
             KeyCode::Esc => self.close_details(),
+            KeyCode::Left if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.details.sideways(false)
+            }
+            KeyCode::Right if key.modifiers.contains(KeyModifiers::SHIFT) => {
+                self.details.sideways(true)
+            }
+            KeyCode::Char('H') if plain => self.details.sideways(false),
+            KeyCode::Char('L') if plain => self.details.sideways(true),
             KeyCode::Left => self.details.back(),
             KeyCode::Char('h') if plain => self.details.back(),
             KeyCode::Right => self.details.forward(),
@@ -2076,6 +2086,12 @@ impl App {
                         _ if click => self.close_details(),
                         MouseEventKind::ScrollUp if inside(drawn.area) => self.details.wheel(-1),
                         MouseEventKind::ScrollDown if inside(drawn.area) => self.details.wheel(1),
+                        MouseEventKind::ScrollLeft if inside(drawn.area) => {
+                            self.details.wheel_sideways(false)
+                        }
+                        MouseEventKind::ScrollRight if inside(drawn.area) => {
+                            self.details.wheel_sideways(true)
+                        }
                         _ => return false,
                     }
                     return true;
@@ -2163,6 +2179,8 @@ impl App {
                         }
                         MouseEventKind::ScrollUp => self.details.wheel(-1),
                         MouseEventKind::ScrollDown => self.details.wheel(1),
+                        MouseEventKind::ScrollLeft => self.details.wheel_sideways(false),
+                        MouseEventKind::ScrollRight => self.details.wheel_sideways(true),
                         _ => return false,
                     }
                     return true;
@@ -13975,11 +13993,12 @@ mod tests {
         let rows = body_after(&mut app, 200, 50);
         let text: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
         assert_eq!(
-            text[4..9],
+            text[4..10],
             [
                 "1 file",
                 "¶ Show whitespace changes",
                 "⇊ Expand all files",
+                "↵ Disable line wrapping",
                 "",
                 "› M src/lib.rs +1 -1"
             ]
@@ -13995,11 +14014,14 @@ mod tests {
         assert!(shown.contains("Enter expand all files · "), "{shown}");
         press(&mut app, KeyCode::Down);
         let shown = status(&mut app);
+        assert!(shown.contains("Enter disable line wrapping · "), "{shown}");
+        press(&mut app, KeyCode::Down);
+        let shown = status(&mut app);
         assert!(shown.contains("Enter expand file · "), "{shown}");
         press(&mut app, KeyCode::Enter);
         let rows = body_after(&mut app, 200, 50);
         let text: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
-        assert_eq!(text[8..11], ["⌄ M src/lib.rs +1 -1", "1 - old", "1 + new"]);
+        assert_eq!(text[9..12], ["⌄ M src/lib.rs +1 -1", "1 - old", "1 + new"]);
         press(&mut app, KeyCode::Right);
         assert_eq!(app.details.pulls.tabs(), Some(Tab::Code));
         assert_eq!(*diffs.borrow(), [named, again]);
