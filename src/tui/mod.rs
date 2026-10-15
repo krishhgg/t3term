@@ -13961,6 +13961,51 @@ mod tests {
     }
 
     #[test]
+    fn the_terminal_gaining_focus_reads_the_open_details_again_while_you_use_t3term() {
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        let asked = note_reads(&mut app);
+        let reads = |asked: &std::cell::RefCell<Vec<Noted>>| {
+            let asked = asked.borrow();
+            asked
+                .iter()
+                .map(|ask| (ask.4, ask.6.clone()))
+                .collect::<Vec<_>>()
+        };
+        let shown = Some("2026-10-13T11:00:00Z".to_string());
+        press(&mut app, KeyCode::Enter);
+        let came = now_ms().max(app.now);
+        app.now = came;
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        let activity = Part::Activity(Ok(Box::new(host_activity())));
+        hear(&mut app, 1, vec![detail, activity, Part::Done]);
+
+        // Within ten seconds of the detail, focus reads nothing, and losing it never does.
+        app.now = came + 9_000;
+        assert!(!app.on_terminal_event(Event::FocusGained));
+        app.now = came + 20_000;
+        assert!(!app.on_terminal_event(Event::FocusLost));
+        assert_eq!(reads(&asked).len(), 1);
+
+        // Later, focus reads the detail again, and draws that it does.
+        assert!(app.on_terminal_event(Event::FocusGained));
+        assert_eq!(reads(&asked), [(1, None), (2, shown)]);
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Refreshing from github.com…"), "{text}");
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        hear(&mut app, 2, vec![detail, Part::Done]);
+
+        // Focus after six minutes without input waits for the next input, as it isn't input.
+        app.now = came + 40_000;
+        let input = app.now - pull_requests::IDLE;
+        app.input_at = input;
+        assert!(!app.on_terminal_event(Event::FocusGained));
+        assert_eq!(app.input_at, input);
+        assert_eq!(reads(&asked).len(), 2);
+        assert!(mouse(&mut app, MouseEventKind::Moved, 1, 1));
+        assert_eq!(reads(&asked).len(), 3);
+    }
+
+    #[test]
     fn t3_ending_the_refresh_numbers_leaves_reads_as_they_were() {
         let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
         let asked = note_reads(&mut app);
