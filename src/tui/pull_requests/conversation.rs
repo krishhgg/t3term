@@ -19,7 +19,10 @@
 //!
 //! The review threads, each a conversation on a line of the diff, show on the Code tab, which
 //! places them. Each is a `Thread` of remarks, open unless resolved until the reader opens or
-//! closes it, as the desktop's `ReviewThreadCard` starts.
+//! closes it, as the desktop's `ReviewThreadCard` starts. Where the host has more remarks than
+//! the activity sent, the reader can read them a page at a time, as the card's `Load more
+//! comments` does. The pages a thread read go with it when the details read the conversation
+//! again.
 //!
 //! What shows is cleaned and bounded once, when the answer arrives. Each remark's Markdown is
 //! laid out once for each width, and only while it shows.
@@ -35,7 +38,7 @@ use super::super::markdown::{self, Styles};
 use super::super::setup::bounded;
 use super::super::theme::{Theme, age, parse_iso_ms};
 use super::super::{clip, row};
-use super::{Answer, NAME, flowed, grouped, whole};
+use super::{Answer, FAILURE, NAME, flowed, grouped, whole};
 use crate::pull_request::{
     self, Actor, Comment, CommentKind, Commit, Reaction, ReactionContent, ReviewThread, Side,
     ThreadComment,
@@ -137,7 +140,7 @@ impl Shown {
                 }
             }
             Control::OffDiff => self.off_diff_open = !self.off_diff_open,
-            Control::File(_) | Control::Retry => {}
+            Control::File(_) | Control::Retry | Control::More(_) => {}
         }
     }
 
@@ -215,6 +218,9 @@ pub(super) enum Control {
     Thread(usize),
     /// Opens or closes the Code tab's list of the conversations off the diff.
     OffDiff,
+    /// Reads the next page of a review thread's remarks, by the thread's place as for
+    /// `Thread`.
+    More(usize),
 }
 
 impl Control {
@@ -347,6 +353,29 @@ pub(super) struct Thread {
     count: u64,
     /// Oldest first, as T3 sends them.
     remarks: Vec<Remark>,
+    /// The remarks pages read after those, oldest first, none of them one `remarks` has.
+    loaded: Vec<Remark>,
+    /// Where the next page of remarks starts: the activity's cursor until a page came, then
+    /// the last page's. `None` once the thread is whole, or holds as many remarks as t3term
+    /// keeps.
+    next: Option<String>,
+    /// Whether a page came, so `next` is a page's cursor.
+    paged: bool,
+    /// Where the read of the next page is.
+    more: More,
+}
+
+/// Where the read of a thread's next page of remarks is.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) enum More {
+    #[default]
+    Idle,
+    /// The reader asked for it, and the next read sends it.
+    Wanted,
+    /// The read with this ticket is under way.
+    Asked(u64),
+    /// The last read failed, for this reason.
+    Failed(String),
 }
 
 /// One remark, cleaned and bounded.
@@ -575,11 +604,74 @@ impl Conversation {
     pub(super) fn lay_out_threads(&mut self, at: &[usize], width: usize, theme: &Theme) {
         for &at in at {
             if let Some(thread) = self.threads.get_mut(at) {
-                for remark in &mut thread.remarks {
+                for remark in thread.remarks.iter_mut().chain(&mut thread.loaded) {
                     remark.lay_out(thread::inner(width), theme);
                 }
             }
         }
+    }
+
+    /// Takes from `old`, the conversation this one replaces, the pages of remarks each thread
+    /// read and where each thread's read of the next is, as the desktop's card keeps the
+    /// pages it loaded while the activity reads again.
+    pub(super) fn carry(&mut self, old: &mut Conversation) {
+        let olds: HashMap<String, usize> = old
+            .threads
+            .iter()
+            .enumerate()
+            .map(|(at, thread)| (thread.id.clone(), at))
+            .collect();
+        for thread in &mut self.threads {
+            if let Some(&at) = olds.get(&thread.id) {
+                thread.carry(&mut old.threads[at]);
+            }
+        }
+    }
+
+    /// Asks for the next page of the remarks of the thread at `at`, unless it is whole or a
+    /// read of it is under way. Says whether it asked.
+    pub(super) fn want_more(&mut self, at: usize) -> bool {
+        let Some(thread) = self.threads.get_mut(at) else {
+            return false;
+        };
+        if !thread.offers_more() {
+            return false;
+        }
+        thread.more = More::Wanted;
+        true
+    }
+
+    /// The id and cursor of the first thread whose next page is wanted, which the read with
+    /// `ticket` is to read.
+    pub(super) fn take_wanted(&mut self, ticket: u64) -> Option<(String, String)> {
+        let thread = self
+            .threads
+            .iter_mut()
+            .find(|thread| thread.more == More::Wanted)?;
+        let cursor = thread.next.clone()?;
+        thread.more = More::Asked(ticket);
+        Some((thread.id.clone(), cursor))
+    }
+
+    /// Takes the answer to the read with `ticket` of a thread's next page, or why it failed.
+    /// Says whether a thread asked for it.
+    pub(super) fn take_page(
+        &mut self,
+        ticket: u64,
+        answer: Result<&pull_request::CommentPage, &str>,
+    ) -> bool {
+        let Some(thread) = self
+            .threads
+            .iter_mut()
+            .find(|thread| thread.more == More::Asked(ticket))
+        else {
+            return false;
+        };
+        match answer {
+            Ok(page) => thread.take(page),
+            Err(failure) => thread.more = More::Failed(bounded(failure, FAILURE)),
+        }
+        true
     }
 
     /// Lays the Timeline out from the pull request's `lifecycle`, from its detail, unless it
@@ -666,7 +758,11 @@ impl Conversation {
             Control::Remark(at) => shown.finished_open && at < self.finished.len(),
             Control::TimelineOrder => self.timeline.is_some(),
             Control::Run(at) => self.timeline.as_ref().is_some_and(|t| at < t.runs()),
-            Control::File(_) | Control::Retry | Control::Thread(_) | Control::OffDiff => false,
+            Control::File(_)
+            | Control::Retry
+            | Control::Thread(_)
+            | Control::OffDiff
+            | Control::More(_) => false,
         }
     }
 
@@ -709,6 +805,7 @@ impl Conversation {
                 toggle(open, "conversation")
             }
             Control::OffDiff => toggle(shown.off_diff_open, "conversations off the diff"),
+            Control::More(_) => "load more comments".to_string(),
             Control::File(_) | Control::Retry => String::new(),
         }
     }

@@ -1397,6 +1397,27 @@ async fn pull_request_reads_send_t3s_reference_and_read_its_answers() {
     let layers: Vec<_> = stack.layers.iter().map(|layer| layer.number).collect();
     assert_eq!((stack.number, layers), (7, vec![40, 41]));
 
+    // A page of a review thread's remarks names the thread and the cursor it starts at.
+    let mut paged = payload.clone();
+    paged["threadId"] = json!("PRRT_1");
+    paged["cursor"] = json!("Y3Vyc29y");
+    let page = json!({"comments": [{"id": "PRRC_2", "author": null, "body": "Done.",
+        "createdAt": "2026-10-14T09:00:00Z", "url": null}], "nextCursor": null});
+    let (page, ()) = tokio::join!(
+        pull_request::thread_comments(&rpc, &reference, "PRRT_1", "Y3Vyc29y"),
+        answer_request(
+            &mut socket,
+            "pullRequests.threadComments",
+            &paged,
+            success(page)
+        ),
+    );
+    let page = page.unwrap();
+    assert_eq!(
+        (page.comments[0].id.as_str(), page.next_cursor),
+        ("PRRC_2", None)
+    );
+
     // Invalidating names the one pull request, so T3 keeps its listings.
     let named = json!({"reference": payload});
     let (invalidated, ()) = tokio::join!(
@@ -1499,6 +1520,23 @@ async fn a_pull_request_read_names_what_failed() {
     assert_eq!(
         error.unwrap_err().to_string(),
         "T3 sent a pull request answer t3term can't read: a detail has no valid state"
+    );
+
+    // A host whose remarks come in no pages says so in T3's words
+    // (apps/server/src/pullRequest/PullRequestService.ts:1853-1865 at f570bd2).
+    let unpaged = fail(json!({"_tag": "PullRequestOperationError",
+        "operation": "threadComments",
+        "detail": "This host does not page review thread comments."}));
+    let mut paged = payload.clone();
+    paged["threadId"] = json!("t1");
+    paged["cursor"] = json!("c2");
+    let (error, ()) = tokio::join!(
+        pull_request::thread_comments(&rpc, &reference, "t1", "c2"),
+        answer_request(&mut socket, "pullRequests.threadComments", &paged, unpaged),
+    );
+    assert_eq!(
+        error.unwrap_err().to_string(),
+        "This host does not page review thread comments."
     );
 }
 

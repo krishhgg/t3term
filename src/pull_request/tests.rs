@@ -824,6 +824,62 @@ fn checks_read_their_state_and_list() {
 
 /// A stack as T3's GitHub provider sends it: three layers, bottom to top, the middle one
 /// without its optional fields.
+#[test]
+fn a_page_of_thread_comments_reads_its_remarks_and_where_the_next_starts() {
+    let comment = |id: &str| {
+        json!({"id": id, "author": {"login": "mona", "name": null, "avatarUrl": null},
+            "body": "Could the test cover a reload too?", "createdAt": "2026-10-14T23:58:00Z",
+            "url": null})
+    };
+    let page = CommentPage::read(&json!({"comments": [comment("tc2"), comment("tc3")],
+        "nextCursor": "cursor-3"}))
+    .unwrap();
+    let ids: Vec<&str> = page.comments.iter().map(|c| c.id.as_str()).collect();
+    assert_eq!(ids, ["tc2", "tc3"]);
+    assert_eq!(
+        page.comments[0].body.text,
+        "Could the test cover a reload too?"
+    );
+    assert_eq!(page.next_cursor.as_deref(), Some("cursor-3"));
+    assert!(!page.cut);
+
+    // The last page has no cursor.
+    let last = CommentPage::read(&json!({"comments": [], "nextCursor": null})).unwrap();
+    let whole = CommentPage {
+        comments: Vec::new(),
+        next_cursor: None,
+        cut: false,
+    };
+    assert_eq!(last, whole);
+
+    // A page longer than t3term keeps is cut, and says so.
+    let many: Vec<Value> = (0..=1000).map(|at| comment(&format!("c{at}"))).collect();
+    let long = CommentPage::read(&json!({"comments": many, "nextCursor": "x"})).unwrap();
+    assert_eq!(long.comments.len(), 1000);
+    assert_eq!(long.comments[999].id, "c999");
+    assert!(long.cut);
+
+    let broken = |value: Value| CommentPage::read(&value).unwrap_err().to_string();
+    let says = |what: &str| format!("T3 sent a pull request answer t3term can't read: {what}");
+    let cursor = |cursor: Value| broken(json!({"comments": [], "nextCursor": cursor}));
+    let no_cursor = says("a page of thread comments has no valid nextCursor");
+    assert_eq!(broken(json!({"comments": []})), no_cursor);
+    assert_eq!(cursor(json!("  ")), no_cursor);
+    assert_eq!(cursor(json!(3)), no_cursor);
+    assert_eq!(
+        broken(json!({"nextCursor": null})),
+        says("a page of thread comments has no valid comments")
+    );
+    assert_eq!(
+        broken(json!({"comments": [{"body": "No id."}], "nextCursor": null})),
+        says("a thread comment has no valid id")
+    );
+    assert_eq!(
+        broken(json!([])),
+        says("a page of thread comments isn't an object")
+    );
+}
+
 fn stack_value() -> Value {
     json!({
         "id": "S_kwDOAbc", "number": 7, "url": "https://github.com/krishhgg/t3term/stacks/7",
