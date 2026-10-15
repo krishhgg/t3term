@@ -30,8 +30,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEventKind,
 };
 use futures_util::StreamExt;
 use ratatui::Frame;
@@ -564,7 +565,13 @@ struct App {
 
 pub async fn run(client: Arc<Client>) -> Result<()> {
     let mut screen = Screen(Some(ratatui::init()));
-    crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+    // Focus reports say when the terminal gains focus, which reads the open details again.
+    crossterm::execute!(
+        std::io::stdout(),
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        EnableFocusChange
+    )?;
     let Some(terminal) = screen.0.as_mut() else {
         return Ok(());
     };
@@ -580,7 +587,8 @@ impl Drop for Screen {
         let _ = crossterm::execute!(
             std::io::stdout(),
             DisableMouseCapture,
-            DisableBracketedPaste
+            DisableBracketedPaste,
+            DisableFocusChange
         );
         // Once the terminal has closed, ratatui's own Drop for Terminal and `ratatui::restore`
         // print their errors with `eprintln!`, which panics. A panic here aborts the process
@@ -1724,15 +1732,21 @@ impl App {
     fn on_terminal_event(&mut self, event: Event) -> bool {
         let now = now_ms().max(self.now);
         let input = matches!(event, Event::Key(_) | Event::Mouse(_) | Event::Paste(_));
-        let returned = input && now - self.input_at >= pull_requests::IDLE;
+        let idle = now - self.input_at >= pull_requests::IDLE;
+        // You arrive at the open details with your first input after an idle spell, or when
+        // the terminal gains focus while you use t3term, as the desktop's window does. Focus
+        // after an idle spell waits for that input, as the desktop's does.
+        let arrived = match event {
+            Event::FocusGained => !idle,
+            _ => input && idle,
+        };
         if input {
             self.input_at = now;
         }
         let changed = self.on_input(event);
         self.read_opened_pull();
-        // Coming back after an idle spell reads what the details then show, once this input
-        // has done what it does.
-        if returned && self.pulls_project().is_some() && self.details.pulls.returned(now) {
+        // The read follows what the input showed.
+        if arrived && self.pulls_project().is_some() && self.details.pulls.arrive(now) {
             self.read_opened_pull();
         }
         changed

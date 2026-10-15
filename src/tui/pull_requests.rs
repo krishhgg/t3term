@@ -1573,6 +1573,8 @@ impl PullRequests {
         };
         if let Some(read) = self.read.as_mut().filter(|read| read.key == entry.key) {
             if read.stands(now) {
+                // Its answers show, and the detail is read again unless it just came.
+                self.arrive(now);
                 return;
             }
             if read.answered() {
@@ -1688,21 +1690,21 @@ impl PullRequests {
         self.read_live(now)
     }
 
-    /// Reads the detail the details show again at `now`, when you come back to t3term after
-    /// `IDLE` or more without a key, click or wheel, as the desktop's `useLiveRefresh` reads
-    /// when its reader comes back. Not while its last read was asked for under `SOONEST` ago.
+    /// Reads the detail the details show again at `now`, when you arrive at them: their link's
+    /// details open again, you come back to t3term after `IDLE` or more without a key, click
+    /// or wheel, or its terminal gains focus. The desktop's `useLiveRefresh` reads on each of
+    /// these (`onArrival`), and on arriving at a pull request only once it read it before
+    /// (`shouldRefreshOnArrival`). Not while the detail they show came under `SOONEST` ago.
     /// Says whether it wants a read.
-    pub fn returned(&mut self, now: i64) -> bool {
-        let Some(due) = self.live_at() else {
-            return false;
-        };
-        if now - (due - LIVE) < SOONEST {
-            return false;
+    pub fn arrive(&mut self, now: i64) -> bool {
+        let came = self.read.as_ref().filter(|_| self.live_at().is_some());
+        match came.map(|read| read.at) {
+            Some(at) if now - at >= SOONEST => self.read_live(now),
+            _ => false,
         }
-        self.read_live(now)
     }
 
-    /// Wants the shown read again to keep it current, as `live` and `returned` say: the detail,
+    /// Wants the shown read again to keep it current, as `live` and `arrive` say: the detail,
     /// and the conversation only once it changed. A read that failed reads both, as a first
     /// read does, as the desktop's live refresh reads a detail it couldn't read.
     fn read_live(&mut self, now: i64) -> bool {
@@ -3968,7 +3970,7 @@ mod tests {
         assert!(rows.contains(&"Read from github.com just now".to_string()));
         assert!(!rows.contains(&"timed out".to_string()));
         // Both answers stand for a minute, and then show while the read goes again.
-        assert_eq!(reopen(&mut pulls, now() + FRESH - 1), None);
+        assert_eq!(reopen(&mut pulls, now() + SOONEST - 1), None);
         assert_eq!(reopen(&mut pulls, now() + FRESH), Some(3));
         pulls.page(44, 60, now() + FRESH, true, &theme());
         let rows = detail_rows(&pulls);
@@ -4053,13 +4055,17 @@ mod tests {
         assert_eq!(ask, Some(5));
 
         // The new answers stand for a minute from when the pull request came, though the host
-        // took 45 seconds.
+        // took 45 seconds, so opening the details again reads only the detail.
         assert!(!pulls.answer(5, Part::Detail(Ok(read_detail(&bare_detail()))), now()));
         assert!(!pulls.answer(5, activity(), now()));
         assert!(pulls.answer(5, Part::Done, now()));
         pulls.back();
         pulls.toggle();
-        assert_eq!(pulls.take_ask(true, now() + 20_000), None);
+        let ask = pulls.take_ask(true, now() + 20_000);
+        assert_eq!(
+            ask.map(|ask| (ask.ticket, ask.updated.is_some())),
+            Some((6, true))
+        );
     }
 
     #[test]
@@ -4266,10 +4272,10 @@ mod tests {
             "b",
         )])));
         let t0 = now();
-        assert!(!pulls.returned(t0));
+        assert!(!pulls.arrive(t0));
         pulls.toggle();
         assert_eq!(pulls.take_ask(true, t0).map(|ask| ask.ticket), Some(1));
-        assert!(!pulls.returned(t0 + LIVE));
+        assert!(!pulls.arrive(t0 + LIVE));
         let mut detail = bare_detail();
         detail["updatedAt"] = json!("2026-10-13T11:00:00Z");
         pulls.answer(1, Part::Detail(Ok(read_detail(&detail))), t0);
@@ -4277,18 +4283,18 @@ mod tests {
 
         // Well before the five minutes, coming back reads the detail again, though not within
         // ten seconds of the last read.
-        assert!(!pulls.returned(t0 + SOONEST - 1));
-        assert!(pulls.returned(t0 + SOONEST));
+        assert!(!pulls.arrive(t0 + SOONEST - 1));
+        assert!(pulls.arrive(t0 + SOONEST));
         let ask = pulls.take_ask(true, t0 + SOONEST).expect("a read again");
         let updated = Some("2026-10-13T11:00:00Z".to_string());
         assert_eq!((ask.ticket, ask.updated), (2, updated));
-        assert!(!pulls.returned(t0 + LIVE));
+        assert!(!pulls.arrive(t0 + LIVE));
         pulls.answer(2, Part::Done, t0 + SOONEST);
         assert_eq!(pulls.live_at(), Some(t0 + SOONEST + LIVE));
 
         // Not on the list.
         pulls.back();
-        assert!(!pulls.returned(t0 + LIVE));
+        assert!(!pulls.arrive(t0 + LIVE));
     }
 
     #[test]
@@ -4399,33 +4405,42 @@ mod tests {
 
     #[test]
     fn an_answer_stands_for_a_minute_from_when_it_came() {
-        let mut pulls = PullRequests::default();
-        pulls.set(list_of(&thread(vec![link(
-            "krishhgg/t3term",
-            31,
-            "a",
-            "b",
-        )])));
-        let reopen = |pulls: &mut PullRequests, at: i64| {
+        // The host took 45 seconds, and the details say when the answer came.
+        let answered = || {
+            let mut pulls = PullRequests::default();
+            pulls.set(list_of(&thread(vec![link(
+                "krishhgg/t3term",
+                31,
+                "a",
+                "b",
+            )])));
+            pulls.toggle();
+            let asked = now() - 45_000;
+            assert_eq!(pulls.take_ask(true, asked).map(|ask| ask.ticket), Some(1));
+            assert!(pulls.answer(1, Part::Detail(Ok(read_detail(&bare_detail()))), now()));
+            let activity = pull_request::Activity::read(&bare_activity()).unwrap();
+            assert!(pulls.answer(1, Part::Activity(Ok(Box::new(activity))), now()));
+            assert!(!pulls.answer(1, Part::Done, now()));
+            pulls.page(44, 30, now(), true, &theme());
+            let rows = detail_rows(&pulls);
+            assert!(rows.contains(&"Read from github.com just now".to_string()));
+            pulls
+        };
+        // Which read opening the details again at `at` asks for, and whether it reads only the
+        // detail.
+        let reopen = |at: i64| {
+            let mut pulls = answered();
             pulls.back();
             pulls.toggle();
-            pulls.take_ask(true, at).map(|ask| ask.ticket)
+            let ask = pulls.take_ask(true, at);
+            ask.map(|ask| (ask.ticket, ask.updated.is_some()))
         };
-        pulls.toggle();
-        let asked = now() - 45_000;
-        assert_eq!(pulls.take_ask(true, asked).map(|ask| ask.ticket), Some(1));
-        // The host took 45 seconds, and the details say when the answer came.
-        assert!(pulls.answer(1, Part::Detail(Ok(read_detail(&bare_detail()))), now()));
-        let activity = pull_request::Activity::read(&bare_activity()).unwrap();
-        assert!(pulls.answer(1, Part::Activity(Ok(Box::new(activity))), now()));
-        assert!(!pulls.answer(1, Part::Done, now()));
-        pulls.page(44, 30, now(), true, &theme());
-        let rows = detail_rows(&pulls);
-        assert!(rows.contains(&"Read from github.com just now".to_string()));
-        // Twenty seconds on, the answer stands.
-        assert_eq!(reopen(&mut pulls, now() + 20_000), None);
-        assert_eq!(reopen(&mut pulls, now() + FRESH - 1), None);
-        assert_eq!(reopen(&mut pulls, now() + FRESH), Some(2));
+        // Within ten seconds of the answer, nothing is read. Within the minute the answers
+        // stand, and only the detail is read again. After it, both are.
+        assert_eq!(reopen(now() + SOONEST - 1), None);
+        assert_eq!(reopen(now() + SOONEST), Some((2, true)));
+        assert_eq!(reopen(now() + FRESH - 1), Some((2, true)));
+        assert_eq!(reopen(now() + FRESH), Some((2, false)));
     }
 
     #[test]
