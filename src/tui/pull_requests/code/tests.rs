@@ -80,21 +80,22 @@ Binary files a/logo.png and b/logo.png differ
 
 #[test]
 fn files_show_folded_and_each_unfolds_into_its_hunks() {
+    // In reading order, which for files that import nothing is by path.
     let mut code = read(slice(PATCH, None), 0);
     assert_eq!(
         rows(&code, 40),
         [
             "5 files",
             "",
-            "› M src/lib.rs +2 -1",
-            "",
             "› A docs/new.md +2 -0",
+            "",
+            "› M logo.png",
             "",
             "› D old.txt +0 -1",
             "",
-            "› R from.rs → to.rs",
+            "› M src/lib.rs +2 -1",
             "",
-            "› M logo.png",
+            "› R from.rs → to.rs",
         ]
     );
     let (_, targets) = code.lay_out(40, &theme());
@@ -119,6 +120,18 @@ fn files_show_folded_and_each_unfolds_into_its_hunks() {
         [
             "5 files",
             "",
+            "⌄ A docs/new.md +2 -0",
+            "1 + # New",
+            "2 + Text",
+            "    No newline at end of file",
+            "",
+            "⌄ M logo.png",
+            "A binary file, whose changes have no",
+            "lines to show.",
+            "",
+            "⌄ D old.txt +0 -1",
+            "1 - gone",
+            "",
             "⌄ M src/lib.rs +2 -1",
             " 1   use std::fmt;",
             " 2 - fn old() {}",
@@ -129,26 +142,14 @@ fn files_show_folded_and_each_unfolds_into_its_hunks() {
             "11 + fn b() {}",
             "12   fn c() {}",
             "",
-            "⌄ A docs/new.md +2 -0",
-            "1 + # New",
-            "2 + Text",
-            "    No newline at end of file",
-            "",
-            "⌄ D old.txt +0 -1",
-            "1 - gone",
-            "",
             "⌄ R from.rs → to.rs",
             "No lines changed.",
-            "",
-            "⌄ M logo.png",
-            "A binary file, whose changes have no",
-            "lines to show.",
         ]
     );
     let (_, targets) = code.lay_out(40, &theme());
-    assert_eq!(targets[1], (12..13, Control::File(1)));
+    assert_eq!(targets[1], (7..8, Control::File(1)));
     code.act(Control::File(0));
-    assert_eq!(rows(&code, 40)[2..4], ["› M src/lib.rs +2 -1", ""]);
+    assert_eq!(rows(&code, 40)[2..4], ["› A docs/new.md +2 -0", ""]);
 }
 
 #[test]

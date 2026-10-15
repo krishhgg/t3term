@@ -9,7 +9,9 @@
 //! number from T3 or a new `updatedAt` on the detail, as the desktop's refresh token says
 //! (PullRequestDetailPanel.tsx:832-847). The slices read show until the new first one comes.
 //!
-//! Each file shows folded on one row, as the desktop's do by default: whether the change added,
+//! Each slice's files show in the desktop's reading order, source before tests before the files
+//! a tool wrote, as `order` says. Each file shows folded on one row, as the desktop's do by
+//! default: whether the change added,
 //! deleted, renamed or modified it, its path, and the lines it adds and removes. Enter or a
 //! click unfolds it into its hunks. Each line has one number, the one it has after the change,
 //! or before it for a removed line, as the desktop's stacked view has, and the unchanged lines
@@ -54,9 +56,9 @@ const UNREAD: &str = "t3term couldn't split this patch into files.";
 pub(super) struct Code {
     /// The slices read, in the order T3 sent them.
     slices: Vec<Slice>,
-    /// The files of every slice in order, as a slice's place and a file's place in it. A path
-    /// a slice has twice shows once, as its last part, as the desktop's `orderDiffFiles` keeps
-    /// it.
+    /// The files of every slice, as a slice's place and a file's place in it: the slices in the
+    /// order T3 sent them, and each slice's files in reading order. A path a slice has twice
+    /// shows once, as its last part, as the desktop's `orderDiffFiles` keeps it.
     files: Vec<(usize, usize)>,
     /// The lines the host counted for each file whose changes it withheld, by path, from every
     /// slice.
@@ -102,6 +104,8 @@ struct Asked {
 struct Slice {
     diff: pull_request::Diff,
     patch: patch::Patch,
+    /// The places of its files in reading order, as `order::reading_order` says.
+    order: Vec<usize>,
 }
 
 impl Code {
@@ -182,7 +186,12 @@ impl Code {
                     self.at = now;
                 }
                 let patch = patch::Patch::read(&diff.patch);
-                self.slices.push(Slice { diff: *diff, patch });
+                let order = order::reading_order(&diff.patch, &patch);
+                self.slices.push(Slice {
+                    diff: *diff,
+                    patch,
+                    order,
+                });
                 self.failed = None;
                 self.index();
             }
@@ -196,14 +205,8 @@ impl Code {
         self.files.clear();
         self.omitted.clear();
         for (at, slice) in self.slices.iter().enumerate() {
-            let mut seen = HashSet::new();
-            let mut files: Vec<(usize, usize)> = (0..slice.patch.files.len())
-                .rev()
-                .filter(|&file| seen.insert(slice.patch.files[file].path()))
-                .map(|file| (at, file))
-                .collect();
-            files.reverse();
-            self.files.extend(files);
+            self.files
+                .extend(slice.order.iter().map(|&file| (at, file)));
             for omitted in &slice.diff.omitted {
                 let counts = (omitted.additions, omitted.deletions);
                 self.omitted.insert(omitted.path.clone(), counts);
@@ -671,6 +674,8 @@ fn broken(text: &str, width: usize) -> Vec<String> {
     }
     rows
 }
+
+mod order;
 
 #[cfg(test)]
 mod tests;
