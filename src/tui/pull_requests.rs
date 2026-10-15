@@ -1700,11 +1700,12 @@ impl PullRequests {
     /// details open again, you come back to t3term after `IDLE` or more without a key, click
     /// or wheel, or its terminal gains focus. The desktop's `useLiveRefresh` reads on each of
     /// these (`onArrival`), and on arriving at a pull request only once it read it before
-    /// (`shouldRefreshOnArrival`). Not while the detail they show came under `SOONEST` ago.
-    /// Says whether it wants a read.
+    /// (`shouldRefreshOnArrival`). Not while the detail they show came, or their last read
+    /// was asked for, under `SOONEST` ago, so a read again that failed isn't asked again at
+    /// once. Says whether it wants a read.
     pub fn arrive(&mut self, now: i64) -> bool {
         let came = self.read.as_ref().filter(|_| self.live_at().is_some());
-        match came.map(|read| read.at) {
+        match came.map(|read| read.at.max(read.asked)) {
             Some(at) if now - at >= SOONEST => self.read_live(now),
             _ => false,
         }
@@ -4367,8 +4368,14 @@ mod tests {
         let updated = Some("2026-10-13T11:00:00Z".to_string());
         assert_eq!((ask.ticket, ask.updated), (2, updated));
         assert!(!pulls.arrive(t0 + LIVE));
+        pulls.answer(2, Part::Detail(Err("timed out".into())), t0 + SOONEST);
         pulls.answer(2, Part::Done, t0 + SOONEST);
         assert_eq!(pulls.live_at(), Some(t0 + SOONEST + LIVE));
+
+        // A read again that failed counts from when it was asked for, so arriving within ten
+        // seconds of it asks nothing more, though the detail shown came before.
+        assert!(!pulls.arrive(t0 + 2 * SOONEST - 1));
+        assert!(pulls.arrive(t0 + 2 * SOONEST));
 
         // Not on the list.
         pulls.back();
