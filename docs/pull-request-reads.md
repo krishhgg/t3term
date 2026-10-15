@@ -1,6 +1,6 @@
 # Pull request reads
 
-`src/pull_request.rs` reads one pull request from T3's server: its detail, its checks, its conversation, the stack it is in and its diff. It is the first part of PR reviews in the TUI ([parity.md, group 12](parity.md#12-pull-requests)). The thread details call `detail` and `activity` at once when a link's details open, then `stack` once the detail says its host keeps stacks, and `r` there sends `invalidate` first, as [linked pull requests](pull-request-panel.md#what-a-links-details-read-from-its-host) says. Nothing calls `checks` or `diff` yet.
+`src/pull_request.rs` reads one pull request from T3's server: its detail, its checks, its conversation, the stack it is in and its diff. It is the first part of PR reviews in the TUI ([parity.md, group 12](parity.md#12-pull-requests)). The thread details call `detail` and `activity` at once when a link's details open, then `stack` once the detail says its host keeps stacks, and `r` there sends `invalidate` first, as [linked pull requests](pull-request-panel.md#what-a-links-details-read-from-its-host) says. Their Code tab calls `diff` once it shows, as [the Code tab](pull-request-panel.md#the-code-tab) says. Nothing calls `checks` yet.
 
 ```rust
 let reference = Reference::new(&thread_project_id, Some(&link.host), &link.repository, link.number)?;

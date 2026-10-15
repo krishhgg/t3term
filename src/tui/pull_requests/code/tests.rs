@@ -353,6 +353,7 @@ diff --git a/two b/two
     code.again();
     assert_eq!(code.ask(3), Some(None));
     code.again();
+    assert_eq!(code.ask(4), None, "one read at a time");
     assert_eq!(code.take(3, Ok(slice(first, None)), 5), None);
     assert_eq!(code.ask(4), Some(None));
     assert_eq!(code.take(4, Ok(slice(again, None)), 7), Some(true));

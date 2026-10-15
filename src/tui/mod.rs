@@ -713,11 +713,7 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
             terminal.draw(|frame| app.draw(frame))?;
             last_draw = Instant::now();
             dirty = false;
-            // The frame may have shown the end of the Code tab's files, which reads the next
-            // slice.
-            if app.details.pulls.code_due() {
-                app.read_opened_pull();
-            }
+            app.after_frame();
         }
         let redraw_at = tokio::time::Instant::from_std(last_draw + FRAME);
         // The sidebar's half reads the last frame drawn. A frame still waiting out the budget
@@ -1317,6 +1313,13 @@ impl App {
             }
         }
         asked
+    }
+
+    /// Reads the Code tab's next slice once a frame showed the end of its files.
+    fn after_frame(&mut self) {
+        if self.details.pulls.code_due() {
+            self.read_opened_pull();
+        }
     }
 
     /// The project of the thread whose details show, which a read of its links names, while
@@ -13591,13 +13594,15 @@ mod tests {
             let came = iso_at(now_ms() - hours * 3_600_000);
             activity["comments"][at]["createdAt"] = json!(came);
         }
-        let activity = pull_request::Activity::read(&activity).unwrap();
-        let parts = vec![
-            Part::Detail(Ok(Box::new(host_detail()))),
-            Part::Activity(Ok(Box::new(activity))),
-            Part::Done,
-        ];
-        hear(&mut app, 1, parts);
+        let answers = || {
+            let activity = pull_request::Activity::read(&activity).unwrap();
+            vec![
+                Part::Detail(Ok(Box::new(host_detail()))),
+                Part::Activity(Ok(Box::new(activity))),
+                Part::Done,
+            ]
+        };
+        hear(&mut app, 1, answers());
         let shown = status(&mut app);
         let hint = "↑↓/PgUp scroll · → timeline · ← list · r refresh · Esc leave";
         assert!(shown.contains(hint), "{shown}");
@@ -13653,19 +13658,44 @@ mod tests {
             "Loading pull request diff…",
         ];
         assert_eq!(rows, loading);
+        let diff = |patch: &str| {
+            Ok(Box::new(pull_request::Diff {
+                patch: patch.into(),
+                truncated: false,
+                next_cursor: None,
+                omitted: Vec::new(),
+                omitted_cut: false,
+            }))
+        };
+
+        // `r` reads the detail again after `pullRequests.invalidate`, then the diff once that
+        // read is done and the slice under way came, as the new read replaces it.
+        press(&mut app, KeyCode::Char('r'));
+        hear(&mut app, 3, answers());
+        assert_eq!(diffs.borrow().len(), 1);
+        let gone = diff("diff --git a/gone b/gone\n--- a/gone\n+++ b/gone\n@@ -1 +1 @@\n-a\n+b\n");
+        app.on_action_result(ActionResult::PullRequestDiff {
+            ticket: 2,
+            answer: gone,
+        });
+        let again = (
+            named.0.clone(),
+            named.1.clone(),
+            named.2.clone(),
+            31,
+            4,
+            None,
+        );
+        assert_eq!(*diffs.borrow(), [named.clone(), again.clone()]);
+        let rows = body_after(&mut app, 200, 50);
+        assert_eq!(rows[4].trim(), "Loading pull request diff…");
 
         // The slice shows its files, folded, and Enter unfolds the one ↓ chose.
-        let diff = pull_request::Diff {
-            patch: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n\
-                    @@ -1 +1 @@\n-old\n+new\n"
-                .into(),
-            truncated: false,
-            next_cursor: None,
-            omitted: Vec::new(),
-            omitted_cut: false,
-        };
-        let answer = Ok(Box::new(diff));
-        app.on_action_result(ActionResult::PullRequestDiff { ticket: 2, answer });
+        let answer = diff(
+            "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n\
+             @@ -1 +1 @@\n-old\n+new\n",
+        );
+        app.on_action_result(ActionResult::PullRequestDiff { ticket: 4, answer });
         let rows = body_after(&mut app, 200, 50);
         let text: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
         assert_eq!(text[4..8], ["1 file", "", "› M src/lib.rs +1 -1", ""]);
@@ -13678,7 +13708,7 @@ mod tests {
         assert_eq!(text[6..9], ["⌄ M src/lib.rs +1 -1", "1 - old", "1 + new"]);
         press(&mut app, KeyCode::Right);
         assert_eq!(app.details.pulls.tabs(), Some(Tab::Code));
-        assert_eq!(*diffs.borrow(), [named]);
+        assert_eq!(*diffs.borrow(), [named, again]);
         for (code, tab, viewing) in [
             (KeyCode::Char('h'), Some(Tab::Timeline), true),
             (KeyCode::Char('l'), Some(Tab::Code), true),
@@ -13709,8 +13739,45 @@ mod tests {
         cells(&mut app, 200, 50);
         assert!(mouse(&mut app, CLICK, body.x + 1, body.y));
         assert!(!app.details.pulls.viewing());
-        // The diff's read is still under way, so none of this asked for another.
+        // The diff came under a minute ago, so none of this read it again.
+        assert_eq!(diffs.borrow().len(), 2);
+    }
+
+    #[test]
+    fn a_frame_that_shows_the_end_of_the_code_reads_its_next_slice() {
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        let _asked = note_reads(&mut app);
+        let diffs = note_diffs(&mut app);
+        press(&mut app, KeyCode::Enter);
+        let parts = vec![
+            Part::Detail(Ok(Box::new(host_detail()))),
+            Part::Activity(Ok(Box::new(host_activity()))),
+            Part::Done,
+        ];
+        hear(&mut app, 1, parts);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
         assert_eq!(diffs.borrow().len(), 1);
+        let diff = pull_request::Diff {
+            patch: "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b\n".into(),
+            truncated: false,
+            next_cursor: Some("c2".into()),
+            omitted: Vec::new(),
+            omitted_cut: false,
+        };
+        let answer = Ok(Box::new(diff));
+        app.on_action_result(ActionResult::PullRequestDiff { ticket: 2, answer });
+        // Only a frame that shows the end of the files reads the next slice, once.
+        app.after_frame();
+        assert_eq!(diffs.borrow().len(), 1);
+        cells(&mut app, 200, 50);
+        app.after_frame();
+        app.after_frame();
+        let next = diffs.borrow().last().map(|ask| (ask.4, ask.5.clone()));
+        assert_eq!(
+            (diffs.borrow().len(), next),
+            (2, Some((3, Some("c2".into()))))
+        );
     }
 
     #[test]
