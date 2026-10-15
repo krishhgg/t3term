@@ -3942,3 +3942,313 @@ fn the_side_whose_text_runs_furthest_sets_how_far_the_rows_scroll() {
     assert_eq!(slid.runs, [(8..9, 4, Some(19))]);
     assert_eq!(slid.widest, long.width() + BETWEEN.width() + 20);
 }
+
+/// A later slice that adds a file to PATCH's `docs` folder.
+const MORE_DOCS: &str = "diff --git a/docs/more.md b/docs/more.md
+new file mode 100644
+--- /dev/null
++++ b/docs/more.md
+@@ -0,0 +1 @@
++more
+";
+
+/// The file tree's rows: from its count to the row before the files.
+fn tree_of(code: &Code) -> Vec<String> {
+    let rows = rows(code, 40);
+    let start = rows.iter().position(|row| row.starts_with("Files · "));
+    let rows = rows.into_iter().skip(start.expect("the tree"));
+    rows.take_while(|row| !row.is_empty()).collect()
+}
+
+#[test]
+fn a_row_shows_the_files_in_a_tree_of_their_folders() {
+    // No row shows before a slice, or with no files.
+    assert!(!Code::new().has(Control::Tree, &[]));
+    for empty in [slice("", None), slice("", Some("2"))] {
+        let code = read(empty, 0);
+        assert!(!code.has(Control::Tree, &[]));
+        assert!(!rows(&code, 40).contains(&TREE_HIDDEN.to_string()));
+    }
+    let mut code = read(slice(PATCH, Some("2")), 0);
+    let (lines, targets) = laid(&code, 40);
+    assert_eq!(rows_of(&lines)[5..7], [TREE_HIDDEN, ""]);
+    assert_eq!(targets[4], (5..6, Control::Tree));
+    assert_eq!(color_of(&lines, TREE_HIDDEN), Some(theme().fg));
+    assert_eq!(code.action(Control::Tree, &[]), "show file tree");
+    let tree = [
+        Control::Folders,
+        Control::Folder(0, 1),
+        Control::TreeFile(0),
+        Control::MoreFiles,
+    ];
+    for control in tree {
+        assert!(!code.has(control, &[]), "{control:?}");
+    }
+
+    // Shown, each folder comes before what it holds, and in the place of its first file, so
+    // the rows keep the order the files show in. A folder's files are indented under it. Then
+    // a row reads the next slice.
+    code.prepare(40, &theme());
+    let builds = code.builds;
+    assert!(!code.act(Control::Tree, &[]));
+    let (lines, targets) = laid(&code, 40);
+    assert_eq!(
+        rows_of(&lines)[5..18],
+        [
+            TREE_SHOWN,
+            "",
+            "Files · 5",
+            FOLDERS_OPEN,
+            "⌄ docs",
+            "  A new.md",
+            "M logo.png",
+            "D old.txt",
+            "⌄ src",
+            "  M lib.rs",
+            "R to.rs",
+            MORE_FILES,
+            "",
+        ]
+    );
+    assert_eq!(
+        targets[4..14],
+        [
+            (5..6, Control::Tree),
+            (8..9, Control::Folders),
+            (9..10, Control::Folder(0, 1)),
+            (10..11, Control::TreeFile(0)),
+            (11..12, Control::TreeFile(1)),
+            (12..13, Control::TreeFile(2)),
+            (13..14, Control::Folder(3, 1)),
+            (14..15, Control::TreeFile(3)),
+            (15..16, Control::TreeFile(4)),
+            (16..17, Control::MoreFiles),
+        ]
+    );
+    assert_eq!(targets[14], (18..19, Control::File(0)));
+    // The files' rows stay as they were.
+    code.prepare(40, &theme());
+    assert_eq!(code.builds, builds);
+    let theme = theme();
+    assert_eq!(color_of(&lines[7..8], "Files"), Some(theme.fg));
+    assert_eq!(color_of(&lines[7..8], "5"), Some(theme.muted));
+    assert_eq!(color_of(&lines, FOLDERS_OPEN), Some(theme.fg));
+    assert_eq!(color_of(&lines, "docs"), Some(theme.fg));
+    assert_eq!(color_of(&lines, "new.md"), Some(theme.success));
+    assert_eq!(color_of(&lines, MORE_FILES), Some(theme.fg));
+    for (control, action) in [
+        (Control::Tree, "hide file tree"),
+        (Control::Folders, "collapse all folders"),
+        (Control::Folder(0, 1), "collapse folder"),
+        (Control::TreeFile(4), "go to file"),
+        (Control::MoreFiles, "load more files"),
+    ] {
+        assert!(code.has(control, &[]), "{control:?}");
+        assert_eq!(code.action(control, &[]), action);
+    }
+    for control in [
+        Control::Folder(0, 2),
+        Control::Folder(1, 1),
+        Control::TreeFile(5),
+    ] {
+        assert!(!code.has(control, &[]), "{control:?}");
+    }
+
+    // A tree of files at the root alone has no row for its folders.
+    let mut flat = read(slice(ONE, None), 0);
+    flat.act(Control::Tree, &[]);
+    assert_eq!(tree_of(&flat), ["Files · 1", "M a"]);
+    assert!(!flat.has(Control::Folders, &[]));
+
+    // Hidden again, nothing of it shows.
+    code.act(Control::Tree, &[]);
+    assert_eq!(
+        rows(&code, 40)[5..8],
+        [TREE_HIDDEN, "", "› A docs/new.md +2 -0"]
+    );
+    for control in tree {
+        assert!(!code.has(control, &[]), "{control:?}");
+    }
+}
+
+#[test]
+fn a_folder_s_row_closes_it_and_one_row_closes_or_opens_them_all() {
+    let mut code = read(slice(PATCH, Some("2")), 0);
+    code.act(Control::Tree, &[]);
+    let open = tree_of(&code);
+    assert!(!code.act(Control::Folder(0, 1), &[]));
+    assert_eq!(
+        tree_of(&code),
+        [
+            "Files · 5",
+            FOLDERS_FOLDED,
+            "› docs",
+            "M logo.png",
+            "D old.txt",
+            "⌄ src",
+            "  M lib.rs",
+            "R to.rs",
+            MORE_FILES,
+        ]
+    );
+    assert_eq!(code.action(Control::Folder(0, 1), &[]), "expand folder");
+    assert_eq!(code.action(Control::Folders, &[]), "expand all folders");
+    assert!(!code.has(Control::TreeFile(0), &[]));
+    // While a folder is closed, the row opens them all, and while all are open, it closes
+    // them all.
+    code.act(Control::Folders, &[]);
+    assert_eq!(tree_of(&code), open);
+    code.act(Control::Folders, &[]);
+    let closed = [
+        "Files · 5",
+        FOLDERS_FOLDED,
+        "› docs",
+        "M logo.png",
+        "D old.txt",
+        "› src",
+        "R to.rs",
+        MORE_FILES,
+    ];
+    assert_eq!(tree_of(&code), closed);
+    code.act(Control::Folder(3, 1), &[]);
+    assert_eq!(tree_of(&code)[5..7], ["⌄ src", "  M lib.rs"]);
+    assert_eq!(tree_of(&code)[1], FOLDERS_FOLDED);
+    code.act(Control::Folder(0, 1), &[]);
+    assert_eq!(tree_of(&code), open);
+
+    // A later slice keeps them as they were, and a folder's row stays its own as the slice
+    // adds to it.
+    code.act(Control::Folder(0, 1), &[]);
+    code.near_end();
+    assert_eq!(code.ask(2), Some(Some("2".into())));
+    assert_eq!(code.take(2, Ok(slice(MORE_DOCS, None)), 0), Some(false));
+    assert_eq!(
+        tree_of(&code)[..4],
+        ["Files · 6", FOLDERS_FOLDED, "› docs", "M logo.png"]
+    );
+    code.act(Control::Folder(0, 1), &[]);
+    assert_eq!(
+        tree_of(&code)[2..5],
+        ["⌄ docs", "  A new.md", "  A more.md"]
+    );
+
+    // A read again keeps them too, where the tree hidden or another diff opens them all.
+    code.act(Control::Folder(0, 1), &[]);
+    code.again();
+    assert_eq!(code.ask(3), Some(None));
+    assert_eq!(code.take(3, Ok(slice(PATCH, None)), 0), Some(true));
+    assert_eq!(tree_of(&code)[2], "› docs");
+    code.act(Control::Tree, &[]);
+    code.act(Control::Tree, &[]);
+    assert_eq!(tree_of(&code)[2], "⌄ docs");
+    code.act(Control::Folder(0, 1), &[]);
+    assert!(code.show("abc1234".into()));
+    assert_eq!(code.ask(4), Some(None));
+    assert_eq!(code.take(4, Ok(slice(PATCH, None)), 0), Some(true));
+    assert_eq!(tree_of(&code)[2], "⌄ docs");
+}
+
+#[test]
+fn a_file_s_row_unfolds_it_and_leaves_one_unfolded_so() {
+    let mut code = read(slice(PATCH, None), 0);
+    code.act(Control::Tree, &[]);
+    assert!(!code.act(Control::TreeFile(3), &[]));
+    let shown = rows(&code, 40);
+    assert!(shown.contains(&"⌄ M src/lib.rs +2 -1".to_string()));
+    assert!(shown.contains(&"› M logo.png".to_string()));
+    // Again, it stays unfolded, as the desktop opens a file it reveals and leaves one open.
+    code.act(Control::TreeFile(3), &[]);
+    assert!(rows(&code, 40).contains(&"⌄ M src/lib.rs +2 -1".to_string()));
+    code.act(Control::Folds, &[]);
+    code.act(Control::Folds, &[]);
+    assert!(rows(&code, 40).contains(&"⌄ M logo.png".to_string()));
+    code.act(Control::TreeFile(1), &[]);
+    assert!(rows(&code, 40).contains(&"⌄ M logo.png".to_string()));
+    // A file the reader folded unfolds again.
+    code.act(Control::File(1), &[]);
+    code.act(Control::TreeFile(1), &[]);
+    assert!(rows(&code, 40).contains(&"⌄ M logo.png".to_string()));
+}
+
+#[test]
+fn the_tree_ends_with_a_row_that_reads_the_next_slice_or_reads_it_again() {
+    let mut code = read(slice(PATCH, Some("2")), 0);
+    code.act(Control::Tree, &[]);
+    let last = |code: &Code| tree_of(code).last().cloned().unwrap();
+    assert_eq!(last(&code), MORE_FILES);
+    assert!(!code.act(Control::MoreFiles, &[]));
+    assert!(code.due());
+    // While the slice is to be read and while it is read, the row says so and does nothing.
+    for asked in [false, true] {
+        let (lines, targets) = laid(&code, 40);
+        assert_eq!(rows_of(&lines)[16], LOADING_MORE);
+        assert_eq!(color_of(&lines[16..17], LOADING_MORE), Some(theme().muted));
+        assert!(!targets.iter().any(|(_, c)| *c == Control::MoreFiles));
+        assert!(!code.has(Control::MoreFiles, &[]));
+        if !asked {
+            assert_eq!(code.ask(2), Some(Some("2".into())));
+        }
+    }
+    // A failure offers to read it again, as the files' own row does.
+    assert_eq!(code.take(2, Err("T3 timed out.".into()), 0), Some(false));
+    assert_eq!(last(&code), "↻ Retry");
+    assert!(code.has(Control::MoreFiles, &[]));
+    assert_eq!(code.action(Control::MoreFiles, &[]), "retry");
+    code.act(Control::MoreFiles, &[]);
+    assert_eq!(code.ask(3), Some(Some("2".into())));
+    // Once every slice came, the tree ends with its files.
+    assert_eq!(code.take(3, Ok(slice(MORE_DOCS, None)), 0), Some(false));
+    assert_eq!(last(&code), "R to.rs");
+    assert!(!code.has(Control::MoreFiles, &[]));
+    code.act(Control::MoreFiles, &[]);
+    assert_eq!(code.ask(4), None);
+}
+
+#[test]
+fn the_tree_fits_every_width_and_cleans_hostile_paths() {
+    let patch = "diff --git a/src/\u{1b}]8;;evil\u{7}very/long/path/漢字漢字/name.rs b/src/\u{1b}]8;;evil\u{7}very/long/path/漢字漢字/name.rs
+--- a/src/\u{1b}]8;;evil\u{7}very/long/path/漢字漢字/name.rs
++++ b/src/\u{1b}]8;;evil\u{7}very/long/path/漢字漢字/name.rs
+@@ -1 +1 @@
+-a
++b
+diff --git a/src/b.rs b/src/b.rs
+--- a/src/b.rs
++++ b/src/b.rs
+@@ -1 +1 @@
+-a
++b
+";
+    let mut code = read(slice(patch, Some("2")), 0);
+    code.act(Control::Tree, &[]);
+    for width in 1..=80 {
+        let (lines, targets) = laid(&code, width);
+        for line in &lines {
+            let text = line.to_string();
+            assert!(text.width() <= width, "{width}: {text:?}");
+            assert!(
+                !text.contains(|c: char| c.is_control()),
+                "{width}: {text:?}"
+            );
+        }
+        assert!(targets.iter().all(|(rows, _)| rows.end <= lines.len()));
+        assert!(
+            targets
+                .windows(2)
+                .all(|pair| pair[0].0.end <= pair[1].0.start),
+            "{width}: {targets:?}"
+        );
+    }
+    assert_eq!(
+        tree_of(&code),
+        [
+            "Files · 2",
+            FOLDERS_OPEN,
+            "⌄ src",
+            "  M b.rs",
+            "  ⌄ ]8;;evilvery/long/path/漢字漢字",
+            "    M name.rs",
+            MORE_FILES,
+        ]
+    );
+}

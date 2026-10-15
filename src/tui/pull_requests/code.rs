@@ -72,13 +72,13 @@
 //! numbers stay while its lines scroll.
 //!
 //! A row under the wrap row shows the files in a tree, or hides it again, as the desktop's
-//! toolbar toggle does (PullRequestCodeTab.tsx:1299-1317). It starts hidden, as the desktop's
+//! toolbar toggle does (PullRequestCodeTab.tsx:1299-1318). It starts hidden, as the desktop's
 //! `t3code.pullRequestFileTreeOpen` is false until changed. The details have no room for the
 //! desktop's tree beside the files, so it shows above them, as `tree` lays it out, under a row
 //! that counts its paths and one that closes every folder or opens them all. A folder's row
 //! opens or closes it, and a file's row unfolds the file and shows it at the top of the
-//! details, as the desktop's `revealFile` does (663-672). While slices are left, a row under the
-//! tree reads the next, as the desktop's footer does (1529-1554).
+//! details, as the desktop's `revealFile` does (665-673). While slices are left, a row under the
+//! tree reads the next, as the desktop's footer does (1530-1549).
 //!
 //! Only the files unfolded are laid out, each once for each width. Each line of them is cleaned
 //! of control characters, its tabs set every `TAB` columns, and cut at `LINE` characters as it
@@ -832,7 +832,7 @@ impl Code {
                 self.folded.clear();
             }
             // Every folder the other way, as the desktop's button sets each folder
-            // (fileTreeExpansion.ts:43-55).
+            // (fileTreeExpansion.ts:44-56).
             Control::Folders => {
                 let folders = self.tree().folders();
                 match folders.iter().all(|path| !self.folded.contains(path)) {
@@ -1618,7 +1618,7 @@ impl Code {
     /// The file tree's rows, after a blank row: its count of paths, the row that closes every
     /// folder or opens them all where it has one, a row for each folder and file that shows, and
     /// while slices are left, the row that reads the next, as the desktop's footer has `Load
-    /// more files`, `Loading more files...` or `Retry` (PullRequestCodeTab.tsx:1529-1554).
+    /// more files`, `Loading more files...` or `Retry` (PullRequestCodeTab.tsx:1530-1549).
     fn tree_lines(
         &self,
         lines: &mut Vec<Line<'static>>,

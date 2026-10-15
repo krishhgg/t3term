@@ -7382,6 +7382,74 @@ mod tests {
     }
 
     #[test]
+    fn a_file_picked_from_the_tree_unfolds_and_shows_at_the_top() {
+        let theme = theme();
+        let mut pulls = on_code();
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
+        assert!(pulls.answer_diff(2, Ok(added(0, 30, None)), now()));
+        pulls.page(40, 20, now(), true, &theme);
+        for _ in 0..5 {
+            pulls.step(true);
+        }
+        assert_eq!(pulls.pick, Some(Control::Tree));
+        pulls.enter();
+        assert_eq!(pulls.pick, Some(Control::Tree));
+        assert_eq!(pulls.action().as_deref(), Some("hide file tree"));
+        pulls.page(40, 20, now(), true, &theme);
+        // ↓ goes on to the tree's files, each at the root.
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::TreeFile(0)));
+        assert_eq!(pulls.action().as_deref(), Some("go to file"));
+
+        // Enter unfolds the file and chooses its header, at the top of the details. The files
+        // show in the order of their paths, so the 21st is f27.rs.
+        pulls.pick = Some(Control::TreeFile(20));
+        pulls.enter();
+        assert_eq!(pulls.pick, Some(Control::File(20)));
+        assert_eq!(pulls.action().as_deref(), Some("collapse file"));
+        let page = pulls.page(40, 20, now(), true, &theme);
+        assert_eq!(
+            rows_of(&page.lines[1..3]),
+            ["⌄ A f27.rs +1 -0", "1 + line 27"]
+        );
+        // The next frame keeps the scroll.
+        let top = pulls.scroll;
+        pulls.page(40, 20, now(), true, &theme);
+        assert_eq!(pulls.scroll, top);
+
+        // A click on a file's row does the same.
+        pulls.home();
+        let page = pulls.page(40, 20, now(), true, &theme);
+        let spot = Some(Spot::Control(Control::TreeFile(3)));
+        let row = page.rows.iter().position(|row| *row == spot).unwrap();
+        assert!(pulls.click(4, row));
+        assert_eq!(pulls.pick, Some(Control::File(3)));
+        let page = pulls.page(40, 20, now(), true, &theme);
+        assert_eq!(
+            rows_of(&page.lines[1..3]),
+            ["⌄ A f11.rs +1 -0", "1 + line 11"]
+        );
+
+        // A file near the end shows as high as the last page lets it.
+        pulls.home();
+        pulls.pick = Some(Control::TreeFile(29));
+        pulls.enter();
+        let page = pulls.page(40, 20, now(), true, &theme);
+        let rows = rows_of(&page.lines);
+        assert_eq!(rows[rows.len() - 2..], ["⌄ A f9.rs +1 -0", "1 + line 9"]);
+
+        // Another tab doesn't take the reveal, nor does a frame after the details hid.
+        pulls.home();
+        pulls.pick = Some(Control::TreeFile(10));
+        pulls.enter();
+        assert!(pulls.back());
+        pulls.page(40, 20, now(), true, &theme);
+        assert!(pulls.forward());
+        pulls.page(40, 20, now(), true, &theme);
+        assert_eq!(pulls.scroll, Offset::Top(0));
+    }
+
+    #[test]
     fn the_code_shows_review_threads_that_enter_opens_and_closes() {
         let theme = theme();
         let remark = |id: &str, body: &str| {
