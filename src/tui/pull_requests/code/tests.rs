@@ -263,6 +263,204 @@ fn one_row_unfolds_every_file_and_folds_them_all_again() {
     assert_eq!(targets[1], (5..8, Control::Folds));
 }
 
+/// A file with a line changed only in its whitespace beside one changed in its text, and a
+/// file whose only change is to whitespace.
+const SPACED: &str = "diff --git a/src/lib.rs b/src/lib.rs
+--- a/src/lib.rs
++++ b/src/lib.rs
+@@ -1,4 +1,4 @@
+ use std::fmt;
+-fn a() {
++fn a()  {
+-    old();
++    new();
+ }
+diff --git a/notes.md b/notes.md
+--- a/notes.md
++++ b/notes.md
+@@ -1,2 +1,2 @@
+-Some text
++Some\ttext
+ end
+";
+
+#[test]
+fn whitespace_starts_hidden_and_one_row_shows_it() {
+    // Nothing to show before a slice comes, nor in a diff with no files.
+    assert!(!Code::new().has(Control::Whitespace, &[]));
+    for empty in [slice("", None), slice("", Some("2"))] {
+        let code = read(empty, 0);
+        assert!(!code.has(Control::Whitespace, &[]));
+        let (lines, targets) = laid(&code, 40);
+        assert!(!rows_of(&lines).iter().any(|row| row.contains("whitespace")));
+        assert!(
+            targets
+                .iter()
+                .all(|(_, control)| *control != Control::Whitespace)
+        );
+    }
+
+    // At first a line changed only in its whitespace shows unchanged, with its text after the
+    // change, and a file changed only so counts no lines.
+    let mut code = read(slice(SPACED, None), 0);
+    assert!(code.has(Control::Whitespace, &[]));
+    code.act(Control::Folds, &[]);
+    let (lines, targets) = laid(&code, 40);
+    assert_eq!(
+        rows_of(&lines),
+        [
+            "2 files",
+            "¶ Show whitespace changes",
+            "⇈ Collapse all files",
+            "",
+            "⌄ M notes.md",
+            "1   Some    text",
+            "2   end",
+            "⋯ More unchanged context may be",
+            "available",
+            "",
+            "⌄ M src/lib.rs +1 -1",
+            "1   use std::fmt;",
+            "2   fn a()  {",
+            "3 -     old();",
+            "3 +     new();",
+            "4   }",
+            "⋯ More unchanged context may be",
+            "available",
+        ]
+    );
+    assert_eq!(targets[0], (1..2, Control::Whitespace));
+    assert_eq!(
+        color_of(&lines, "¶ Show whitespace changes"),
+        Some(theme().fg)
+    );
+    assert_eq!(
+        code.action(Control::Whitespace, &[]),
+        "show whitespace changes"
+    );
+    // At a narrow width the row takes as many rows as it needs, and every one leads to it.
+    let (lines, targets) = laid(&code, 8);
+    assert_eq!(
+        rows_of(&lines)[1..5],
+        ["¶ Show", "whitespa", "ce", "changes"]
+    );
+    assert_eq!(targets[0], (1..5, Control::Whitespace));
+
+    // The row shows the patch's lines in every file, laid out again, and hides them again.
+    code.prepare(40, &theme());
+    let builds = code.builds;
+    assert!(!code.act(Control::Whitespace, &[]), "the diff is the same");
+    assert!(code.bodies.is_empty());
+    assert_eq!(
+        code.action(Control::Whitespace, &[]),
+        "hide whitespace changes"
+    );
+    let (lines, _) = laid(&code, 40);
+    assert_eq!(
+        rows_of(&lines)[1..18],
+        [
+            "¶ Hide whitespace changes",
+            "⇈ Collapse all files",
+            "",
+            "⌄ M notes.md +1 -1",
+            "1 - Some text",
+            "1 + Some    text",
+            "2   end",
+            "⋯ More unchanged context may be",
+            "available",
+            "",
+            "⌄ M src/lib.rs +2 -2",
+            "1   use std::fmt;",
+            "2 - fn a() {",
+            "2 + fn a()  {",
+            "3 -     old();",
+            "3 +     new();",
+            "4   }",
+        ]
+    );
+    assert_eq!(
+        color_of(&lines, "¶ Hide whitespace changes"),
+        Some(theme().fg)
+    );
+    code.prepare(40, &theme());
+    assert_eq!(code.builds, builds + 2);
+    code.act(Control::Whitespace, &[]);
+    assert_eq!(rows(&code, 40)[1], "¶ Show whitespace changes");
+}
+
+#[test]
+fn the_whitespace_shown_stays_through_reads_and_commits() {
+    let mut code = read(slice(SPACED, Some("2")), 0);
+    code.act(Control::Whitespace, &[]);
+    code.act(Control::Folds, &[]);
+    let raw = "diff --git a/z b/z\n--- a/z\n+++ b/z\n@@ -1 +1 @@\n-a b\n+a  b\n";
+    code.near_end();
+    assert_eq!(code.ask(2), Some(Some("2".to_string())));
+    assert_eq!(code.take(2, Ok(slice(raw, None)), 0), Some(false));
+    let shown = rows(&code, 40);
+    let at = shown.iter().position(|row| row == "⌄ M z +1 -1").unwrap();
+    assert_eq!(shown[at + 1..at + 3], ["1 - a b", "1 + a  b"]);
+
+    // A read again and another diff picked from the commits keep it, as the desktop's toggle
+    // lives in the tab and not in the diff picked.
+    code.again();
+    assert_eq!(code.ask(3), Some(None));
+    assert_eq!(code.take(3, Ok(slice(raw, None)), 0), Some(true));
+    assert_eq!(rows(&code, 40)[1], "¶ Hide whitespace changes");
+    assert!(code.show("abc1234".into()));
+    assert_eq!(code.ask(4), Some(None));
+    assert_eq!(code.take(4, Ok(slice(raw, None)), 0), Some(true));
+    assert_eq!(rows(&code, 40)[1], "¶ Hide whitespace changes");
+    assert_eq!(rows(&code, 40)[4], "› M z +1 -1");
+    code.act(Control::Whitespace, &[]);
+    assert_eq!(rows(&code, 40)[4], "› M z");
+}
+
+/// A file whose hunk removes `count` lines and adds `count` others, none the same.
+fn rewritten(path: &str, count: usize) -> String {
+    let mut patch = format!(
+        "diff --git a/{path} b/{path}\n--- a/{path}\n+++ b/{path}\n@@ -1,{count} +1,{count} @@\n"
+    );
+    for n in 0..count {
+        patch.push_str(&format!("-old {n}\n"));
+    }
+    for n in 0..count {
+        patch.push_str(&format!("+new {n}\n"));
+    }
+    patch
+}
+
+#[test]
+fn hunks_too_large_to_compare_show_their_whitespace_changes_and_say_so() {
+    // 2,000 lines removed and 2,000 added take more steps than a slice may.
+    let big = rewritten("big", 2_000);
+    let mut code = read(slice(&big, Some("2")), 0);
+    let note = "1 hunk too large to compare show their whitespace changes.";
+    let (lines, _) = laid(&code, 80);
+    assert_eq!(
+        rows_of(&lines)[..3],
+        ["1 file+", note, "¶ Show whitespace changes"]
+    );
+    assert_eq!(color_of(&lines, note), Some(theme().muted));
+    // Each slice has steps of its own, and the note counts the hunks of every slice.
+    code.near_end();
+    assert_eq!(code.ask(2), Some(Some("2".to_string())));
+    let both = format!("{}{}", rewritten("more", 2_000), SPACED);
+    assert_eq!(code.take(2, Ok(slice(&both, None)), 0), Some(false));
+    let note = "2 hunks too large to compare show their whitespace changes.";
+    assert_eq!(
+        rows(&code, 80)[..3],
+        ["4 files", note, "¶ Show whitespace changes"]
+    );
+    assert!(rows(&code, 80).contains(&"› M notes.md".to_string()));
+    // With the changes to whitespace shown, the note goes.
+    code.act(Control::Whitespace, &[]);
+    assert_eq!(
+        rows(&code, 80)[..2],
+        ["4 files", "¶ Hide whitespace changes"]
+    );
+}
+
 #[test]
 fn the_unchanged_lines_before_a_hunk_count_from_the_line_git_names() {
     // A hunk that removes nothing names the line before it, so the five above it are unchanged,

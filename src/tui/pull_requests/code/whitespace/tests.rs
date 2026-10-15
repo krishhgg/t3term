@@ -230,27 +230,44 @@ fn a_line_with_no_end_keeps_its_note_where_the_desktop_shows_it() {
     assert_eq!(hidden(&["-a", "-b", "+a", no_end]), ["1 1  a", "2 _ -b"]);
 }
 
-#[test]
-fn a_hunk_past_the_steps_left_shows_as_the_patch_has_it() {
-    // 2,000 lines removed and 2,000 others added take more than `MOST_STEPS` to compare.
-    let mut lines: Vec<String> = (0..2000).map(|at| format!("-old {at}")).collect();
-    lines.extend((0..2000).map(|at| format!("+new {at}")));
+/// The patch of a file at `path` whose hunk removes `x` and `count` - 1 lines and adds ` x` and
+/// `count` - 1 others.
+fn rewritten(path: &str, count: usize) -> String {
+    let mut lines = vec!["-x".to_string()];
+    lines.extend((1..count).map(|at| format!("-old {at}")));
+    lines.push("+ x".into());
+    lines.extend((1..count).map(|at| format!("+new {at}")));
     let lines: Vec<&str> = lines.iter().map(String::as_str).collect();
-    let mut patch = patch_of("@@ -1,2000 +1,2000 @@", &lines);
-    // A file after it, which the steps left can't compare either, and one that needs none.
-    patch.push_str(&patch_of("@@ -1 +1 @@", &["-a", "+ a"]).replace("a/f b/f", "a/g b/g"));
-    let read = Patch::read(&patch);
-    let hidden = hide(&patch, &read.files);
-    assert_eq!(hidden.kept, 2);
-    assert_eq!(hidden.files, read.files);
+    patch_of(&format!("@@ -1,{count} +1,{count} @@"), &lines)
+        .replace("a/f b/f", &format!("a/{path} b/{path}"))
+}
 
-    // One that fits shows filtered, and a hunk after it takes what is left.
-    let mut patch = patch_of("@@ -1 +1 @@", &["-a", "+ a"]);
-    patch.push_str(&patch_of("@@ -1 +1 @@", &["-b", "+\tb"]).replace("a/f b/f", "a/g b/g"));
+#[test]
+fn hunks_past_the_steps_left_show_as_the_patch_has_them() {
+    // 2,000 lines removed and 2,000 others added take more than `MOST_STEPS` to compare, and
+    // a smaller hunk after it is compared first.
+    let mut patch = rewritten("f", 2_000);
+    patch.push_str(&rewritten("g", 2));
     let read = Patch::read(&patch);
     let hidden = hide(&patch, &read.files);
-    assert_eq!(hidden.kept, 0);
-    assert_eq!(marked(&patch, &hidden.files[1]), ["1 1  \tb"]);
+    assert_eq!(hidden.kept, 1);
+    assert_eq!(hidden.files[0], read.files[0]);
+    assert_eq!(
+        marked(&patch, &hidden.files[1]),
+        ["1 1   x", "2 _ -old 1", "_ 2 +new 1"]
+    );
+
+    // 1,500 and 1,500 take about 2,250,000, so the steps compare one of two such hunks, the
+    // first, and the one smaller than both.
+    let mut patch = rewritten("f", 1_500);
+    patch.push_str(&rewritten("g", 1_500));
+    patch.push_str(&rewritten("h", 2));
+    let read = Patch::read(&patch);
+    let hidden = hide(&patch, &read.files);
+    assert_eq!(hidden.kept, 1);
+    assert_eq!(marked(&patch, &hidden.files[0])[0], "1 1   x");
+    assert_eq!(hidden.files[1], read.files[1]);
+    assert_eq!(marked(&patch, &hidden.files[2])[0], "1 1   x");
 }
 
 #[test]

@@ -22,21 +22,37 @@ pub(super) struct Hidden {
     pub(super) kept: usize,
 }
 
-/// `files`, whose lines are ranges of `patch`, with the changes to whitespace hidden. A file's
-/// counts lose a line added and one removed for each pair that shows unchanged, so those of
-/// hunks left out past the bound stay.
+/// `files`, whose lines are ranges of `patch`, with the changes to whitespace hidden. The hunks
+/// are compared from the one with the fewest lines up, so only the largest are left out once
+/// the steps run out. A file's counts lose a line added and one removed for each pair that
+/// shows unchanged, so those of hunks left out past the bound stay.
 pub(super) fn hide(patch: &str, files: &[File]) -> Hidden {
+    let mut order: Vec<(usize, usize)> = files
+        .iter()
+        .enumerate()
+        .flat_map(|(at, file)| (0..file.hunks.len()).map(move |hunk| (at, hunk)))
+        .collect();
+    order.sort_by_key(|&(at, hunk)| files[at].hunks[hunk].lines.len());
+    let mut compared: Vec<Vec<Option<Rebuilt>>> = files
+        .iter()
+        .map(|file| file.hunks.iter().map(|_| None).collect())
+        .collect();
     let mut left = MOST_STEPS;
+    for (at, hunk) in order {
+        compared[at][hunk] = rebuilt(patch, &files[at].hunks[hunk], &mut left);
+    }
     let mut kept = 0;
     let files = files
         .iter()
-        .map(|file| {
+        .zip(compared)
+        .map(|(file, compared)| {
             let mut joined = 0;
             let hunks = file
                 .hunks
                 .iter()
-                .map(|hunk| {
-                    let lines = match rebuilt(patch, hunk, &mut left) {
+                .zip(compared)
+                .map(|(hunk, compared)| {
+                    let lines = match compared {
                         Some((lines, pairs)) => {
                             joined += pairs;
                             lines
@@ -66,9 +82,13 @@ pub(super) fn hide(patch: &str, files: &[File]) -> Hidden {
     Hidden { files, kept }
 }
 
-/// `hunk`'s lines compared without whitespace, and how many more show unchanged than in the
-/// patch. None where comparing them would take more steps than are `left`.
-fn rebuilt(patch: &str, hunk: &Hunk, left: &mut usize) -> Option<(Vec<Line>, u64)> {
+/// A hunk's lines compared without whitespace, and how many more show unchanged than in the
+/// patch.
+type Rebuilt = (Vec<Line>, u64);
+
+/// `hunk`'s lines as `Rebuilt` says. None where comparing them would take more steps than are
+/// `left`.
+fn rebuilt(patch: &str, hunk: &Hunk, left: &mut usize) -> Option<Rebuilt> {
     let old: Vec<&Line> = hunk
         .lines
         .iter()
