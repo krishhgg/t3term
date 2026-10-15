@@ -1221,8 +1221,8 @@ impl App {
     /// (apps/web/src/components/pullRequest/ThreadPullRequestsPanel.tsx). Only an environment
     /// whose capabilities have `pullRequests` reads them. The details show the answer when it
     /// comes, and a reference T3's schema would refuse fails at once. While the details hold a
-    /// read, T3's refresh numbers say when to read it again.
-    fn read_opened_pull(&mut self) {
+    /// read, T3's refresh numbers say when to read it again. Says whether it asked for a read.
+    fn read_opened_pull(&mut self) -> bool {
         let project = self.pulls_project();
         let enabled = project.is_some();
         // A read that waits goes once its details don't show, and nothing is asked for until
@@ -1239,7 +1239,7 @@ impl App {
             .flatten();
         self.follow_refreshes(enabled);
         let Some(ask) = ask else {
-            return;
+            return false;
         };
         let project = project.unwrap_or_default();
         match Reference::new(&project, Some(&ask.host), &ask.repository, ask.number) {
@@ -1250,6 +1250,7 @@ impl App {
                 self.details.answer_pull(ask.ticket, Part::Done, now);
             }
         }
+        true
     }
 
     /// The project of the thread whose details show, which a read of its links names, while
@@ -1728,7 +1729,7 @@ impl App {
     // ---- input ----
 
     /// Acts on a key, a paste or the mouse. When that opened a link's details, asks its host
-    /// for the pull request.
+    /// for the pull request. Says whether what shows changed.
     fn on_terminal_event(&mut self, event: Event) -> bool {
         let now = now_ms().max(self.now);
         let input = matches!(event, Event::Key(_) | Event::Mouse(_) | Event::Paste(_));
@@ -1744,12 +1745,14 @@ impl App {
             self.input_at = now;
         }
         let changed = self.on_input(event);
-        self.read_opened_pull();
+        // A read asked for changes what the details show, though the input itself may not,
+        // as a mouse move or focus doesn't.
+        let mut asked = self.read_opened_pull();
         // The read follows what the input showed.
         if arrived && self.pulls_project().is_some() && self.details.pulls.arrive(now) {
-            self.read_opened_pull();
+            asked |= self.read_opened_pull();
         }
-        changed
+        changed || asked
     }
 
     fn on_input(&mut self, event: Event) -> bool {
@@ -13937,7 +13940,8 @@ mod tests {
         app.on_terminal_event(Event::Resize(200, 50));
         assert_eq!(reads(&asked).len(), 3);
         assert_eq!(app.live_at(), None);
-        press(&mut app, KeyCode::Down);
+        // A mouse move counts, and draws the read it asked for.
+        assert!(mouse(&mut app, MouseEventKind::Moved, 1, 1));
         assert_eq!(reads(&asked).len(), 4);
         assert_eq!(reads(&asked)[3], (4, shown));
         let detail = Part::Detail(Ok(Box::new(host_detail())));
