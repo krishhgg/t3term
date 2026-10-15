@@ -57,9 +57,16 @@
 //! above the files shows them, or hides them again, as the desktop's toolbar toggle does
 //! (PullRequestCodeTab.tsx:1211-1234), for every file and every diff the tab shows after.
 //!
+//! The lines stack at first, as the desktop's `diffLayout` setting is `stacked` until changed
+//! (packages/contracts/src/settings.ts:53-55). A row under the fold row sets the lines before
+//! the change on the left and those after it on the right, or stacks them again, as the
+//! desktop's toolbar toggle group does (PullRequestCodeTab.tsx:1259-1278). The lines pair as
+//! @pierre/diffs pairs them, as `pairs` says, and a file added or deleted keeps one column.
+//! Unwrapped, both sides' text scrolls sideways by the same columns.
+//!
 //! The lines wrap at first, as the desktop's `wordWrap` setting is true until changed
-//! (packages/contracts/src/settings.ts:506). A row under the fold row lets them run on past the
-//! end of their rows, or wraps them again, as the desktop's toolbar toggle does
+//! (packages/contracts/src/settings.ts:506). A row under the layout row lets them run on past
+//! the end of their rows, or wraps them again, as the desktop's toolbar toggle does
 //! (PullRequestCodeTab.tsx:1279-1298). Each line then takes one row, and the panel scrolls the
 //! text of those rows sideways while their numbers stay, as `Sideways` says, as the desktop's
 //! numbers stay while its lines scroll.
