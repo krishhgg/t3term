@@ -6680,9 +6680,18 @@ mod tests {
         pulls.page(60, 40, now(), true, &theme);
         let rows = detail_rows(&pulls);
         assert_eq!(count(&rows, "│ Load more comments"), 1, "{rows:#?}");
-        // Nothing reads until the reader asks.
+        // Nothing reads until the reader asks, nor from a button that no longer shows, as
+        // a click on a closed thread's last frame would.
         assert_eq!(pulls.take_comments_ask(true), None);
         pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::Thread(0)));
+        pulls.enter();
+        pulls.pick = Some(Control::More(0));
+        pulls.enter();
+        assert_eq!(pulls.take_comments_ask(true), None);
+        pulls.pick = Some(Control::Thread(0));
+        pulls.enter();
+        pulls.page(60, 40, now(), true, &theme);
         pulls.step(true);
         assert_eq!(pulls.pick, Some(Control::More(0)));
         assert_eq!(pulls.action().as_deref(), Some("load more comments"));

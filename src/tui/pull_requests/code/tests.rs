@@ -1049,12 +1049,17 @@ fn a_thread_reads_its_remarks_a_page_at_a_time() {
     );
     assert_eq!(more_rows(&targets, 0), None);
     assert!(!code.shows(Control::More(0), conversation.threads(), &shown));
+    shown.act(Control::Thread(0), &conversation);
+    // Nor under a folded file.
+    assert!(code.shows(Control::More(0), conversation.threads(), &shown));
+    code.act(Control::File(0));
+    assert!(!code.shows(Control::More(0), conversation.threads(), &shown));
+    code.act(Control::File(0));
     assert!(conversation.want_more(0));
     assert_eq!(
         conversation.take_wanted(10),
         Some(("t".into(), "p3".into()))
     );
-    shown.act(Control::Thread(0), &conversation);
 
     // The last page takes the button away, and the host counts one remark that never came.
     assert!(conversation.take_page(10, Ok(&page(&["z"], None))));
@@ -1153,6 +1158,12 @@ fn pages_go_with_their_thread_when_the_conversation_is_read_again() {
         );
     }
     assert!(!rows.contains(&"│   Remark t-1.".to_string()), "{rows:#?}");
+    // A read after that keeps them too.
+    let mut newer = conversation(threads(&["First.", "Second."], "fresher"));
+    newer.carry(&mut new);
+    let (rows, _) = with_threads(&code, &mut newer, &shown, 40);
+    assert!(rows.contains(&"│   Remark t-2.".to_string()), "{rows:#?}");
+    let mut new = newer;
     assert!(new.want_more(0));
     assert_eq!(new.take_wanted(3), Some(("t".into(), "p3".into())));
 
@@ -1169,11 +1180,18 @@ fn pages_go_with_their_thread_when_the_conversation_is_read_again() {
     assert!(old.want_more(0));
     assert_eq!(old.take_wanted(1), Some(("t".into(), "p2".into())));
     assert!(old.take_page(1, Ok(&page(&["t-1", "x"], Some("p3")))));
+    assert!(old.want_more(0) && old.want_more(1));
     let mut new = conversation(threads(&vec!["Kept."; 1_000], "fresh"));
     new.carry(&mut old);
     assert!(!new.want_more(0));
     let (rows, _) = with_threads(&code, &mut new, &shown, 40);
     assert!(!rows.contains(&"│   Remark x.".to_string()));
+    // Its page the reader wanted goes unread, and the next thread's goes.
+    assert_eq!(new.take_wanted(4), Some(("u".into(), "q2".into())));
+    assert_eq!(new.take_wanted(5), None);
+    let (rows, _) = with_threads(&code, &mut new, &shown, 40);
+    let loading = rows.iter().filter(|row| row.contains("Loading more"));
+    assert_eq!(loading.count(), 1, "{rows:#?}");
 
     // A thread no page was read for keeps the cursor the read again sent.
     let mut old = conversation(threads(&["First."], "p2"));

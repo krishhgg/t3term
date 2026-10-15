@@ -644,13 +644,19 @@ impl Conversation {
     /// The id and cursor of the first thread whose next page is wanted, which the read with
     /// `ticket` is to read.
     pub(super) fn take_wanted(&mut self, ticket: u64) -> Option<(String, String)> {
-        let thread = self
-            .threads
-            .iter_mut()
-            .find(|thread| thread.more == More::Wanted)?;
-        let cursor = thread.next.clone()?;
-        thread.more = More::Asked(ticket);
-        Some((thread.id.clone(), cursor))
+        for thread in &mut self.threads {
+            if thread.more != More::Wanted {
+                continue;
+            }
+            // A read again of the conversation can leave a wanted thread with no page to read.
+            let Some(cursor) = thread.next.clone() else {
+                thread.more = More::Idle;
+                continue;
+            };
+            thread.more = More::Asked(ticket);
+            return Some((thread.id.clone(), cursor));
+        }
+        None
     }
 
     /// Takes the answer to the read with `ticket` of a thread's next page, or why it failed.

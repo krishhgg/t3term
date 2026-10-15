@@ -13950,7 +13950,10 @@ mod tests {
             Ok(Box::new(pull_request::CommentPage::read(&page).unwrap()))
         };
         let answer = page("t0b", "Unused now.", Some("p3"));
+        assert!(!app.details.moved);
         app.on_action_result(ActionResult::PullRequestComments { ticket: 3, answer });
+        // The rows moved, so the mouse waits for the next frame.
+        assert!(app.details.moved);
         let rows = body_after(&mut app, 200, 50);
         let at = rows
             .iter()
@@ -13960,6 +13963,7 @@ mod tests {
         assert!(!rows.iter().any(|row| row.contains("Loading more")));
         let answer = page("t0c", "Stale.", None);
         app.on_action_result(ActionResult::PullRequestComments { ticket: 9, answer });
+        assert!(!app.details.moved);
         let rows = body_after(&mut app, 200, 50);
         assert!(!rows.iter().any(|row| row.contains("Stale.")), "{rows:#?}");
 
@@ -14556,8 +14560,10 @@ mod tests {
             };
             reply(&mut socket, activity, success(host_activity_sent())).await;
         };
-        let (read, ()) = beside(parts(&client, &reference, ask(false, None)), server).await;
-        assert_eq!(read, ["detail", "stack", "activity", "done"]);
+        let (mut read, ()) = beside(parts(&client, &reference, ask(false, None)), server).await;
+        // The stack and the conversation are read at once, so either answer can come first.
+        read[1..3].sort();
+        assert_eq!(read, ["detail", "activity", "stack", "done"]);
 
         // A read that keeps the details current reads no stack, as the desktop's live refresh
         // reads only the detail.
