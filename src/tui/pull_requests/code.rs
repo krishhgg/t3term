@@ -46,6 +46,7 @@ const EMPTY: &str = "This pull request has no file changes.";
 const WITHHELD: &str =
     "The host withheld part of this diff, such as a binary file or a change too large to show.";
 const REST_FAILED: &str = "t3term couldn't read the rest of this diff.";
+const STALE: &str = "May be out of date: t3term couldn't read the diff again.";
 const UNREAD: &str = "t3term couldn't split this patch into files.";
 
 /// What the Code tab read of a pull request's diff.
@@ -224,10 +225,12 @@ impl Code {
         }
     }
 
-    /// Whether the end of the files offers Retry: a read failed, and slices show above it with
-    /// more after them.
+    /// Whether the end of the files offers Retry: the read of a later slice failed, and slices
+    /// show above it with more after them.
     fn retries(&self) -> bool {
-        self.failed.is_some() && !self.slices.is_empty() && self.next_cursor().is_some()
+        matches!(self.failed, Some((_, false)))
+            && !self.slices.is_empty()
+            && self.next_cursor().is_some()
     }
 
     /// Does what `control` does: folds or unfolds a file, or reads again the slice whose read
@@ -306,6 +309,12 @@ impl Code {
         if unread || self.slices.iter().any(|slice| slice.diff.truncated) {
             lines.extend(whole(WITHHELD, width, Style::new().fg(theme.warning_fg)));
         }
+        // A read again of the first slice that failed leaves the files read before, which may
+        // be out of date.
+        if let Some((failure, true)) = &self.failed {
+            lines.extend(whole(STALE, width, Style::new().fg(theme.warning_fg)));
+            lines.extend(whole(failure, width, muted));
+        }
         if self.slices.iter().any(|slice| slice.patch.files_cut) {
             let note = format!(
                 "T3 sent more files in one slice than the {} t3term reads.",
@@ -335,7 +344,7 @@ impl Code {
                 lines.extend(body(text, file, withheld, width, theme));
             }
         }
-        if self.next_cursor().is_some() {
+        if self.next_cursor().is_some() && !self.failed.as_ref().is_some_and(|(_, first)| *first) {
             lines.push(Line::default());
             match &self.failed {
                 Some((failure, _)) => {

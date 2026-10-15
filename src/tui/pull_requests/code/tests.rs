@@ -296,15 +296,27 @@ fn a_failure_says_why_and_a_later_slice_s_offers_retry() {
     assert!(!code.has(Control::Retry));
     assert_eq!(code.ask(3), Some(Some("2".to_string())));
 
-    // A read of the first slice again that failed leaves the slices shown, and Retry reads the
-    // first slice again.
+    // A read of the first slice again that failed leaves the slices shown under a note that
+    // they may be out of date, with no Retry and no slice read after them. Showing the tab
+    // again, or `r`, reads the first slice again.
     let mut code = read(slice(first, Some("2")), 0);
     code.again();
     assert_eq!(code.ask(2), Some(None));
     assert_eq!(code.take(2, Err("Gone.".into()), 0), Some(true));
-    assert_eq!(rows(&code, 40)[2], "› M one +1 -1");
+    let shown = [
+        "1 file+",
+        "May be out of date: t3term couldn't read",
+        "the diff again.",
+        "Gone.",
+        "",
+        "› M one +1 -1",
+    ];
+    assert_eq!(rows(&code, 40), shown);
+    assert!(!code.has(Control::Retry));
+    code.near_end();
+    assert_eq!(code.ask(3), None);
     assert!(code.stale(0));
-    code.act(Control::Retry);
+    code.again();
     assert_eq!(code.ask(3), Some(None));
 }
 
