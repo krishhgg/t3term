@@ -374,6 +374,12 @@ impl Code {
         true
     }
 
+    /// Shows the diff of the commit `oid` names, as its row on the Timeline does. Says whether
+    /// the diff changed.
+    pub(super) fn show(&mut self, oid: String) -> bool {
+        self.scope(Some(oid))
+    }
+
     /// Shows the whole change's diff again where `commits`, from a read of the conversation,
     /// no longer list the commit shown, as after a rebase or a force-push. Says whether the
     /// diff changed.

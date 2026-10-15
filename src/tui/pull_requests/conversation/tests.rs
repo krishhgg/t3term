@@ -1086,7 +1086,7 @@ fn timeline_rows(
     if let Answer::Read(conversation) = answer {
         conversation.lay_out_timeline(width, &theme(), shown);
     }
-    let section = timeline_section(answer, shown, width, now(), &theme());
+    let section = timeline_section(answer, shown, false, width, now(), &theme());
     (rows_of(&section.lines), section.targets)
 }
 
@@ -1189,6 +1189,31 @@ fn the_timeline_reads_as_the_desktops_does() {
         "show comments"
     );
     assert!(!conversation.has(Control::Run(2), &shown));
+
+    // Where the details offer the Code tab, each commit's rows open its own diff there, by its
+    // place as T3 sent it.
+    let opening = timeline_section(&answer, &shown, true, 60, now(), &theme());
+    assert_eq!(rows_of(&opening.lines), expected);
+    assert_eq!(
+        opening.targets,
+        [
+            (0..1, Control::TimelineOrder),
+            (5..7, Control::Run(0)),
+            (11..13, Control::TimelineCommit(1)),
+            (14..16, Control::Run(1)),
+            (21..23, Control::TimelineCommit(0)),
+        ]
+    );
+    assert_eq!(
+        conversation.action(Control::TimelineCommit(0), &shown),
+        "view commit a1b2c3d"
+    );
+    assert_eq!(
+        conversation.action(Control::TimelineCommit(1), &shown),
+        "view commit 0f0f0f0"
+    );
+    assert!(conversation.has(Control::TimelineCommit(1), &shown));
+    assert!(!conversation.has(Control::TimelineCommit(2), &shown));
 
     // A run opens to each of its remarks, and stays open the other way round, where the
     // desktop's closes. Oldest first, a run's time is its oldest remark's.
