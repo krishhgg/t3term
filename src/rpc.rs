@@ -390,6 +390,14 @@ async fn handle_message(message: Value, pending: &PendingMap, ack: &mpsc::Unboun
     }
 }
 
+impl RpcError {
+    /// The failure an encoded Effect `Exit` names, as a call to `tag` would fail with it. For
+    /// a failure T3 sends another way, such as in an HTTP answer.
+    pub(crate) fn failed(tag: &str, exit: &Value) -> RpcError {
+        failure(tag, exit)
+    }
+}
+
 /// Reads the most useful message out of an encoded Effect `Exit` failure.
 fn failure(tag: &str, exit: &Value) -> RpcError {
     let reasons = exit
