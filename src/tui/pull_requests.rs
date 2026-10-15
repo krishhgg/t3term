@@ -801,8 +801,13 @@ pub(super) struct Ask {
 /// A read of one link's pull request from its host, with `pullRequests.detail`.
 struct Read {
     key: Key,
-    ticket: u64,
-    /// The time it was asked for.
+    host: String,
+    repository: String,
+    number: u64,
+    /// The read's ticket, once it was asked for. A read waits without one while another is
+    /// under way.
+    ticket: Option<u64>,
+    /// The time it was asked for, or wanted while it waits.
     asked: i64,
     answer: Answer,
 }
@@ -975,6 +980,10 @@ pub(super) struct PullRequests {
     asking: bool,
     /// The ticket of the last read asked for.
     tickets: u64,
+    /// The ticket of the read under way, until its answer comes. One read at a time is under
+    /// way, so links opened one after another don't each start a read. Another thread opening
+    /// leaves it, since its answer still comes.
+    running: Option<u64>,
     /// How many times the links were worked out and a page laid out, so the tests can tell
     /// what a frame or an event did.
     #[cfg(test)]
@@ -1038,6 +1047,9 @@ impl PullRequests {
             .min(entries.len().saturating_sub(1));
         self.chosen = entries.get(selected).map(|entry| entry.key.clone());
         self.selected = selected;
+        if !self.viewing {
+            self.unqueue();
+        }
     }
 
     /// How many links show, once they are known.
@@ -1147,46 +1159,82 @@ impl PullRequests {
         }
     }
 
-    /// The read of the selected link's pull request that opening its details asks for. None
-    /// unless the details opened since the last call and still show, when `enabled` is false
-    /// because the environment doesn't read pull requests or the thread names no project, and
-    /// while a read of the link is under way or one from the last minute stands. The details
-    /// then show that the read is under way until `answer` takes its answer.
+    /// The read of the selected link's pull request that opening its details asks for. Opening
+    /// them wants a read, unless `enabled` is false because the environment doesn't read pull
+    /// requests or the thread names no project, or a read of the link is under way or one from
+    /// the last minute stands. The details show that the read is under way until `answer`
+    /// takes its answer. A read wanted while another is under way waits, and the caller calls
+    /// again once that one's answer comes. None while nothing waits.
     pub fn take_ask(&mut self, enabled: bool, now: i64) -> Option<Ask> {
-        if !std::mem::take(&mut self.asking) || !enabled || !self.viewing {
+        if std::mem::take(&mut self.asking) && enabled && self.viewing {
+            self.want(now);
+        }
+        if !enabled {
+            self.unqueue();
             return None;
         }
-        let entry = entries_of(self.list.as_ref()).get(self.selected)?;
+        if self.running.is_some() {
+            return None;
+        }
+        let read = self.read.as_mut().filter(|read| read.ticket.is_none())?;
+        self.tickets += 1;
+        read.ticket = Some(self.tickets);
+        read.asked = now;
+        self.running = read.ticket;
+        Some(Ask {
+            ticket: self.tickets,
+            host: read.host.clone(),
+            repository: read.repository.clone(),
+            number: read.number,
+        })
+    }
+
+    /// Wants a read of the selected link's pull request, unless one under way or from the last
+    /// minute stands.
+    fn want(&mut self, now: i64) {
+        let Some(entry) = entries_of(self.list.as_ref()).get(self.selected) else {
+            return;
+        };
         let read = self.read.as_ref().filter(|read| read.key == entry.key);
         if read.is_some_and(|read| read.stands(now)) {
-            return None;
+            return;
         }
-        self.tickets += 1;
-        let ask = Ask {
-            ticket: self.tickets,
+        self.read = Some(Read {
+            key: entry.key.clone(),
             host: entry.ask_host.clone(),
             repository: entry.ask_repository.clone(),
             number: entry.number,
-        };
-        self.read = Some(Read {
-            key: entry.key.clone(),
-            ticket: self.tickets,
+            ticket: None,
             asked: now,
             answer: Answer::Reading,
         });
         self.relay();
-        Some(ask)
+    }
+
+    /// Drops a read that waits to be asked for, once nothing shows it or it can't be asked.
+    fn unqueue(&mut self) {
+        if self.read.as_ref().is_some_and(|read| read.ticket.is_none()) {
+            self.read = None;
+            self.relay();
+        }
     }
 
     /// Takes the answer to read `ticket`: the pull request's detail, or why the read failed.
     /// Says whether it is the read the details wait for. An answer to an earlier read, or to a
-    /// read of another thread's link, is dropped.
+    /// read of another thread's link, is dropped. Either way, another read can be asked for.
     pub fn answer(
         &mut self,
         ticket: u64,
         answer: Result<Box<pull_request::Detail>, String>,
     ) -> bool {
-        let Some(read) = self.read.as_mut().filter(|read| read.ticket == ticket) else {
+        if self.running == Some(ticket) {
+            self.running = None;
+        }
+        let Some(read) = self
+            .read
+            .as_mut()
+            .filter(|read| read.ticket == Some(ticket))
+        else {
             return false;
         };
         read.answer = match answer {
@@ -1214,6 +1262,7 @@ impl PullRequests {
         self.viewing = false;
         self.scroll = Offset::Top(0);
         self.current = false;
+        self.unqueue();
         true
     }
 
@@ -3153,6 +3202,49 @@ mod tests {
         pulls.follow();
         assert!(!pulls.answer(1, Err("late".into())));
         assert!(pulls.read.is_none());
+    }
+
+    #[test]
+    fn a_link_opened_while_a_read_is_under_way_waits_for_it() {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![
+            link("krishhgg/t3term", 31, "feature", "master"),
+            link("krishhgg/t3term", 32, "b", "c"),
+        ])));
+        let numbers = |ask: Option<Ask>| ask.map(|ask| (ask.number, ask.ticket));
+        pulls.toggle();
+        assert_eq!(numbers(pulls.take_ask(true, now())), Some((31, 1)));
+        // #32 waits for #31's read, and shows that it reads meanwhile.
+        pulls.back();
+        pulls.move_by(1);
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(true, now()), None);
+        pulls.page(44, 30, now(), &theme());
+        assert!(detail_rows(&pulls).contains(&"Reading from github.com…".to_string()));
+        // Leaving its details drops it, and opening them again wants it again.
+        pulls.back();
+        assert!(pulls.read.is_none());
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(true, now()), None);
+        // #31's answer is dropped, and #32 is asked for next.
+        assert!(!pulls.answer(1, Err("late".into())));
+        assert_eq!(numbers(pulls.take_ask(true, now())), Some((32, 2)));
+        assert_eq!(pulls.take_ask(true, now()), None);
+
+        // Another thread's link waits for the read the last thread left under way.
+        pulls.follow();
+        let other = link("krishhgg/t3term", 40, "d", "e");
+        pulls.set(list_of(&thread(vec![other])));
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(true, now()), None);
+        // A read that can't be asked for any more is dropped.
+        assert_eq!(pulls.take_ask(false, now()), None);
+        assert!(pulls.read.is_none());
+        pulls.back();
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(true, now()), None);
+        assert!(!pulls.answer(2, Err("late".into())));
+        assert_eq!(numbers(pulls.take_ask(true, now())), Some((40, 3)));
     }
 
     #[test]

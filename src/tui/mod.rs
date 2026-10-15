@@ -2141,7 +2141,9 @@ impl App {
                 }
             }
             ActionResult::PullRequest { ticket, answer } => {
-                self.details.answer_pull(ticket, answer)
+                self.details.answer_pull(ticket, answer);
+                // A link opened while that read was under way is asked for now.
+                self.read_opened_pull();
             }
             ActionResult::Output {
                 item_id,
@@ -13225,14 +13227,36 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         assert_eq!(asked.borrow().last(), Some(&ask(3)));
 
-        // Another link's details read that link. Only the last read is kept.
+        // Another link opened while #31's read is under way waits for it, and says it reads.
+        // Only the last read is kept, so #31's answer is dropped and #32 is asked for then.
         press(&mut app, KeyCode::Left);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter);
+        assert_eq!(asked.borrow().last(), Some(&ask(3)));
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Reading from github.com…"), "{text}");
+        app.on_action_result(ActionResult::PullRequest {
+            ticket: 3,
+            answer: Ok(Box::new(host_detail())),
+        });
         let last = asked.borrow().last().cloned().expect("a read");
         assert_eq!((last.3, last.4), (32, 4));
+        let text = details_after(&mut app, 200, 50);
+        assert!(
+            text.contains("Reading from github.com…") && !text.contains("octocat"),
+            "{text}"
+        );
+
+        // A link opened and left while #32's read is under way is never asked for.
         press(&mut app, KeyCode::Left);
         press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Left);
+        app.on_action_result(ActionResult::PullRequest {
+            ticket: 4,
+            answer: Err("late".into()),
+        });
+        assert_eq!(asked.borrow().len(), 4);
         press(&mut app, KeyCode::Enter);
         assert_eq!(asked.borrow().last(), Some(&ask(5)));
     }
