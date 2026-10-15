@@ -7029,6 +7029,110 @@ mod tests {
     }
 
     #[test]
+    fn a_run_of_unchanged_lines_reads_its_files_text_once() {
+        let theme = theme();
+        let patch = "diff --git a/f.rs b/f.rs\n--- a/f.rs\n+++ b/f.rs\n\
+                     @@ -3 +3 @@\n-o3\n+l3\n@@ -254 +254 @@\n-o254\n+l254\n\
+                     @@ -256 +256 @@\n-o256\n+l256\n";
+        let diff = || {
+            Box::new(pull_request::Diff {
+                patch: patch.into(),
+                truncated: false,
+                next_cursor: None,
+                omitted: Vec::new(),
+                omitted_cut: false,
+            })
+        };
+        let text = |count: u64| {
+            let new = (1..=count).map(|n| format!("l{n}\n")).collect();
+            Ok(Box::new(pull_request::FileContents { new }))
+        };
+        let text_ask = |ticket: u64| TextAsk {
+            ticket,
+            host: "github.com".into(),
+            repository: "krishhgg/t3term".into(),
+            number: 31,
+            commit: None,
+            change: pull_request::ChangeType::Change,
+            old_path: "f.rs".into(),
+            new_path: "f.rs".into(),
+        };
+        let mut pulls = conversing(remarks(1));
+        assert!(!pulls.answer(1, Part::Done, now()));
+        assert!(pulls.forward() && pulls.forward());
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
+        assert!(pulls.answer_diff(2, Ok(diff()), now()));
+        pulls.page(60, 40, now(), true, &theme);
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::File(0)));
+        pulls.enter();
+        pulls.page(60, 40, now(), true, &theme);
+        // Nothing reads until Enter on a run.
+        assert_eq!(pulls.take_text_ask(true), None);
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::Stretch(0, 0)));
+        assert_eq!(pulls.action().as_deref(), Some("show 2 unmodified lines"));
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::Stretch(0, 1)));
+        assert_eq!(pulls.action().as_deref(), Some("show 200 unmodified lines"));
+
+        // Enter asks for the file's text once, and the run stays chosen while it comes.
+        pulls.enter();
+        assert_eq!(pulls.pick, Some(Control::Stretch(0, 1)));
+        assert_eq!(pulls.take_text_ask(false), None);
+        assert_eq!(pulls.take_text_ask(true), Some(text_ask(3)));
+        assert_eq!(pulls.take_text_ask(true), None);
+        pulls.page(60, 40, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(
+            rows.contains(&"⋯ 250 unmodified lines · Reading…".to_string()),
+            "{rows:#?}"
+        );
+
+        // An answer to another read changes nothing. A failure says why under the run, and
+        // Enter reads again.
+        assert!(!pulls.answer_text(99, text(400)));
+        let failure = Err("GitHub took too long to answer.".to_string());
+        assert!(pulls.answer_text(3, failure));
+        assert!(!pulls.answer_text(3, text(400)));
+        pulls.page(60, 40, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        let at = rows
+            .iter()
+            .position(|row| row == "⋯ 250 unmodified lines")
+            .expect("the run");
+        assert_eq!(rows[at + 1], "GitHub took too long to answer.");
+        assert_eq!(pulls.pick, Some(Control::Stretch(0, 1)));
+
+        // A run that shows whole once the text comes goes, and so does its choice.
+        pulls.pick = Some(Control::Stretch(0, 2));
+        assert_eq!(pulls.action().as_deref(), Some("show 1 unmodified line"));
+        pulls.enter();
+        assert_eq!(pulls.take_text_ask(true), Some(text_ask(4)));
+        assert!(pulls.answer_text(4, text(400)));
+        assert_eq!(pulls.pick, None);
+        pulls.page(60, 40, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        let at = rows
+            .iter()
+            .position(|row| row == "255   l255")
+            .expect("the run shown");
+        assert_eq!(rows[at - 1], "254 + l254");
+        assert_eq!(rows[at + 1], "256 - o256");
+
+        // With the text read, Enter shows lines at once and asks for nothing.
+        pulls.pick = Some(Control::Stretch(0, 1));
+        pulls.enter();
+        assert_eq!(pulls.take_text_ask(true), None);
+        assert_eq!(pulls.pick, Some(Control::Stretch(0, 1)));
+        assert_eq!(pulls.action().as_deref(), Some("show 50 unmodified lines"));
+        pulls.page(60, 40, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(rows.contains(&"103   l103".to_string()), "{rows:#?}");
+        assert!(rows.contains(&"⋯ 50 unmodified lines".to_string()));
+    }
+
+    #[test]
     fn the_code_goes_where_the_host_stops_giving_a_diff() {
         let mut pulls = on_code();
         assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
