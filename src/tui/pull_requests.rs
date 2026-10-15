@@ -65,6 +65,11 @@ const ENTRY_ROWS: usize = 3;
 const VALUE_ROWS: usize = 3;
 /// What a GitHub stack does, as the desktop's tooltip says it.
 const NATIVE_STACK: &str = "merging a layer lands the ones below it.";
+/// The note over a stack whose last read failed, as the desktop's `Stack data may be stale`.
+const STACK_STALE: &str = "May be out of date: t3term couldn't read the stack again.";
+/// The note over the stack saved on a link while the first read of the host's is on its
+/// way, as the desktop's `Refreshing stack… Showing saved data.`
+const STACK_SAVED: &str = "Saved with the link. Reading the host's stack…";
 /// What watching a pull request does, as the desktop's tooltip says it.
 const WATCHING: &str =
     "Watching: the agent wakes when checks finish, someone comments, or the branch conflicts";
@@ -225,6 +230,9 @@ struct Entry {
     /// How many layers of its stack lie under it.
     depth: usize,
     chain: Option<Chain>,
+    /// The host-native stack saved on the link, where it holds the link, which its details
+    /// show until they read the host's.
+    saved: Option<Box<StackView>>,
 }
 
 impl Entry {
@@ -319,6 +327,8 @@ struct Raw {
     entry: Entry,
     /// Its host-native stack's id and the numbers of the stack's layers, bottom to top.
     stack: Option<(String, Vec<u64>)>,
+    /// That stack whole, where it holds every field the contract requires.
+    saved: Option<pull_request::Stack>,
     /// When it last changed, for the order of the stacks.
     activity: i64,
 }
@@ -357,6 +367,16 @@ fn links_of(thread: &Value) -> Body {
     // The first of the links with one identity stands for them all.
     let mut seen = HashSet::new();
     raws.retain(|raw| seen.insert(raw.entry.key.clone()));
+    let saved: Vec<_> = {
+        let snapshots: HashMap<&Key, &Snapshot> = raws
+            .iter()
+            .filter_map(|raw| Some((&raw.entry.key, raw.entry.snapshot()?)))
+            .collect();
+        raws.iter().map(|raw| saved_of(raw, &snapshots)).collect()
+    };
+    for (raw, saved) in raws.iter_mut().zip(saved) {
+        raw.entry.saved = saved;
+    }
     let entries = chained(raws);
     let open = entries.iter().filter(|entry| entry.open()).count();
     let synced = entries
@@ -371,6 +391,24 @@ fn links_of(thread: &Value) -> Body {
         open,
         synced,
     })
+}
+
+/// The stack saved on `raw`'s link, as the details show it before they read the host's, as
+/// `savedPullRequestStack` makes it (apps/web/src/components/pullRequest/
+/// pullRequestStackSnapshot.ts:4-48). Only a stack that holds the link counts. Each layer the
+/// thread links has the title and the draft flag its link's snapshot holds.
+fn saved_of(raw: &Raw, snapshots: &HashMap<&Key, &Snapshot>) -> Option<Box<StackView>> {
+    let stack = raw.saved.as_ref()?;
+    let number = raw.entry.number;
+    if !stack.layers.iter().any(|layer| layer.number == number) {
+        return None;
+    }
+    let mut key = raw.entry.key.clone();
+    let view = StackView::saved(stack, |number| {
+        key.number = number;
+        snapshots.get(&key).copied()
+    });
+    Some(Box::new(view))
 }
 
 /// A pull request's number, when it is a positive integer.
@@ -426,10 +464,15 @@ fn link_of(link: &Value) -> Option<Parsed> {
         watching: link.get("watch").is_some_and(Value::is_object),
         depth: 0,
         chain: None,
+        saved: None,
     };
+    let saved = link
+        .get("stack")
+        .and_then(|stack| pull_request::Stack::read(stack).ok());
     let raw = Raw {
         entry,
         stack: stack_of(link.get("stack")),
+        saved,
         activity,
     };
     Some(Parsed::Shown(Box::new(raw)))
@@ -460,11 +503,13 @@ fn legacy_of(linked: &Value) -> Option<Raw> {
         watching: false,
         depth: 0,
         chain: None,
+        saved: None,
         key,
     };
     Some(Raw {
         entry,
         stack: None,
+        saved: None,
         activity: 0,
     })
 }
@@ -1076,6 +1121,8 @@ struct Summary {
     lifecycle: Lifecycle,
     /// The detail's `updatedAt`, which a read that keeps the details current compares.
     updated: String,
+    /// Whether the host keeps stacks, as the detail's `capabilities.stacks` says.
+    stacks: bool,
 }
 
 /// One check on the pull request's head.
@@ -1120,6 +1167,7 @@ impl Summary {
             laid_out: None,
             lifecycle: Lifecycle::of(detail),
             updated: detail.updated_at.clone(),
+            stacks: detail.capabilities.stacks,
         }
     }
 
@@ -1142,6 +1190,7 @@ impl Summary {
 /// What the details show of the stack the host keeps a pull request in, as the desktop's stack
 /// menu lists it (apps/web/src/components/pullRequest/PullRequestStackMenu.tsx). Each text is
 /// cleaned and bounded once, when the answer arrives.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct StackView {
     /// The stack's own number on the host.
     number: u64,
@@ -1154,6 +1203,7 @@ struct StackView {
 }
 
 /// One pull request in a stack.
+#[derive(Debug, Clone, PartialEq, Eq)]
 struct LayerRow {
     number: u64,
     /// Its title, or its head branch where it has none, as the desktop's
@@ -1165,12 +1215,36 @@ struct LayerRow {
 
 impl StackView {
     fn of(stack: &pull_request::Stack) -> StackView {
+        StackView::with(stack, |layer| {
+            let title = layer.title.as_deref().map(|title| bounded(title, TITLE));
+            (title, layer.is_draft == Some(true))
+        })
+    }
+
+    /// The stack saved on a link, which holds no titles. A layer whose `snapshot` T3 sent has
+    /// that snapshot's title and draft flag.
+    fn saved<'a>(
+        stack: &pull_request::Stack,
+        mut snapshot: impl FnMut(u64) -> Option<&'a Snapshot>,
+    ) -> StackView {
+        StackView::with(stack, |layer| match snapshot(layer.number) {
+            Some(snapshot) => (Some(snapshot.title.clone()), snapshot.state == State::Draft),
+            None => (None, false),
+        })
+    }
+
+    /// `stack`, with each layer's title, cleaned and bounded, and whether it is a draft, as
+    /// `about` says.
+    fn with(
+        stack: &pull_request::Stack,
+        mut about: impl FnMut(&pull_request::Layer) -> (Option<String>, bool),
+    ) -> StackView {
         let layers = stack.layers.iter().map(|layer| {
             let branch = bounded(&layer.head_branch, NAME);
-            let title = layer.title.as_deref().map(|title| bounded(title, TITLE));
+            let (title, draft) = about(layer);
             // An open draft is a draft, as the desktop's `resolvePullRequestState` reads it.
             let state = match layer.state {
-                pull_request::State::Open if layer.is_draft == Some(true) => State::Draft,
+                pull_request::State::Open if draft => State::Draft,
                 pull_request::State::Open => State::Open,
                 pull_request::State::Merged => State::Merged,
                 pull_request::State::Closed => State::Closed,
@@ -2802,9 +2876,24 @@ fn host_lines(
         lines.push(Line::styled(clip(label, width), muted));
         lines.extend(rows);
     };
-    // The desktop shows the stack in the details' header, beside the merge controls.
-    if let Some(stack) = read.stack.as_deref() {
-        let (label, rows) = stack_lines(stack, entry.number, read.stack_failed, width, theme);
+    // The desktop shows the stack in the details' header, beside the merge controls. Until a
+    // read of it came, and after a read failed with none to keep, it shows the one saved on
+    // the link where the host keeps stacks (pullRequestStackSnapshot.ts:51-73).
+    let saved = summary.stacks && (read.stack_at.is_none() || read.stack_failed);
+    let stack = match (read.stack.as_deref(), entry.saved.as_deref()) {
+        (Some(stack), _) => Some((stack, read.stack_failed.then_some(STACK_STALE))),
+        (None, Some(stack)) if saved => {
+            let note = if read.stack_failed {
+                STACK_STALE
+            } else {
+                STACK_SAVED
+            };
+            Some((stack, Some(note)))
+        }
+        _ => None,
+    };
+    if let Some((stack, note)) = stack {
+        let (label, rows) = stack_lines(stack, entry.number, note, width, theme);
         section(&label, rows);
     }
     let conversation = match &read.conversation {
@@ -2895,14 +2984,14 @@ fn check_lines(check: &CheckRow, width: usize, theme: &Theme) -> Vec<Line<'stati
 }
 
 /// The stack's label, which names it and where pull request `number` sits in it, as the
-/// desktop's stack button does (PullRequestStackMenu.tsx:130-146), and its rows: a note that
-/// it may be out of date where `stale`, then its layers from the top down, as the desktop's
-/// menu lists them (PullRequestStackLayers.tsx:17-38), then the branch the bottom one merges
-/// into.
+/// desktop's stack button does (PullRequestStackMenu.tsx:130-146), and its rows: `note`, which
+/// says where the stack may be out of date, then its layers from the top down, as the
+/// desktop's menu lists them (PullRequestStackLayers.tsx:17-38), then the branch the bottom
+/// one merges into.
 fn stack_lines(
     stack: &StackView,
     number: u64,
-    stale: bool,
+    note: Option<&str>,
     width: usize,
     theme: &Theme,
 ) -> (String, Vec<Line<'static>>) {
@@ -2913,8 +3002,7 @@ fn stack_lines(
         None => format!("Stack #{}", stack.number),
     };
     let mut lines = Vec::new();
-    if stale {
-        let note = "May be out of date: t3term couldn't read the stack again.";
+    if let Some(note) = note {
         lines.extend(whole(note, width, muted));
     }
     if stack.cut {
@@ -4368,6 +4456,176 @@ mod tests {
 
         // A read again that finds the pull request in no stack takes the stack away.
         read_again(&mut pulls, Some(Part::Stack(Ok(None))));
+        assert_eq!(stack_rows(&mut pulls, 44), Vec::<String>::new());
+    }
+
+    /// The stack T3 saved on link 31 when it last synced it, which holds no titles.
+    fn stack_saved() -> Value {
+        json!({"kind": "native", "id": "S_1", "number": 7,
+        "url": "https://github.com/krishhgg/t3term/stacks/7", "base": "master", "layers": [
+            {"number": 30, "headBranch": "base", "state": "merged"},
+            {"number": 31, "headBranch": "feature", "state": "open"},
+            {"number": 32, "headBranch": "feature-32", "state": "open"}
+        ]})
+    }
+
+    #[test]
+    fn a_link_keeps_the_stack_saved_on_it_with_its_layers_titled_by_their_links() {
+        let mut stacked = Vec::new();
+        for (number, head) in [(30, "base"), (31, "feature"), (32, "feature-32")] {
+            let mut one = link("krishhgg/t3term", number, head, "master");
+            one["stack"] = stack_saved();
+            stacked.push(one);
+        }
+        // The host's state for a layer wins over the link's, and a link's draft flag counts
+        // only on an open layer.
+        stacked[0]["snapshot"]["isDraft"] = json!(true);
+        stacked[2]["snapshot"]["isDraft"] = json!(true);
+        stacked[2]["snapshot"]["title"] = json!("Draw\u{7} it");
+        // A link to the same number in another repository titles nothing.
+        let mut other = link("someone/else", 33, "x", "y");
+        other["snapshot"]["title"] = json!("Elsewhere");
+        let mut saved = stack_saved();
+        saved["layers"][2]["number"] = json!(33);
+        saved["layers"]
+            .as_array_mut()
+            .unwrap()
+            .push(json!({"number": 34, "headBranch": "top", "state": "closed"}));
+        let mut top = link("krishhgg/t3term", 33, "feature-33", "feature-32");
+        top["stack"] = saved;
+        let list = list_of(&thread(stacked.into_iter().chain([other, top]).collect()));
+        let saved = |number: u64| {
+            let entry = entries(&list)
+                .iter()
+                .find(|entry| entry.number == number && entry.repository == "krishhgg/t3term")
+                .unwrap();
+            entry.saved.as_deref().cloned()
+        };
+        let row = |number: u64, title: &str, branch: &str, state: State| LayerRow {
+            number,
+            title: title.to_string(),
+            branch: branch.to_string(),
+            state,
+        };
+        assert_eq!(
+            saved(31),
+            Some(StackView {
+                number: 7,
+                base: "master".into(),
+                layers: vec![
+                    row(30, "Change 30", "base", State::Merged),
+                    row(31, "Change 31", "feature", State::Open),
+                    row(32, "Draw it", "feature-32", State::Draft),
+                ],
+                cut: false,
+            })
+        );
+        assert_eq!(saved(30), saved(31));
+        // Link 33's saved stack holds it, and #34 isn't linked, so its branch stands in.
+        let view = saved(33).unwrap();
+        assert_eq!(
+            view.layers[2],
+            row(33, "Change 33", "feature-32", State::Open)
+        );
+        assert_eq!(view.layers[3], row(34, "top", "top", State::Closed));
+
+        // A saved stack that doesn't hold the link, or lacks a field T3 requires, isn't kept,
+        // and the links still stack by the stack's id.
+        let mut alone = link("krishhgg/t3term", 40, "a", "master");
+        alone["stack"] = stack_saved();
+        let mut broken = link("krishhgg/t3term", 31, "feature", "master");
+        broken["stack"] = stack_saved();
+        broken["stack"]["base"] = json!(" ");
+        let mut base = link("krishhgg/t3term", 30, "base", "master");
+        base["stack"] = stack_saved();
+        assert_eq!(entries(&list_of(&thread(vec![alone])))[0].saved, None);
+        let list = list_of(&thread(vec![broken, base]));
+        let entry = |number: u64| {
+            entries(&list)
+                .iter()
+                .find(|entry| entry.number == number)
+                .unwrap()
+        };
+        assert_eq!(entry(31).saved, None);
+        assert!(entry(30).saved.is_some());
+        assert_eq!(entry(31).depth, 1);
+    }
+
+    #[test]
+    fn the_details_show_the_saved_stack_until_the_host_s_comes() {
+        let mut one = link("krishhgg/t3term", 31, "feature", "master");
+        one["stack"] = stack_saved();
+        let mut stacks = bare_detail();
+        stacks["capabilities"]["stacks"] = json!(true);
+        let open = |detail: &Value| {
+            let mut pulls = PullRequests::default();
+            pulls.set(list_of(&thread(vec![one.clone()])));
+            pulls.toggle();
+            let ticket = pulls.take_ask(true, now()).expect("a read").ticket;
+            pulls.answer(ticket, Part::Detail(Ok(read_detail(detail))), now());
+            (pulls, ticket)
+        };
+        let check = format!("● Change 31{}✓", " ".repeat(32));
+        let layers = [
+            "● feature-32",
+            "  #32 · feature-32 · Open",
+            check.as_str(),
+            "  #31 · feature · Open",
+            "● base",
+            "  #30 · base · Merged",
+            "↳ master",
+        ];
+
+        // Once the detail came and before the stack did, the stack saved on the link shows.
+        let (mut pulls, ticket) = open(&stacks);
+        let rows = stack_rows(&mut pulls, 44);
+        assert_eq!(rows[0], "Stack #7 · layer 2 of 3");
+        assert_eq!(
+            rows[1..3],
+            ["Saved with the link. Reading the host's", "stack…"]
+        );
+        assert_eq!(rows[3..], layers);
+        // The host's stack replaces it.
+        pulls.answer(ticket, stack_part(&stack_sent()), now());
+        let mut read = read_with_stack(Some(stack_part(&stack_sent())));
+        assert_eq!(stack_rows(&mut pulls, 44), stack_rows(&mut read, 44));
+
+        // A pull request the host finds in no stack shows none.
+        let (mut pulls, ticket) = open(&stacks);
+        pulls.answer(ticket, Part::Stack(Ok(None)), now());
+        assert_eq!(stack_rows(&mut pulls, 44), Vec::<String>::new());
+        // When the next read fails, the saved stack shows again, as out of date.
+        let failed = |pulls: &mut PullRequests| {
+            assert!(pulls.refresh());
+            let ask = pulls.take_ask(true, now()).expect("a read again");
+            let parts = [
+                Part::Detail(Ok(read_detail(&stacks))),
+                Part::Stack(Err("timed out".into())),
+                Part::Done,
+            ];
+            for part in parts {
+                pulls.answer(ask.ticket, part, now());
+            }
+        };
+        pulls.answer(ticket, Part::Done, now());
+        failed(&mut pulls);
+        let rows = stack_rows(&mut pulls, 44);
+        assert_eq!(
+            rows[1..3],
+            [
+                "May be out of date: t3term couldn't read the",
+                "stack again."
+            ]
+        );
+        assert_eq!(rows[3..], layers);
+
+        // So does a first read that failed.
+        let (mut pulls, ticket) = open(&stacks);
+        pulls.answer(ticket, Part::Stack(Err("timed out".into())), now());
+        assert_eq!(stack_rows(&mut pulls, 44)[3..], layers);
+
+        // A host without stacks shows none, saved or not.
+        let (mut pulls, _) = open(&bare_detail());
         assert_eq!(stack_rows(&mut pulls, 44), Vec::<String>::new());
     }
 
