@@ -55,7 +55,7 @@ use details::Details;
 use environment::{Feed, Identity};
 use markdown::Styles;
 use picker::{Item, Kind, Pick};
-use pull_requests::{Ask, CommentsAsk, DiffAsk, Part, TextAsk};
+use pull_requests::{Ask, CommentsAsk, DiffAsk, Part, TextAsk, ViewedAsk};
 use scroll::{Pin, Scroll};
 use sidebar::{Badges, Capabilities, Shelf, ShelfChoices, Sidebar, View};
 use theme::{Theme, duration_label, model_display_name, now_ms, parse_iso_ms, runtime_mode_label};
@@ -102,6 +102,9 @@ type ReadComments = Box<dyn Fn(Reference, CommentsAsk)>;
 /// Reads a file's whole text in the background as `TextAsk` says, and sends the answer as an
 /// action with the ask's ticket.
 type ReadText = Box<dyn Fn(Reference, TextAsk)>;
+/// Reads the reader's marks on files viewed in the background as `ViewedAsk` says, and sends
+/// the answer as an action with the ask's ticket.
+type ReadViewed = Box<dyn Fn(Reference, ViewedAsk)>;
 /// Opens T3's `pullRequests.subscribeRefreshes`: `Client::watch_pull_request_refreshes`, or a
 /// test's stand-in.
 type WatchRefreshes = Box<dyn Fn() -> mpsc::UnboundedReceiver<WatchEvent>>;
@@ -366,6 +369,12 @@ enum ActionResult {
         ticket: u64,
         answer: Result<Box<pull_request::FileContents>, String>,
     },
+    /// The reader's marks on files viewed, or why reading them failed, for the read with this
+    /// ticket.
+    PullRequestViewed {
+        ticket: u64,
+        answer: Result<Box<pull_request::FilesViewed>, String>,
+    },
     /// A send that failed. The composer gets its text back.
     SendFailed {
         thread_id: String,
@@ -581,6 +590,8 @@ struct App {
     read_comments: ReadComments,
     /// Reads a file's whole text for the unchanged lines around its hunks on that Code tab.
     read_text: ReadText,
+    /// Reads which files the reader marked viewed for that Code tab.
+    read_viewed: ReadViewed,
     /// Opens T3's refresh numbers for pull requests.
     watch_refreshes: WatchRefreshes,
     /// T3's refresh numbers, open while the details hold a read of a link's pull request.
@@ -753,6 +764,20 @@ async fn read_text(
         pull_request::diff_file_contents(&rpc, reference, commit, ask.change, old_path, new_path);
     match read.await {
         Ok(contents) => Ok(Box::new(contents)),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Reads the reader's marks on files viewed of the pull request `reference` names, through
+/// `pullRequests.filesViewed`, as the desktop's Code tab does. The reason shows under the
+/// count of files, so it is the error alone.
+async fn read_viewed(
+    client: &Client,
+    reference: &Reference,
+) -> Result<Box<pull_request::FilesViewed>, String> {
+    let rpc = client.rpc().await.map_err(|e| e.to_string())?;
+    match pull_request::files_viewed(&rpc, reference).await {
+        Ok(viewed) => Ok(Box::new(viewed)),
         Err(e) => Err(e.to_string()),
     }
 }
@@ -985,6 +1010,7 @@ impl App {
         let (differ, diffs) = (client.clone(), actions.clone());
         let (pager, pages) = (client.clone(), actions.clone());
         let (texter, texts) = (client.clone(), actions.clone());
+        let (viewer, views) = (client.clone(), actions.clone());
         let environment = Identity::new(client.runtime.label.as_deref(), &client.runtime.origin);
         App {
             client,
@@ -1086,6 +1112,14 @@ impl App {
                     let answer = read_text(&client, &reference, &ask).await;
                     let ticket = ask.ticket;
                     let _ = answers.send(ActionResult::PullRequestText { ticket, answer });
+                });
+            }),
+            read_viewed: Box::new(move |reference, ask: ViewedAsk| {
+                let (client, answers) = (viewer.clone(), views.clone());
+                tokio::spawn(async move {
+                    let answer = read_viewed(&client, &reference).await;
+                    let ticket = ask.ticket;
+                    let _ = answers.send(ActionResult::PullRequestViewed { ticket, answer });
                 });
             }),
             watch_refreshes: Box::new(move || refresher.watch_pull_request_refreshes()),
@@ -1379,6 +1413,11 @@ impl App {
         let diff = shown
             .then(|| self.details.pulls.take_diff_ask(enabled, now))
             .flatten();
+        // The marks on files viewed go after the detail's read, which says who keeps them and
+        // can hold them as it holds the diff.
+        let viewed = shown
+            .then(|| self.details.pulls.take_viewed_ask(enabled))
+            .flatten();
         // Each thread whose next page the reader asked for while no read could go, as when
         // the environment was away, goes now.
         let mut comments = Vec::new();
@@ -1398,7 +1437,11 @@ impl App {
         }
         self.follow_refreshes(enabled);
         let project = project.unwrap_or_default();
-        let asked = ask.is_some() || diff.is_some() || !comments.is_empty() || !texts.is_empty();
+        let asked = ask.is_some()
+            || diff.is_some()
+            || viewed.is_some()
+            || !comments.is_empty()
+            || !texts.is_empty();
         if let Some(ask) = ask {
             match Reference::new(&project, Some(&ask.host), &ask.repository, ask.number) {
                 Ok(reference) => (self.read_pull)(reference, ask),
@@ -1415,6 +1458,15 @@ impl App {
                 Err(failure) => {
                     let failure = Err(failure.to_string());
                     self.details.answer_diff(ask.ticket, failure, now);
+                }
+            }
+        }
+        if let Some(ask) = viewed {
+            match Reference::new(&project, Some(&ask.host), &ask.repository, ask.number) {
+                Ok(reference) => (self.read_viewed)(reference, ask),
+                Err(failure) => {
+                    let failure = Err(failure.to_string());
+                    self.details.answer_viewed(ask.ticket, failure, now);
                 }
             }
         }
@@ -2544,6 +2596,12 @@ impl App {
             }
             ActionResult::PullRequestText { ticket, answer } => {
                 self.details.answer_text(ticket, answer);
+            }
+            ActionResult::PullRequestViewed { ticket, answer } => {
+                let now = now_ms().max(self.now);
+                self.details.answer_viewed(ticket, answer, now);
+                // Marks wanted again while that read was under way are asked for once it came.
+                self.read_opened_pull();
             }
             ActionResult::PullRequestDiff { ticket, answer } => {
                 let now = now_ms().max(self.now);
@@ -13669,6 +13727,26 @@ mod tests {
         asked
     }
 
+    /// What a read of the marks on files viewed named: the project, the host, the repository,
+    /// the number and the ticket.
+    type NotedViewed = (String, String, String, u64, u64);
+
+    /// Replaces how `app` reads the marks on files viewed, so a read only notes what it named.
+    fn note_viewed(app: &mut App) -> std::rc::Rc<std::cell::RefCell<Vec<NotedViewed>>> {
+        let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let noted = asked.clone();
+        app.read_viewed = Box::new(move |reference: Reference, ask: ViewedAsk| {
+            noted.borrow_mut().push((
+                reference.project_id().to_string(),
+                reference.host().unwrap_or_default().to_string(),
+                reference.repository().to_string(),
+                reference.number(),
+                ask.ticket,
+            ));
+        });
+        asked
+    }
+
     /// Replaces how `app` opens T3's refresh numbers, so each subscription only notes its
     /// sender, which a test sends numbers on.
     fn note_refreshes(
@@ -14373,6 +14451,156 @@ mod tests {
         let rows: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
         assert_eq!(rows[at + 3..at + 6], ["3 + l3", "4   l4", "5   l5"]);
         assert_eq!(texts.borrow().len(), 3);
+    }
+
+    #[test]
+    fn the_code_tab_reads_the_viewed_marks_through_the_links_project() {
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        let asked = note_reads(&mut app);
+        let diffs = note_diffs(&mut app);
+        let viewed = note_viewed(&mut app);
+        press(&mut app, KeyCode::Enter);
+        let mut detail = host_detail_sent();
+        detail["capabilities"]["viewedFiles"] = json!("environment");
+        let detail = pull_request::Detail::read(&detail).unwrap();
+        let activity = pull_request::Activity::read(&host_activity_sent()).unwrap();
+        let parts = vec![
+            Part::Detail(Ok(Box::new(detail))),
+            Part::Activity(Ok(Box::new(activity))),
+            Part::Done,
+        ];
+        hear(&mut app, 1, parts);
+        // Nothing reads them until the Code shows, then they read with the diff.
+        press(&mut app, KeyCode::Right);
+        assert!(viewed.borrow().is_empty());
+        press(&mut app, KeyCode::Right);
+        let named = |ticket| {
+            let (project, host, repository) = ("p", "github.com", "krishhgg/t3term");
+            (
+                project.to_string(),
+                host.to_string(),
+                repository.to_string(),
+                31,
+                ticket,
+            )
+        };
+        assert_eq!(*viewed.borrow(), [named(3)]);
+        let diff = pull_request::Diff {
+            patch: "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -3 +3 @@\n-o3\n+l3\n\
+                    diff --git a/b b/b\n--- a/b\n+++ b/b\n@@ -2 +2 @@\n-o2\n+l2\n"
+                .into(),
+            truncated: false,
+            next_cursor: None,
+            omitted: Vec::new(),
+            omitted_cut: false,
+        };
+        let answer = Ok(Box::new(diff));
+        app.on_action_result(ActionResult::PullRequestDiff { ticket: 2, answer });
+
+        // A failure says why under the count, and an answer to no read changes nothing.
+        let reason = "This environment could not reach its record of which files you have seen.";
+        app.details.moved = false;
+        let answer = Err(reason.to_string());
+        app.on_action_result(ActionResult::PullRequestViewed { ticket: 3, answer });
+        assert!(app.details.moved);
+        let rows = body_after(&mut app, 200, 50);
+        let rows: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
+        let at = rows
+            .iter()
+            .position(|row| *row == "2 files")
+            .unwrap_or_else(|| panic!("{rows:#?}"));
+        let notes = rows[at + 1..].iter().take_while(|row| !row.is_empty());
+        let notes: Vec<&str> = notes.copied().collect();
+        let says = format!("t3term couldn't read which files you viewed. {reason}");
+        assert_eq!(notes.join(" "), says);
+        app.details.moved = false;
+        let file = pull_request::FileViewed {
+            path: "b".into(),
+            state: pull_request::ViewedState::Viewed,
+        };
+        let marks = pull_request::FilesViewed {
+            files: vec![file],
+            truncated: false,
+            cut: false,
+        };
+        let answer = Ok(Box::new(marks.clone()));
+        app.on_action_result(ActionResult::PullRequestViewed { ticket: 9, answer });
+        assert!(!app.details.moved);
+
+        // `r` reads them again once the read that sent `pullRequests.invalidate` is done, and
+        // they show in the count and on the file's header.
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(*viewed.borrow(), [named(3)]);
+        let mut detail = host_detail_sent();
+        detail["capabilities"]["viewedFiles"] = json!("environment");
+        let detail = pull_request::Detail::read(&detail).unwrap();
+        let activity = pull_request::Activity::read(&host_activity_sent()).unwrap();
+        let parts = vec![
+            Part::Detail(Ok(Box::new(detail))),
+            Part::Activity(Ok(Box::new(activity))),
+            Part::Done,
+        ];
+        hear(&mut app, 4, parts);
+        assert_eq!(*viewed.borrow(), [named(3), named(6)]);
+        let answer = Ok(Box::new(marks.clone()));
+        app.on_action_result(ActionResult::PullRequestViewed { ticket: 6, answer });
+        assert!(app.details.moved);
+        let rows = body_after(&mut app, 200, 50);
+        let rows: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
+        // The pane is narrow, so the count of those viewed takes a row of its own.
+        let at = rows
+            .iter()
+            .position(|row| *row == "2 files")
+            .unwrap_or_else(|| panic!("{rows:#?}"));
+        assert_eq!(rows[at + 1], "1 / 2 viewed in T3 Code");
+        assert!(rows.contains(&"› M b +1 -1 · ✓ Viewed"), "{rows:#?}");
+        assert!(rows.contains(&"› M a +1 -1"), "{rows:#?}");
+        assert!(
+            !rows.iter().any(|row| row.contains("couldn't")),
+            "{rows:#?}"
+        );
+
+        // Showing the Code again 15 seconds after the marks came reads them again, though the
+        // diff is still fresh.
+        app.now = now_ms() + 16_000;
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Left);
+        }
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Right);
+        let (reads, read_diffs) = (asked.borrow().len(), diffs.borrow().len());
+        assert!(app.details.pulls.forward());
+        assert!(app.read_opened_pull());
+        assert_eq!(viewed.borrow().len(), 3);
+        assert_eq!(viewed.borrow()[2].4, 8);
+        assert_eq!(asked.borrow().len(), reads);
+        assert_eq!(diffs.borrow().len(), read_diffs);
+        assert!(!app.read_opened_pull());
+
+        // `r` while that read is under way drops its answer, and reads them again once it
+        // came. The details' own read on arrival comes first, as `r` waits for it.
+        let parts = || {
+            let mut detail = host_detail_sent();
+            detail["capabilities"]["viewedFiles"] = json!("environment");
+            let detail = pull_request::Detail::read(&detail).unwrap();
+            let activity = pull_request::Activity::read(&host_activity_sent()).unwrap();
+            vec![
+                Part::Detail(Ok(Box::new(detail))),
+                Part::Activity(Ok(Box::new(activity))),
+                Part::Done,
+            ]
+        };
+        let arrival = asked.borrow().last().expect("the read on arrival").4;
+        hear(&mut app, arrival, parts());
+        press(&mut app, KeyCode::Char('r'));
+        let ticket = asked.borrow().last().expect("the read again").4;
+        assert!(ticket > arrival);
+        hear(&mut app, ticket, parts());
+        assert_eq!(viewed.borrow().len(), 3);
+        let answer = Ok(Box::new(marks));
+        app.on_action_result(ActionResult::PullRequestViewed { ticket: 8, answer });
+        assert_eq!(viewed.borrow().len(), 4);
+        assert!(viewed.borrow()[3].4 > ticket);
     }
 
     #[test]
@@ -15946,6 +16174,94 @@ mod tests {
             };
             assert_eq!(of, ticket);
             assert_eq!(answer.map(|text| text.new), read);
+        }
+    }
+
+    /// The app's reader sends T3 the pull request a read of the marks on files viewed names,
+    /// over the socket, and the marks or T3's reason come back with the ticket.
+    #[tokio::test]
+    async fn the_app_reads_the_viewed_marks_from_t3() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let accepting = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        };
+        let (rpc, mut socket) = tokio::join!(crate::rpc::RpcClient::connect_url(&url), accepting);
+        let (sender, mut results) = mpsc::unbounded_channel();
+        let app = App::new(
+            Arc::new(Client::over(rpc.unwrap())),
+            Theme::new(Depth::TrueColor),
+            &Settings::default(),
+            sender,
+        );
+        let reference = Reference::new("p", Some("github.com"), "krishhgg/t3term", 31).unwrap();
+        let ask = |ticket| ViewedAsk {
+            ticket,
+            host: "github.com".into(),
+            repository: "krishhgg/t3term".into(),
+            number: 31,
+        };
+        let untracked = "This host does not track which files a reader has seen.";
+        let answers = [
+            (
+                json!({"_tag": "Success", "value": {"files": [{"path": "src/a.rs",
+                    "state": "dismissed"}], "truncated": true}}),
+                Ok((
+                    vec![("src/a.rs".to_string(), pull_request::ViewedState::Dismissed)],
+                    true,
+                )),
+            ),
+            (
+                json!({"_tag": "Failure", "cause": [{"_tag": "Fail", "error": {
+                    "_tag": "PullRequestOperationError", "operation": "filesViewed",
+                    "detail": untracked}}]}),
+                Err(untracked.to_string()),
+            ),
+        ];
+        let soon = Duration::from_secs(5);
+        for (ticket, (exit, read)) in (7..).zip(answers) {
+            (app.read_viewed)(reference.clone(), ask(ticket));
+            let request = async {
+                loop {
+                    let frame = socket.next().await.expect("an open socket").unwrap();
+                    if let Message::Text(text) = frame {
+                        let frame: Value = serde_json::from_str(&text).unwrap();
+                        if frame["_tag"] == "Request" {
+                            return frame;
+                        }
+                    }
+                }
+            };
+            let request = tokio::time::timeout(soon, request)
+                .await
+                .expect("a request within five seconds");
+            assert_eq!(request["tag"], "pullRequests.filesViewed");
+            assert_eq!(
+                request["payload"],
+                json!({"projectId": "p", "host": "github.com", "repository": "krishhgg/t3term",
+                    "number": 31})
+            );
+            let reply = json!({"_tag": "Exit", "requestId": request["id"], "exit": exit});
+            let reply = Message::Text(reply.to_string().into());
+            socket.send(reply).await.unwrap();
+            let result = tokio::time::timeout(soon, results.recv())
+                .await
+                .expect("an answer within five seconds")
+                .expect("the answer");
+            let ActionResult::PullRequestViewed { ticket: of, answer } = result else {
+                panic!("an answer of another kind");
+            };
+            assert_eq!(of, ticket);
+            let answer = answer.map(|viewed| {
+                let files = viewed.files.into_iter();
+                let files = files.map(|file| (file.path, file.state)).collect();
+                (files, viewed.truncated)
+            });
+            assert_eq!(answer, read);
         }
     }
 }

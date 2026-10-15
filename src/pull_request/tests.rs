@@ -1161,6 +1161,86 @@ fn a_files_text_keeps_the_side_after_the_change_up_to_its_bound() {
 }
 
 #[test]
+fn the_files_viewed_read_keeps_each_path_as_sent_and_its_state() {
+    let mark = |path: &str, state: &str| json!({"path": path, "state": state});
+    let read = FilesViewed::read(&json!({"files": [mark("src/a.rs", "viewed"),
+        mark(" b.rs ", "dismissed"), mark("c.rs", "unviewed")], "truncated": true}))
+    .unwrap();
+    let file = |path: &str, state| FileViewed {
+        path: path.into(),
+        state,
+    };
+    let expected = FilesViewed {
+        files: vec![
+            file("src/a.rs", ViewedState::Viewed),
+            file(" b.rs ", ViewedState::Dismissed),
+            file("c.rs", ViewedState::Unviewed),
+        ],
+        truncated: true,
+        cut: false,
+    };
+    assert_eq!(read, expected);
+
+    // A state this version doesn't know leaves its mark out, which reads as unviewed.
+    let newer = FilesViewed::read(&json!({"files": [mark("a.rs", "skimmed"),
+        mark("b.rs", "viewed")], "truncated": false}))
+    .unwrap();
+    assert_eq!(newer.files, [file("b.rs", ViewedState::Viewed)]);
+    assert!(!newer.truncated);
+
+    // A path of 4,096 UTF-16 units reads, though it is longer in bytes.
+    let longest = "é".repeat(VIEWED_PATH);
+    let read = FilesViewed::read(&json!({"files": [mark(&longest, "viewed")],
+        "truncated": false}));
+    assert_eq!(read.unwrap().files[0].path, longest);
+    let astral = "😀".repeat(VIEWED_PATH / 2);
+    let read = FilesViewed::read(&json!({"files": [mark(&astral, "viewed")],
+        "truncated": false}));
+    assert_eq!(read.unwrap().files[0].path, astral);
+
+    // More marks than t3term keeps are cut, and say so. Those past the bound aren't read.
+    let mut many: Vec<Value> = (0..MOST_VIEWED)
+        .map(|at| mark(&format!("f{at}.rs"), "viewed"))
+        .collect();
+    let read = FilesViewed::read(&json!({"files": many.clone(), "truncated": false})).unwrap();
+    assert_eq!((read.files.len(), read.cut), (MOST_VIEWED, false));
+    many.push(json!(null));
+    let read = FilesViewed::read(&json!({"files": many, "truncated": false})).unwrap();
+    assert_eq!((read.files.len(), read.cut), (MOST_VIEWED, true));
+    assert_eq!(read.files[MOST_VIEWED - 1].path, "f999.rs");
+
+    let broken = |value: Value| FilesViewed::read(&value).unwrap_err().to_string();
+    let says = |what: &str| format!("T3 sent a pull request answer t3term can't read: {what}");
+    let one = |file: Value| broken(json!({"files": [file], "truncated": false}));
+    let no_path = says("a file viewed has no valid path");
+    assert_eq!(one(mark("", "viewed")), no_path);
+    assert_eq!(one(mark(&"a".repeat(VIEWED_PATH + 1), "viewed")), no_path);
+    assert_eq!(
+        one(mark(&"😀".repeat(VIEWED_PATH / 2 + 1), "viewed")),
+        no_path
+    );
+    assert_eq!(one(json!({"state": "viewed"})), no_path);
+    assert_eq!(one(json!({"path": 3, "state": "viewed"})), no_path);
+    let no_state = says("a file viewed has no valid state");
+    assert_eq!(one(json!({"path": "a.rs"})), no_state);
+    assert_eq!(one(json!({"path": "a.rs", "state": null})), no_state);
+    assert_eq!(one(json!({"path": "a.rs", "state": true})), no_state);
+    assert_eq!(one(json!("a.rs")), says("a file viewed isn't an object"));
+    assert_eq!(
+        broken(json!({"files": []})),
+        says("a read of files viewed has no valid truncated")
+    );
+    assert_eq!(
+        broken(json!({"files": {}, "truncated": false})),
+        says("a read of files viewed has no valid files")
+    );
+    assert_eq!(
+        broken(json!([])),
+        says("a read of files viewed isn't an object")
+    );
+}
+
+#[test]
 fn a_change_type_is_named_as_t3s_contract_names_it() {
     assert_eq!(ChangeType::Change.name(), "change");
     assert_eq!(ChangeType::RenameChanged.name(), "rename-changed");

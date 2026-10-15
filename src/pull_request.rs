@@ -4,8 +4,9 @@
 //! read of it ask the host again. Each is one RPC call, which T3 answers through the host's CLI or API or from a cache
 //! of its own. The diff comes over HTTP instead, from `POST /api/pull-requests/diff`, as the
 //! desktop reads it, and `patch` splits it into files and hunks. `pullRequests.diffFileContents`
-//! reads a file's whole text, for the unchanged lines between its hunks. Nothing here writes
-//! to the host, and nothing keeps what it read.
+//! reads a file's whole text, for the unchanged lines between its hunks, and
+//! `pullRequests.filesViewed` which files the reader marked viewed. Nothing here writes to the
+//! host, and nothing keeps what it read.
 //! `pullRequests.subscribeRefreshes` is a stream of numbers that says when T3's reads may have
 //! changed, which `client::spawn_pull_request_refresh_watch` follows.
 //!
@@ -41,6 +42,7 @@ pub const ACTIVITY: &str = "pullRequests.activity";
 pub const STACK: &str = "pullRequests.stack";
 pub const THREAD_COMMENTS: &str = "pullRequests.threadComments";
 pub const DIFF_FILE_CONTENTS: &str = "pullRequests.diffFileContents";
+pub const FILES_VIEWED: &str = "pullRequests.filesViewed";
 pub const INVALIDATE: &str = "pullRequests.invalidate";
 pub const SUBSCRIBE_REFRESHES: &str = "pullRequests.subscribeRefreshes";
 /// The HTTP route of a pull request's diff (packages/contracts/src/environmentHttp.ts:650-663).
@@ -62,6 +64,14 @@ const MOST_OMITTED: usize = 3000;
 /// reads at most 1 MiB of each side from GitHub and GitLab (GitHubPullRequestCli.ts:345,
 /// GitLabPullRequestCli.ts:202).
 pub const MOST_CONTENTS: usize = 2 * 1024 * 1024;
+
+/// The most marks on files viewed kept. T3 reads at most five pages of a hundred from GitHub
+/// (GitHubPullRequestCli.ts:373) and keeps at most 500 for a host that keeps none
+/// (PullRequestFilesViewed.ts:59).
+pub const MOST_VIEWED: usize = 1000;
+/// The longest path a mark on a file viewed names, in UTF-16 units, as T3's `FilePath` bounds
+/// it (packages/contracts/src/pullRequest.ts:1007-1016).
+const VIEWED_PATH: usize = 4096;
 
 /// The longest project id, host or repository a `Reference` sends, in bytes.
 const KEY: usize = 1024;
@@ -417,6 +427,21 @@ pub async fn diff_file_contents(
     FileContents::read(answer)
 }
 
+/// Which files of the pull request the reader marked viewed, as the desktop's Code tab reads
+/// them (apps/web/src/components/pullRequest/usePullRequestFilesViewed.ts at f570bd2). T3 asks
+/// the host where it keeps the marks and reads its own otherwise, as `Capabilities::viewed_files`
+/// says, and fails on a host that keeps none (pullRequestViewedFiles.ts:367-389). The marks are
+/// the reader's whatever diff shows: the whole change or one commit.
+pub async fn files_viewed(
+    rpc: &RpcClient,
+    reference: &Reference,
+) -> Result<FilesViewed, PullRequestError> {
+    let answer = rpc
+        .call(FILES_VIEWED, reference.payload(), CALL_TIMEOUT)
+        .await?;
+    FilesViewed::read(&answer)
+}
+
 /// One slice of the pull request's diff, from the slice `cursor` names or from the first, of
 /// the whole change or of the commit `commit` names alone, as the desktop's Code tab scopes it
 /// (PullRequestCodeTab.tsx:262-290 at f570bd2). T3 sends the whole diff in one slice where the
@@ -704,6 +729,26 @@ impl ViewedFilesStore {
         Some(match text {
             "host" => ViewedFilesStore::Host,
             "environment" => ViewedFilesStore::Environment,
+            _ => return None,
+        })
+    }
+}
+
+/// Where a file stands with the reader. `PullRequestFileViewedState`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ViewedState {
+    Unviewed,
+    Viewed,
+    /// Marked viewed, and pushed to since, which the desktop reads as not viewed and says.
+    Dismissed,
+}
+
+impl ViewedState {
+    fn of(text: &str) -> Option<ViewedState> {
+        Some(match text {
+            "unviewed" => ViewedState::Unviewed,
+            "viewed" => ViewedState::Viewed,
+            "dismissed" => ViewedState::Dismissed,
             _ => return None,
         })
     }
@@ -1051,6 +1096,26 @@ pub struct CommentPage {
     pub cut: bool,
 }
 
+/// Which files of a pull request the reader marked viewed. `PullRequestFilesViewedResult`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FilesViewed {
+    /// Only the files the host gave a state for, in its order. A file not here is unviewed.
+    pub files: Vec<FileViewed>,
+    /// The host had more files than T3 read, so some marks are missing.
+    pub truncated: bool,
+    /// t3term left marks out past its bound.
+    pub cut: bool,
+}
+
+/// One file's state with the reader. `PullRequestFileViewed`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileViewed {
+    /// The path as the host gave it, which T3 doesn't trim: a space at either end is part of a
+    /// file's name.
+    pub path: String,
+    pub state: ViewedState,
+}
+
 /// `PullRequestCommit`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
@@ -1350,6 +1415,36 @@ impl CommentPage {
             cut,
         })
     }
+}
+
+impl FilesViewed {
+    /// Reads T3's answer. A mark whose state this version doesn't know is left out, which
+    /// reads as unviewed.
+    pub fn read(value: &Value) -> Result<FilesViewed, PullRequestError> {
+        let object = Object::of(value, "read of files viewed")?;
+        let (files, cut) = object.entries("files", MOST_VIEWED, read_file_viewed)?;
+        Ok(FilesViewed {
+            files: files.into_iter().flatten().collect(),
+            truncated: object.flag("truncated")?,
+            cut,
+        })
+    }
+}
+
+/// A mark on a file viewed, or None where its state is one this version doesn't know.
+fn read_file_viewed(value: &Value) -> Result<Option<FileViewed>, PullRequestError> {
+    let object = Object::of(value, "file viewed")?;
+    let path = match object.map.get("path").and_then(Value::as_str) {
+        Some(path) if !path.is_empty() && path.encode_utf16().count() <= VIEWED_PATH => path,
+        _ => return Err(object.wrong("path")),
+    };
+    let Some(state) = object.map.get("state").and_then(Value::as_str) else {
+        return Err(object.wrong("state"));
+    };
+    Ok(ViewedState::of(state).map(|state| FileViewed {
+        path: path.to_string(),
+        state,
+    }))
 }
 
 impl Stack {

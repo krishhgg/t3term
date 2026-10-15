@@ -18,7 +18,9 @@ use t3term::client::{
     spawn_worktree_setup_watch,
 };
 use t3term::projection::{Applied, ThreadState, apply_config};
-use t3term::pull_request::{self, ChangeType, PullRequestError, Reference, State, Unavailable};
+use t3term::pull_request::{
+    self, ChangeType, PullRequestError, Reference, State, Unavailable, ViewedState,
+};
 use t3term::rpc::{BoundedChunk, BoundedStream, RpcClient, RpcError, StreamLimits};
 
 type Socket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
@@ -1480,6 +1482,23 @@ async fn pull_request_reads_send_t3s_reference_and_read_its_answers() {
         );
     }
 
+    // The marks on files viewed name only the pull request, and keep each path as sent.
+    let marks = json!({"files": [{"path": "src/main.rs", "state": "viewed"},
+        {"path": "README.md ", "state": "dismissed"}], "truncated": false});
+    let (viewed, ()) = tokio::join!(
+        pull_request::files_viewed(&rpc, &reference),
+        answer_request(
+            &mut socket,
+            "pullRequests.filesViewed",
+            &payload,
+            success(marks)
+        ),
+    );
+    let viewed = viewed.unwrap();
+    let paths: Vec<_> = viewed.files.iter().map(|file| file.path.as_str()).collect();
+    assert_eq!(paths, ["src/main.rs", "README.md "]);
+    assert_eq!(viewed.files[1].state, ViewedState::Dismissed);
+
     // Invalidating names the one pull request, so T3 keeps its listings.
     let named = json!({"reference": payload});
     let (invalidated, ()) = tokio::join!(
@@ -1629,6 +1648,20 @@ async fn a_pull_request_read_names_what_failed() {
     assert_eq!(
         error.unwrap_err().to_string(),
         "This host cannot expand unchanged pull request lines."
+    );
+
+    // So does a host that keeps no marks on files viewed
+    // (apps/server/src/pullRequest/pullRequestViewedFiles.ts:384-389 at f570bd2).
+    let untracked = fail(json!({"_tag": "PullRequestOperationError",
+        "operation": "filesViewed",
+        "detail": "This host does not track which files a reader has seen."}));
+    let (error, ()) = tokio::join!(
+        pull_request::files_viewed(&rpc, &reference),
+        answer_request(&mut socket, "pullRequests.filesViewed", &payload, untracked),
+    );
+    assert_eq!(
+        error.unwrap_err().to_string(),
+        "This host does not track which files a reader has seen."
     );
 }
 
