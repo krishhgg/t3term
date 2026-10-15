@@ -599,11 +599,14 @@ fn entry(
         .collect()
 }
 
-/// `meta`'s parts in grey, a dot between each two, wrapped at `room`.
+/// `meta`'s parts in grey, a dot between each two on a row. A part that doesn't fit beside the
+/// others starts a row, so `1d ago` stays whole.
 fn meta_rows(meta: &[String], room: usize, theme: &Theme) -> Vec<Vec<Span<'static>>> {
-    if meta.is_empty() {
-        return Vec::new();
-    }
-    let lines = whole(&meta.join(" · "), room, Style::new().fg(theme.muted));
+    let style = Style::new().fg(theme.muted);
+    let parts = meta
+        .iter()
+        .map(|part| Span::styled(part.clone(), style))
+        .collect();
+    let lines = flowed(parts, " · ", room, theme);
     lines.into_iter().map(|line| line.spans).collect()
 }

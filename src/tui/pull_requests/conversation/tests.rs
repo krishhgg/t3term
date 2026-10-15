@@ -1091,6 +1091,9 @@ fn the_timeline_fits_every_width() {
             // The Markdown renderer keeps 8 columns for text, and the details' page cuts what
             // is wider than it shows.
             assert!(row.width() <= width.max(8), "{width}: {row:?}");
+            // A row of parts wraps between them, so none ends on a dot or splits `6h ago`.
+            assert!(!row.ends_with('·'), "{width}: {row:?}");
+            assert!(width < 12 || row.trim() != "ago", "{width}: {rows:?}");
         }
         assert!(targets.iter().all(|(rows_of, _)| rows_of.end <= rows.len()));
         assert_eq!(targets.len(), if width == 0 { 0 } else { 3 }, "{width}");
@@ -1115,7 +1118,9 @@ fn the_timeline_fits_every_width() {
     }
     let (rows, _) = timeline_rows(&mut answer, &Shown::default(), 80);
     assert!(rows[2].starts_with("○ ]52;c;xwww"), "{}", rows[2]);
-    assert_eq!(rows[3], "  2Jabcde ·", "the id cleaned, then cut");
+    assert_eq!(rows[3], "  2Jabcde", "the id cleaned, then cut");
+    // The author too wide for the row beside the id starts a row of its own.
+    assert!(rows[4].starts_with("  ]52;c;xwww"), "{}", rows[4]);
     // Two columns are too few to spare for the marks.
     let (rows, _) = timeline_rows(&mut answer, &Shown::default(), 2);
     assert!(rows.windows(2).any(|pair| pair == ["Pu", "ll"]), "{rows:?}");
