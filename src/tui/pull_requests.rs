@@ -72,6 +72,14 @@ const WATCHING: &str =
 /// `pullRequests.detail` for 60 seconds (packages/client-runtime/src/state/pullRequests.ts).
 /// Opening the link's details again within it shows that read rather than asking again.
 const FRESH: i64 = 60_000;
+/// How long after a read of a link was asked its details read the detail again while they
+/// show and you use t3term, in milliseconds, as the desktop's `LIVE_REFRESH_INTERVAL_MS`
+/// (apps/web/src/hooks/useLiveRefresh.ts:22).
+const LIVE: i64 = 5 * 60_000;
+/// How long after the last key, click or wheel t3term stops reading the details again, in
+/// milliseconds, as the desktop's `LIVE_REFRESH_IDLE_AFTER_MS` (useLiveRefresh.ts:31). The
+/// next one reads them again at once when they are due.
+pub(super) const IDLE: i64 = 6 * 60_000;
 /// The most characters kept of why a read failed.
 const FAILURE: usize = 1024;
 
@@ -830,6 +838,8 @@ impl Default for Offset {
 /// What reading a link's pull request from its host names: the link's host, repository and
 /// number as T3 sent them, and the ticket its answer comes back with. `invalidate` says a
 /// person asked to read it from the host, so the read sends `pullRequests.invalidate` first.
+/// `updated` is the `updatedAt` of the detail the details show, for a read that only keeps
+/// them current: it reads the conversation only when the new detail's differs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Ask {
     pub ticket: u64,
@@ -837,6 +847,7 @@ pub(super) struct Ask {
     pub repository: String,
     pub number: u64,
     pub invalidate: bool,
+    pub updated: Option<String>,
 }
 
 /// Part of what a host said of a pull request. A read sends its detail and its conversation as
@@ -881,6 +892,11 @@ struct Read {
     /// Set while a read that sent `pullRequests.invalidate` is under way, until T3's refresh
     /// number moves. The invalidate moves it, so that number doesn't read again.
     echo: bool,
+    /// When its last read was asked for, which `LIVE` counts from.
+    asked: i64,
+    /// Set when the read again that `again` wants only keeps the details current, so it reads
+    /// the detail, and the conversation only once the detail changed.
+    live: bool,
 }
 
 /// A read under way to replace a read's answers. It holds each answer until both came, so the
@@ -917,6 +933,8 @@ impl Read {
             missed: false,
             invalidate: false,
             echo: false,
+            asked: now,
+            live: false,
         }
     }
 
@@ -947,10 +965,10 @@ impl Read {
     /// own, and a failure replaces only a failure, as the desktop keeps showing the last
     /// detail and conversation it read (PullRequestDetailPanel.tsx:2728).
     fn settle(&mut self, next: Next) {
-        self.missed = !matches!(
-            (&next.answer, &next.conversation),
-            (Some(Ok(_)), Some(Ok(_)))
-        );
+        // A read that keeps the details current reads no conversation while the detail stays
+        // the same, which misses nothing.
+        self.missed =
+            !matches!(next.answer, Some(Ok(_))) || matches!(next.conversation, Some(Err(_)));
         match next.answer {
             Some(Ok(summary)) => {
                 self.answer = Answer::Read(summary);
@@ -996,6 +1014,8 @@ struct Summary {
     laid_out: Option<(usize, Vec<Line<'static>>)>,
     /// When the pull request opened and ended, for the Timeline.
     lifecycle: Lifecycle,
+    /// The detail's `updatedAt`, which a read that keeps the details current compares.
+    updated: String,
 }
 
 /// One check on the pull request's head.
@@ -1039,6 +1059,7 @@ impl Summary {
             cut: detail.cut,
             laid_out: None,
             lifecycle: Lifecycle::of(detail),
+            updated: detail.updated_at.clone(),
         }
     }
 
@@ -1504,11 +1525,17 @@ impl PullRequests {
         let showing = self.showing_read();
         let read = self.read.as_mut()?;
         let ticket = self.tickets + 1;
+        let mut updated = None;
         if read.ticket.is_none() {
             read.ticket = Some(ticket);
             read.at = now;
         } else if read.again && showing {
             read.again = false;
+            if std::mem::take(&mut read.live)
+                && let Answer::Read(summary) = &read.answer
+            {
+                updated = Some(summary.updated.clone());
+            }
             read.next = Some(Next {
                 ticket,
                 at: now,
@@ -1520,6 +1547,7 @@ impl PullRequests {
         }
         self.tickets = ticket;
         self.running = Some(ticket);
+        read.asked = now;
         let invalidate = std::mem::take(&mut read.invalidate);
         read.echo = invalidate;
         Some(Ask {
@@ -1528,6 +1556,7 @@ impl PullRequests {
             repository: read.repository.clone(),
             number: read.number,
             invalidate,
+            updated,
         })
     }
 
@@ -1545,6 +1574,7 @@ impl PullRequests {
             }
             if read.answered() {
                 read.again = true;
+                read.live = false;
                 self.relay();
                 return;
             }
@@ -1588,6 +1618,7 @@ impl PullRequests {
             return false;
         }
         read.again = true;
+        read.live = false;
         if showing {
             self.relay();
         }
@@ -1607,6 +1638,7 @@ impl PullRequests {
         let read = self.read.as_mut().expect("a read of the shown link");
         if read.answered() {
             read.again = true;
+            read.live = false;
             read.invalidate = true;
         } else {
             // Nothing came to show meanwhile, so it reads as the details' first read does.
@@ -1627,6 +1659,42 @@ impl PullRequests {
                 let done = read.ticket.is_some() && read.ticket != self.running;
                 self.reads_selected(read) && done && read.next.is_none()
             })
+    }
+
+    /// When the details read the detail they show again to keep it current, as the desktop's
+    /// `useLiveRefresh` does while its panel shows a pull request: `LIVE` after its last read
+    /// was asked for. None unless they show a read that is done, with no read again wanted.
+    pub fn live_at(&self) -> Option<i64> {
+        let read = self.read.as_ref().filter(|_| self.showing_read())?;
+        let done = read.ticket.is_some() && read.ticket != self.running && read.next.is_none();
+        (done && !read.again).then_some(read.asked + LIVE)
+    }
+
+    /// Reads the detail the details show again once `live_at` is past at `now`, unless the
+    /// last key, click or wheel at `input` came `IDLE` or more before then, as the desktop
+    /// stops its interval for a reader who left. The next one then reads it at once. The read
+    /// reads the conversation again only when the detail's `updatedAt` changed, as the
+    /// desktop does (PullRequestDetailPanel.tsx:836-856). A read that failed is read again
+    /// too, as the desktop's interval refreshes a detail it couldn't read. Says whether it
+    /// wants a read.
+    pub fn live(&mut self, now: i64, input: i64) -> bool {
+        let Some(due) = self.live_at() else {
+            return false;
+        };
+        if now < due || due.saturating_sub(input) >= IDLE {
+            return false;
+        }
+        let read = self.read.as_mut().expect("the shown read");
+        if read.answered() {
+            read.again = true;
+            read.live = true;
+        } else {
+            // Nothing came to show, so it reads as the details' first read does.
+            let entry = &entries_of(self.list.as_ref())[self.selected];
+            self.read = Some(Read::of(entry, now));
+        }
+        self.relay();
+        true
     }
 
     /// Notes whether the details show the pull requests' tab. Once they don't, as when the
@@ -4055,6 +4123,141 @@ mod tests {
         assert!(!pulls.reloads() && !pulls.reload(now()));
         pulls.answer(7, Part::Done, now());
         assert_eq!(asked(&mut pulls), Some((31, 8, false)));
+    }
+
+    #[test]
+    fn the_details_read_their_detail_again_after_five_minutes_while_in_use() {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![link(
+            "krishhgg/t3term",
+            31,
+            "a",
+            "b",
+        )])));
+        let detail = |updated: &str| {
+            let mut detail = bare_detail();
+            detail["updatedAt"] = json!(updated);
+            Part::Detail(Ok(read_detail(&detail)))
+        };
+        let remark = |body: &str| {
+            let mut activity = bare_activity();
+            activity["comments"] = json!([{"id": body, "kind": "issue-comment",
+                "author": {"login": "mona", "name": null}, "body": body,
+                "createdAt": "2026-10-13T09:00:00Z", "url": null, "path": null,
+                "reviewState": null}]);
+            activity["commentCount"] = json!(1);
+            let activity = pull_request::Activity::read(&activity).unwrap();
+            Part::Activity(Ok(Box::new(activity)))
+        };
+        let asked = |pulls: &mut PullRequests, at: i64| {
+            let ask = pulls.take_ask(true, at);
+            ask.map(|ask| (ask.ticket, ask.updated))
+        };
+        let rows = |pulls: &mut PullRequests, at: i64| {
+            pulls.page(44, 60, at, true, &theme());
+            detail_rows(pulls)
+        };
+        let t0 = now();
+
+        // Nothing is due until a read is done.
+        assert_eq!(pulls.live_at(), None);
+        pulls.toggle();
+        assert_eq!(asked(&mut pulls, t0), Some((1, None)));
+        assert_eq!(pulls.live_at(), None);
+        pulls.answer(1, detail("2026-10-13T11:00:00Z"), t0);
+        pulls.answer(1, remark("First."), t0);
+        pulls.answer(1, Part::Done, t0);
+        assert_eq!(pulls.live_at(), Some(t0 + LIVE));
+
+        // Five minutes after it was asked for, with a key a minute ago, the detail is read
+        // again with the `updatedAt` it showed.
+        assert!(!pulls.live(t0 + LIVE - 1, t0 + LIVE - 60_000));
+        assert!(pulls.live(t0 + LIVE, t0 + LIVE - 60_000));
+        let t1 = t0 + LIVE;
+        let updated = Some("2026-10-13T11:00:00Z".to_string());
+        assert_eq!(asked(&mut pulls, t1), Some((2, updated)));
+        assert_eq!(pulls.live_at(), None);
+        assert!(rows(&mut pulls, t1).contains(&"Refreshing from github.com…".to_string()));
+
+        // A detail that stayed the same keeps the conversation, and the read stands.
+        assert!(!pulls.answer(2, detail("2026-10-13T11:00:00Z"), t1));
+        assert!(pulls.answer(2, Part::Done, t1));
+        let shown = rows(&mut pulls, t1);
+        assert!(shown.contains(&"Read from github.com just now".to_string()));
+        assert!(shown.iter().any(|row| row.trim() == "First."), "{shown:#?}");
+        pulls.back();
+        pulls.toggle();
+        assert_eq!(asked(&mut pulls, t1 + 1), None);
+
+        // Left alone for six minutes by then, the details wait, and the next key reads them.
+        let t2 = t1 + LIVE;
+        assert_eq!(pulls.live_at(), Some(t2));
+        assert!(!pulls.live(t2, t2 - IDLE));
+        assert!(!pulls.live(t2 + 60_000, t2 - IDLE));
+        assert!(pulls.live(t2 + 60_000, t2 + 60_000));
+        assert_eq!(asked(&mut pulls, t2).map(|ask| ask.0), Some(3));
+
+        // A detail that changed comes with the conversation the read asked for after it.
+        assert!(!pulls.answer(3, detail("2026-10-13T12:00:00Z"), t2));
+        assert!(!pulls.answer(3, remark("Second."), t2));
+        assert!(pulls.answer(3, Part::Done, t2));
+        let shown = rows(&mut pulls, t2);
+        assert!(
+            shown.iter().any(|row| row.trim() == "Second."),
+            "{shown:#?}"
+        );
+
+        // A failed read waits five minutes more rather than ask again at once.
+        let t3 = t2 + LIVE;
+        assert!(pulls.live(t3, t3));
+        assert_eq!(asked(&mut pulls, t3).map(|ask| ask.0), Some(4));
+        assert!(!pulls.answer(4, Part::Detail(Err("timed out".into())), t3));
+        assert!(pulls.answer(4, Part::Done, t3));
+        assert!(!rows(&mut pulls, t3).contains(&"timed out".to_string()));
+        assert_eq!(pulls.live_at(), Some(t3 + LIVE));
+        assert!(!pulls.live(t3 + 1, t3 + 1));
+
+        // A refresh number reads the conversation too, though a live read was due.
+        let t4 = t3 + LIVE;
+        assert!(pulls.live(t4, t4));
+        assert!(pulls.refresh());
+        assert_eq!(asked(&mut pulls, t4), Some((5, None)));
+        pulls.answer(5, Part::Done, t4);
+
+        // Nothing is due while the list shows or the tab doesn't.
+        pulls.back();
+        assert_eq!(pulls.live_at(), None);
+        pulls.toggle();
+        pulls.shown(false);
+        assert_eq!(pulls.live_at(), None);
+        pulls.shown(true);
+        assert_eq!(pulls.live_at(), Some(t4 + LIVE));
+    }
+
+    #[test]
+    fn details_whose_read_failed_read_it_again_after_five_minutes_while_in_use() {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![link(
+            "krishhgg/t3term",
+            31,
+            "a",
+            "b",
+        )])));
+        let t0 = now();
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(true, t0).map(|ask| ask.ticket), Some(1));
+        pulls.answer(1, Part::Detail(Err("timed out".into())), t0);
+        pulls.answer(1, Part::Activity(Err("timed out".into())), t0);
+        pulls.answer(1, Part::Done, t0);
+        assert_eq!(pulls.live_at(), Some(t0 + LIVE));
+
+        // It reads both again as a first read does, since there is no detail to compare.
+        let t1 = t0 + LIVE;
+        assert!(pulls.live(t1, t1));
+        let ask = pulls.take_ask(true, t1).expect("a read again");
+        assert_eq!((ask.ticket, ask.invalidate, ask.updated), (2, false, None));
+        pulls.page(44, 60, t1, true, &theme());
+        assert!(detail_rows(&pulls).contains(&"Reading from github.com…".to_string()));
     }
 
     #[test]
