@@ -1794,6 +1794,9 @@ class Fixture:
         with self.lock:
             self.ensure_world()
             self.counts['write.requests'] += 1
+            if isinstance(data, str):
+                # Counted before the checks below, so a write over the limit shows in largestWrite.
+                self.most('write.largest', utf16_len(data))
             if not (named(tid) and named(terminal)) or not isinstance(data, str) or not data \
                     or utf16_len(data) > WRITE_LIMIT:
                 self.counts['write.badInput'] += 1
@@ -1803,7 +1806,6 @@ class Fixture:
             key = (tid, terminal)
             units = utf16_len(data)
             self.counts['write.units'] += units
-            self.most('write.largest', units)
             if self.busy_writes[key]:
                 self.counts['write.overlapped'] += 1
             # The log keeps the length and a hash of what was typed, never the text.
@@ -3569,6 +3571,10 @@ def broken_rules(report: dict) -> list:
          f'writesOverlapped {report["writesOverlapped"]}: a write went before the last one was answered')
     rule(report['largestWrite'] <= WRITE_LIMIT,
          f'largestWrite {report["largestWrite"]}: a write was over {WRITE_LIMIT} UTF-16 units')
+    bad_writes = report['writes'].get('badInput', 0)
+    rule(bad_writes == 0,
+         f'writes.badInput {bad_writes}: a write named no terminal, or its data was empty, not text '
+         f'or over {WRITE_LIMIT} UTF-16 units')
     if report['tmuxSession'] is not None:
         rule(report['rawAnsiBytes'] is not None, 'capture/raw.ansi is missing, so leaks went unchecked')
         rule(not nonzero(report['controlLeaks']),
