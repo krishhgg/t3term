@@ -40,8 +40,7 @@ use super::super::theme::{Theme, age, parse_iso_ms};
 use super::super::{clip, row};
 use super::{Answer, FAILURE, NAME, flowed, grouped, whole};
 use crate::pull_request::{
-    self, Actor, Comment, CommentKind, Commit, Reaction, ReactionContent, ReviewThread, Side,
-    ThreadComment,
+    self, Actor, Comment, CommentKind, Reaction, ReactionContent, ReviewThread, Side, ThreadComment,
 };
 use crate::transcript::without_controls;
 
@@ -49,7 +48,7 @@ mod thread;
 mod timeline;
 
 use timeline::Timeline;
-pub(super) use timeline::{Lifecycle, section as timeline_section};
+pub(super) use timeline::{Commit, Lifecycle, section as timeline_section};
 
 /// How many active remarks show, as the desktop's first page of the conversation holds
 /// (`COMMENT_PAGE`).
@@ -140,8 +139,20 @@ impl Shown {
                 }
             }
             Control::OffDiff => self.off_diff_open = !self.off_diff_open,
-            Control::File(_) | Control::Retry | Control::More(_) => {}
+            Control::File(_)
+            | Control::Retry
+            | Control::More(_)
+            | Control::Commits
+            | Control::AllCommits
+            | Control::Commit(_)
+            | Control::MoreCommits => {}
         }
+    }
+
+    /// Closes the Code tab's list of the conversations off the diff, as the desktop does when
+    /// the reader picks another commit's diff (PullRequestCodeTab.tsx:268-277).
+    pub(super) fn close_off_diff(&mut self) {
+        self.off_diff_open = false;
     }
 
     /// Whether `thread` shows its remarks: as the reader left it, or else unless resolved.
@@ -221,9 +232,32 @@ pub(super) enum Control {
     /// Reads the next page of a review thread's remarks, by the thread's place as for
     /// `Thread`.
     More(usize),
+    /// Opens or closes the Code tab's list of commits, which picks the diff it shows.
+    Commits,
+    /// Shows the diff of the whole change on the Code tab, from its list of commits.
+    AllCommits,
+    /// Shows a commit's own diff on the Code tab, by its place among the commits newest
+    /// first.
+    Commit(usize),
+    /// Lists up to 10 more commits in the Code tab's list.
+    MoreCommits,
 }
 
 impl Control {
+    /// Whether the Code tab's own state, rather than the conversation's, says what it does:
+    /// a file, Retry and the list of commits.
+    pub(super) fn on_code(self) -> bool {
+        matches!(self, Control::File(_) | Control::Retry) || self.on_commits()
+    }
+
+    /// Whether it is the list of commits, which stays above the files when a diff comes.
+    pub(super) fn on_commits(self) -> bool {
+        matches!(
+            self,
+            Control::Commits | Control::AllCommits | Control::Commit(_) | Control::MoreCommits
+        )
+    }
+
     /// The control that takes this one's place when it goes: Show only 10 recent once every
     /// older remark shows, and Show older once only 10 do.
     pub(super) fn partner(self) -> Option<Control> {
@@ -518,6 +552,8 @@ pub(super) struct Conversation {
     places: Vec<Place>,
     /// The commits, in the order T3 sent them.
     commits: Vec<timeline::Commit>,
+    /// The places of the commits, newest first, as the Code tab lists them.
+    newest: Vec<usize>,
     /// The author's login, where the host gave it with the conversation. It takes the place of
     /// the detail's.
     author: Option<String>,
@@ -571,6 +607,13 @@ impl Conversation {
             .reviewers
             .as_ref()
             .map(|reviewers| reviewers.iter().map(Reviewer::of).collect());
+        let commits: Vec<timeline::Commit> =
+            activity.commits.iter().map(timeline::Commit::of).collect();
+        // By when each was committed, not by its text, as the desktop sorts them
+        // (PullRequestCodeTab.tsx:683-692). Commits at the same instant keep the order T3 sent
+        // them in, and one with no time T3 could read goes last.
+        let mut newest: Vec<usize> = (0..commits.len()).collect();
+        newest.sort_by_key(|&at| std::cmp::Reverse(commits[at].at));
         Conversation {
             count: activity.comment_count,
             truncated: activity.comments_truncated,
@@ -584,7 +627,8 @@ impl Conversation {
             verdicts: verdicts(&activity.comments, &activity.commits),
             cut: activity.cut,
             places,
-            commits: activity.commits.iter().map(timeline::Commit::of).collect(),
+            commits,
+            newest,
             author: activity
                 .author
                 .as_ref()
@@ -597,6 +641,11 @@ impl Conversation {
     /// The review threads, in the order T3 sent them.
     pub(super) fn threads(&self) -> &[Thread] {
         &self.threads
+    }
+
+    /// The commits, newest first, as the Code tab's list of commits shows them.
+    pub(super) fn commits(&self) -> Vec<&Commit> {
+        self.newest.iter().map(|&at| &self.commits[at]).collect()
     }
 
     /// Lays the text of each remark of the threads at `at` out at `width`, unless it already
@@ -768,7 +817,11 @@ impl Conversation {
             | Control::Retry
             | Control::Thread(_)
             | Control::OffDiff
-            | Control::More(_) => false,
+            | Control::More(_)
+            | Control::Commits
+            | Control::AllCommits
+            | Control::Commit(_)
+            | Control::MoreCommits => false,
         }
     }
 
@@ -812,7 +865,12 @@ impl Conversation {
             }
             Control::OffDiff => toggle(shown.off_diff_open, "conversations off the diff"),
             Control::More(_) => "load more comments".to_string(),
-            Control::File(_) | Control::Retry => String::new(),
+            Control::File(_)
+            | Control::Retry
+            | Control::Commits
+            | Control::AllCommits
+            | Control::Commit(_)
+            | Control::MoreCommits => String::new(),
         }
     }
 }
@@ -1045,7 +1103,7 @@ fn state_label(state: &str) -> String {
 /// for each login, whatever order the host sent them in, with dismissed ones left out. Two
 /// reviews with no author are two reviewers. A verdict given before the newest commit is
 /// stale. A time that doesn't parse can't be said to come before or after another.
-fn verdicts(comments: &[Comment], commits: &[Commit]) -> Vec<Verdict> {
+fn verdicts(comments: &[Comment], commits: &[pull_request::Commit]) -> Vec<Verdict> {
     let newest = commits
         .iter()
         .filter_map(|commit| instant(&commit.committed_at))

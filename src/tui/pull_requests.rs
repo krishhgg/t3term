@@ -926,8 +926,8 @@ pub(super) struct Ask {
 }
 
 /// What reading a slice of a link's pull request's diff names: the link's host, repository and
-/// number as T3 sent them, the cursor of the slice, or None for the first, and the ticket its
-/// answer comes back with.
+/// number as T3 sent them, the cursor of the slice, or None for the first, the commit whose own
+/// diff it reads, or None for the whole change's, and the ticket its answer comes back with.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct DiffAsk {
     pub ticket: u64,
@@ -935,6 +935,7 @@ pub(super) struct DiffAsk {
     pub repository: String,
     pub number: u64,
     pub cursor: Option<String>,
+    pub commit: Option<String>,
 }
 
 /// What reading the next page of a review thread's remarks names: the link's host, repository
@@ -1675,13 +1676,32 @@ impl PullRequests {
         {
             return;
         }
-        if let Control::File(_) | Control::Retry = control {
+        if control.on_code() {
             let read = self.read.as_mut().expect("the shown read");
-            let Some(code) = read.code.as_mut().filter(|code| code.has(control)) else {
-                return;
+            let commits = match &read.conversation {
+                Answer::Read(conversation) => conversation.commits(),
+                _ => Vec::new(),
             };
-            code.act(control);
-            self.pick = Some(control).filter(|control| code.has(*control));
+            let code = read.code.get_or_insert_with(Code::new);
+            if !code.has(control, &commits) {
+                return;
+            }
+            let listed = code.listed(&commits);
+            if code.act(control, &commits) {
+                self.shown.close_off_diff();
+            }
+            self.pick = match control {
+                // The list closes on the row that opened it, as a menu gives its button the
+                // focus back.
+                Control::AllCommits | Control::Commit(_) => Some(Control::Commits),
+                // The first of the commits it listed takes the place of Show more once none
+                // are left.
+                Control::MoreCommits if !code.has(control, &commits) => {
+                    Some(Control::Commit(listed))
+                }
+                _ => Some(control),
+            }
+            .filter(|control| code.has(*control, &commits));
             self.relay();
             return;
         }
@@ -1743,8 +1763,12 @@ impl PullRequests {
             .read
             .as_ref()
             .filter(|read| self.reads_selected(read))?;
-        if let Control::File(_) | Control::Retry = pick {
-            return read.code.as_ref().map(|code| code.action(pick));
+        if pick.on_code() {
+            let commits = match &read.conversation {
+                Answer::Read(conversation) => conversation.commits(),
+                _ => Vec::new(),
+            };
+            return read.code.as_ref().map(|code| code.action(pick, &commits));
         }
         match &read.conversation {
             Answer::Read(conversation) => Some(conversation.action(pick, &self.shown)),
@@ -2178,6 +2202,12 @@ impl PullRequests {
             conversation.follow(&summary.lifecycle);
             self.shown.prune(conversation);
         }
+        // A commit a rebase took out of the change takes the Code tab back to the whole of it.
+        if let (Some(code), Answer::Read(conversation)) = (&mut read.code, &read.conversation)
+            && code.follow(&conversation.commits())
+        {
+            self.shown.close_off_diff();
+        }
         // A detail that says the host gives no diff takes the Code tab away, and the Summary
         // shows in its place, as the desktop's panel moves the reader (1444-1455).
         if self.tabs() == Some(Tab::Code) && !self.offers_code() {
@@ -2208,7 +2238,8 @@ impl PullRequests {
         if read.invalidate || read.echo {
             return None;
         }
-        let cursor = read.code.as_mut().expect("made above").ask(ticket)?;
+        let code = read.code.as_mut().expect("made above");
+        let cursor = code.ask(ticket)?;
         self.tickets = ticket;
         Some(DiffAsk {
             ticket,
@@ -2216,6 +2247,7 @@ impl PullRequests {
             repository: read.repository.clone(),
             number: read.number,
             cursor,
+            commit: code.commit().map(str::to_string),
         })
     }
 
@@ -2266,7 +2298,9 @@ impl PullRequests {
 
     /// Takes the answer to read `ticket` of a slice of the diff, which came at `now`, or why it
     /// failed. Says whether what the details show changed. A first slice replaces the files
-    /// shown, so no control stays chosen. An answer to another read is dropped.
+    /// shown, so no control on them stays chosen. The list of commits above them keeps its
+    /// own, as the desktop's menu gives its button the focus back after a pick. An answer to
+    /// another read is dropped.
     pub fn answer_diff(
         &mut self,
         ticket: u64,
@@ -2277,7 +2311,7 @@ impl PullRequests {
         let Some(first) = code.and_then(|code| code.take(ticket, answer, now)) else {
             return false;
         };
-        if first {
+        if first && !self.pick.is_some_and(Control::on_commits) {
             self.pick = None;
         }
         self.relay();
@@ -3040,15 +3074,16 @@ fn detail_lines(
     if let (Tab::Code, Some(read)) = (tab, read) {
         lines.push(Line::default());
         let at = lines.len();
-        // The review threads come with the conversation, and none show until it came.
-        let threads = match &read.conversation {
-            Answer::Read(conversation) => conversation.threads(),
-            _ => &[],
+        // The review threads and the commits come with the conversation, and none show until
+        // it came.
+        let (threads, commits) = match &read.conversation {
+            Answer::Read(conversation) => (conversation.threads(), conversation.commits()),
+            _ => (&[][..], Vec::new()),
         };
         // Until the tab asks for its first slice, it shows as it does while that read runs.
         let (code, controls) = match &read.code {
-            Some(code) => code.lay_out(threads, shown, width, now, theme),
-            None => Code::new().lay_out(threads, shown, width, now, theme),
+            Some(code) => code.lay_out(threads, &commits, shown, width, now, theme),
+            None => Code::new().lay_out(threads, &commits, shown, width, now, theme),
         };
         lines.extend(code);
         let moved = |rows: Range<usize>| rows.start + at..rows.end + at;
@@ -6276,6 +6311,7 @@ mod tests {
             repository: "krishhgg/t3term".into(),
             number: 31,
             cursor: cursor.map(str::to_string),
+            commit: None,
         }
     }
 
@@ -6638,6 +6674,127 @@ mod tests {
             "{rows:#?}"
         );
         assert!(rows.contains(&"› A f1.rs +1 -0".to_string()), "{rows:#?}");
+    }
+
+    #[test]
+    fn the_code_tab_reads_the_commit_picked_from_its_list() {
+        let theme = theme();
+        let commit = |n: u32| {
+            json!({"oid": format!("{n:07}abc"), "messageHeadline": format!("Commit {n}"),
+                "committedDate": format!("2026-10-13T00:{n:02}:00Z")})
+        };
+        let mut activity = remarks(1);
+        activity["commits"] = (0..21).map(commit).collect();
+        activity["reviewThreads"] = json!([
+            {"id": "t0", "path": "f0.rs", "line": 1, "side": "right", "isResolved": false,
+                "isOutdated": false, "comments": [{"id": "r0",
+                "author": {"login": "mona", "name": null}, "body": "On line 1.",
+                "createdAt": "2026-10-13T00:30:00Z", "url": null}]},
+        ]);
+        let scoped = |ticket: u64, commit: Option<&str>| DiffAsk {
+            commit: commit.map(str::to_string),
+            ..diff_ask(ticket, None)
+        };
+        let mut pulls = conversing(activity.clone());
+        assert!(!pulls.answer(1, Part::Done, now()));
+        assert!(pulls.forward() && pulls.forward());
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(scoped(2, None)));
+        assert!(pulls.answer_diff(2, Ok(added(0, 1, None)), now()));
+        pulls.page(60, 40, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        let at = rows
+            .iter()
+            .position(|row| row == "› All commits")
+            .expect("the row");
+        assert_eq!(rows[at + 1], "1 file");
+
+        // The row that picks the diff comes first, and opens the list.
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::Commits));
+        assert_eq!(pulls.action().as_deref(), Some("choose commit"));
+        pulls.enter();
+        assert_eq!(pulls.pick, Some(Control::Commits));
+        assert_eq!(pulls.action().as_deref(), Some("hide commits"));
+        pulls.page(60, 40, now(), true, &theme);
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::AllCommits));
+        assert_eq!(pulls.action().as_deref(), Some("show all commits"));
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::Commit(0)));
+        assert_eq!(pulls.action().as_deref(), Some("show commit 0000020"));
+
+        // Show more stays chosen while more are left, and the first commit it listed takes
+        // its place once none are.
+        pulls.pick = Some(Control::MoreCommits);
+        assert_eq!(pulls.action().as_deref(), Some("show more commits"));
+        pulls.enter();
+        assert_eq!(pulls.pick, Some(Control::MoreCommits));
+        pulls.enter();
+        assert_eq!(pulls.pick, Some(Control::Commit(20)));
+        pulls.enter();
+        assert_eq!(pulls.pick, Some(Control::Commits));
+        assert_eq!(
+            pulls.take_diff_ask(true, now()),
+            Some(scoped(3, Some("0000000abc")))
+        );
+        // An entry of the list closed picks nothing.
+        pulls.pick = Some(Control::Commit(1));
+        pulls.enter();
+        assert_eq!(pulls.pick, Some(Control::Commit(1)));
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        pulls.pick = Some(Control::Commits);
+
+        // A commit's diff places no thread, and picking another closes the list of those
+        // off the diff.
+        // The diff that comes keeps the row that picked it chosen, where it chooses nothing
+        // on the files it replaced.
+        assert!(pulls.answer_diff(3, Ok(added(0, 1, None)), now()));
+        assert_eq!(pulls.pick, Some(Control::Commits));
+        pulls.page(60, 40, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert_eq!(
+            rows[at..at + 4],
+            [
+                "› Commit 0 · 0000000",
+                "1 file",
+                "",
+                "› 1 conversation not on the current diff"
+            ]
+        );
+        pulls.pick = Some(Control::OffDiff);
+        pulls.enter();
+        assert!(pulls.shown.off_diff_open());
+        pulls.pick = Some(Control::Commits);
+        pulls.enter();
+        pulls.pick = Some(Control::Commit(0));
+        pulls.enter();
+        assert!(!pulls.shown.off_diff_open());
+        assert_eq!(
+            pulls.take_diff_ask(true, now()),
+            Some(scoped(4, Some("0000020abc")))
+        );
+        pulls.pick = Some(Control::File(0));
+        assert!(pulls.answer_diff(4, Ok(added(0, 1, None)), now()));
+        assert_eq!(pulls.pick, None);
+        pulls.pick = Some(Control::OffDiff);
+        pulls.enter();
+        assert!(pulls.shown.off_diff_open());
+
+        // A read of the conversation that no longer lists the commit, as after a force-push,
+        // takes the tab back to the whole change, the list of threads off it closed.
+        activity["commits"] = (0..20).map(commit).collect();
+        assert!(pulls.reload(now()));
+        let ask = pulls.take_ask(true, now()).expect("the read again");
+        let detail = Part::Detail(Ok(read_detail(&bare_detail())));
+        pulls.answer(ask.ticket, detail, now());
+        let again = pull_request::Activity::read(&activity).unwrap();
+        pulls.answer(ask.ticket, Part::Activity(Ok(Box::new(again))), now());
+        assert!(pulls.shown.off_diff_open());
+        pulls.answer(ask.ticket, Part::Done, now());
+        assert!(!pulls.shown.off_diff_open());
+        let ask = pulls.take_diff_ask(true, now()).expect("the whole change");
+        assert_eq!(ask.commit, None);
+        assert_eq!(ask.cursor, None);
     }
 
     #[test]

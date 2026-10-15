@@ -17,11 +17,21 @@
 //! or before it for a removed line, as the desktop's stacked view has, and the unchanged lines
 //! between two hunks are counted on a row of their own.
 //!
+//! Where the conversation read lists commits, a row above the files says which diff the tab
+//! shows, `All commits` or a commit's headline, and opens a list of the commits, newest first,
+//! 10 at a time, as the desktop's scope menu does (PullRequestCodeTab.tsx:1063-1119). Picking
+//! one reads that commit's own diff in place of the whole change's, from its first slice, with
+//! the files folded and the list of conversations off the diff closed. A read of the
+//! conversation that no longer lists the commit picked goes back to the whole change, as after
+//! a force-push (1050-1062).
+//!
 //! The review threads the conversation read show under the lines they are on, in the files
 //! unfolded, as the desktop's annotations do. A thread shows under a line only where a line of
 //! the file's hunks has its number on its side, as `isLineInFileDiff` asks
 //! (pullRequestDiff.logic.ts:12-22). The rest, on a line the diff doesn't show, on a file or on
-//! a file not read yet, show above the files in a list that starts closed, by file.
+//! a file not read yet, show above the files in a list that starts closed, by file. Under a
+//! commit's own diff, where a line's number may mean other code than the thread's, every thread
+//! shows in that list (PullRequestCodeTab.tsx:454-458).
 //!
 //! Only the files unfolded are laid out, each once for each width. Each line of them is cleaned
 //! of control characters, its tabs set every `TAB` columns, and cut at `LINE` characters as it
@@ -31,13 +41,13 @@ use std::collections::{HashMap, HashSet};
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
-use unicode_width::UnicodeWidthChar;
+use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
-use super::super::clip;
 use super::super::setup::bounded;
 use super::super::theme::Theme;
-use super::conversation::{Control, Shown, Targets, Thread};
-use super::{FAILURE, FRESH, grouped, whole};
+use super::super::{clip, row};
+use super::conversation::{Commit, Control, Shown, Targets, Thread};
+use super::{FAILURE, FRESH, flowed, grouped, whole};
 use crate::pull_request::{self, Side, patch};
 use crate::transcript::clusters;
 
@@ -52,6 +62,9 @@ const PATH: usize = 1024;
 const LOADING: &str = "Loading pull request diff…";
 const LOADING_MORE: &str = "Loading more files…";
 const EMPTY: &str = "This pull request has no file changes.";
+const EMPTY_COMMIT: &str = "This commit has no file changes.";
+/// How many more commits the list shows at a time, as the desktop's `COMMIT_PAGE_SIZE`.
+const COMMIT_PAGE: usize = 10;
 const WITHHELD: &str =
     "The host withheld part of this diff, such as a binary file or a change too large to show.";
 const REST_FAILED: &str = "t3term couldn't read the rest of this diff.";
@@ -85,6 +98,12 @@ pub(super) struct Code {
     /// The rows of each unfolded file's lines, by its slice's place and its place in that
     /// slice, so a file is laid out again only when its slice, the width or its fold changes.
     bodies: HashMap<(usize, usize), Body>,
+    /// The id of the commit whose own diff the tab shows, or None for the whole change.
+    commit: Option<String>,
+    /// Whether the list of commits is open.
+    commits_open: bool,
+    /// How many commits the list shows.
+    commits_shown: usize,
     /// How many times a file's rows were laid out for `bodies`.
     #[cfg(test)]
     pub(super) builds: usize,
@@ -147,6 +166,9 @@ impl Code {
             due: false,
             open: HashSet::new(),
             bodies: HashMap::new(),
+            commit: None,
+            commits_open: false,
+            commits_shown: COMMIT_PAGE,
             #[cfg(test)]
             builds: 0,
         }
@@ -263,13 +285,29 @@ impl Code {
         self.due && self.asked.is_none()
     }
 
-    /// Whether `control` is one of the tab's and shows.
-    pub(super) fn has(&self, control: Control) -> bool {
+    /// The id of the commit whose own diff the tab shows, or None for the whole change.
+    pub(super) fn commit(&self) -> Option<&str> {
+        self.commit.as_deref()
+    }
+
+    /// Whether `control` is one of the tab's and shows, with `commits` newest first in its
+    /// list.
+    pub(super) fn has(&self, control: Control, commits: &[&Commit]) -> bool {
+        let open = self.commits_open && !commits.is_empty();
         match control {
             Control::File(at) => at < self.files.len(),
             Control::Retry => self.retries(),
+            Control::Commits => !commits.is_empty(),
+            Control::AllCommits => open,
+            Control::Commit(at) => open && at < self.listed(commits),
+            Control::MoreCommits => open && commits.len() > self.listed(commits),
             _ => false,
         }
+    }
+
+    /// How many of `commits` the list shows while it is open.
+    pub(super) fn listed(&self, commits: &[&Commit]) -> usize {
+        commits.len().min(self.commits_shown)
     }
 
     /// Whether the end of the files offers Retry: the read of a later slice failed, and slices
@@ -280,13 +318,22 @@ impl Code {
             && self.next_cursor().is_some()
     }
 
-    /// Does what `control` does: folds or unfolds a file, or reads again the slice whose read
-    /// failed.
-    pub(super) fn act(&mut self, control: Control) {
+    /// Does what `control` does, with `commits` newest first in the list: folds or unfolds a
+    /// file, reads again the slice whose read failed, opens or closes the list of commits,
+    /// lists more of them, or picks the diff the tab shows. Says whether that diff changed.
+    pub(super) fn act(&mut self, control: Control, commits: &[&Commit]) -> bool {
         match control {
+            Control::Commits => self.commits_open = !self.commits_open,
+            Control::MoreCommits => self.commits_shown += COMMIT_PAGE,
+            Control::AllCommits => return self.scope(None),
+            Control::Commit(at) => {
+                if let Some(commit) = commits.get(at) {
+                    return self.scope(Some(commit.oid.clone()));
+                }
+            }
             Control::File(at) => {
                 let Some(path) = self.file(at).map(|(_, file)| file.path().to_string()) else {
-                    return;
+                    return false;
                 };
                 if !self.open.remove(&path) {
                     self.open.insert(path);
@@ -300,10 +347,47 @@ impl Code {
             }
             _ => {}
         }
+        false
     }
 
-    /// What Enter does with `control`, for the status line.
-    pub(super) fn action(&self, control: Control) -> String {
+    /// Shows the diff of the commit `commit` names, or of the whole change, and closes the list
+    /// of commits. Another diff than the one shown is read from its first slice at once, with
+    /// its files folded and the list back to its first 10 commits, as the desktop's scope key
+    /// starts over (PullRequestCodeTab.tsx:268-277). A read under way for the diff before is
+    /// dropped when it comes. Says whether the diff changed.
+    fn scope(&mut self, commit: Option<String>) -> bool {
+        self.commits_open = false;
+        if self.commit == commit {
+            return false;
+        }
+        self.commit = commit;
+        self.slices.clear();
+        self.files.clear();
+        self.omitted.clear();
+        self.bodies.clear();
+        self.open.clear();
+        self.asked = None;
+        self.failed = None;
+        self.again = true;
+        self.due = false;
+        self.commits_shown = COMMIT_PAGE;
+        true
+    }
+
+    /// Shows the whole change's diff again where `commits`, from a read of the conversation,
+    /// no longer list the commit shown, as after a rebase or a force-push. Says whether the
+    /// diff changed.
+    pub(super) fn follow(&mut self, commits: &[&Commit]) -> bool {
+        let gone = self
+            .commit
+            .as_deref()
+            .is_some_and(|oid| !commits.iter().any(|commit| commit.oid == oid));
+        gone && self.scope(None)
+    }
+
+    /// What Enter does with `control`, for the status line, with `commits` newest first in
+    /// the list.
+    pub(super) fn action(&self, control: Control, commits: &[&Commit]) -> String {
         match control {
             Control::File(at) => {
                 let open = self
@@ -311,6 +395,14 @@ impl Code {
                     .is_some_and(|(_, file)| self.open.contains(file.path()));
                 if open { "collapse file" } else { "expand file" }.to_string()
             }
+            Control::Commits if self.commits_open => "hide commits".to_string(),
+            Control::Commits => "choose commit".to_string(),
+            Control::AllCommits => "show all commits".to_string(),
+            Control::Commit(at) => match commits.get(at) {
+                Some(commit) => format!("show commit {}", commit.short),
+                None => "show commit".to_string(),
+            },
+            Control::MoreCommits => "show more commits".to_string(),
             _ => "retry".to_string(),
         }
     }
@@ -330,8 +422,15 @@ impl Code {
 
     /// Where each of `threads` shows: under a line of each file shown with its path whose
     /// hunks have a line with its number on its side, or else in the list of those off the
-    /// diff.
+    /// diff, as every thread does under a commit's own diff.
     fn place(&self, threads: &[Thread]) -> Placed {
+        if self.commit.is_some() {
+            let off = (0..threads.len()).collect();
+            return Placed {
+                on: HashMap::new(),
+                off,
+            };
+        }
         let mut by_path: HashMap<&str, Vec<usize>> = HashMap::new();
         for at in 0..self.files.len() {
             let (_, file) = self.file(at).expect("a file shown");
@@ -443,16 +542,18 @@ impl Code {
         self.bodies = bodies;
     }
 
-    /// The tab's rows at `width`, with the rows of each file's header, of each review thread's
-    /// first row, of the list of those off the diff, and of Retry. Until the first slice came,
-    /// or when its read failed, it says so. Then the count of files, `+` while more are to be
-    /// read, and a note when the host withheld part of the diff. Then the list of `threads` off
-    /// the diff, then each file with the threads on its lines, and at the end `Loading more
-    /// files…`, or Retry once that failed. `shown` says which threads and whether the list are
-    /// open.
+    /// The tab's rows at `width`, with the rows of each control: the list of `commits`, newest
+    /// first, each file's header, each review thread's first row, the list of those off the
+    /// diff and Retry. First the row that picks the diff from `commits`, and its list while it
+    /// is open. Until the first slice came, or when its read failed, it says so. Then the count
+    /// of files, `+` while more are to be read, and a note when the host withheld part of the
+    /// diff. Then the list of `threads` off the diff, then each file with the threads on its
+    /// lines, and at the end `Loading more files…`, or Retry once that failed. `shown` says
+    /// which threads and whether the list are open.
     pub(super) fn lay_out(
         &self,
         threads: &[Thread],
+        commits: &[&Commit],
         shown: &Shown,
         width: usize,
         now: i64,
@@ -464,12 +565,16 @@ impl Code {
         if width == 0 {
             return (lines, targets);
         }
+        // Above the diff while it loads too, so the list that picked a commit stays where it
+        // was while that commit's diff comes (PullRequestCodeTab.tsx:1322-1335).
+        self.scope_lines(commits, &mut lines, &mut targets, width, theme);
         if self.slices.is_empty() {
             let text = match &self.failed {
                 Some((failure, _)) => failure.as_str(),
                 None => LOADING,
             };
-            return (whole(text, width, muted), targets);
+            lines.extend(whole(text, width, muted));
+            return (lines, targets);
         }
         let count = self.files.len();
         let noun = if count == 1 { "file" } else { "files" };
@@ -502,7 +607,11 @@ impl Code {
         }
         if !self.lists_files() {
             lines.push(Line::default());
-            let text = if unread { UNREAD } else { EMPTY };
+            let text = match (unread, &self.commit) {
+                (true, _) => UNREAD,
+                (false, Some(_)) => EMPTY_COMMIT,
+                (false, None) => EMPTY,
+            };
             lines.extend(whole(text, width, muted));
             return (lines, targets);
         }
@@ -633,6 +742,97 @@ impl Code {
         }
         (lines, targets)
     }
+
+    /// The row that says which diff the tab shows, `All commits` or the commit's headline and
+    /// the first seven characters of its id, and opens the list of `commits`, newest first.
+    /// While open, the list follows: `All commits`, then each commit's headline with those
+    /// seven characters at the end, ✓ before the diff shown, and `Show more (N left)` while
+    /// more are left, then a blank row. Nothing shows where there are no commits, as the
+    /// desktop draws no menu with nothing to pick (PullRequestCodeTab.tsx:1067-1069).
+    fn scope_lines(
+        &self,
+        commits: &[&Commit],
+        lines: &mut Vec<Line<'static>>,
+        targets: &mut Targets,
+        width: usize,
+        theme: &Theme,
+    ) {
+        if commits.is_empty() {
+            return;
+        }
+        let fg = Style::new().fg(theme.fg);
+        let muted = Style::new().fg(theme.muted);
+        let chevron = if self.commits_open { "⌄" } else { "›" };
+        let shown = self.commit.as_deref();
+        let start = lines.len();
+        match commits
+            .iter()
+            .find(|commit| Some(commit.oid.as_str()) == shown)
+        {
+            Some(commit) => {
+                let parts = vec![
+                    Span::styled(format!("{chevron} {}", commit.headline()), fg),
+                    Span::styled(commit.short.clone(), muted),
+                ];
+                lines.extend(flowed(parts, " · ", width, theme));
+            }
+            None => lines.extend(whole(&format!("{chevron} All commits"), width, fg)),
+        }
+        targets.push((start..lines.len(), Control::Commits));
+        if !self.commits_open {
+            return;
+        }
+        targets.push((lines.len()..lines.len() + 1, Control::AllCommits));
+        lines.push(entry(shown.is_none(), "All commits", "", fg, width, theme));
+        let listed = self.listed(commits);
+        for (at, commit) in commits[..listed].iter().enumerate() {
+            let picked = shown == Some(commit.oid.as_str());
+            let (headline, short) = (commit.headline(), commit.short.as_str());
+            targets.push((lines.len()..lines.len() + 1, Control::Commit(at)));
+            lines.push(entry(picked, headline, short, fg, width, theme));
+        }
+        if commits.len() > listed {
+            let left = grouped((commits.len() - listed) as u64);
+            let text = format!("Show more ({left} left)");
+            targets.push((lines.len()..lines.len() + 1, Control::MoreCommits));
+            lines.push(entry(false, &text, "", muted, width, theme));
+        }
+        lines.push(Line::default());
+    }
+}
+
+/// An entry of the list of commits on one row of `width`: ✓ where it is `picked`, its `text`
+/// in `style` cut to fit, and `short`, a commit's id's first seven characters, at the end
+/// beside at least four columns of the text.
+fn entry(
+    picked: bool,
+    text: &str,
+    short: &str,
+    style: Style,
+    width: usize,
+    theme: &Theme,
+) -> Line<'static> {
+    let lead = if picked { "  ✓ " } else { "    " };
+    let indent = lead.width();
+    if width <= indent {
+        return Line::from(Span::styled(clip(text, width), style));
+    }
+    let id = short.width();
+    let (right, room) = match id > 0 && indent + 4 + 1 + id <= width {
+        true => (
+            vec![Span::styled(
+                short.to_string(),
+                Style::new().fg(theme.muted),
+            )],
+            width - indent - 1 - id,
+        ),
+        false => (Vec::new(), width - indent),
+    };
+    let left = vec![
+        Span::styled(lead, Style::new().fg(theme.fg)),
+        Span::styled(clip(text, room), style),
+    ];
+    row(left, right, width)
 }
 
 /// A file's header: a chevron that says whether it is unfolded, a letter for how it changed,
@@ -907,7 +1107,7 @@ fn broken(text: &str, width: usize) -> Vec<String> {
     let mut rows = vec![String::new()];
     let mut used = 0;
     for piece in clusters(text) {
-        let columns = unicode_width::UnicodeWidthStr::width(piece);
+        let columns = piece.width();
         if used > 0 && used + columns > width {
             rows.push(String::new());
             used = 0;
