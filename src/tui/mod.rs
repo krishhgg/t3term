@@ -14340,7 +14340,7 @@ mod tests {
         // Each text shows the lines of the run Enter was pressed on.
         app.on_action_result(ActionResult::PullRequestText {
             ticket: 4,
-            answer: text(3),
+            answer: text(5),
         });
         app.on_action_result(ActionResult::PullRequestText {
             ticket: 5,
@@ -14352,7 +14352,10 @@ mod tests {
             .iter()
             .position(|row| *row == "1   l1")
             .unwrap_or_else(|| panic!("{rows:#?}"));
-        assert_eq!(rows[at + 1..at + 3], ["2   l2", "3 - o3"]);
+        assert_eq!(
+            rows[at + 1..at + 5],
+            ["2   l2", "3 - o3", "3 + l3", "⋯ 2 unmodified lines"]
+        );
         let renamed = at
             + 1
             + rows[at + 1..]
@@ -14361,6 +14364,15 @@ mod tests {
                 .unwrap_or_else(|| panic!("{rows:#?}"));
         assert_eq!(rows[renamed + 1], "2 - o2");
         assert!(!rows.iter().any(|row| row.contains("Reading…")));
+
+        // A click on a run shows its lines from the text read, and reads nothing more.
+        let body = app.details.drawn.expect("the pane").body;
+        let row = u16::try_from(at + 4).unwrap();
+        assert!(mouse(&mut app, CLICK, body.x + 2, body.y + row));
+        let rows = body_after(&mut app, 200, 50);
+        let rows: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
+        assert_eq!(rows[at + 3..at + 6], ["3 + l3", "4   l4", "5   l5"]);
+        assert_eq!(texts.borrow().len(), 3);
     }
 
     #[test]
