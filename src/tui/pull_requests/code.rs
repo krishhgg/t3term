@@ -1789,7 +1789,8 @@ fn entry(
 /// A file's header: a chevron that says whether it is unfolded, a letter for how it changed,
 /// its path, or both paths of a rename, then the lines it adds and removes unless both are 0,
 /// as the desktop's `PullRequestDiffStat` leaves out, and `mark`: `✓ Viewed`, or `Changed since
-/// viewed` for a file pushed to since. The path wraps under itself.
+/// viewed` for a file pushed to since. The path wraps under itself. Where it has less than two
+/// columns, room for a wide character, the header shows what fits on one row.
 fn header(
     file: &patch::File,
     open: bool,
@@ -1830,7 +1831,7 @@ fn header(
             Style::new().fg(theme.error_fg),
         ));
     }
-    if width <= indent {
+    if width < indent + 2 {
         return vec![Line::from(Span::raw(clip(
             &format!("{chevron} {letter} {name}"),
             width,
@@ -1838,12 +1839,13 @@ fn header(
     }
     let fg = Style::new().fg(theme.fg);
     let mut lines: Vec<Line<'static>> = Vec::new();
-    for (row, piece) in broken(&name, width - indent).into_iter().enumerate() {
+    let room = width - indent;
+    for (row, piece) in broken(&name, room).into_iter().enumerate() {
         let mut spans = match row {
             0 => lead.to_vec(),
             _ => vec![Span::raw(" ".repeat(indent))],
         };
-        spans.push(Span::styled(piece, fg));
+        spans.push(Span::styled(clip(&piece, room), fg));
         lines.push(Line::from(spans));
     }
     // The counts, then the mark, each after the last row where it fits and on a row of its

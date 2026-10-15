@@ -3368,6 +3368,24 @@ fn the_marks_are_read_once_at_a_time_and_again_when_stale() {
 }
 
 #[test]
+fn a_header_of_wide_characters_fits_every_width() {
+    let patch =
+        "diff --git a/漢字漢字 b/漢字漢字\n--- a/漢字漢字\n+++ b/漢字漢字\n@@ -1 +1 @@\n-a\n+b\n";
+    let code = read(slice(patch, None), 0);
+    for width in 1..=40 {
+        for row in rows(&code, width) {
+            assert!(row.width() <= width, "{width}: {row:?}");
+        }
+    }
+    // A path with two columns past its lead wraps a character to a row, and one with less
+    // shows what fits on one row.
+    let narrow = rows(&code, 6);
+    let at = narrow.iter().position(|row| row == "› M 漢").unwrap();
+    assert_eq!(narrow[at..], ["› M 漢", "    字", "    漢", "    字"]);
+    assert_eq!(rows(&code, 5).last().unwrap(), "› M …");
+}
+
+#[test]
 fn a_header_with_a_mark_fits_every_width() {
     use ViewedState::{Dismissed, Viewed};
     let host = Some(ViewedFilesStore::Host);
