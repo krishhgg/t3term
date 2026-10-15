@@ -167,9 +167,7 @@ fn rebuilt(patch: &str, hunk: &Hunk, left: &mut usize) -> Option<Rebuilt> {
     // A side's note follows its last line only where that line is in the last run, as the
     // desktop marks only the last run's rows (utils/iterateOverDiff.js:174-197 and 447-448).
     if removed.is_empty() && added.is_empty() {
-        if let Some(end) = old_end.or(new_end).filter(|_| !lines.is_empty()) {
-            lines.push(end.clone());
-        }
+        lines.extend(old_end.or(new_end).cloned());
     } else {
         let removes = !removed.is_empty();
         lines.append(&mut removed);

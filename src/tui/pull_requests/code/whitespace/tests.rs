@@ -228,6 +228,16 @@ fn a_line_with_no_end_keeps_its_note_where_the_desktop_shows_it() {
         ["1 1  a", "2 _ -b", note, "_ 2 +c"]
     );
     assert_eq!(hidden(&["-a", "-b", "+a", no_end]), ["1 1  a", "2 _ -b"]);
+    // A last line in context that pairs with nothing is removed or added, and the note that
+    // was both sides' follows it, as @pierre/diffs 1.5.2 marks it.
+    assert_eq!(
+        hidden(&["-  x", "-y", " x", no_end]),
+        ["1 1  x", "2 _ -y", "3 _ -x", note]
+    );
+    assert_eq!(
+        hidden(&["+  x", "+y", " x", no_end]),
+        ["1 1    x", "_ 2 +y", "_ 3 +x", note]
+    );
 }
 
 /// The patch of a file at `path` whose hunk removes `x` and `count` - 1 lines and adds ` x` and
