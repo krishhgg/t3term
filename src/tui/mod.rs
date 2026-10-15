@@ -14119,8 +14119,10 @@ mod tests {
             };
             reply(&mut socket, activity, success(host_activity_sent())).await;
         };
-        let (read, ()) = beside(parts(&client, &reference, ask(false, None)), server).await;
-        assert_eq!(read, ["detail", "stack", "activity", "done"]);
+        let (mut read, ()) = beside(parts(&client, &reference, ask(false, None)), server).await;
+        // The stack and the conversation are read at once, so either answer can come first.
+        read[1..3].sort();
+        assert_eq!(read, ["detail", "activity", "stack", "done"]);
 
         // A read that keeps the details current reads no stack, as the desktop's live refresh
         // reads only the detail.
