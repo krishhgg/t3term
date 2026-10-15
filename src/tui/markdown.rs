@@ -336,26 +336,33 @@ pub fn render(text: &str, width: usize, styles: &Styles, margin: usize) -> Vec<L
     let base = styles.text;
     let pad = " ".repeat(margin);
     let mut lines = Vec::new();
-    let mut in_code = false;
+    let mut fence: Option<Fence> = None;
     let panel_width = width.saturating_sub(margin).max(8);
     for raw in text.lines() {
         let trimmed = raw.trim_start();
-        if trimmed.starts_with("```") {
-            in_code = !in_code;
-            if in_code {
-                // The fence's language names the panel, like the GUI's code block header.
-                let language = trimmed.trim_start_matches('`').trim();
-                lines.push(Line::from(vec![
-                    Span::styled(pad.clone(), base),
-                    Span::styled(
-                        pad_to(&format!(" {language}"), panel_width),
-                        styles.code_label,
-                    ),
-                ]));
+        match fence {
+            Some(open) if open.closes(raw) => {
+                fence = None;
+                continue;
             }
-            continue;
+            None => {
+                if let Some((open, info)) = Fence::opening(raw) {
+                    fence = Some(open);
+                    // The fence's language names the panel, like the GUI's code block header.
+                    let language = info.split_whitespace().next().unwrap_or_default();
+                    lines.push(Line::from(vec![
+                        Span::styled(pad.clone(), base),
+                        Span::styled(
+                            pad_to(&format!(" {language}"), panel_width),
+                            styles.code_label,
+                        ),
+                    ]));
+                    continue;
+                }
+            }
+            Some(_) => {}
         }
-        if in_code {
+        if fence.is_some() {
             let mut row = String::from(" ");
             for c in raw.chars() {
                 if row.width() + c.width().unwrap_or(0) > panel_width {
@@ -435,6 +442,41 @@ pub fn render(text: &str, width: usize, styles: &Styles, margin: usize) -> Vec<L
         }
     }
     lines
+}
+
+/// A code fence: a run of three or more backticks or tildes, as CommonMark reads one.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct Fence {
+    mark: char,
+    length: usize,
+}
+
+impl Fence {
+    /// The fence `line` opens and its info string. A backtick fence's info string can't hold a
+    /// backtick, or the backticks are inline code.
+    fn opening(line: &str) -> Option<(Fence, &str)> {
+        let (fence, info) = Fence::start(line)?;
+        (fence.mark == '~' || !info.contains('`')).then_some((fence, info))
+    }
+
+    /// Whether `line` closes this fence: the same mark, at least as long, with nothing after
+    /// it. So a fence of four backticks can show an example of three.
+    fn closes(self, line: &str) -> bool {
+        Fence::start(line).is_some_and(|(fence, rest)| {
+            fence.mark == self.mark && fence.length >= self.length && rest.trim().is_empty()
+        })
+    }
+
+    fn start(line: &str) -> Option<(Fence, &str)> {
+        let line = line.trim_start();
+        let mark = line
+            .chars()
+            .next()
+            .filter(|mark| matches!(mark, '`' | '~'))?;
+        let rest = line.trim_start_matches(mark);
+        let length = line.len() - rest.len();
+        (length >= 3).then_some((Fence { mark, length }, rest))
+    }
 }
 
 fn is_rule(line: &str) -> bool {
@@ -532,6 +574,72 @@ mod tests {
         assert_eq!(lines[4].spans[1].content.width(), 40);
         assert_eq!(lines[4].spans[1].style, styles.code_block);
         assert_eq!(lines[3].spans[1].style, styles.code_label);
+    }
+
+    #[test]
+    fn a_fence_closes_only_on_its_own_mark_at_least_as_long() {
+        let styles = styles();
+        let text = [
+            // A longer fence shows an example of a shorter one, and closes with trailing spaces.
+            "````markdown",
+            "```rust ignore",
+            "let x = 1;",
+            "```",
+            "````  ",
+            "between",
+            // Tildes fence too, and backticks don't close them.
+            "~~~",
+            "```",
+            "~~~",
+            // A fence never closed runs to the end, and its language is the info's first word.
+            "  ```rust ignore",
+            "open",
+            "```` not a close",
+        ]
+        .join("\n");
+        let lines = render(&text, 30, &styles, 0);
+        let rows: Vec<String> = plain(&lines)
+            .into_iter()
+            .map(|row| row.trim_end().to_string())
+            .collect();
+        let expected = [
+            " markdown",
+            " ```rust ignore",
+            " let x = 1;",
+            " ```",
+            "between",
+            "",
+            " ```",
+            " rust",
+            " open",
+            " ```` not a close",
+        ];
+        assert_eq!(rows, expected);
+        let style = |row: usize| lines[row].spans.last().map(|span| span.style);
+        for (row, want) in [
+            (0, styles.code_label),
+            (3, styles.code_block),
+            (5, styles.code_label),
+            (6, styles.code_block),
+            (7, styles.code_label),
+            (9, styles.code_block),
+        ] {
+            assert_eq!(style(row), Some(want), "row {row}: {:?}", rows[row]);
+        }
+        assert_ne!(style(4), Some(styles.code_block));
+
+        // Backticks with a backtick after them are inline code, so no panel opens.
+        let inline = render("```a`b```\nafter", 30, &styles, 0);
+        assert_eq!(inline.len(), 2);
+        let panels = [styles.code_label, styles.code_block];
+        assert!(
+            inline
+                .iter()
+                .flat_map(|line| &line.spans)
+                .all(|span| !panels.contains(&span.style)),
+            "{:?}",
+            plain(&inline)
+        );
     }
 
     #[test]
