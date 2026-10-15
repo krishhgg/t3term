@@ -2032,6 +2032,18 @@ diff --git a/skewed b/skewed
     }
     file.old_path = None;
     assert_eq!(change_type(&file), None);
+
+    // Nor does a file added or deleted whose header names both paths.
+    let named = "diff --git a/fresh b/fresh\nnew file mode 100644\n--- a/fresh\n+++ b/fresh\n\
+                 @@ -0,0 +1 @@\n+a\ndiff --git a/gone b/gone\ndeleted file mode 100644\n\
+                 --- a/gone\n+++ b/gone\n@@ -1 +0,0 @@\n-a\n";
+    for file in patch::Patch::read(named).files {
+        assert!(
+            file.old_path.is_some() && file.new_path.is_some(),
+            "{file:?}"
+        );
+        assert_eq!(change_type(&file), None, "{file:?}");
+    }
 }
 
 #[test]
@@ -2104,6 +2116,120 @@ fn the_text_stays_while_the_hunks_do_and_goes_with_another_diff() {
     assert_eq!(code.take(3, Ok(slice(STRETCHED, None)), 1), Some(true));
     code.act(Control::File(0), &[]);
     assert_eq!(rows(&code, 80)[6], "⋯ 250 unmodified lines");
+}
+
+#[test]
+fn a_files_text_goes_when_its_hunks_or_paths_change() {
+    let read_text = |code: &mut Code, ticket| {
+        code.act(Control::Stretch(0, 1), &[]);
+        assert!(code.ask_text(ticket).is_some());
+        assert!(code.take_text(ticket, text(numbered(400))));
+        assert!(rows(code, 80).contains(&"⋯ 50 unmodified lines".to_string()));
+    };
+    let read_again = |code: &mut Code, ticket, patch: &str| {
+        code.again();
+        assert_eq!(code.ask(ticket), Some(None));
+        assert_eq!(code.take(ticket, Ok(slice(patch, None)), 1), Some(true));
+    };
+    let unread = |code: &Code, before: &str, between: &str| {
+        let rows_now = rows(code, 80);
+        assert_eq!(rows_now[3], before, "{rows_now:#?}");
+        assert!(rows_now.contains(&between.to_string()), "{rows_now:#?}");
+        assert!(
+            !rows_now.iter().any(|row| row.ends_with("   l4")),
+            "{rows_now:#?}"
+        );
+    };
+    let mut code = read(slice(STRETCHED, None), 0);
+    code.act(Control::File(0), &[]);
+    read_text(&mut code, 2);
+
+    // Hunks that change and change back don't bring back the text read before.
+    read_again(&mut code, 3, &STRETCHED.replace("-o256", "-p256"));
+    read_again(&mut code, 4, STRETCHED);
+    unread(&code, "⋯ 2 unmodified lines", "⋯ 250 unmodified lines");
+
+    // Nor does a hunk that moves with the same lines, as after the base gained a line.
+    read_text(&mut code, 5);
+    let moved = STRETCHED.replace("@@ -3 +3 @@", "@@ -4 +4 @@");
+    read_again(&mut code, 6, &moved);
+    unread(&code, "⋯ 3 unmodified lines", "⋯ 249 unmodified lines");
+
+    // Nor a file renamed before and changed in place now, which T3 reads by other paths.
+    let renamed = STRETCHED.replace(
+        "diff --git a/f.rs b/f.rs\n--- a/f.rs",
+        "diff --git a/e.rs b/f.rs\nsimilarity index 90%\nrename from e.rs\nrename to f.rs\n--- a/e.rs",
+    );
+    read_again(&mut code, 7, &renamed);
+    code.act(Control::Stretch(0, 1), &[]);
+    assert_eq!(
+        code.ask_text(8),
+        Some((ChangeType::RenameChanged, "e.rs".into(), "f.rs".into()))
+    );
+    assert!(code.take_text(8, text(numbered(400))));
+    read_again(&mut code, 9, STRETCHED);
+    unread(&code, "⋯ 2 unmodified lines", "⋯ 250 unmodified lines");
+    code.act(Control::Stretch(0, 1), &[]);
+    assert_eq!(
+        code.ask_text(10),
+        Some((ChangeType::Change, "f.rs".into(), "f.rs".into()))
+    );
+
+    // An answer that comes while the file waits for a later slice is dropped, and the file
+    // reads its text again once it's back.
+    let other = "diff --git a/z b/z\n--- a/z\n+++ b/z\n@@ -1 +1 @@\n-a\n+b\n";
+    code.again();
+    assert_eq!(code.ask(11), Some(None));
+    assert_eq!(code.take(11, Ok(slice(other, Some("2"))), 2), Some(true));
+    assert!(!code.take_text(10, text(numbered(400))));
+    code.near_end();
+    assert_eq!(code.ask(12), Some(Some("2".into())));
+    assert!(code.take(12, Ok(slice(STRETCHED, None)), 2).is_some());
+    let rows_now = rows(&code, 80);
+    assert!(
+        rows_now.contains(&"⋯ 250 unmodified lines".to_string()),
+        "{rows_now:#?}"
+    );
+    assert_eq!(code.file(1).unwrap().1.path(), "f.rs");
+    code.act(Control::Stretch(1, 1), &[]);
+    assert!(code.ask_text(13).is_some());
+}
+
+#[test]
+fn a_run_shows_the_lines_nearest_its_hunk_and_widens_the_numbers() {
+    // Before the first hunk, the 100 lines nearest it show first.
+    let late = "diff --git a/h.rs b/h.rs\n--- a/h.rs\n+++ b/h.rs\n@@ -251 +251 @@\n-o251\n+l251\n";
+    let mut code = read(slice(late, None), 0);
+    code.act(Control::File(0), &[]);
+    assert_eq!(
+        code.action(Control::Stretch(0, 0), &[]),
+        "show 100 unmodified lines"
+    );
+    code.act(Control::Stretch(0, 0), &[]);
+    assert!(code.ask_text(2).is_some());
+    assert!(code.take_text(2, text(numbered(260))));
+    let rows_now = rows(&code, 80);
+    assert_eq!(rows_now[3], "⋯ 150 unmodified lines");
+    assert_eq!(rows_now[4..104], unchanged(151..=250, 3));
+    assert_eq!(
+        rows_now[104..],
+        ["251 - o251", "251 + l251", "⋯ 9 unmodified lines"]
+    );
+
+    // Lines past the hunks' numbers widen the column the numbers take.
+    let early = "diff --git a/g.rs b/g.rs\n--- a/g.rs\n+++ b/g.rs\n@@ -98 +98 @@\n-o98\n+l98\n";
+    let mut code = read(slice(early, None), 0);
+    code.act(Control::File(0), &[]);
+    assert_eq!(rows(&code, 80)[4..6], ["98 - o98", "98 + l98"]);
+    code.act(Control::Stretch(0, 1), &[]);
+    assert!(code.ask_text(2).is_some());
+    assert!(code.take_text(2, text(numbered(150))));
+    let rows_now = rows(&code, 80);
+    assert_eq!(
+        rows_now[3..6],
+        ["⋯ 97 unmodified lines", " 98 - o98", " 98 + l98"]
+    );
+    assert_eq!(rows_now[6..], unchanged(99..=150, 3));
 }
 
 #[test]

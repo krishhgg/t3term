@@ -497,10 +497,10 @@ impl Code {
         let path = file.path().to_string();
         let found = self
             .contexts
-            .iter()
-            .position(|context| context.path == path);
-        match found.map(|found| (found, &mut self.contexts[found])) {
-            Some((_, context)) if context.print == print => {
+            .iter_mut()
+            .find(|context| context.path == path && context.print == print);
+        match found {
+            Some(context) => {
                 context.pressed = place;
                 match context.text {
                     Text::Read { .. } => context.widen(place, last),
@@ -508,10 +508,7 @@ impl Code {
                     Text::Wanted | Text::Asked(_) => {}
                 }
             }
-            _ => {
-                if let Some(found) = found {
-                    self.contexts.remove(found);
-                }
+            None => {
                 let context = Context {
                     path: path.clone(),
                     print,
@@ -1531,9 +1528,7 @@ fn fits(text: &str, patch: &str, file: &patch::File) -> Option<u64> {
             return None;
         }
     }
-    if lines.next().is_some() {
-        return None;
-    }
+    // A text too short for a hunk's lines ends before the line after the last hunk.
     let reach = file
         .hunks
         .iter()

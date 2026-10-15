@@ -7028,21 +7028,25 @@ mod tests {
         );
     }
 
-    #[test]
-    fn a_run_of_unchanged_lines_reads_its_files_text_once() {
-        let theme = theme();
+    /// A diff of one file changed in place, whose hunks at lines 3, 254 and 256 leave runs of
+    /// 2, 250 and 1 unchanged lines before them.
+    fn stretched() -> Box<pull_request::Diff> {
         let patch = "diff --git a/f.rs b/f.rs\n--- a/f.rs\n+++ b/f.rs\n\
                      @@ -3 +3 @@\n-o3\n+l3\n@@ -254 +254 @@\n-o254\n+l254\n\
                      @@ -256 +256 @@\n-o256\n+l256\n";
-        let diff = || {
-            Box::new(pull_request::Diff {
-                patch: patch.into(),
-                truncated: false,
-                next_cursor: None,
-                omitted: Vec::new(),
-                omitted_cut: false,
-            })
-        };
+        Box::new(pull_request::Diff {
+            patch: patch.into(),
+            truncated: false,
+            next_cursor: None,
+            omitted: Vec::new(),
+            omitted_cut: false,
+        })
+    }
+
+    #[test]
+    fn a_run_of_unchanged_lines_reads_its_files_text_once() {
+        let theme = theme();
+        let diff = stretched;
         let text = |count: u64| {
             let new = (1..=count).map(|n| format!("l{n}\n")).collect();
             Ok(Box::new(pull_request::FileContents { new }))
@@ -7130,6 +7134,40 @@ mod tests {
         let rows = detail_rows(&pulls);
         assert!(rows.contains(&"103   l103".to_string()), "{rows:#?}");
         assert!(rows.contains(&"⋯ 50 unmodified lines".to_string()));
+    }
+
+    #[test]
+    fn a_run_under_a_commits_diff_reads_that_commits_text() {
+        let theme = theme();
+        let mut activity = remarks(1);
+        activity["commits"] = json!([{"oid": "abc1234def", "messageHeadline": "One",
+            "committedDate": "2026-10-13T00:00:00Z"}]);
+        let mut pulls = conversing(activity);
+        assert!(!pulls.answer(1, Part::Done, now()));
+        assert!(pulls.forward() && pulls.forward());
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
+        assert!(pulls.answer_diff(2, Ok(stretched()), now()));
+        pulls.page(60, 40, now(), true, &theme);
+        pulls.pick = Some(Control::Commits);
+        pulls.enter();
+        pulls.page(60, 40, now(), true, &theme);
+        pulls.pick = Some(Control::Commit(0));
+        pulls.enter();
+        let ask = pulls.take_diff_ask(true, now()).expect("the commit's diff");
+        assert_eq!(ask.commit.as_deref(), Some("abc1234def"));
+        assert!(pulls.answer_diff(ask.ticket, Ok(stretched()), now()));
+        pulls.page(60, 40, now(), true, &theme);
+        pulls.pick = Some(Control::File(0));
+        pulls.enter();
+        pulls.page(60, 40, now(), true, &theme);
+        pulls.pick = Some(Control::Stretch(0, 1));
+        pulls.enter();
+        let ask = pulls.take_text_ask(true).expect("the file's text");
+        assert_eq!(ask.commit.as_deref(), Some("abc1234def"));
+        assert_eq!(
+            (ask.old_path.as_str(), ask.new_path.as_str()),
+            ("f.rs", "f.rs")
+        );
     }
 
     #[test]
