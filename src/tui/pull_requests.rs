@@ -1311,8 +1311,11 @@ impl PullRequests {
             self.scroll = Offset::Top(0);
             self.current = false;
             self.asking = true;
+            // What was opened starts over, so the rows laid out for it go too, even where the
+            // link, the width and the minute are the same.
             self.shown = Shown::default();
             self.pick = None;
+            self.relay();
         }
     }
 
@@ -3909,6 +3912,35 @@ mod tests {
         // A row between two controls takes no click.
         pulls.page(40, 24, now(), true, &theme);
         assert!(!pulls.click(bots[0] - 1));
+        assert_eq!(pulls.action().as_deref(), Some("show bot comments"));
+    }
+
+    #[test]
+    fn details_opened_again_in_the_same_minute_start_over() {
+        let mut pulls = conversing(remarks(12));
+        let theme = theme();
+        pulls.page(40, 24, now(), true, &theme);
+        pulls.act(Control::Bots);
+        pulls.act(Control::Older);
+        pulls.page(40, 24, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(rows.iter().any(|row| row == "⌄ 1 bot comment"), "{rows:?}");
+
+        // Back to the list and in again, at the same width and minute, with the read standing.
+        pulls.toggle();
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(true, now()), None);
+        pulls.page(40, 24, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(rows.iter().any(|row| row == "› 1 bot comment"), "{rows:?}");
+        let remarks = rows
+            .iter()
+            .filter(|row| row.starts_with("  Remark"))
+            .count();
+        assert_eq!(remarks, 10);
+        pulls.end();
+        pulls.page(40, 24, now(), true, &theme);
+        pulls.step(false);
         assert_eq!(pulls.action().as_deref(), Some("show bot comments"));
     }
 
