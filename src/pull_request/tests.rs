@@ -555,6 +555,35 @@ fn text_is_cut_on_a_character_boundary_and_says_so() {
 }
 
 #[test]
+fn only_the_part_kept_is_checked_for_blankness() {
+    // Whitespace past the bound is never scanned, so a title padded with a mebibyte of it
+    // reads as its first `LINE` bytes.
+    let mut value = detail_value();
+    let padded = format!("Fix{}", " ".repeat(1 << 20));
+    value["title"] = json!(padded);
+    let detail = Detail::read(&value).unwrap();
+    assert_eq!(detail.title, padded[..LINE]);
+
+    // A title or login whose first `LINE` or `NAME` bytes are blank is blank, whatever
+    // follows. T3 trims both, so it never sends one.
+    value["title"] = json!(format!("{}title", " ".repeat(LINE)));
+    let error = Detail::read(&value).unwrap_err().to_string();
+    assert!(error.ends_with("a detail has no valid title"), "{error}");
+    let mut activity = activity_value();
+    activity["comments"][0]["reactions"][0]["actors"] =
+        json!([format!("{}octo", "\n".repeat(NAME))]);
+    let error = Activity::read(&activity).unwrap_err().to_string();
+    assert!(error.ends_with("a reaction has no valid actors"), "{error}");
+
+    // A login whose first `NAME` bytes hold text reads as them, padding and all.
+    let login = format!("octo{}", "\t".repeat(NAME));
+    activity["comments"][0]["reactions"][0]["actors"] = json!([login]);
+    let read = Activity::read(&activity).unwrap();
+    let reactions = read.comments[0].reactions.as_ref().expect("reactions");
+    assert_eq!(reactions[0].actors, [login[..NAME].to_string()]);
+}
+
+#[test]
 fn lists_past_their_bound_are_cut_and_the_rest_left_unread() {
     let mut value = detail_value();
     let check = json!({"name": "c", "status": "success", "description": null, "url": null});
