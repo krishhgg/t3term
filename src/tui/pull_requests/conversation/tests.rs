@@ -166,6 +166,17 @@ fn html_comments_go_except_in_fenced_code() {
             "~~~\n```\n<!-- kept -->\n~~~\n<!--x-->y",
             "~~~\n```\n<!-- kept -->\n~~~\ny",
         ),
+        // A fence closes only on one at least as long, with nothing after it.
+        (
+            "````md\n```\n<!-- kept -->\n```\n````\n<!--x-->y",
+            "````md\n```\n<!-- kept -->\n```\n````\ny",
+        ),
+        (
+            "```\n``` rust\n<!-- kept -->\n```  \n<!--x-->y",
+            "```\n``` rust\n<!-- kept -->\n```  \ny",
+        ),
+        // Backticks with a backtick after them are inline code, not a fence.
+        ("```a`b```<!--x-->y", "```a`b```y"),
         ("<!-- never closed\nmore", ""),
         ("no comment <!- here", "no comment <!- here"),
     ];
@@ -341,9 +352,9 @@ fn each_reviewer_shows_their_last_verdict() {
         review("o1", actor("octocat"), &at(9), "CHANGES_REQUESTED"),
         // Given before the newest commit.
         review("m1", actor("mona"), &at(8), "CHANGES_REQUESTED"),
-        // Taken back.
+        // Taken back, by the same login in another casing.
         review("h1", actor("hubot"), &at(10), "APPROVED"),
-        review("h2", actor("hubot"), &at(11), "DISMISSED"),
+        review("h2", actor("Hubot"), &at(11), "DISMISSED"),
         // A time that doesn't parse can't stand against a later one.
         review("l1", actor("lee"), "never", "APPROVED"),
         review("l2", actor("lee"), &at(10), "CHANGES_REQUESTED"),
@@ -351,6 +362,7 @@ fn each_reviewer_shows_their_last_verdict() {
         review("g1", Value::Null, &at(10), "APPROVED"),
         review("g2", Value::Null, &at(10), "APPROVED"),
         review("z1", actor("zed"), &at(10), "APPROVED"),
+        review("z2", actor("Zed"), &at(11), "CHANGES_REQUESTED"),
         review("c1", actor("kim"), &at(10), "COMMENTED"),
     ];
     let commits = vec![json!({"oid": "1", "messageHeadline": "x", "committedDate": at(9)})];
@@ -375,7 +387,7 @@ fn each_reviewer_shows_their_last_verdict() {
         "ci-bot (bot)".to_string(),
         line("ghost", "Approved"),
         line("ghost", "Approved"),
-        line("zed", "Approved"),
+        line("Zed", "Changes requested"),
     ];
     assert_eq!(rows, expected);
 
