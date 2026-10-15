@@ -936,6 +936,302 @@ fn what_the_reader_opened_of_threads_goes_with_them() {
     assert_eq!(shown, Shown::default());
 }
 
+/// A diff of one file, `a`, whose one line changed.
+const ONE: &str = "diff --git a/a b/a
+--- a/a
++++ b/a
+@@ -1 +1 @@
+-old
++new
+";
+
+/// A page of a thread's remarks with these `ids`, each saying `Remark {id}.`, and `next` where
+/// the page after starts.
+fn page(ids: &[&str], next: Option<&str>) -> pull_request::CommentPage {
+    let comments: Vec<Value> = ids
+        .iter()
+        .map(|id| {
+            json!({"id": id, "author": {"login": "mona", "name": null},
+                "body": format!("Remark {id}."), "createdAt": "2026-10-15T10:00:00Z", "url": null})
+        })
+        .collect();
+    pull_request::CommentPage::read(&json!({"comments": comments, "nextCursor": next})).unwrap()
+}
+
+/// The rows that read thread `index`'s next page, where they show.
+fn more_rows(targets: &Targets, index: usize) -> Option<std::ops::Range<usize>> {
+    targets
+        .iter()
+        .find(|(_, control)| *control == Control::More(index))
+        .map(|(rows, _)| rows.clone())
+}
+
+#[test]
+fn a_thread_reads_its_remarks_a_page_at_a_time() {
+    let mut first = thread("t", "a", Some(1), "right", false, &["First."]);
+    first["commentCount"] = json!(5);
+    first["nextCommentsCursor"] = json!("p2");
+    let mut conversation = conversation(vec![first]);
+    let mut code = read(slice(ONE, None), 0);
+    code.act(Control::File(0));
+    let mut shown = Shown::default();
+    let (rows, targets) = with_threads(&code, &mut conversation, &shown, 40);
+    let at = rows
+        .iter()
+        .position(|row| row == "│ ⌄ Open · 5 comments")
+        .unwrap();
+    assert_eq!(rows[at + 2..at + 4], ["│   First.", "│ Load more comments"]);
+    assert_eq!(rows.len(), at + 4, "{rows:#?}");
+    assert_eq!(more_rows(&targets, 0), Some(at + 3..at + 4));
+    assert!(code.shows(Control::More(0), conversation.threads(), &shown));
+    assert_eq!(conversation.take_wanted(1), None);
+
+    // Asked for, it says the page is coming and offers no button until it comes. One read at
+    // a time goes for each thread.
+    assert!(conversation.want_more(0));
+    assert!(!conversation.want_more(0));
+    assert!(!conversation.want_more(1));
+    let (rows, targets) = with_threads(&code, &mut conversation, &shown, 40);
+    assert_eq!(rows[at + 3], "│ Loading more comments…");
+    assert_eq!(more_rows(&targets, 0), None);
+    assert!(!code.shows(Control::More(0), conversation.threads(), &shown));
+    assert_eq!(conversation.take_wanted(7), Some(("t".into(), "p2".into())));
+    assert_eq!(conversation.take_wanted(8), None);
+    assert!(!conversation.want_more(0));
+    let (rows, _) = with_threads(&code, &mut conversation, &shown, 40);
+    assert_eq!(rows[at + 3], "│ Loading more comments…");
+
+    // Another read's answer isn't its. A failure says why, cleaned, above the button.
+    assert!(!conversation.take_page(8, Ok(&page(&["x"], None))));
+    assert!(conversation.take_page(7, Err("Slow \u{1b}[2J host.")));
+    assert!(!conversation.take_page(7, Ok(&page(&["x"], None))));
+    let (rows, targets) = with_threads(&code, &mut conversation, &shown, 40);
+    assert_eq!(
+        rows[at + 3..at + 6],
+        [
+            "│ t3term couldn't read more comments.",
+            "│ Slow [2J host.",
+            "│ Load more comments"
+        ]
+    );
+    assert_eq!(more_rows(&targets, 0), Some(at + 5..at + 6));
+
+    // The page's remarks follow the thread's, each once, and its cursor reads the next.
+    assert!(conversation.want_more(0));
+    assert_eq!(conversation.take_wanted(9), Some(("t".into(), "p2".into())));
+    let next = page(&["t-0", "x", "x", "y"], Some("p3"));
+    assert!(conversation.take_page(9, Ok(&next)));
+    let (rows, targets) = with_threads(&code, &mut conversation, &shown, 40);
+    assert_eq!(
+        rows[at + 2..at + 10],
+        [
+            "│   First.",
+            "│",
+            "│ mona                            5m ago",
+            "│   Remark x.",
+            "│",
+            "│ mona                            5m ago",
+            "│   Remark y.",
+            "│ Load more comments",
+        ]
+    );
+    assert!(!rows.iter().any(|row| row.contains("Remark t-0.")));
+    assert_eq!(more_rows(&targets, 0), Some(at + 9..at + 10));
+
+    // Closed, it shows none of them, nor the button.
+    shown.act(Control::Thread(0), &conversation);
+    let (rows, targets) = with_threads(&code, &mut conversation, &shown, 40);
+    assert_eq!(rows[at], "│ › Open · 5 comments");
+    assert!(
+        !rows
+            .iter()
+            .any(|row| row.contains("Remark") || row.contains("Load"))
+    );
+    assert_eq!(more_rows(&targets, 0), None);
+    assert!(!code.shows(Control::More(0), conversation.threads(), &shown));
+    shown.act(Control::Thread(0), &conversation);
+    // Nor under a folded file.
+    assert!(code.shows(Control::More(0), conversation.threads(), &shown));
+    code.act(Control::File(0));
+    assert!(!code.shows(Control::More(0), conversation.threads(), &shown));
+    code.act(Control::File(0));
+    assert!(conversation.want_more(0));
+    assert_eq!(
+        conversation.take_wanted(10),
+        Some(("t".into(), "p3".into()))
+    );
+
+    // The last page takes the button away, and the host counts one remark that never came.
+    assert!(conversation.take_page(10, Ok(&page(&["z"], None))));
+    assert!(!conversation.want_more(0));
+    let (rows, targets) = with_threads(&code, &mut conversation, &shown, 40);
+    assert_eq!(
+        rows[at + 11..at + 13],
+        ["│   Remark z.", "│ 1 more comment on the host."]
+    );
+    assert_eq!(more_rows(&targets, 0), None);
+    assert!(!code.shows(Control::More(0), conversation.threads(), &shown));
+}
+
+#[test]
+fn a_thread_reads_no_page_past_what_t3term_keeps() {
+    let bodies = |count: usize| vec!["Kept."; count];
+    let ids = |count: usize| (0..count).map(|at| format!("p-{at}")).collect::<Vec<_>>();
+    let mut nearly = thread("nearly", "a", Some(1), "right", false, &bodies(999));
+    nearly["commentCount"] = json!(1_005);
+    nearly["nextCommentsCursor"] = json!("p2");
+    let mut full = thread("full", "a", Some(1), "left", false, &bodies(1_000));
+    full["nextCommentsCursor"] = json!("p2");
+    let mut cut = thread("cut", "a", Some(1), "left", false, &["Cut."]);
+    cut["nextCommentsCursor"] = json!("p2");
+    let mut conversation = conversation(vec![nearly, full, cut]);
+    let mut code = read(slice(ONE, None), 0);
+    code.act(Control::File(0));
+    let shown = Shown::default();
+
+    // A thread that came with as many remarks as t3term keeps reads no page after them.
+    assert!(!conversation.want_more(1));
+    let (_, targets) = with_threads(&code, &mut conversation, &shown, 40);
+    assert!(more_rows(&targets, 0).is_some() && more_rows(&targets, 2).is_some());
+    assert_eq!(more_rows(&targets, 1), None);
+
+    // A page keeps what fits and reads no page after it.
+    assert!(conversation.want_more(0));
+    assert_eq!(
+        conversation.take_wanted(1),
+        Some(("nearly".into(), "p2".into()))
+    );
+    let ids_of_three = ids(3);
+    let three: Vec<&str> = ids_of_three.iter().map(String::as_str).collect();
+    assert!(conversation.take_page(1, Ok(&page(&three, Some("p3")))));
+    assert!(!conversation.want_more(0));
+    let (rows, targets) = with_threads(&code, &mut conversation, &shown, 40);
+    assert_eq!(more_rows(&targets, 0), None);
+    assert!(rows.contains(&"│   Remark p-0.".to_string()));
+    assert!(!rows.contains(&"│   Remark p-1.".to_string()));
+    assert!(rows.contains(&"│ 5 more comments on the host.".to_string()));
+
+    // Nor does a page longer than t3term keeps, whose last remarks the next would skip.
+    assert!(conversation.want_more(2));
+    assert_eq!(
+        conversation.take_wanted(2),
+        Some(("cut".into(), "p2".into()))
+    );
+    let mut long = vec!["cut-0"; 1_000];
+    long.push("cut-1");
+    let long = page(&long, Some("p3"));
+    assert!(long.cut);
+    assert!(conversation.take_page(2, Ok(&long)));
+    assert!(!conversation.want_more(2));
+}
+
+#[test]
+fn pages_go_with_their_thread_when_the_conversation_is_read_again() {
+    let threads = |bodies: &[&str], cursor: &str| {
+        let mut paged = thread("t", "a", Some(1), "right", false, bodies);
+        paged["commentCount"] = json!(9);
+        paged["nextCommentsCursor"] = json!(cursor);
+        let mut asked = thread("u", "a", Some(1), "left", false, &["Asked."]);
+        asked["nextCommentsCursor"] = json!("q2");
+        vec![paged, asked]
+    };
+    let mut old = conversation(threads(&["First."], "p2"));
+    assert!(old.want_more(0));
+    assert_eq!(old.take_wanted(1), Some(("t".into(), "p2".into())));
+    assert!(old.take_page(1, Ok(&page(&["t-1", "t-2"], Some("p3")))));
+    assert!(old.want_more(1));
+    assert_eq!(old.take_wanted(2), Some(("u".into(), "q2".into())));
+
+    // The read again sends the first remark of the page with the thread, and a cursor of its
+    // own. The page's other remark stays, and the next page is the one after it.
+    let mut new = conversation(threads(&["First.", "Second."], "fresh"));
+    new.carry(&mut old);
+    let mut code = read(slice(ONE, None), 0);
+    code.act(Control::File(0));
+    let shown = Shown::default();
+    let (rows, _) = with_threads(&code, &mut new, &shown, 40);
+    for body in ["│   First.", "│   Second.", "│   Remark t-2."] {
+        assert_eq!(
+            rows.iter().filter(|row| *row == body).count(),
+            1,
+            "{rows:#?}"
+        );
+    }
+    assert!(!rows.contains(&"│   Remark t-1.".to_string()), "{rows:#?}");
+    // A read after that keeps them too.
+    let mut newer = conversation(threads(&["First.", "Second."], "fresher"));
+    newer.carry(&mut new);
+    let (rows, _) = with_threads(&code, &mut newer, &shown, 40);
+    assert!(rows.contains(&"│   Remark t-2.".to_string()), "{rows:#?}");
+    let mut new = newer;
+    assert!(new.want_more(0));
+    assert_eq!(new.take_wanted(3), Some(("t".into(), "p3".into())));
+
+    // The read under way still answers to the thread, which had no page, and its cursor is
+    // the new one's until then.
+    assert!(!new.want_more(1));
+    assert!(new.take_page(2, Ok(&page(&["u-9"], None))));
+    let (rows, _) = with_threads(&code, &mut new, &shown, 40);
+    assert!(rows.contains(&"│   Remark u-9.".to_string()), "{rows:#?}");
+
+    // A thread read again with as many remarks as t3term keeps takes no page's remarks past
+    // them, and reads no page after.
+    let mut old = conversation(threads(&["First."], "p2"));
+    assert!(old.want_more(0));
+    assert_eq!(old.take_wanted(1), Some(("t".into(), "p2".into())));
+    assert!(old.take_page(1, Ok(&page(&["t-1", "x"], Some("p3")))));
+    assert!(old.want_more(0) && old.want_more(1));
+    let mut new = conversation(threads(&vec!["Kept."; 1_000], "fresh"));
+    new.carry(&mut old);
+    assert!(!new.want_more(0));
+    let (rows, _) = with_threads(&code, &mut new, &shown, 40);
+    assert!(!rows.contains(&"│   Remark x.".to_string()));
+    // Its page the reader wanted goes unread, and the next thread's goes.
+    assert_eq!(new.take_wanted(4), Some(("u".into(), "q2".into())));
+    assert_eq!(new.take_wanted(5), None);
+    let (rows, _) = with_threads(&code, &mut new, &shown, 40);
+    let loading = rows.iter().filter(|row| row.contains("Loading more"));
+    assert_eq!(loading.count(), 1, "{rows:#?}");
+
+    // A thread no page was read for keeps the cursor the read again sent.
+    let mut old = conversation(threads(&["First."], "p2"));
+    let mut new = conversation(threads(&["First."], "fresh"));
+    new.carry(&mut old);
+    assert!(new.want_more(0));
+    assert_eq!(new.take_wanted(1), Some(("t".into(), "fresh".into())));
+
+    // A thread whose pages ran out reads on from the read again's own cursor once the host
+    // counts more remarks than it holds, as after a reply, and holds each remark once.
+    let counted = |count: u64| {
+        let mut paged = thread("t", "a", Some(1), "right", false, &["First."]);
+        paged["commentCount"] = json!(count);
+        paged["nextCommentsCursor"] = json!("p2");
+        vec![paged]
+    };
+    let mut old = conversation(counted(3));
+    assert!(old.want_more(0));
+    assert_eq!(old.take_wanted(1), Some(("t".into(), "p2".into())));
+    assert!(old.take_page(1, Ok(&page(&["t-1", "t-2"], None))));
+    assert!(!old.want_more(0));
+    let mut same = conversation(counted(3));
+    same.carry(&mut old);
+    assert!(!same.want_more(0));
+    let mut replied = conversation(counted(4));
+    replied.carry(&mut same);
+    assert!(replied.want_more(0));
+    assert_eq!(replied.take_wanted(2), Some(("t".into(), "p2".into())));
+    assert!(replied.take_page(2, Ok(&page(&["t-1", "t-2", "t-3"], None))));
+    assert!(!replied.want_more(0));
+    let (rows, _) = with_threads(&code, &mut replied, &shown, 40);
+    for body in ["│   Remark t-1.", "│   Remark t-2.", "│   Remark t-3."] {
+        assert_eq!(
+            rows.iter().filter(|row| *row == body).count(),
+            1,
+            "{rows:#?}"
+        );
+    }
+}
+
 #[test]
 fn threads_fit_every_width_and_hostile_text_is_cleaned() {
     let path = "src/\u{1b}]8;;evil\u{7}name.rs";
@@ -963,7 +1259,14 @@ fn threads_fit_every_width_and_hostile_text_is_cleaned() {
     threads[0]["comments"][0]["author"]["login"] = json!("ev\u{1b}]0;il");
     threads[0]["isOutdated"] = json!(true);
     threads[0]["commentCount"] = json!(12_000);
+    threads[1]["nextCommentsCursor"] = json!("p2");
     let mut conversation = conversation(threads);
+    assert!(conversation.want_more(1));
+    assert_eq!(
+        conversation.take_wanted(1),
+        Some(("off".into(), "p2".into()))
+    );
+    assert!(conversation.take_page(1, Err(hostile)));
     let mut code = read(slice(&patch, None), 0);
     code.act(Control::File(0));
     let mut shown = Shown::default();
@@ -992,6 +1295,7 @@ fn threads_fit_every_width_and_hostile_text_is_cleaned() {
             rows.len()
         };
         assert!(header(0) >= 1 && header(1) >= 1, "{width}");
+        assert!(more_rows(&targets, 1).is_some_and(|rows| !rows.is_empty()));
     }
     // A first row that wraps opens and closes the thread on every row it takes.
     let (rows, targets) = with_threads(&code, &mut conversation, &shown, 12);
@@ -1008,6 +1312,18 @@ fn threads_fit_every_width_and_hostile_text_is_cleaned() {
     let (rows, _) = with_threads(&code, &mut conversation, &shown, 50);
     assert!(rows.contains(&"│ ⌄ Open · 12,000 comments · outdated".to_string()));
     assert!(rows.contains(&"│ 11,998 more comments on the host.".to_string()));
+    let at = rows
+        .iter()
+        .position(|row| row == "│ t3term couldn't read more comments.")
+        .unwrap();
+    assert_eq!(
+        rows[at + 1..at + 4],
+        [
+            "│ Look [2J here, at a remark long enough to wrap",
+            "│ at every width.",
+            "│ Load more comments"
+        ]
+    );
     assert!(
         rows.contains(&"src/]8;;evilname.rsx".to_string()),
         "{rows:#?}"

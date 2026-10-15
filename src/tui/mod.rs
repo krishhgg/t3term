@@ -55,7 +55,7 @@ use details::Details;
 use environment::{Feed, Identity};
 use markdown::Styles;
 use picker::{Item, Kind, Pick};
-use pull_requests::{Ask, DiffAsk, Part};
+use pull_requests::{Ask, CommentsAsk, DiffAsk, Part};
 use scroll::{Pin, Scroll};
 use sidebar::{Badges, Capabilities, Shelf, ShelfChoices, Sidebar, View};
 use theme::{Theme, duration_label, model_display_name, now_ms, parse_iso_ms, runtime_mode_label};
@@ -95,6 +95,9 @@ type ReadPull = Box<dyn Fn(Reference, Ask)>;
 /// Reads a slice of a pull request's diff in the background as `DiffAsk` says, and sends the
 /// answer as an action with the ask's ticket.
 type ReadDiff = Box<dyn Fn(Reference, DiffAsk)>;
+/// Reads the next page of a review thread's remarks in the background as `CommentsAsk` says,
+/// and sends the answer as an action with the ask's ticket.
+type ReadComments = Box<dyn Fn(Reference, CommentsAsk)>;
 /// Opens T3's `pullRequests.subscribeRefreshes`: `Client::watch_pull_request_refreshes`, or a
 /// test's stand-in.
 type WatchRefreshes = Box<dyn Fn() -> mpsc::UnboundedReceiver<WatchEvent>>;
@@ -348,6 +351,12 @@ enum ActionResult {
         ticket: u64,
         answer: Result<Box<pull_request::Diff>, String>,
     },
+    /// A page of a review thread's remarks, or why reading it failed, for the read with this
+    /// ticket.
+    PullRequestComments {
+        ticket: u64,
+        answer: Result<Box<pull_request::CommentPage>, String>,
+    },
     /// A send that failed. The composer gets its text back.
     SendFailed {
         thread_id: String,
@@ -559,6 +568,8 @@ struct App {
     read_pull: ReadPull,
     /// Reads a slice of the diff of the pull request whose Code tab shows.
     read_diff: ReadDiff,
+    /// Reads the next page of the remarks of a review thread on that Code tab.
+    read_comments: ReadComments,
     /// Opens T3's refresh numbers for pull requests.
     watch_refreshes: WatchRefreshes,
     /// T3's refresh numbers, open while the details hold a read of a link's pull request.
@@ -692,6 +703,23 @@ async fn read_diff(
     match pull_request::diff(&client.api, reference, cursor).await {
         Ok(diff) => Ok(Box::new(diff)),
         Err(e @ PullRequestError::Rpc(_)) => Err(format!("Couldn't read this diff: {e}")),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Reads the page of review thread `thread`'s remarks at `cursor`, of the pull request
+/// `reference` names, through `pullRequests.threadComments`, as the desktop's `Load more
+/// comments` does. The thread's card says t3term couldn't read more above the reason, so the
+/// reason is the error alone, and a sentence of T3's own reads as T3 wrote it.
+async fn read_comments(
+    client: &Client,
+    reference: &Reference,
+    thread: &str,
+    cursor: &str,
+) -> Result<Box<pull_request::CommentPage>, String> {
+    let rpc = client.rpc().await.map_err(|e| e.to_string())?;
+    match pull_request::thread_comments(&rpc, reference, thread, cursor).await {
+        Ok(page) => Ok(Box::new(page)),
         Err(e) => Err(e.to_string()),
     }
 }
@@ -922,6 +950,7 @@ impl App {
         let refresher = client.clone();
         let (reader, answers) = (client.clone(), actions.clone());
         let (differ, diffs) = (client.clone(), actions.clone());
+        let (pager, pages) = (client.clone(), actions.clone());
         let environment = Identity::new(client.runtime.label.as_deref(), &client.runtime.origin);
         App {
             client,
@@ -998,6 +1027,14 @@ impl App {
                     let answer = read_diff(&client, &reference, ask.cursor.as_deref()).await;
                     let ticket = ask.ticket;
                     let _ = answers.send(ActionResult::PullRequestDiff { ticket, answer });
+                });
+            }),
+            read_comments: Box::new(move |reference, ask: CommentsAsk| {
+                let (client, answers) = (pager.clone(), pages.clone());
+                tokio::spawn(async move {
+                    let answer = read_comments(&client, &reference, &ask.thread, &ask.cursor).await;
+                    let ticket = ask.ticket;
+                    let _ = answers.send(ActionResult::PullRequestComments { ticket, answer });
                 });
             }),
             watch_refreshes: Box::new(move || refresher.watch_pull_request_refreshes()),
@@ -1269,7 +1306,8 @@ impl App {
     /// whose capabilities have `pullRequests` reads them. The details show the answer when it
     /// comes, and a reference T3's schema would refuse fails at once. While the details hold a
     /// read, T3's refresh numbers say when to read it again. A slice of its diff that the Code
-    /// tab wants is asked for the same way. Says whether it asked for a read.
+    /// tab wants, and each page of a review thread's remarks, is asked for the same way. Says
+    /// whether it asked for a read.
     fn read_opened_pull(&mut self) -> bool {
         let project = self.pulls_project();
         let enabled = project.is_some();
@@ -1290,9 +1328,18 @@ impl App {
         let diff = shown
             .then(|| self.details.pulls.take_diff_ask(enabled, now))
             .flatten();
+        // Each thread whose next page the reader asked for while no read could go, as when
+        // the environment was away, goes now.
+        let mut comments = Vec::new();
+        while let Some(ask) = shown
+            .then(|| self.details.pulls.take_comments_ask(enabled))
+            .flatten()
+        {
+            comments.push(ask);
+        }
         self.follow_refreshes(enabled);
         let project = project.unwrap_or_default();
-        let asked = ask.is_some() || diff.is_some();
+        let asked = ask.is_some() || diff.is_some() || !comments.is_empty();
         if let Some(ask) = ask {
             match Reference::new(&project, Some(&ask.host), &ask.repository, ask.number) {
                 Ok(reference) => (self.read_pull)(reference, ask),
@@ -1309,6 +1356,15 @@ impl App {
                 Err(failure) => {
                     let failure = Err(failure.to_string());
                     self.details.answer_diff(ask.ticket, failure, now);
+                }
+            }
+        }
+        for ask in comments {
+            match Reference::new(&project, Some(&ask.host), &ask.repository, ask.number) {
+                Ok(reference) => (self.read_comments)(reference, ask),
+                Err(failure) => {
+                    let failure = Err(failure.to_string());
+                    self.details.answer_comments(ask.ticket, failure);
                 }
             }
         }
@@ -2414,6 +2470,9 @@ impl App {
                 self.details.answer_pull(ticket, part, now);
                 // A link opened while that read was under way is asked for once it is done.
                 self.read_opened_pull();
+            }
+            ActionResult::PullRequestComments { ticket, answer } => {
+                self.details.answer_comments(ticket, answer);
             }
             ActionResult::PullRequestDiff { ticket, answer } => {
                 let now = now_ms().max(self.now);
@@ -13473,6 +13532,29 @@ mod tests {
         asked
     }
 
+    /// What a read of a review thread's next page named: the project, the host, the
+    /// repository, the number, the ticket, the thread and the cursor.
+    type NotedPage = (String, String, String, u64, u64, String, String);
+
+    /// Replaces how `app` reads a review thread's next page, so a read only notes what it
+    /// named.
+    fn note_pages(app: &mut App) -> std::rc::Rc<std::cell::RefCell<Vec<NotedPage>>> {
+        let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let noted = asked.clone();
+        app.read_comments = Box::new(move |reference: Reference, ask: CommentsAsk| {
+            noted.borrow_mut().push((
+                reference.project_id().to_string(),
+                reference.host().unwrap_or_default().to_string(),
+                reference.repository().to_string(),
+                reference.number(),
+                ask.ticket,
+                ask.thread,
+                ask.cursor,
+            ));
+        });
+        asked
+    }
+
     /// Replaces how `app` opens T3's refresh numbers, so each subscription only notes its
     /// sender, which a test sends numbers on.
     fn note_refreshes(
@@ -13778,6 +13860,157 @@ mod tests {
             (diffs.borrow().len(), next),
             (2, Some((3, Some("c2".into()))))
         );
+    }
+
+    #[test]
+    fn load_more_comments_reads_a_threads_next_page_through_the_links_project() {
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        let _asked = note_reads(&mut app);
+        let _diffs = note_diffs(&mut app);
+        let pages = note_pages(&mut app);
+        press(&mut app, KeyCode::Enter);
+        let remark = |id: &str, body: &str| {
+            json!({"id": id, "author": {"login": "mona", "name": null}, "body": body,
+                "createdAt": "2026-10-13T09:00:00Z", "url": null})
+        };
+        let mut activity = host_activity_sent();
+        activity["reviewThreads"] = json!([
+            {"id": "t0", "path": "a", "line": 1, "side": "left", "isResolved": false,
+                "isOutdated": false, "commentCount": 3, "nextCommentsCursor": "p2",
+                "comments": [remark("t0a", "Why drop a?")]},
+            {"id": "t1", "path": "a", "line": 1, "side": "right", "isResolved": false,
+                "isOutdated": false, "commentCount": 2, "nextCommentsCursor": "q2",
+                "comments": [remark("t1a", "Is b right?")]},
+        ]);
+        let activity = pull_request::Activity::read(&activity).unwrap();
+        let parts = vec![
+            Part::Detail(Ok(Box::new(host_detail()))),
+            Part::Activity(Ok(Box::new(activity))),
+            Part::Done,
+        ];
+        hear(&mut app, 1, parts);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        let diff = pull_request::Diff {
+            patch: "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b\n".into(),
+            truncated: false,
+            next_cursor: None,
+            omitted: Vec::new(),
+            omitted_cut: false,
+        };
+        let answer = Ok(Box::new(diff));
+        app.on_action_result(ActionResult::PullRequestDiff { ticket: 2, answer });
+        // ↓ goes down the controls until `action` says what Enter does. A frame lays the
+        // details out first, as each key's would.
+        let down_to = |app: &mut App, action: &str| {
+            for _ in 0..10 {
+                cells(app, 200, 50);
+                if app.details.pulls.action().as_deref() == Some(action) {
+                    return;
+                }
+                press(app, KeyCode::Down);
+            }
+            panic!("no {action:?}: {:?}", app.details.pulls.action());
+        };
+        down_to(&mut app, "expand file");
+        press(&mut app, KeyCode::Enter);
+        down_to(&mut app, "load more comments");
+        let status = text_in(&cells(&mut app, 200, 50), Rect::new(0, 49, 200, 1));
+        assert!(status.contains("Enter load more comments"), "{status}");
+        assert!(pages.borrow().is_empty());
+
+        // Enter reads the old side's thread's next page through the link's project and host.
+        press(&mut app, KeyCode::Enter);
+        let named = |ticket, thread: &str, cursor: &str| {
+            let host = ("p", "github.com", "krishhgg/t3term", 31);
+            let (project, host, repository, number) = host;
+            let (project, host) = (project.to_string(), host.to_string());
+            let (thread, cursor) = (thread.to_string(), cursor.to_string());
+            (
+                project,
+                host,
+                repository.to_string(),
+                number,
+                ticket,
+                thread,
+                cursor,
+            )
+        };
+        assert_eq!(*pages.borrow(), [named(3, "t0", "p2")]);
+        let rows = body_after(&mut app, 200, 50);
+        let loading = rows
+            .iter()
+            .filter(|row| row.contains("Loading more comments…"));
+        assert_eq!(loading.count(), 1, "{rows:#?}");
+
+        // The page's remark shows under the thread's once it comes. An answer to no read
+        // changes nothing.
+        let page = |id: &str, body: &str, next: Option<&str>| {
+            let page = json!({"comments": [remark(id, body)], "nextCursor": next});
+            Ok(Box::new(pull_request::CommentPage::read(&page).unwrap()))
+        };
+        let answer = page("t0b", "Unused now.", Some("p3"));
+        assert!(!app.details.moved);
+        app.on_action_result(ActionResult::PullRequestComments { ticket: 3, answer });
+        // The rows moved, so the mouse waits for the next frame.
+        assert!(app.details.moved);
+        let rows = body_after(&mut app, 200, 50);
+        let at = rows
+            .iter()
+            .position(|row| row.contains("Why drop a?"))
+            .expect("the thread");
+        assert!(rows[at..].iter().any(|row| row.contains("Unused now.")));
+        assert!(!rows.iter().any(|row| row.contains("Loading more")));
+        let answer = page("t0c", "Stale.", None);
+        app.on_action_result(ActionResult::PullRequestComments { ticket: 9, answer });
+        assert!(!app.details.moved);
+        let rows = body_after(&mut app, 200, 50);
+        assert!(!rows.iter().any(|row| row.contains("Stale.")), "{rows:#?}");
+
+        // Pages asked for before t3term next reads go out together, each with its ticket.
+        // The panel steps and enters here without the keys, which would send each read.
+        let enter_more = |app: &mut App| {
+            app.details.pulls.home();
+            for _ in 0..10 {
+                cells(app, 200, 50);
+                if app.details.pulls.action().as_deref() == Some("load more comments") {
+                    app.details.pulls.enter();
+                    return;
+                }
+                app.details.pulls.step(true);
+            }
+            panic!("no button: {:?}", app.details.pulls.action());
+        };
+        enter_more(&mut app);
+        enter_more(&mut app);
+        assert_eq!(pages.borrow().len(), 1);
+        assert!(app.read_opened_pull());
+        assert_eq!(
+            pages.borrow()[1..],
+            [named(4, "t0", "p3"), named(5, "t1", "q2")]
+        );
+        assert!(!app.read_opened_pull());
+
+        // A failure says so in the thread, with the reason as T3 gave it, laid out for the
+        // narrow pane.
+        let answer = Err("This host does not page review thread comments.".to_string());
+        app.on_action_result(ActionResult::PullRequestComments { ticket: 5, answer });
+        let rows = body_after(&mut app, 200, 50);
+        let at = rows
+            .iter()
+            .position(|row| row == "│   Is b right?")
+            .unwrap_or_else(|| panic!("{rows:#?}"));
+        assert_eq!(
+            rows[at + 1..at + 6],
+            [
+                "│ t3term couldn't read more",
+                "│ comments.",
+                "│ This host does not page review",
+                "│ thread comments.",
+                "│ Load more comments"
+            ]
+        );
+        assert_eq!(rows[at - 4], "│ Loading more comments…");
     }
 
     #[test]
@@ -14327,8 +14560,10 @@ mod tests {
             };
             reply(&mut socket, activity, success(host_activity_sent())).await;
         };
-        let (read, ()) = beside(parts(&client, &reference, ask(false, None)), server).await;
-        assert_eq!(read, ["detail", "stack", "activity", "done"]);
+        let (mut read, ()) = beside(parts(&client, &reference, ask(false, None)), server).await;
+        // The stack and the conversation are read at once, so either answer can come first.
+        read[1..3].sort();
+        assert_eq!(read, ["detail", "activity", "stack", "done"]);
 
         // A read that keeps the details current reads no stack, as the desktop's live refresh
         // reads only the detail.
