@@ -368,6 +368,88 @@ diff --git a/two b/two
 }
 
 #[test]
+fn each_unfolded_file_is_laid_out_once_for_each_width() {
+    let first = "diff --git a/big.json b/big.json
+--- a/big.json
++++ b/big.json
+diff --git a/one b/one
+--- a/one
++++ b/one
+@@ -1 +1 @@
+-a
++b
+diff --git a/two b/two
+--- a/two
++++ b/two
+@@ -1 +1 @@
+-c
++d
+";
+    let later = "diff --git a/three b/three
+--- a/three
++++ b/three
+@@ -1 +1 @@
+-e
++f
+";
+    let mut code = read(slice(first, Some("2")), 0);
+    code.act(Control::File(0));
+    code.act(Control::File(1));
+    let fresh = rows(&code, 40);
+    code.prepare(40, &theme());
+    // The rows the tab keeps are those it lays out afresh, and it shows those it keeps.
+    assert_eq!(rows(&code, 40), fresh);
+    let one = code.bodies[&(0, 1)].lines.as_ptr();
+    let kept = std::mem::replace(
+        &mut code.bodies.get_mut(&(0, 1)).unwrap().lines,
+        vec![Line::from("kept")],
+    );
+    assert!(rows(&code, 40).contains(&"kept".to_string()));
+    assert!(!rows(&code, 41).contains(&"kept".to_string()));
+    code.bodies.get_mut(&(0, 1)).unwrap().lines = kept;
+
+    // Unfolding another file, or the minute changing, lays out that file alone, and folding
+    // one forgets its rows.
+    code.act(Control::File(2));
+    code.act(Control::File(0));
+    code.prepare(40, &theme());
+    assert_eq!(code.bodies[&(0, 1)].lines.as_ptr(), one);
+    let mut kept: Vec<_> = code.bodies.keys().copied().collect();
+    kept.sort();
+    assert_eq!(kept, [(0, 1), (0, 2)]);
+    code.prepare(41, &theme());
+    assert_eq!(code.bodies[&(0, 1)].width, 41);
+
+    // A later slice keeps the rows of the files before it, unless it says the host withheld
+    // one of them.
+    code.act(Control::File(0));
+    code.prepare(41, &theme());
+    assert_eq!(rows_of(&code.bodies[&(0, 0)].lines), ["No lines changed."]);
+    let two = code.bodies[&(0, 2)].lines.as_ptr();
+    code.near_end();
+    assert_eq!(code.ask(2), Some(Some("2".to_string())));
+    let mut diff = slice(later, None);
+    diff.omitted = vec![pull_request::Omitted {
+        path: "big.json".into(),
+        additions: 5,
+        deletions: 0,
+    }];
+    assert_eq!(code.take(2, Ok(diff), 0), Some(false));
+    code.prepare(41, &theme());
+    assert_eq!(code.bodies[&(0, 2)].lines.as_ptr(), two);
+    assert_eq!(
+        rows_of(&code.bodies[&(0, 0)].lines),
+        ["The host withheld this file's changes."]
+    );
+
+    // A read again of the first slice lays out every file again.
+    code.again();
+    assert_eq!(code.ask(3), Some(None));
+    assert_eq!(code.take(3, Ok(slice(first, None)), 5), Some(true));
+    assert!(code.bodies.is_empty());
+}
+
+#[test]
 fn what_the_host_withheld_is_noted_and_counted() {
     // GitHub's file list sends a file too large to show as its header alone, with its counts
     // in `omittedFileStats` (gitHubPullRequestJson.ts:3229-3258).

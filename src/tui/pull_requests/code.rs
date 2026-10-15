@@ -15,8 +15,9 @@
 //! or before it for a removed line, as the desktop's stacked view has, and the unchanged lines
 //! between two hunks are counted on a row of their own.
 //!
-//! Only the files unfolded are laid out. Each line of them is cleaned of control characters,
-//! its tabs set every `TAB` columns, and cut at `LINE` characters as it is.
+//! Only the files unfolded are laid out, each once for each width. Each line of them is cleaned
+//! of control characters, its tabs set every `TAB` columns, and cut at `LINE` characters as it
+//! is.
 
 use std::collections::{HashMap, HashSet};
 
@@ -73,6 +74,20 @@ pub(super) struct Code {
     due: bool,
     /// The paths of the files unfolded, which stay unfolded when the diff is read again.
     open: HashSet<String>,
+    /// The rows of each unfolded file's lines, by its slice's place and its place in that
+    /// slice, so a file is laid out again only when its slice, the width or its fold changes.
+    bodies: HashMap<(usize, usize), Body>,
+    /// How many times a file's rows were laid out for `bodies`.
+    #[cfg(test)]
+    pub(super) builds: usize,
+}
+
+/// An unfolded file's rows, and what they were laid out for.
+struct Body {
+    width: usize,
+    /// Whether the host withheld part of the file, which adds a note.
+    withheld: bool,
+    lines: Vec<Line<'static>>,
 }
 
 /// A read of a slice under way.
@@ -102,6 +117,9 @@ impl Code {
             again: true,
             due: false,
             open: HashSet::new(),
+            bodies: HashMap::new(),
+            #[cfg(test)]
+            builds: 0,
         }
     }
 
@@ -160,6 +178,7 @@ impl Code {
             Ok(diff) => {
                 if asked.first {
                     self.slices.clear();
+                    self.bodies.clear();
                     self.at = now;
                 }
                 let patch = patch::Patch::read(&diff.patch);
@@ -275,6 +294,39 @@ impl Code {
         Some((&slice.diff.patch, &slice.patch.files[file]))
     }
 
+    /// Lays out at `width` the lines of each unfolded file not yet laid out for it, and forgets
+    /// those of the files folded, so `lay_out` builds only the files that changed.
+    pub(super) fn prepare(&mut self, width: usize, theme: &Theme) {
+        if width == 0 {
+            return;
+        }
+        let mut bodies = HashMap::new();
+        for &(at, place) in &self.files {
+            let slice = &self.slices[at];
+            let file = &slice.patch.files[place];
+            if !self.open.contains(file.path()) {
+                continue;
+            }
+            let withheld = self.omitted.contains_key(file.path());
+            let laid = match self.bodies.remove(&(at, place)) {
+                Some(laid) if laid.width == width && laid.withheld == withheld => laid,
+                _ => {
+                    #[cfg(test)]
+                    {
+                        self.builds += 1;
+                    }
+                    Body {
+                        width,
+                        withheld,
+                        lines: body(&slice.diff.patch, file, withheld, width, theme),
+                    }
+                }
+            };
+            bodies.insert((at, place), laid);
+        }
+        self.bodies = bodies;
+    }
+
     /// The tab's rows at `width`, with the rows of each file's header and of Retry. Until the
     /// first slice came, or when its read failed, it says so. Then the count of files, `+`
     /// while more are to be read, and a note when the host withheld part of the diff. Then each
@@ -341,7 +393,12 @@ impl Code {
             targets.push((start..lines.len(), Control::File(at)));
             if open {
                 let withheld = self.omitted.contains_key(file.path());
-                lines.extend(body(text, file, withheld, width, theme));
+                match self.bodies.get(&self.files[at]) {
+                    Some(laid) if laid.width == width && laid.withheld == withheld => {
+                        lines.extend(laid.lines.iter().cloned());
+                    }
+                    _ => lines.extend(body(text, file, withheld, width, theme)),
+                }
             }
         }
         if self.next_cursor().is_some() && !self.failed.as_ref().is_some_and(|(_, first)| *first) {

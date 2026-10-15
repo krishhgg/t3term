@@ -2291,6 +2291,9 @@ impl PullRequests {
                         if let (Tab::Summary, Answer::Read(summary)) = (tab, &mut read.answer) {
                             summary.lay_out(width, theme);
                         }
+                        if let (Tab::Code, Some(code)) = (tab, &mut read.code) {
+                            code.prepare(width, theme);
+                        }
                         if let Answer::Read(conversation) = &mut read.conversation {
                             match tab {
                                 Tab::Summary => conversation.lay_out(width, theme, &self.shown),
@@ -6257,6 +6260,14 @@ mod tests {
             rows.contains(&"⌄ A f0.rs +1 -0".to_string()) && rows.contains(&"1 + line 0".into())
         };
         assert!(unfolded(&mut pulls));
+        // The file unfolded is laid out once, and not again when the minute changes.
+        let builds = |pulls: &PullRequests| {
+            let code = pulls.read.as_ref().and_then(|read| read.code.as_ref());
+            code.map(|code| code.builds)
+        };
+        assert_eq!(builds(&pulls), Some(1));
+        pulls.page(40, 30, now() + 60_000, true, &theme);
+        assert_eq!(builds(&pulls), Some(1));
         let answer = |pulls: &mut PullRequests, ticket, detail: &Value, conversation| {
             let detail = Part::Detail(Ok(read_detail(detail)));
             assert!(!pulls.answer(ticket, detail, now()));
