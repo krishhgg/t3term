@@ -693,14 +693,16 @@ async fn read_pull_request(client: &Client, reference: &Reference, ask: &Ask, se
 }
 
 /// Reads the slice of the diff of the pull request `reference` names that `cursor` names, or the
-/// first, through T3's HTTP route, as the desktop's Code tab does. A sentence of T3's own, such
-/// as a host the server has no credentials for, reads as T3 wrote it, as for the detail.
+/// first, of the whole change or of the commit `commit` names, through T3's HTTP route, as the
+/// desktop's Code tab does. A sentence of T3's own, such as a host the server has no
+/// credentials for, reads as T3 wrote it, as for the detail.
 async fn read_diff(
     client: &Client,
     reference: &Reference,
     cursor: Option<&str>,
+    commit: Option<&str>,
 ) -> Result<Box<pull_request::Diff>, String> {
-    match pull_request::diff(&client.api, reference, cursor).await {
+    match pull_request::diff(&client.api, reference, cursor, commit).await {
         Ok(diff) => Ok(Box::new(diff)),
         Err(e @ PullRequestError::Rpc(_)) => Err(format!("Couldn't read this diff: {e}")),
         Err(e) => Err(e.to_string()),
@@ -1024,7 +1026,8 @@ impl App {
             read_diff: Box::new(move |reference, ask: DiffAsk| {
                 let (client, answers) = (differ.clone(), diffs.clone());
                 tokio::spawn(async move {
-                    let answer = read_diff(&client, &reference, ask.cursor.as_deref()).await;
+                    let (cursor, commit) = (ask.cursor.as_deref(), ask.commit.as_deref());
+                    let answer = read_diff(&client, &reference, cursor, commit).await;
                     let ticket = ask.ticket;
                     let _ = answers.send(ActionResult::PullRequestDiff { ticket, answer });
                 });
@@ -13512,8 +13515,16 @@ mod tests {
     }
 
     /// What a read of a pull request's diff named: the project, the host, the repository,
-    /// the number, the ticket and the cursor of the slice.
-    type NotedDiff = (String, String, String, u64, u64, Option<String>);
+    /// the number, the ticket, the cursor of the slice and the commit.
+    type NotedDiff = (
+        String,
+        String,
+        String,
+        u64,
+        u64,
+        Option<String>,
+        Option<String>,
+    );
 
     /// Replaces how `app` reads a pull request's diff, so a read only notes what it named.
     fn note_diffs(app: &mut App) -> std::rc::Rc<std::cell::RefCell<Vec<NotedDiff>>> {
@@ -13527,6 +13538,7 @@ mod tests {
                 reference.number(),
                 ask.ticket,
                 ask.cursor,
+                ask.commit,
             ));
         });
         asked
@@ -13726,6 +13738,7 @@ mod tests {
             named.3,
             named.4,
             named.5,
+            None,
         );
         assert_eq!(*diffs.borrow(), std::slice::from_ref(&named));
         let shown = status(&mut app);
@@ -13766,6 +13779,7 @@ mod tests {
             named.2.clone(),
             31,
             4,
+            None,
             None,
         );
         assert_eq!(*diffs.borrow(), [named.clone(), again.clone()]);
@@ -13860,6 +13874,96 @@ mod tests {
             (diffs.borrow().len(), next),
             (2, Some((3, Some("c2".into()))))
         );
+    }
+
+    #[test]
+    fn a_commit_picked_on_the_code_tab_reads_its_own_diff_through_the_links_project() {
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        let _asked = note_reads(&mut app);
+        let diffs = note_diffs(&mut app);
+        press(&mut app, KeyCode::Enter);
+        let mut activity = host_activity_sent();
+        activity["commits"] = json!([
+            {"oid": "1111111aaaa", "messageHeadline": "Read the schema first",
+                "committedDate": "2026-10-13T08:00:00Z"},
+            {"oid": "2222222bbbb", "messageHeadline": "Check the schema on reload",
+                "committedDate": "2026-10-13T09:00:00Z"},
+        ]);
+        let activity = pull_request::Activity::read(&activity).unwrap();
+        let parts = vec![
+            Part::Detail(Ok(Box::new(host_detail()))),
+            Part::Activity(Ok(Box::new(activity))),
+            Part::Done,
+        ];
+        hear(&mut app, 1, parts);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        let diff = pull_request::Diff {
+            patch: "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b\n".into(),
+            truncated: false,
+            next_cursor: None,
+            omitted: Vec::new(),
+            omitted_cut: false,
+        };
+        let answer = Ok(Box::new(diff.clone()));
+        app.on_action_result(ActionResult::PullRequestDiff { ticket: 2, answer });
+        let status = |app: &mut App| {
+            let buffer = cells(app, 200, 50);
+            text_in(&buffer, Rect::new(0, 49, 200, 1))
+        };
+        let rows = body_after(&mut app, 200, 50);
+        let text: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
+        assert_eq!(text[4..6], ["› All commits", "1 file"]);
+
+        // ↓ chooses the row, Enter opens the list, and Enter on a commit reads its diff.
+        press(&mut app, KeyCode::Down);
+        assert!(status(&mut app).contains("Enter choose commit · "));
+        press(&mut app, KeyCode::Enter);
+        let rows = body_after(&mut app, 200, 50);
+        let text: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
+        assert_eq!(text[4..6], ["⌄ All commits", "✓ All commits"]);
+        // The pane is narrow, so the headline is cut to keep the id.
+        assert_eq!(text[6], "Check the schema on… 2222222");
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        let shown = status(&mut app);
+        assert!(shown.contains("Enter show commit 2222222 · "), "{shown}");
+        press(&mut app, KeyCode::Enter);
+        let named = |ticket: u64, commit: Option<&str>| {
+            (
+                "p".to_string(),
+                "github.com".to_string(),
+                "krishhgg/t3term".to_string(),
+                31,
+                ticket,
+                None,
+                commit.map(str::to_string),
+            )
+        };
+        assert_eq!(diffs.borrow()[1..], [named(3, Some("2222222bbbb"))]);
+        let rows = body_after(&mut app, 200, 50);
+        let text: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
+        // The row wraps the commit's id under its headline.
+        assert_eq!(
+            text[4..7],
+            [
+                "› Check the schema on reload",
+                "2222222",
+                "Loading pull request diff…"
+            ]
+        );
+
+        // A click on either of its rows opens the list, and one on All commits reads the
+        // whole change again.
+        let answer = Ok(Box::new(diff));
+        app.on_action_result(ActionResult::PullRequestDiff { ticket: 3, answer });
+        cells(&mut app, 200, 50);
+        let body = app.details.drawn.expect("the pane").body;
+        assert!(mouse(&mut app, CLICK, body.x + 2, body.y + 5));
+        let rows = body_after(&mut app, 200, 50);
+        assert_eq!(rows[6].trim(), "All commits");
+        assert!(mouse(&mut app, CLICK, body.x + 4, body.y + 6));
+        assert_eq!(diffs.borrow()[2..], [named(4, None)]);
     }
 
     #[test]

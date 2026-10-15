@@ -1140,7 +1140,7 @@ mod diff {
         let answer = fake::response(status, &["location: http://127.0.0.1:1/"], body);
         let t3 = fake::Server::start(move |_| answer.clone());
         let api = Api::without_proxy(&t3.origin);
-        diff(&api, &reference(), None).await.unwrap_err()
+        diff(&api, &reference(), None, None).await.unwrap_err()
     }
 
     fn http(error: PullRequestError) -> String {
@@ -1164,7 +1164,7 @@ mod diff {
         let answer = fake::response("200 OK", &[], &body.to_string());
         let t3 = fake::Server::start(move |_| answer.clone());
         let api = Api::without_proxy(&t3.origin);
-        let first = diff(&api, &reference(), None).await.unwrap();
+        let first = diff(&api, &reference(), None, None).await.unwrap();
         assert_eq!(
             first,
             Diff {
@@ -1186,10 +1186,17 @@ mod diff {
                 omitted_cut: false,
             }
         );
-        diff(&api, &reference(), first.next_cursor.as_deref())
+        diff(&api, &reference(), first.next_cursor.as_deref(), None)
             .await
             .unwrap();
-        assert_eq!(t3.paths(), [DIFF, DIFF]);
+        // A commit's own diff names it, beside the cursor of its own next slice.
+        diff(&api, &reference(), None, Some("abc1234def"))
+            .await
+            .unwrap();
+        diff(&api, &reference(), Some("3"), Some("abc1234def"))
+            .await
+            .unwrap();
+        assert_eq!(t3.paths(), [DIFF, DIFF, DIFF, DIFF]);
         let bodies: Vec<Value> = t3
             .bodies()
             .iter()
@@ -1197,7 +1204,11 @@ mod diff {
             .collect();
         let mut next = reference().payload();
         next["cursor"] = json!("2");
-        assert_eq!(bodies, [reference().payload(), next]);
+        let mut commit = reference().payload();
+        commit["commit"] = json!("abc1234def");
+        let mut commit_next = commit.clone();
+        commit_next["cursor"] = json!("3");
+        assert_eq!(bodies, [reference().payload(), next, commit, commit_next]);
     }
 
     #[test]
@@ -1321,7 +1332,7 @@ mod diff {
 
         let t3 = fake::Server::start(|_| String::new());
         let api = Api::without_proxy(&t3.origin);
-        let error = http(diff(&api, &reference(), None).await.unwrap_err());
+        let error = http(diff(&api, &reference(), None, None).await.unwrap_err());
         assert!(
             error.starts_with("t3term couldn't read the diff from T3: "),
             "{error}"
@@ -1339,9 +1350,9 @@ mod diff {
         for answer in [sized, streamed] {
             let t3 = fake::Server::start(move |_| answer.clone());
             let api = Api::without_proxy(&t3.origin);
-            let read = read_diff(&api, &reference(), None, body.len()).await;
+            let read = read_diff(&api, &reference(), None, None, body.len()).await;
             assert_eq!(read.unwrap().patch, "0123456789");
-            let error = read_diff(&api, &reference(), None, body.len() - 1).await;
+            let error = read_diff(&api, &reference(), None, None, body.len() - 1).await;
             assert_eq!(
                 http(error.unwrap_err()),
                 "The diff is longer than the 16 MiB t3term reads."
