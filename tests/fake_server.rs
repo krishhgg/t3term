@@ -1055,7 +1055,7 @@ async fn chunks_the_caller_holds_count_toward_the_limit_until_it_accepts_them() 
     // c arrived before d, so the stream returns it before the reason it stopped.
     let c = next_chunk(&mut stream).await;
     let reason = stopped(&mut stream).await;
-    assert_eq!(reason, "a chunk would go over the 2-chunk limit");
+    assert_eq!(reason, "a chunk would go over the limit of 2 chunks");
     assert!(end(&mut stream).await.is_none());
 
     // Chunks accepted after the stop keep their values and send nothing. Neither does a chunk
@@ -1084,15 +1084,17 @@ async fn a_chunk_counts_the_bytes_of_its_whole_message_as_t3_writes_it() {
     assert_eq!(json!(held.values()), values);
     // While it is held, even an empty chunk, 44 bytes as T3 writes it, goes over.
     send(&mut socket, chunk(&exact_id, json!([]))).await;
-    let over =
-        format!("a 44-byte chunk would take {size} unaccepted bytes past the {size}-byte limit");
+    let over = format!(
+        "a chunk of 44 bytes on top of the {size} bytes not yet accepted would go over the limit \
+         of {size} bytes"
+    );
     assert_eq!(stopped(&mut exact).await, over);
     assert_eq!(within(recv(&mut socket)).await, interrupt(&exact_id));
 
     // With a byte less, the same chunk is over the limit by itself.
     let (mut short, short_id) = open(&rpc, &mut socket, limits(4, size - 1)).await;
     send_text(&mut socket, wide_chunk(&short_id)).await;
-    let alone = format!("a chunk was over the {}-byte limit by itself", size - 1);
+    let alone = format!("a chunk was over the limit of {} bytes by itself", size - 1);
     assert_eq!(stopped(&mut short).await, alone);
     assert_eq!(within(recv(&mut socket)).await, interrupt(&short_id));
 
@@ -1279,5 +1281,5 @@ async fn a_full_or_stopped_bounded_stream_holds_up_nothing_else_on_its_socket() 
     // The bounded stream still returns the chunk it held, then the reason it stopped.
     assert_eq!(accept_next(&mut bounded).await, [json!("held")]);
     let reason = stopped(&mut bounded).await;
-    assert_eq!(reason, "a chunk would go over the 1-chunk limit");
+    assert_eq!(reason, "a chunk would go over the limit of 1 chunk");
 }

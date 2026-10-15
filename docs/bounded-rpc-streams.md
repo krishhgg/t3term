@@ -32,7 +32,7 @@ An Ack names the request, not the chunk, and T3's window frees its oldest chunk 
 
 ## How a stream stops
 
-The connection's reader never waits for a stream's caller. If a chunk would take the stream over either limit, or is over the byte limit by itself, t3term stops the stream. It sends T3 an `Interrupt`, forgets the request, and drops that chunk and anything T3 sends after it. A `Chunk` without a `values` array stops the stream the same way. So does a chunk the caller drops without accepting, since its values are gone and what follows would have a gap. The other calls and streams on the socket, and its pings, carry on.
+The connection's reader never waits for a stream's caller. If a chunk would take the stream over either limit, or is over the byte limit by itself, t3term stops the stream. It sends T3 an `Interrupt`, forgets the request, and drops that chunk and anything T3 sends after it. A `Chunk` without a `values` array stops the stream the same way. So does a chunk the caller drops without accepting, since its values are gone and what follows would have a gap. The other calls and streams on the socket, and its pings, carry on. The stop's reason gives each size in whole MiB or KiB where it divides evenly and in bytes otherwise, as in `a chunk of 44 bytes on top of the 56 MiB not yet accepted would go over the limit of 56 MiB`.
 
 An end never needs room in the stream, so it reaches a full one. However a stream ends, `next` returns the chunks already queued, in order, then how it ended, then `None` from then on.
 
