@@ -494,9 +494,10 @@ pub(super) fn lines(
 }
 
 /// `left`'s pieces two columns apart with `right` at the end of the row, when they fit in
-/// `width`. Otherwise each piece on rows of its own, wrapped to every row it takes.
+/// `width`. Otherwise the first piece takes rows of its own, wrapped to every row it takes, and
+/// the rest fit the same way on the rows under it.
 fn fitted(
-    left: Vec<(String, Style)>,
+    mut left: Vec<(String, Style)>,
     right: Option<(String, Style)>,
     width: usize,
 ) -> Vec<Line<'static>> {
@@ -516,10 +517,13 @@ fn fitted(
             None => vec![Line::from(spans)],
         };
     }
-    left.into_iter()
-        .chain(right)
-        .flat_map(|(text, style)| whole(&text, width, style))
-        .collect()
+    if left.is_empty() {
+        return right.map_or_else(Vec::new, |(text, style)| whole(&text, width, style));
+    }
+    let (text, style) = left.remove(0);
+    let mut lines = whole(&text, width, style);
+    lines.extend(fitted(left, right, width));
+    lines
 }
 
 /// How long before `now` the moment `then` was, as the desktop's `formatRelativeTimeLabel`

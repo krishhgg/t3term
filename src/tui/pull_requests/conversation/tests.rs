@@ -295,6 +295,14 @@ fn a_remark_shows_its_author_time_verdict_place_and_text() {
         "  On the file.".to_string(),
     ];
     assert_eq!(rows, expected);
+
+    // Too narrow for the whole header: the author takes a row and the rest fit under it.
+    let split = review("r", "mona", "CHANGES_REQUESTED", "Please split this.");
+    let (_, rows) = section(conversation_of(&activity(vec![split], vec![], vec![])), 24);
+    assert_eq!(
+        rows,
+        ["mona", "Changes requested 5m ago", "  Please split this."]
+    );
 }
 
 #[test]
