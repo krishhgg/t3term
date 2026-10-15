@@ -81,7 +81,10 @@ impl Thread {
     }
 
     /// Takes from `old`, the same thread as the conversation read before had it, the remarks
-    /// its pages read that this doesn't have, and where the next page and its read are.
+    /// its pages read that this doesn't have, and where the next page and its read are. Where
+    /// its pages ran out and the host now counts more remarks than it holds, as after a reply,
+    /// this read's own cursor reads on, and the remarks it holds are skipped, as the desktop
+    /// reopens the cursor after a reply (PullRequestReviewAnnotation.tsx:175-182).
     pub(super) fn carry(&mut self, old: &mut Thread) {
         if old.paged {
             let have: HashSet<&str> = self.remarks.iter().map(|r| r.id.as_str()).collect();
@@ -91,9 +94,11 @@ impl Thread {
                 .filter(|remark| !have.contains(remark.id.as_str()))
                 .take(room)
                 .collect();
-            let full = self.remarks.len() + loaded.len() >= MOST_THREAD_COMMENTS;
+            let held = self.remarks.len() + loaded.len();
+            let full = held >= MOST_THREAD_COMMENTS;
             self.loaded = loaded;
-            self.next = old.next.take().filter(|_| !full);
+            let fresh = self.next.take().filter(|_| self.count > held as u64);
+            self.next = old.next.take().or(fresh).filter(|_| !full);
             self.paged = true;
         }
         self.more = std::mem::take(&mut old.more);
