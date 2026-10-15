@@ -6953,6 +6953,28 @@ mod tests {
             lines(&mut pulls),
             ["1 -", "1 + efghijklmnopqrstuvwxyzabcdefghijklmn"]
         );
+        // Where the last frame showed another link's details, their lines don't hold it back,
+        // and the next frame of this link's does.
+        pulls.detail.as_mut().expect("the details").index = 1;
+        pulls.sideways(true);
+        pulls.sideways(true);
+        assert_eq!(pulls.across, 44);
+        pulls.page(40, 30, now(), true, &theme);
+        assert_eq!(pulls.across, 24);
+        // On a page one column wide, a step is a column.
+        pulls.page(1, 30, now(), true, &theme);
+        pulls.sideways(false);
+        assert_eq!(pulls.across, 23);
+        pulls.page(40, 30, now(), true, &theme);
+        pulls.wheel_sideways(false);
+        pulls.wheel_sideways(false);
+        pulls.wheel_sideways(false);
+        pulls.wheel_sideways(false);
+        pulls.wheel_sideways(false);
+        assert_eq!(pulls.across, 3);
+        pulls.sideways(false);
+        pulls.wheel_sideways(true);
+        assert_eq!(pulls.across, 4);
 
         // The other tabs neither scroll it nor lose it.
         assert!(pulls.back() && pulls.back());
@@ -6968,6 +6990,11 @@ mod tests {
         assert_eq!(pulls.across, 4);
         pulls.page(70, 30, now(), true, &theme);
         assert_eq!(pulls.across, 0);
+        assert!(!pulls.slides());
+        // The line's row is 64 columns wide, so it scrolls on a page of 63 and not of 64.
+        pulls.page(63, 30, now(), true, &theme);
+        assert!(pulls.slides());
+        pulls.page(64, 30, now(), true, &theme);
         assert!(!pulls.slides());
         pulls.wheel_sideways(true);
         pulls.page(40, 30, now(), true, &theme);
@@ -6991,6 +7018,41 @@ mod tests {
         pulls.page(40, 30, now(), true, &theme);
         pulls.pick = Some(Control::Commit(0));
         pulls.enter();
+        assert_eq!(pulls.across, 0);
+        let ask = pulls
+            .take_diff_ask(true, now())
+            .expect("the commit's slice");
+        assert!(pulls.answer_diff(ask.ticket, Ok(diff()), now()));
+        pulls.pick = Some(Control::Folds);
+        pulls.enter();
+        lines(&mut pulls);
+        pulls.sideways(true);
+        assert_eq!(pulls.across, 20);
+        // The same commit opened from the Timeline keeps it, as it keeps the Code's place.
+        assert!(pulls.back());
+        pulls.pick = Some(Control::TimelineCommit(0));
+        pulls.enter();
+        assert_eq!(pulls.tabs(), Some(Tab::Code));
+        assert_eq!(pulls.across, 20);
+        // Opened while the Code shows the whole change, the commit's diff starts at the left.
+        pulls.pick = Some(Control::Commits);
+        pulls.enter();
+        pulls.page(40, 30, now(), true, &theme);
+        pulls.pick = Some(Control::AllCommits);
+        pulls.enter();
+        let ask = pulls
+            .take_diff_ask(true, now())
+            .expect("the whole change's slice");
+        assert!(pulls.answer_diff(ask.ticket, Ok(diff()), now()));
+        pulls.pick = Some(Control::Folds);
+        pulls.enter();
+        lines(&mut pulls);
+        pulls.sideways(true);
+        assert_eq!(pulls.across, 20);
+        assert!(pulls.back());
+        pulls.pick = Some(Control::TimelineCommit(0));
+        pulls.enter();
+        assert_eq!(pulls.tabs(), Some(Tab::Code));
         assert_eq!(pulls.across, 0);
         let ask = pulls
             .take_diff_ask(true, now())

@@ -195,8 +195,6 @@ struct Body {
     width: usize,
     /// Whether the host withheld part of the file, which adds a note.
     withheld: bool,
-    /// Whether its lines wrap.
-    wrap: bool,
     lines: Vec<Line<'static>>,
     /// While its lines don't wrap, the rows they take, which scroll sideways past the first
     /// `lead` columns, those of the numbers and the marks.
@@ -209,10 +207,9 @@ struct Body {
 }
 
 impl Body {
-    /// Whether it was laid out at `width`, for a file whose changes the host withheld or not,
-    /// and with its lines wrapped or not.
-    fn fits(&self, width: usize, withheld: bool, wrap: bool) -> bool {
-        (self.width, self.withheld, self.wrap) == (width, withheld, wrap)
+    /// Whether it was laid out at `width`, for a file whose changes the host withheld or not.
+    fn fits(&self, width: usize, withheld: bool) -> bool {
+        (self.width, self.withheld) == (width, withheld)
     }
 }
 
@@ -1054,7 +1051,7 @@ impl Code {
             }
             let withheld = self.omitted.contains_key(file.path());
             let laid = match self.bodies.remove(&(at, place)) {
-                Some(laid) if laid.fits(width, withheld, self.wrap) => laid,
+                Some(laid) if laid.fits(width, withheld) => laid,
                 _ => {
                     #[cfg(test)]
                     {
@@ -1286,7 +1283,7 @@ impl Code {
                 let withheld = self.omitted.contains_key(file.path());
                 let fresh;
                 let laid = match self.bodies.get(&self.files[at]) {
-                    Some(laid) if laid.fits(width, withheld, self.wrap) => laid,
+                    Some(laid) if laid.fits(width, withheld) => laid,
                     _ => {
                         let (slice, place) = self.files[at];
                         let print = self.slices[slice].prints[place];
@@ -1630,7 +1627,6 @@ fn body(
         return Body {
             width,
             withheld,
-            wrap,
             lines: whole(note, width, muted),
             slides,
             lead: 0,
@@ -1770,7 +1766,6 @@ fn body(
     Body {
         width,
         withheld,
-        wrap,
         lines,
         slides,
         lead,

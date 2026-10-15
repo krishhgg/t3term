@@ -619,6 +619,10 @@ fn the_lines_left_unwrapped_stay_so_through_reads_and_commits() {
     assert_eq!(shown[at - 1], "1 - a");
     assert_eq!(slid.runs.last(), Some(&(at - 1..at + 1, 4)));
     assert_eq!(slid.runs.len(), 2);
+    // The widest is the first file's, wider than the later one's.
+    let long = "10 + let long = \"a line that runs on well past forty columns\";";
+    assert!(shown.iter().any(|row| row == long));
+    assert_eq!(slid.widest, long.width());
 
     // A read again and another diff picked from the commits keep it, as the desktop's toggle
     // lives in the tab and not in the diff picked.
