@@ -574,62 +574,109 @@ fn instant(text: &str) -> Option<i64> {
 }
 
 /// `text` without its HTML comments, which review bots keep their bookkeeping in and the
-/// desktop's Markdown renderer drops. A comment inside a fenced code block stays, since it is
-/// part of the code shown.
+/// desktop's Markdown renderer drops (rehype-sanitize in ChatMarkdown.tsx). A comment inside
+/// code stays, since it is part of the code shown: a fenced code block, or a code span, which
+/// CommonMark reads before a comment when its backticks come first.
 fn without_html_comments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut fence: Option<(char, usize)> = None;
     let mut in_comment = false;
-    for line in text.split_inclusive('\n') {
-        if !in_comment {
-            match (fence, fence_of(line)) {
-                // A backtick fence's info string can't hold a backtick, or it is inline code.
-                (None, Some((mark, length, info))) if mark == '~' || !info.contains('`') => {
-                    fence = Some((mark, length));
-                    out.push_str(line);
-                    continue;
+    let mut at = 0;
+    while at < text.len() {
+        let rest = &text[at..];
+        if in_comment {
+            let Some(end) = rest.find("-->") else {
+                break;
+            };
+            at += end + 3;
+            in_comment = false;
+            continue;
+        }
+        if at == 0 || text.as_bytes()[at - 1] == b'\n' {
+            let line = rest.split_inclusive('\n').next().unwrap_or(rest);
+            let ends = |(mark, length, after): (char, usize, &str)| {
+                fence.is_some_and(|(open, opened)| {
+                    mark == open && length >= opened && after.trim().is_empty()
+                })
+            };
+            let inside = match fence {
+                None => {
+                    fence = opens_fence(line);
+                    fence.is_some()
                 }
                 // Only its own mark, at least as long and with nothing after it, closes a fence.
-                (Some((open, opened)), Some((mark, length, rest)))
-                    if mark == open && length >= opened && rest.trim().is_empty() =>
-                {
-                    fence = None;
-                    out.push_str(line);
-                    continue;
+                Some(_) => {
+                    if fence_of(line).is_some_and(ends) {
+                        fence = None;
+                    }
+                    true
                 }
-                (Some(_), _) => {
-                    out.push_str(line);
-                    continue;
-                }
-                _ => {}
+            };
+            if inside {
+                out.push_str(line);
+                at += line.len();
+                continue;
             }
         }
-        let mut rest = line;
-        loop {
-            if in_comment {
-                match rest.find("-->") {
-                    Some(end) => {
-                        rest = &rest[end + 3..];
-                        in_comment = false;
-                    }
-                    None => break,
-                }
-            } else {
-                match rest.find("<!--") {
-                    Some(start) => {
-                        out.push_str(&rest[..start]);
-                        rest = &rest[start + 4..];
-                        in_comment = true;
-                    }
-                    None => {
-                        out.push_str(rest);
-                        break;
-                    }
-                }
+        let mut chars = rest.chars();
+        let first = chars.next().unwrap_or_default();
+        let taken = match first {
+            // An escaped backtick or bracket opens nothing.
+            '\\' => chars
+                .next()
+                .filter(char::is_ascii_punctuation)
+                .map_or(1, |escaped| 1 + escaped.len_utf8()),
+            '`' => {
+                let run = rest.len() - rest.trim_start_matches('`').len();
+                code_span(rest, run).unwrap_or(run)
             }
-        }
+            '<' if rest.starts_with("<!--") => {
+                in_comment = true;
+                at += 4;
+                continue;
+            }
+            other => other.len_utf8(),
+        };
+        out.push_str(&rest[..taken]);
+        at += taken;
     }
     out
+}
+
+/// The length of the code span `text` starts with, through the run of exactly `run` backticks
+/// that closes it later in the same paragraph, as CommonMark reads one. None when nothing
+/// closes it, so its backticks are text. A blank line or a fence ends the paragraph.
+fn code_span(text: &str, run: usize) -> Option<usize> {
+    let mut at = run;
+    for (index, line) in text[run..].split_inclusive('\n').enumerate() {
+        if index > 0 && (line.trim().is_empty() || opens_fence(line).is_some()) {
+            return None;
+        }
+        let bytes = line.as_bytes();
+        let mut end = 0;
+        while end < bytes.len() {
+            if bytes[end] != b'`' {
+                end += 1;
+                continue;
+            }
+            let start = end;
+            while bytes.get(end) == Some(&b'`') {
+                end += 1;
+            }
+            if end - start == run {
+                return Some(at + end);
+            }
+        }
+        at += line.len();
+    }
+    None
+}
+
+/// The mark and length of the code fence `line` opens, if it opens one.
+fn opens_fence(line: &str) -> Option<(char, usize)> {
+    let (mark, length, info) = fence_of(line)?;
+    // A backtick fence's info string can't hold a backtick, or it is inline code.
+    (mark == '~' || !info.contains('`')).then_some((mark, length))
 }
 
 /// The mark, the length and the rest of a code fence `line` starts with: three or more of the
