@@ -898,7 +898,8 @@ struct Read {
     /// When its last read was asked for, which `LIVE` counts from.
     asked: i64,
     /// Set when the read again that `again` wants only keeps the details current, so it reads
-    /// the detail, and the conversation only once the detail changed.
+    /// the detail, and the conversation only once the detail changed. It reads both when
+    /// either answer failed or the last read missed one.
     live: bool,
 }
 
@@ -1534,8 +1535,11 @@ impl PullRequests {
             read.at = now;
         } else if read.again && showing {
             read.again = false;
-            if std::mem::take(&mut read.live)
-                && let Answer::Read(summary) = &read.answer
+            // Only answers that both came and that the last read missed nothing of are kept,
+            // as a failure is never reused.
+            let live = std::mem::take(&mut read.live) && !read.missed;
+            if live
+                && let (Answer::Read(summary), Answer::Read(_)) = (&read.answer, &read.conversation)
             {
                 updated = Some(summary.updated.clone());
             }
@@ -1676,15 +1680,17 @@ impl PullRequests {
     }
 
     /// Reads the detail the details show again once `live_at` is past at `now`, unless the
-    /// last key, click or wheel at `input` came `IDLE` or more before then, as the desktop
-    /// stops its interval for a reader who left. The next one then reads it at once. The read
-    /// reads the conversation again only when the detail's `updatedAt` changed, as the
-    /// desktop does (PullRequestDetailPanel.tsx:836-856). Says whether it wants a read.
+    /// last key, click or wheel at `input` came `IDLE` or more before `now`, as the desktop
+    /// stops its interval for a reader who left and checks it against the time it runs. A Mac
+    /// that slept past `live_at` so reads nothing on waking, and the next key reads it at
+    /// once. The read reads the conversation again only when the detail's `updatedAt`
+    /// changed, as the desktop does (PullRequestDetailPanel.tsx:836-856). Says whether it
+    /// wants a read.
     pub fn live(&mut self, now: i64, input: i64) -> bool {
         let Some(due) = self.live_at() else {
             return false;
         };
-        if now < due || due.saturating_sub(input) >= IDLE {
+        if now < due || now.saturating_sub(input) >= IDLE {
             return false;
         }
         self.read_live(now)
@@ -4198,8 +4204,10 @@ mod tests {
         assert_eq!(pulls.live_at(), Some(t0 + LIVE));
 
         // Five minutes after it was asked for, with a key a minute ago, the detail is read
-        // again with the `updatedAt` it showed.
+        // again with the `updatedAt` it showed. Waking from a sleep twenty minutes past that
+        // key reads nothing.
         assert!(!pulls.live(t0 + LIVE - 1, t0 + LIVE - 60_000));
+        assert!(!pulls.live(t0 + LIVE + 19 * 60_000, t0 + LIVE - 60_000));
         assert!(pulls.live(t0 + LIVE, t0 + LIVE - 60_000));
         let t1 = t0 + LIVE;
         let updated = Some("2026-10-13T11:00:00Z".to_string());
@@ -4263,6 +4271,74 @@ mod tests {
     }
 
     #[test]
+    fn a_read_that_keeps_details_current_reads_a_conversation_that_failed_again() {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![link(
+            "krishhgg/t3term",
+            31,
+            "a",
+            "b",
+        )])));
+        let detail = |updated: &str| {
+            let mut detail = bare_detail();
+            detail["updatedAt"] = json!(updated);
+            Part::Detail(Ok(read_detail(&detail)))
+        };
+        let remark = |body: &str| {
+            let mut activity = bare_activity();
+            activity["comments"] = json!([{"id": body, "kind": "issue-comment",
+                "author": {"login": "mona", "name": null}, "body": body,
+                "createdAt": "2026-10-13T09:00:00Z", "url": null, "path": null,
+                "reviewState": null}]);
+            activity["commentCount"] = json!(1);
+            let activity = pull_request::Activity::read(&activity).unwrap();
+            Part::Activity(Ok(Box::new(activity)))
+        };
+        let timed_out = || Part::Activity(Err("timed out".into()));
+        let live = |pulls: &mut PullRequests, at: i64| {
+            assert!(pulls.live(at, at));
+            let ask = pulls.take_ask(true, at).expect("a read again");
+            (ask.ticket, ask.updated)
+        };
+        let t0 = now();
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(true, t0).map(|ask| ask.ticket), Some(1));
+        pulls.answer(1, detail("2026-10-13T11:00:00Z"), t0);
+        pulls.answer(1, timed_out(), t0);
+        pulls.answer(1, Part::Done, t0);
+
+        // A first read whose conversation failed reads it again with the detail.
+        let t1 = t0 + LIVE;
+        assert_eq!(live(&mut pulls, t1), (2, None));
+        pulls.answer(2, detail("2026-10-13T11:00:00Z"), t1);
+        pulls.answer(2, remark("First."), t1);
+        pulls.answer(2, Part::Done, t1);
+
+        // A detail that changed and a conversation that then failed keep the last conversation
+        // beside the new detail.
+        let t2 = t1 + LIVE;
+        let shown = Some("2026-10-13T11:00:00Z".to_string());
+        assert_eq!(live(&mut pulls, t2), (3, shown));
+        pulls.answer(3, detail("2026-10-13T12:00:00Z"), t2);
+        pulls.answer(3, timed_out(), t2);
+        pulls.answer(3, Part::Done, t2);
+        pulls.page(44, 60, t2, true, &theme());
+        let rows = detail_rows(&pulls);
+        assert!(rows.iter().any(|row| row.trim() == "First."), "{rows:#?}");
+
+        // The next read reads both, though the detail shown is the newest, and once both came
+        // the one after reads the detail alone again.
+        let t3 = t2 + LIVE;
+        assert_eq!(live(&mut pulls, t3), (4, None));
+        pulls.answer(4, detail("2026-10-13T12:00:00Z"), t3);
+        pulls.answer(4, remark("Second."), t3);
+        pulls.answer(4, Part::Done, t3);
+        let t4 = t3 + LIVE;
+        let shown = Some("2026-10-13T12:00:00Z".to_string());
+        assert_eq!(live(&mut pulls, t4), (5, shown));
+    }
+
+    #[test]
     fn coming_back_to_t3term_reads_the_details_again_unless_read_ten_seconds_ago() {
         let mut pulls = PullRequests::default();
         pulls.set(list_of(&thread(vec![link(
@@ -4279,6 +4355,8 @@ mod tests {
         let mut detail = bare_detail();
         detail["updatedAt"] = json!("2026-10-13T11:00:00Z");
         pulls.answer(1, Part::Detail(Ok(read_detail(&detail))), t0);
+        let activity = pull_request::Activity::read(&bare_activity()).unwrap();
+        pulls.answer(1, Part::Activity(Ok(Box::new(activity))), t0);
         pulls.answer(1, Part::Done, t0);
 
         // Well before the five minutes, coming back reads the detail again, though not within
