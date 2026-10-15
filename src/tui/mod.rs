@@ -1134,6 +1134,12 @@ impl App {
             _ => None,
         };
         let enabled = project.is_some() && self.environment_can("pullRequests");
+        // A read that waits goes once its details don't show.
+        let shown = self.details.shows_pulls();
+        self.details.pulls.shown(shown);
+        if !shown {
+            return;
+        }
         // The last frame's time can be long past, and a test can move it on.
         let now = now_ms().max(self.now);
         let Some(ask) = self.details.pulls.take_ask(enabled, now) else {
@@ -1142,9 +1148,10 @@ impl App {
         let project = project.unwrap_or_default();
         match Reference::new(&project, Some(&ask.host), &ask.repository, ask.number) {
             Ok(reference) => (self.read_pull)(reference, ask.ticket),
-            Err(failure) => self
-                .details
-                .answer_pull(ask.ticket, Err(failure.to_string())),
+            Err(failure) => {
+                let failure = Err(failure.to_string());
+                self.details.answer_pull(ask.ticket, failure, now);
+            }
         }
     }
 
@@ -2141,7 +2148,8 @@ impl App {
                 }
             }
             ActionResult::PullRequest { ticket, answer } => {
-                self.details.answer_pull(ticket, answer);
+                let now = now_ms().max(self.now);
+                self.details.answer_pull(ticket, answer, now);
                 // A link opened while that read was under way is asked for now.
                 self.read_opened_pull();
             }
@@ -13259,6 +13267,46 @@ mod tests {
         assert_eq!(asked.borrow().len(), 4);
         press(&mut app, KeyCode::Enter);
         assert_eq!(asked.borrow().last(), Some(&ask(5)));
+
+        // A link that waits goes when the pane closes, so #31's answer asks for nothing, and
+        // opening the pane on its details again asks for it.
+        let numbers = |asked: &std::cell::RefCell<Vec<Noted>>| {
+            let asked = asked.borrow();
+            asked.iter().map(|ask| (ask.3, ask.4)).collect::<Vec<_>>()
+        };
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        alt(&mut app, 'b');
+        assert!(!app.details.open);
+        app.on_action_result(ActionResult::PullRequest {
+            ticket: 5,
+            answer: Ok(Box::new(host_detail())),
+        });
+        assert_eq!(asked.borrow().len(), 5);
+        alt(&mut app, 'b');
+        assert_eq!(numbers(&asked).last(), Some(&(32, 6)));
+
+        // So does one that waits when the Thread tab shows. A click on the tab's name puts
+        // the keyboard back in the pane.
+        cells(&mut app, 200, 50);
+        let tabs = app.details.drawn.expect("the pane").tabs;
+        assert!(mouse(&mut app, CLICK, tabs[1].x, tabs[1].y));
+        cells(&mut app, 200, 50);
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(asked.borrow().len(), 6);
+        cells(&mut app, 200, 50);
+        assert!(mouse(&mut app, CLICK, tabs[0].x, tabs[0].y));
+        app.on_action_result(ActionResult::PullRequest {
+            ticket: 6,
+            answer: Ok(Box::new(host_detail())),
+        });
+        assert_eq!(asked.borrow().len(), 6);
+        cells(&mut app, 200, 50);
+        assert!(mouse(&mut app, CLICK, tabs[1].x, tabs[1].y));
+        assert_eq!(numbers(&asked).last(), Some(&(31, 7)));
     }
 
     #[test]

@@ -807,8 +807,10 @@ struct Read {
     /// The read's ticket, once it was asked for. A read waits without one while another is
     /// under way.
     ticket: Option<u64>,
-    /// The time it was asked for, or wanted while it waits.
-    asked: i64,
+    /// The time its answer came, which `FRESH` and the age the details show count from, as
+    /// the desktop's `Atom.swr` counts from its result's timestamp. Until then, the time it
+    /// was asked for, or wanted while it waits.
+    at: i64,
     answer: Answer,
 }
 
@@ -825,7 +827,7 @@ impl Read {
     fn stands(&self, now: i64) -> bool {
         match self.answer {
             Answer::Reading => true,
-            Answer::Read(_) => now.saturating_sub(self.asked) < FRESH,
+            Answer::Read(_) => now.saturating_sub(self.at) < FRESH,
             Answer::Failed(_) => false,
         }
     }
@@ -1179,7 +1181,7 @@ impl PullRequests {
         let read = self.read.as_mut().filter(|read| read.ticket.is_none())?;
         self.tickets += 1;
         read.ticket = Some(self.tickets);
-        read.asked = now;
+        read.at = now;
         self.running = read.ticket;
         Some(Ask {
             ticket: self.tickets,
@@ -1205,27 +1207,41 @@ impl PullRequests {
             repository: entry.ask_repository.clone(),
             number: entry.number,
             ticket: None,
-            asked: now,
+            at: now,
             answer: Answer::Reading,
         });
         self.relay();
     }
 
-    /// Drops a read that waits to be asked for, once nothing shows it or it can't be asked.
-    fn unqueue(&mut self) {
-        if self.read.as_ref().is_some_and(|read| read.ticket.is_none()) {
-            self.read = None;
-            self.relay();
+    /// Notes whether the details show the pull requests' tab. Once they don't, as when the
+    /// pane closes or the Thread tab shows, a read that waits to be asked for is dropped, so no
+    /// host is asked for a link nobody looks at, and showing them again wants it again.
+    pub fn shown(&mut self, shown: bool) {
+        if !shown && self.unqueue() {
+            self.asking = true;
         }
     }
 
-    /// Takes the answer to read `ticket`: the pull request's detail, or why the read failed.
-    /// Says whether it is the read the details wait for. An answer to an earlier read, or to a
-    /// read of another thread's link, is dropped. Either way, another read can be asked for.
+    /// Drops a read that waits to be asked for, once nothing shows it or it can't be asked.
+    /// Says whether there was one.
+    fn unqueue(&mut self) -> bool {
+        if self.read.as_ref().is_some_and(|read| read.ticket.is_none()) {
+            self.read = None;
+            self.relay();
+            return true;
+        }
+        false
+    }
+
+    /// Takes the answer to read `ticket`, which came at `now`: the pull request's detail, or
+    /// why the read failed. Says whether it is the read the details wait for. An answer to an
+    /// earlier read, or to a read of another thread's link, is dropped. Either way, another
+    /// read can be asked for.
     pub fn answer(
         &mut self,
         ticket: u64,
         answer: Result<Box<pull_request::Detail>, String>,
+        now: i64,
     ) -> bool {
         if self.running == Some(ticket) {
             self.running = None;
@@ -1238,7 +1254,10 @@ impl PullRequests {
             return false;
         };
         read.answer = match answer {
-            Ok(detail) => Answer::Read(Box::new(Summary::of(&detail))),
+            Ok(detail) => {
+                read.at = now;
+                Answer::Read(Box::new(Summary::of(&detail)))
+            }
             Err(failure) => Answer::Failed(bounded(&failure, FAILURE)),
         };
         self.relay();
@@ -1944,7 +1963,7 @@ fn host_lines(
         }
         Answer::Read(summary) => summary,
     };
-    let at = match age(read.asked, now).as_str() {
+    let at = match age(read.at, now).as_str() {
         "now" => "just now".to_string(),
         ago => format!("{ago} ago"),
     };
@@ -3150,7 +3169,7 @@ mod tests {
         pulls.set(list_of(&thread(vec![link])));
         pulls.toggle();
         let ask = pulls.take_ask(true, now()).expect("a read");
-        assert!(pulls.answer(ask.ticket, answer));
+        assert!(pulls.answer(ask.ticket, answer, now()));
         pulls.page(width, 500, now(), &theme());
         let rows = detail_rows(&pulls);
         let from = rows
@@ -3198,9 +3217,9 @@ mod tests {
         assert_eq!(pulls.take_ask(true, now()), None);
         // An answer to another ticket is dropped. Another thread drops the read and its
         // answer.
-        assert!(!pulls.answer(2, Err("other".into())));
+        assert!(!pulls.answer(2, Err("other".into()), now()));
         pulls.follow();
-        assert!(!pulls.answer(1, Err("late".into())));
+        assert!(!pulls.answer(1, Err("late".into()), now()));
         assert!(pulls.read.is_none());
     }
 
@@ -3227,7 +3246,7 @@ mod tests {
         pulls.toggle();
         assert_eq!(pulls.take_ask(true, now()), None);
         // #31's answer is dropped, and #32 is asked for next.
-        assert!(!pulls.answer(1, Err("late".into())));
+        assert!(!pulls.answer(1, Err("late".into()), now()));
         assert_eq!(numbers(pulls.take_ask(true, now())), Some((32, 2)));
         assert_eq!(pulls.take_ask(true, now()), None);
 
@@ -3243,8 +3262,70 @@ mod tests {
         pulls.back();
         pulls.toggle();
         assert_eq!(pulls.take_ask(true, now()), None);
-        assert!(!pulls.answer(2, Err("late".into())));
+        assert!(!pulls.answer(2, Err("late".into()), now()));
         assert_eq!(numbers(pulls.take_ask(true, now())), Some((40, 3)));
+    }
+
+    #[test]
+    fn a_read_that_waits_goes_while_the_tab_doesnt_show() {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![
+            link("krishhgg/t3term", 31, "feature", "master"),
+            link("krishhgg/t3term", 32, "b", "c"),
+        ])));
+        let numbers = |ask: Option<Ask>| ask.map(|ask| (ask.number, ask.ticket));
+        pulls.toggle();
+        assert_eq!(numbers(pulls.take_ask(true, now())), Some((31, 1)));
+        pulls.back();
+        pulls.move_by(1);
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(true, now()), None);
+        // The pane closes, or the Thread tab shows, while #32 waits, so it goes and #31's
+        // answer asks for nothing.
+        pulls.shown(false);
+        assert!(pulls.read.is_none());
+        assert!(!pulls.answer(1, Err("late".into()), now()));
+        // Shown again, #32's details want it again.
+        pulls.shown(true);
+        assert_eq!(numbers(pulls.take_ask(true, now())), Some((32, 2)));
+        // A read under way stays, and so does an answer.
+        pulls.shown(false);
+        assert!(pulls.answer(2, Ok(read_detail(&bare_detail())), now()));
+        pulls.shown(false);
+        pulls.shown(true);
+        assert_eq!(pulls.take_ask(true, now()), None);
+        assert!(matches!(
+            pulls.read.as_ref().map(|read| &read.answer),
+            Some(Answer::Read(_))
+        ));
+    }
+
+    #[test]
+    fn an_answer_stands_for_a_minute_from_when_it_came() {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![link(
+            "krishhgg/t3term",
+            31,
+            "a",
+            "b",
+        )])));
+        let reopen = |pulls: &mut PullRequests, at: i64| {
+            pulls.back();
+            pulls.toggle();
+            pulls.take_ask(true, at).map(|ask| ask.ticket)
+        };
+        pulls.toggle();
+        let asked = now() - 45_000;
+        assert_eq!(pulls.take_ask(true, asked).map(|ask| ask.ticket), Some(1));
+        // The host took 45 seconds, and the details say when the answer came.
+        assert!(pulls.answer(1, Ok(read_detail(&bare_detail())), now()));
+        pulls.page(44, 30, now(), &theme());
+        let rows = detail_rows(&pulls);
+        assert!(rows.contains(&"Read from github.com just now".to_string()));
+        // Twenty seconds on, the answer stands.
+        assert_eq!(reopen(&mut pulls, now() + 20_000), None);
+        assert_eq!(reopen(&mut pulls, now() + FRESH - 1), None);
+        assert_eq!(reopen(&mut pulls, now() + FRESH), Some(2));
     }
 
     #[test]
