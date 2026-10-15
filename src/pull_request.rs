@@ -1,7 +1,7 @@
-//! One pull request as T3's server reads it from its host: the detail, the checks and the
-//! conversation, through `pullRequests.detail`, `pullRequests.checks` and
-//! `pullRequests.activity`. `pullRequests.invalidate` makes T3's next read of it ask the host
-//! again. Each is one RPC call, which T3 answers through the host's CLI or API or from a cache
+//! One pull request as T3's server reads it from its host: the detail, the checks, the
+//! conversation and the stack, through `pullRequests.detail`, `pullRequests.checks`,
+//! `pullRequests.activity` and `pullRequests.stack`. `pullRequests.invalidate` makes T3's next
+//! read of it ask the host again. Each is one RPC call, which T3 answers through the host's CLI or API or from a cache
 //! of its own. Nothing here writes to the host, and nothing keeps what it read.
 //! `pullRequests.subscribeRefreshes` is a stream of numbers that says when T3's reads may have
 //! changed, which `client::spawn_pull_request_refresh_watch` follows.
@@ -32,6 +32,7 @@ use crate::rpc::{RpcClient, RpcError};
 pub const DETAIL: &str = "pullRequests.detail";
 pub const CHECKS: &str = "pullRequests.checks";
 pub const ACTIVITY: &str = "pullRequests.activity";
+pub const STACK: &str = "pullRequests.stack";
 pub const INVALIDATE: &str = "pullRequests.invalidate";
 pub const SUBSCRIBE_REFRESHES: &str = "pullRequests.subscribeRefreshes";
 
@@ -61,6 +62,8 @@ const MOST_THREADS: usize = 1000;
 const MOST_THREAD_COMMENTS: usize = 1000;
 /// The most commits kept.
 const MOST_COMMITS: usize = 1000;
+/// The most layers of a stack kept.
+const MOST_LAYERS: usize = 1000;
 /// The most actions, merge methods, verdicts or reactions read from one list. Each list has
 /// at most ten values T3 knows today.
 const MOST_LITERALS: usize = 64;
@@ -317,6 +320,21 @@ pub async fn activity(
         .call(ACTIVITY, reference.payload(), CALL_TIMEOUT)
         .await?;
     Activity::read(&answer)
+}
+
+/// The stack the host keeps the pull request in, or `None` where it is in none. T3 also answers
+/// null where it reads no stacks from the host, which is every host but GitHub at f570bd2
+/// (PullRequestService.ts:1689-1693), and where GitHub answers 404, as one without stacks does
+/// (GitHubPullRequestCli.ts:2150-2154). `PullRequestStack`.
+pub async fn stack(
+    rpc: &RpcClient,
+    reference: &Reference,
+) -> Result<Option<Stack>, PullRequestError> {
+    let answer = rpc.call(STACK, reference.payload(), CALL_TIMEOUT).await?;
+    if answer.is_null() {
+        return Ok(None);
+    }
+    Stack::read(&answer).map(Some)
 }
 
 /// Makes T3 forget its cached detail and diff of the pull request, so its next read asks the
@@ -696,9 +714,9 @@ pub struct ReviewerCapabilities {
     pub list_candidates: bool,
 }
 
-/// What the host can do at all. `PullRequestCapabilities`, without the stack fields. An
-/// optional flag T3 leaves out is false, as its schema says: a server that says nothing about
-/// a feature has none.
+/// What the host can do at all. `PullRequestCapabilities`, without `stackActions`. An optional
+/// flag T3 leaves out is false, as its schema says: a server that says nothing about a feature
+/// has none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
     pub diff: bool,
@@ -717,6 +735,8 @@ pub struct Capabilities {
     /// A remark can be rewritten by whoever wrote it.
     pub edit_comment: bool,
     pub labels: bool,
+    /// The host keeps stacks of pull requests as objects of its own, which `stack` reads.
+    pub stacks: bool,
 }
 
 /// What this viewer may do. `PullRequestViewerPermissions`, without `stackRebase`.
@@ -888,6 +908,36 @@ pub struct Activity {
     pub cut: bool,
 }
 
+/// The stack the host keeps a pull request in. `PullRequestStack`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stack {
+    /// The host's id for the stack.
+    pub id: String,
+    /// The stack's own number on the host, which isn't any layer's.
+    pub number: u64,
+    /// The stack's page on the host.
+    pub url: String,
+    /// The branch the bottom layer merges into.
+    pub base: String,
+    /// Bottom to top, as GitHub lists them.
+    pub layers: Vec<Layer>,
+    /// t3term left layers out past its bound.
+    pub cut: bool,
+}
+
+/// One pull request in a stack. `PullRequestStack`'s layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layer {
+    pub number: u64,
+    /// `None` where T3 leaves it out. It may be empty.
+    pub title: Option<String>,
+    /// `None` where T3 leaves it out.
+    pub is_draft: Option<bool>,
+    pub head_sha: Option<String>,
+    pub head_branch: String,
+    pub state: State,
+}
+
 impl Detail {
     pub fn read(value: &Value) -> Result<Detail, PullRequestError> {
         let object = Object::of(value, "detail")?;
@@ -991,6 +1041,33 @@ impl Activity {
             cut,
         })
     }
+}
+
+impl Stack {
+    pub fn read(value: &Value) -> Result<Stack, PullRequestError> {
+        let object = Object::of(value, "stack")?;
+        let (layers, cut) = object.entries("layers", MOST_LAYERS, read_layer)?;
+        Ok(Stack {
+            id: object.name("id")?,
+            number: object.positive("number")?,
+            url: object.trimmed("url", LINE)?,
+            base: object.name("base")?,
+            layers,
+            cut,
+        })
+    }
+}
+
+fn read_layer(value: &Value) -> Result<Layer, PullRequestError> {
+    let object = Object::of(value, "layer")?;
+    Ok(Layer {
+        number: object.positive("number")?,
+        title: object.optional_text("title", LINE)?,
+        is_draft: object.optional_flag("isDraft")?,
+        head_sha: object.optional_name("headSha")?,
+        head_branch: object.name("headBranch")?,
+        state: object.literal("state", State::of)?,
+    })
 }
 
 fn read_actor(value: &Value) -> Result<Actor, PullRequestError> {
@@ -1153,6 +1230,7 @@ fn read_capabilities(object: &Object) -> Result<Capabilities, PullRequestError> 
             None => false,
         },
         labels: object.optional_flag("labels")?.unwrap_or(false),
+        stacks: object.optional_flag("stacks")?.unwrap_or(false),
     })
 }
 

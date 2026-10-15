@@ -1375,6 +1375,28 @@ async fn pull_request_reads_send_t3s_reference_and_read_its_answers() {
     );
     assert_eq!(activity.unwrap().comment_count, 0);
 
+    // A pull request in no stack, or on a host T3 reads no stacks from, answers null.
+    let (stack, ()) = tokio::join!(
+        pull_request::stack(&rpc, &reference),
+        answer_request(
+            &mut socket,
+            "pullRequests.stack",
+            &payload,
+            success(Value::Null)
+        ),
+    );
+    assert_eq!(stack.unwrap(), None);
+    let some = json!({"id": "S_1", "number": 7, "url": "https://github.com/krishhgg/t3term/stacks/7",
+        "base": "master", "layers": [{"number": 40, "headBranch": "a", "state": "merged"},
+        {"number": 41, "headBranch": "feature", "state": "open"}]});
+    let (stack, ()) = tokio::join!(
+        pull_request::stack(&rpc, &reference),
+        answer_request(&mut socket, "pullRequests.stack", &payload, success(some)),
+    );
+    let stack = stack.unwrap().unwrap();
+    let layers: Vec<_> = stack.layers.iter().map(|layer| layer.number).collect();
+    assert_eq!((stack.number, layers), (7, vec![40, 41]));
+
     // Invalidating names the one pull request, so T3 keeps its listings.
     let named = json!({"reference": payload});
     let (invalidated, ()) = tokio::join!(
