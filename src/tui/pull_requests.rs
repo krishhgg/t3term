@@ -32,10 +32,13 @@ use unicode_width::UnicodeWidthStr;
 
 use super::details::Record;
 use super::label::cut;
+use super::markdown::{self, Styles};
 use super::setup::{bounded, middle};
 use super::tasks::wrap;
-use super::theme::{Theme, parse_iso_ms, relative_time};
+use super::theme::{Theme, age, parse_iso_ms, relative_time};
 use super::{clip, row, with_bg};
+use crate::pull_request::{self, BaseComparison, CheckStatus, Mergeability};
+use crate::transcript::without_controls;
 
 /// The most links read from a thread's record. The rest are counted and left unread.
 const MOST_LINKS: usize = 1000;
@@ -59,6 +62,12 @@ const NATIVE_STACK: &str = "merging a layer lands the ones below it.";
 /// What watching a pull request does, as the desktop's tooltip says it.
 const WATCHING: &str =
     "Watching: the agent wakes when checks finish, someone comments, or the branch conflicts";
+/// How long a read of a link's pull request stands, in milliseconds, as the desktop keeps
+/// `pullRequests.detail` for 60 seconds (packages/client-runtime/src/state/pullRequests.ts).
+/// Opening the link's details again within it shows that read rather than asking again.
+const FRESH: i64 = 60_000;
+/// The most characters kept of why a read failed.
+const FAILURE: usize = 1024;
 
 /// A link's state as the host last reported it. An open draft is a draft, and a closed or
 /// merged pull request is never one, as the desktop's `resolvePullRequestState` reads it.
@@ -184,6 +193,10 @@ struct Entry {
     key: Key,
     host: String,
     repository: String,
+    /// The host and the repository as T3 sent them, trimmed, which a read of the pull request
+    /// names. Each is at most `KEY` bytes, as `Key::of` checked.
+    ask_host: String,
+    ask_repository: String,
     number: u64,
     url: String,
     /// Whether `url` is cut short of the one T3 sent.
@@ -384,6 +397,8 @@ fn link_of(link: &Value) -> Option<Parsed> {
     let entry = Entry {
         host: bounded(host, NAME),
         repository: bounded(repository, NAME),
+        ask_host: host.trim().to_string(),
+        ask_repository: repository.trim().to_string(),
         key,
         number,
         url,
@@ -410,11 +425,14 @@ fn legacy_of(linked: &Value) -> Option<Raw> {
     let repository = linked.get("repository")?.as_str()?;
     let number = number_of(linked)?;
     let url = linked.get("url")?.as_str()?;
-    let key = Key::of(&host_of(url), repository, number)?;
+    let host = host_of(url);
+    let key = Key::of(&host, repository, number)?;
     let (url, url_cut) = url_of(url);
     let entry = Entry {
         host: bounded(&key.host, NAME),
         repository: bounded(&key.repository, NAME),
+        ask_host: host,
+        ask_repository: repository.trim().to_string(),
         number,
         url,
         url_cut,
@@ -770,6 +788,163 @@ impl Default for Offset {
     }
 }
 
+/// What reading a link's pull request from its host names: the link's host, repository and
+/// number as T3 sent them, and the ticket its answer comes back with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Ask {
+    pub ticket: u64,
+    pub host: String,
+    pub repository: String,
+    pub number: u64,
+}
+
+/// A read of one link's pull request from its host, with `pullRequests.detail`.
+struct Read {
+    key: Key,
+    ticket: u64,
+    /// The time it was asked for.
+    asked: i64,
+    answer: Answer,
+}
+
+enum Answer {
+    Reading,
+    Read(Box<Summary>),
+    /// Why it failed, cleaned and bounded.
+    Failed(String),
+}
+
+impl Read {
+    /// Whether opening the link's details again should leave it be: it is under way, or it
+    /// was answered within `FRESH` of `now`.
+    fn stands(&self, now: i64) -> bool {
+        match self.answer {
+            Answer::Reading => true,
+            Answer::Read(_) => now.saturating_sub(self.asked) < FRESH,
+            Answer::Failed(_) => false,
+        }
+    }
+}
+
+/// What the details show of a pull request's detail, as the desktop's Summary tab does. Each
+/// text is cleaned and bounded once, when the answer arrives.
+struct Summary {
+    /// The commits the head is behind its base, when the host says an open pull request that
+    /// merges cleanly is behind, as the desktop's `resolveBaseFreshness` warns of it. A
+    /// conflict or an unknown answer leaves the warning out. The inner None is a count the
+    /// host didn't give.
+    behind: Option<Option<u64>>,
+    /// The base branch, which the warning about being behind names.
+    base: String,
+    reviewers: Vec<String>,
+    /// None where the pull request has no labels and the host offers none, which the desktop
+    /// leaves out.
+    labels: Option<Vec<String>>,
+    checks: Vec<CheckRow>,
+    /// The description with its control characters removed, or empty.
+    body: String,
+    /// Whether T3 sent a longer description than t3term keeps.
+    body_cut: bool,
+    /// Whether T3 sent more reviewers, labels or checks than t3term keeps.
+    cut: bool,
+    /// The description laid out at one width, so a new minute doesn't lay it out again.
+    laid_out: Option<(usize, Vec<Line<'static>>)>,
+}
+
+/// One check on the pull request's head.
+struct CheckRow {
+    name: String,
+    status: CheckStatus,
+    /// A GitHub Actions run that waits for a maintainer's approval, which the desktop's
+    /// `isWorkflowApprovalCheck` names.
+    approval: bool,
+}
+
+impl Summary {
+    fn of(detail: &pull_request::Detail) -> Summary {
+        let behind = (detail.state == pull_request::State::Open
+            && detail.mergeability == Mergeability::Mergeable
+            && detail.base_comparison == Some(BaseComparison::Behind))
+        .then_some(detail.behind_by);
+        let reviewers = detail
+            .reviewers
+            .iter()
+            .map(|actor| match actor.is_bot {
+                true => format!("{} (bot)", bounded(&actor.login, NAME)),
+                false => bounded(&actor.login, NAME),
+            })
+            .collect();
+        let labels = (!detail.labels.is_empty() || detail.capabilities.labels).then(|| {
+            let names = detail.labels.iter();
+            names.map(|label| bounded(&label.name, NAME)).collect()
+        });
+        let checks = detail
+            .checks
+            .iter()
+            .map(|check| CheckRow {
+                name: bounded(&check.name, NAME),
+                status: check.status,
+                approval: check.status == CheckStatus::ActionRequired
+                    && check.url.as_deref().is_some_and(is_workflow_run),
+            })
+            .collect();
+        Summary {
+            behind,
+            base: bounded(&detail.base_branch, NAME),
+            reviewers,
+            labels,
+            checks,
+            body: without_controls(detail.body.text.trim()),
+            body_cut: detail.body.cut,
+            cut: detail.cut,
+            laid_out: None,
+        }
+    }
+
+    /// Lays the description out at `width`, unless it already is.
+    fn lay_out(&mut self, width: usize, theme: &Theme) {
+        if self.laid_out.as_ref().is_some_and(|(at, _)| *at == width) {
+            return;
+        }
+        let lines = if self.body.is_empty() {
+            let none = Style::new().fg(theme.muted).add_modifier(Modifier::ITALIC);
+            whole("No description provided.", width, none)
+        } else {
+            let styles = Styles::new(theme, Style::new().fg(theme.fg));
+            markdown::render(&self.body, width, &styles, 0)
+        };
+        self.laid_out = Some((width, lines));
+    }
+}
+
+/// Whether `url` is a GitHub Actions run, as the desktop's `/\/actions\/runs\/\d+(?:\/|$)/`
+/// matches it.
+fn is_workflow_run(url: &str) -> bool {
+    const RUNS: &str = "/actions/runs/";
+    url.match_indices(RUNS).any(|(at, _)| {
+        let rest = &url[at + RUNS.len()..];
+        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        digits > 0 && matches!(rest[digits..].chars().next(), None | Some('/'))
+    })
+}
+
+impl CheckRow {
+    /// The check's mark, its status as the desktop's `pullRequestCheckStatusLabel` names it,
+    /// and their color.
+    fn shown(&self, theme: &Theme) -> (&'static str, &'static str, Color) {
+        match self.status {
+            _ if self.approval => ("◉", "Awaiting approval", theme.warning_fg),
+            CheckStatus::Pending => ("○", "Running", theme.warning_fg),
+            CheckStatus::ActionRequired => ("◉", "Awaiting action", theme.warning_fg),
+            CheckStatus::Success => ("✓", "Passed", theme.success),
+            CheckStatus::Failure => ("✗", "Failed", theme.error_fg),
+            CheckStatus::Cancelled => ("✗", "Cancelled", theme.error_fg),
+            CheckStatus::Skipped => ("–", "Skipped", theme.muted),
+            CheckStatus::Neutral => ("–", "Neutral", theme.muted),
+        }
+    }
+}
+
 /// The pull request list as the reader left it in this window.
 #[derive(Default)]
 pub(super) struct PullRequests {
@@ -793,6 +968,13 @@ pub(super) struct PullRequests {
     /// lands on nothing rather than on a row that moved.
     current: bool,
     detail: Option<Detail>,
+    /// The last read of a link's pull request from its host, of the link whose details opened
+    /// last. No other is kept.
+    read: Option<Read>,
+    /// Set when a link's details open, so the caller asks the host for its pull request.
+    asking: bool,
+    /// The ticket of the last read asked for.
+    tickets: u64,
     /// How many times the links were worked out and a page laid out, so the tests can tell
     /// what a frame or an event did.
     #[cfg(test)]
@@ -817,6 +999,8 @@ impl PullRequests {
         self.top = 0;
         self.page = None;
         self.detail = None;
+        self.read = None;
+        self.asking = false;
     }
 
     /// Whether this frame has to work the links out for thread `open_id`: an event may have
@@ -959,7 +1143,66 @@ impl PullRequests {
             self.viewing = true;
             self.scroll = Offset::Top(0);
             self.current = false;
+            self.asking = true;
         }
+    }
+
+    /// The read of the selected link's pull request that opening its details asks for. None
+    /// unless the details opened since the last call and still show, when `enabled` is false
+    /// because the environment doesn't read pull requests or the thread names no project, and
+    /// while a read of the link is under way or one from the last minute stands. The details
+    /// then show that the read is under way until `answer` takes its answer.
+    pub fn take_ask(&mut self, enabled: bool, now: i64) -> Option<Ask> {
+        if !std::mem::take(&mut self.asking) || !enabled || !self.viewing {
+            return None;
+        }
+        let entry = entries_of(self.list.as_ref()).get(self.selected)?;
+        let read = self.read.as_ref().filter(|read| read.key == entry.key);
+        if read.is_some_and(|read| read.stands(now)) {
+            return None;
+        }
+        self.tickets += 1;
+        let ask = Ask {
+            ticket: self.tickets,
+            host: entry.ask_host.clone(),
+            repository: entry.ask_repository.clone(),
+            number: entry.number,
+        };
+        self.read = Some(Read {
+            key: entry.key.clone(),
+            ticket: self.tickets,
+            asked: now,
+            answer: Answer::Reading,
+        });
+        self.relay();
+        Some(ask)
+    }
+
+    /// Takes the answer to read `ticket`: the pull request's detail, or why the read failed.
+    /// Says whether it is the read the details wait for. An answer to an earlier read, or to a
+    /// read of another thread's link, is dropped.
+    pub fn answer(
+        &mut self,
+        ticket: u64,
+        answer: Result<Box<pull_request::Detail>, String>,
+    ) -> bool {
+        let Some(read) = self.read.as_mut().filter(|read| read.ticket == ticket) else {
+            return false;
+        };
+        read.answer = match answer {
+            Ok(detail) => Answer::Read(Box::new(Summary::of(&detail))),
+            Err(failure) => Answer::Failed(bounded(&failure, FAILURE)),
+        };
+        self.relay();
+        true
+    }
+
+    /// Notes that the details' rows changed, so the next frame lays them out again and a click
+    /// before it lands on nothing.
+    fn relay(&mut self) {
+        self.detail = None;
+        self.page = None;
+        self.current = false;
     }
 
     /// Shows the list again in place of a link's details, with that link still selected. Says
@@ -1015,7 +1258,18 @@ impl PullRequests {
         let cached = self.detail.as_ref().map(|detail| (detail.index, detail.at));
         if cached != Some((index, at)) {
             let lines = match entries_of(self.list.as_ref()).get(index) {
-                Some(entry) => detail_lines(entry, width, now, theme),
+                Some(entry) => {
+                    let read = self.read.as_mut().filter(|read| read.key == entry.key);
+                    if let Some(Read {
+                        answer: Answer::Read(summary),
+                        ..
+                    }) = read
+                    {
+                        summary.lay_out(width, theme);
+                    }
+                    let read = self.read.as_ref().filter(|read| read.key == entry.key);
+                    detail_lines(entry, read, width, now, theme)
+                }
                 None => Vec::new(),
             };
             self.detail = Some(Detail { index, at, lines });
@@ -1526,11 +1780,18 @@ fn branches(repository: &str, head: &str, base: &str, room: usize) -> String {
 }
 
 /// A link's details, which show in the list's place: its number and whole title, its status
-/// and the lines it changes, then each under its label its URL, whole as plain text to copy,
-/// its repository, its branches, its author, and who linked it and when it last changed and
-/// synced, then what watching it does and the stack it heads. Each value wraps to every row it
-/// takes, so the reader can scroll to all of it, and each was bounded when it was read.
-fn detail_lines(entry: &Entry, width: usize, now: i64, theme: &Theme) -> Vec<Line<'static>> {
+/// and the lines it changes, then what its host said of it when the details read it, then each
+/// under its label its URL, whole as plain text to copy, its repository, its branches, its
+/// author, and who linked it and when it last changed and synced, then what watching it does
+/// and the stack it heads. Each value wraps to every row it takes, so the reader can scroll to
+/// all of it, and each was bounded when it was read.
+fn detail_lines(
+    entry: &Entry,
+    read: Option<&Read>,
+    width: usize,
+    now: i64,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
     if width == 0 {
         return Vec::new();
     }
@@ -1542,6 +1803,9 @@ fn detail_lines(entry: &Entry, width: usize, now: i64, theme: &Theme) -> Vec<Lin
     let mut lines = whole(&heading, width, value.add_modifier(Modifier::BOLD));
     lines.extend(flowed(status_parts(entry, theme), " · ", width, theme));
     lines.extend(flowed(diff_parts(snapshot, theme), " ", width, theme));
+    if let Some(read) = read {
+        lines.extend(host_lines(entry, read, width, now, theme));
+    }
 
     // Each section is a blank row, its label when it has one, then each value in its style,
     // wrapped to every row it takes.
@@ -1602,6 +1866,130 @@ fn detail_lines(entry: &Entry, width: usize, now: i64, theme: &Theme) -> Vec<Lin
         section(None, &[(text, muted)]);
     }
     lines
+}
+
+/// What the link's host said of its pull request, as the desktop's Summary tab shows it: that
+/// the read is under way, why it failed, or when it was read, then a warning while the branch
+/// is behind its base, the reviewers, the labels, the checks and the description. The checks
+/// come before the description, which the desktop folds away and these details can't.
+fn host_lines(
+    entry: &Entry,
+    read: &Read,
+    width: usize,
+    now: i64,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let muted = Style::new().fg(theme.muted);
+    let value = Style::new().fg(theme.fg);
+    let warning = Style::new().fg(theme.warning_fg);
+    let mut lines = vec![Line::default()];
+    let summary = match &read.answer {
+        Answer::Reading => {
+            let reading = format!("Reading from {}…", entry.host);
+            lines.extend(whole(&reading, width, muted));
+            return lines;
+        }
+        Answer::Failed(failure) => {
+            lines.extend(whole(failure, width, warning));
+            return lines;
+        }
+        Answer::Read(summary) => summary,
+    };
+    let at = match age(read.asked, now).as_str() {
+        "now" => "just now".to_string(),
+        ago => format!("{ago} ago"),
+    };
+    lines.extend(whole(
+        &format!("Read from {} {at}", entry.host),
+        width,
+        muted,
+    ));
+    if let Some(behind) = summary.behind {
+        let by = match behind {
+            Some(1) => " by 1 commit".to_string(),
+            Some(count) => format!(" by {} commits", grouped(count)),
+            None => String::new(),
+        };
+        let text = format!("This branch is out-of-date with {}{by}.", summary.base);
+        lines.extend(whole(&text, width, warning));
+    }
+    let mut section = |label: &str, rows: Vec<Line<'static>>| {
+        lines.push(Line::default());
+        lines.push(Line::styled(clip(label, width), muted));
+        lines.extend(rows);
+    };
+    let reviewers = match summary.reviewers.is_empty() {
+        true => whole("None", width, muted),
+        false => whole(&summary.reviewers.join(", "), width, value),
+    };
+    section("Reviewers", reviewers);
+    if let Some(labels) = summary.labels.as_ref() {
+        let labels = match labels.is_empty() {
+            true => whole("None", width, muted),
+            false => whole(&labels.join(", "), width, value),
+        };
+        section("Labels", labels);
+    }
+    let mut checks: Vec<Line<'static>> = match summary.checks.is_empty() {
+        true => whole("No checks reported.", width, muted),
+        false => summary
+            .checks
+            .iter()
+            .flat_map(|check| check_lines(check, width, theme))
+            .collect(),
+    };
+    if summary.cut {
+        let note = "T3 sent more reviewers, labels or checks than t3term keeps.";
+        checks.extend(whole(note, width, muted));
+    }
+    section("Checks", checks);
+    let mut body: Vec<Line<'static>> = match summary.laid_out.as_ref() {
+        Some((at, laid_out)) if *at == width => laid_out.clone(),
+        _ => Vec::new(),
+    };
+    if summary.body_cut {
+        let note = format!(
+            "Cut short: T3 sent a description longer than the {} bytes t3term keeps.",
+            grouped(pull_request::BODY as u64)
+        );
+        body.extend(whole(&note, width, muted));
+    }
+    section("Description", body);
+    lines
+}
+
+/// A check's rows: its mark and name, wrapped, with its status at the end of the first row. A
+/// row too narrow for the status beside a few columns of the name has it on a row of its own.
+fn check_lines(check: &CheckRow, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let (mark, status, color) = check.shown(theme);
+    let value = Style::new().fg(theme.fg);
+    let muted = Style::new().fg(theme.muted);
+    let room = width.saturating_sub(2 + status.width() + 1);
+    if room < 4 {
+        let mut lines = whole(&format!("{mark} {}", check.name), width, value);
+        lines.extend(whole(status, width, Style::new().fg(color)));
+        return lines;
+    }
+    let mut pieces = wrap(&check.name, room);
+    if pieces.is_empty() {
+        pieces.push(String::new());
+    }
+    pieces
+        .iter()
+        .enumerate()
+        .map(|(at, piece)| {
+            let lead = match at {
+                0 => Span::styled(mark, Style::new().fg(color)),
+                _ => Span::raw(" "),
+            };
+            let left = vec![lead, Span::raw(" "), Span::styled(clip(piece, room), value)];
+            let right = match at {
+                0 => vec![Span::styled(status, muted)],
+                _ => Vec::new(),
+            };
+            row(left, right, width)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -2674,5 +3062,278 @@ mod tests {
         assert_eq!(grouped(999), "999");
         assert_eq!(grouped(1_000), "1,000");
         assert_eq!(grouped(1_234_567), "1,234,567");
+    }
+
+    /// A pull request's detail as T3 sends it, with no reviewers, labels or checks and an
+    /// empty description, from a host that offers no labels.
+    fn bare_detail() -> Value {
+        json!({
+            "provider": "github",
+            "capabilities": {"diff": true, "comment": true, "actions": [], "mergeMethods": [],
+                "search": true, "review": {"inlineComment": false, "reply": false,
+                "resolve": false, "verdicts": []},
+                "reviewers": {"request": false, "listCandidates": false}},
+            "viewerPermissions": {"actions": [], "comment": false, "resolve": false,
+                "verdicts": [], "requestReviewers": false},
+            "projectId": "p", "projectTitle": "Demo", "workspaceRoot": "/repo",
+            "repository": "krishhgg/t3term", "number": 31, "title": "Change 31", "body": " ",
+            "url": "https://github.com/krishhgg/t3term/pull/31", "author": null,
+            "state": "open", "isDraft": false, "mergeability": "unknown", "additions": 0,
+            "deletions": 0, "changedFiles": 0, "headBranch": "feature", "baseBranch": "master",
+            "createdAt": "2026-10-13T08:00:00Z", "updatedAt": "2026-10-13T11:00:00Z",
+            "mergedAt": null, "closedAt": null, "reviewers": [], "labels": [], "checks": [],
+            "mergeCapabilities": {"merge": false, "squash": false, "rebase": false}
+        })
+    }
+
+    fn read_detail(detail: &Value) -> Box<pull_request::Detail> {
+        Box::new(pull_request::Detail::read(detail).unwrap())
+    }
+
+    /// The details of `link` once its host answered `answer`, `width` columns wide, from the
+    /// row after the lines it changes to the URL's label.
+    fn host_rows(
+        link: Value,
+        answer: Result<Box<pull_request::Detail>, String>,
+        width: usize,
+    ) -> Vec<String> {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![link])));
+        pulls.toggle();
+        let ask = pulls.take_ask(true, now()).expect("a read");
+        assert!(pulls.answer(ask.ticket, answer));
+        pulls.page(width, 500, now(), &theme());
+        let rows = detail_rows(&pulls);
+        let from = rows
+            .iter()
+            .position(|row| row == "+821 -51")
+            .expect("the lines")
+            + 1;
+        let to = rows.iter().position(|row| row == "URL").expect("the URL");
+        rows[from..to].to_vec()
+    }
+
+    #[test]
+    fn opening_a_links_details_asks_for_its_pull_request_once() {
+        let mut pulls = PullRequests::default();
+        let mut pull = link("Krishhgg/T3term", 31, "feature", "master");
+        pull["host"] = json!(" GitHub.com ");
+        pulls.set(list_of(&thread(vec![
+            pull,
+            link("krishhgg/t3term", 32, "b", "c"),
+        ])));
+        // Nothing asks until the details open, and a disabled read asks for nothing.
+        assert_eq!(pulls.take_ask(true, now()), None);
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(false, now()), None);
+        assert_eq!(pulls.take_ask(true, now()), None);
+        // The read names the link as T3 sent it, trimmed, not as it compares.
+        pulls.back();
+        pulls.toggle();
+        let ask = pulls.take_ask(true, now()).expect("a read");
+        let named = ("GitHub.com", "Krishhgg/T3term", 31, 1);
+        assert_eq!(
+            (
+                ask.host.as_str(),
+                ask.repository.as_str(),
+                ask.number,
+                ask.ticket
+            ),
+            named
+        );
+        pulls.page(44, 30, now(), &theme());
+        assert!(detail_rows(&pulls).contains(&"Reading from GitHub.com…".to_string()));
+        // While it is under way, opening the details again asks for nothing.
+        pulls.back();
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(true, now()), None);
+        // An answer to another ticket is dropped. Another thread drops the read and its
+        // answer.
+        assert!(!pulls.answer(2, Err("other".into())));
+        pulls.follow();
+        assert!(!pulls.answer(1, Err("late".into())));
+        assert!(pulls.read.is_none());
+    }
+
+    #[test]
+    fn a_legacy_link_is_read_on_the_host_its_url_names() {
+        let legacy = json!({"repository": "krishhgg/t3term", "number": 7,
+            "url": "https://GitHub.com/krishhgg/t3term/pull/7"});
+        let thread = json!({"id": "t", "projectId": "p", "linkedPullRequest": legacy});
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread));
+        pulls.toggle();
+        let ask = pulls.take_ask(true, now()).expect("a read");
+        assert_eq!((ask.host.as_str(), ask.number), ("github.com", 7));
+    }
+
+    #[test]
+    fn a_hosts_answer_shows_as_the_desktops_summary_tab_does() {
+        let pull = link("krishhgg/t3term", 31, "feature", "master");
+        // An empty answer says so in each section, and leaves out the labels a host that
+        // offers none can't have.
+        let rows = host_rows(pull.clone(), Ok(read_detail(&bare_detail())), 44);
+        let expected = [
+            "",
+            "Read from github.com just now",
+            "",
+            "Reviewers",
+            "None",
+            "",
+            "Checks",
+            "No checks reported.",
+            "",
+            "Description",
+            "No description provided.",
+            "",
+        ];
+        assert_eq!(rows, expected);
+
+        // A full one: a bot among the reviewers, the labels, each check status with its
+        // mark, a run waiting for approval, and the description as Markdown.
+        let mut detail = bare_detail();
+        detail["capabilities"]["labels"] = json!(true);
+        detail["mergeability"] = json!("mergeable");
+        detail["baseComparison"] = json!("behind");
+        detail["reviewers"] = json!([
+            {"login": "octocat", "name": "Mona", "isBot": false},
+            {"login": "greptile-apps[bot]", "name": null, "isBot": true}
+        ]);
+        let runs = "https://github.com/o/r/actions/runs/12/job/3";
+        let check = |name: &str, status: &str, url: Option<&str>| json!({"name": name, "status": status, "description": null, "url": url});
+        detail["checks"] = json!([
+            check("build", "success", None),
+            check("lint", "failure", None),
+            check("deploy", "cancelled", None),
+            check("docs", "skipped", None),
+            check("notes", "neutral", None),
+            check("tests", "pending", None),
+            check("first-time", "action-required", Some(runs)),
+            check("sign", "action-required", None)
+        ]);
+        detail["body"] = json!("## Why\n\nIt **reads** the host.\u{1b}[2J");
+        let rows = host_rows(pull.clone(), Ok(read_detail(&detail)), 44);
+        let status = |name: &str, mark: &str, label: &str| {
+            let gap = " ".repeat(44 - 2 - name.len() - label.chars().count());
+            format!("{mark} {name}{gap}{label}")
+        };
+        let expected = [
+            "".to_string(),
+            "Read from github.com just now".into(),
+            "This branch is out-of-date with master.".into(),
+            "".into(),
+            "Reviewers".into(),
+            "octocat, greptile-apps[bot] (bot)".into(),
+            "".into(),
+            "Labels".into(),
+            "None".into(),
+            "".into(),
+            "Checks".into(),
+            status("build", "✓", "Passed"),
+            status("lint", "✗", "Failed"),
+            status("deploy", "✗", "Cancelled"),
+            status("docs", "–", "Skipped"),
+            status("notes", "–", "Neutral"),
+            status("tests", "○", "Running"),
+            status("first-time", "◉", "Awaiting approval"),
+            status("sign", "◉", "Awaiting action"),
+            "".into(),
+            "Description".into(),
+            "Why".into(),
+            "".into(),
+            "It reads the host.[2J".into(),
+            "".into(),
+        ];
+        assert_eq!(rows, expected);
+
+        // A count of commits behind shows, and an answer that left entries or text out says
+        // so. A closed pull request, or one that conflicts or may, isn't warned of.
+        detail["behindBy"] = json!(1_234);
+        let mut cut = detail.clone();
+        cut["body"] = json!("x".repeat(pull_request::BODY + 1));
+        cut["checks"] = json!(vec![check("a", "success", None); 1001]);
+        let rows = host_rows(pull.clone(), Ok(read_detail(&cut)), 44);
+        let behind = [
+            "This branch is out-of-date with master by",
+            "1,234 commits.",
+        ];
+        assert_eq!(rows[2..4], behind);
+        let note = "T3 sent more reviewers, labels or checks than t3term keeps.";
+        let joined = rows.join(" ");
+        assert!(joined.contains(note), "{joined}");
+        assert!(
+            joined.contains("Cut short: T3 sent a description longer than"),
+            "{joined}"
+        );
+        detail["behindBy"] = json!(1);
+        let rows = host_rows(pull.clone(), Ok(read_detail(&detail)), 60);
+        assert_eq!(
+            rows[2],
+            "This branch is out-of-date with master by 1 commit."
+        );
+        for (field, value) in [
+            ("state", "closed"),
+            ("mergeability", "conflicting"),
+            ("mergeability", "unknown"),
+        ] {
+            let mut quiet = detail.clone();
+            quiet[field] = json!(value);
+            let rows = host_rows(pull.clone(), Ok(read_detail(&quiet)), 60);
+            assert_eq!(rows[2], "", "{field} {value}");
+        }
+    }
+
+    #[test]
+    fn a_failed_read_says_why_cleaned_and_bounded() {
+        let pull = link("krishhgg/t3term", 31, "feature", "master");
+        let failure = format!(
+            "No GitHub credential\u{1b}]52;c;x\u{7} {}",
+            "y".repeat(5_000)
+        );
+        let rows = host_rows(pull, Err(failure), 44);
+        let text = rows.join(" ");
+        assert!(
+            text.trim().starts_with("No GitHub credential]52;c;x y"),
+            "{text}"
+        );
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\u{7}'),
+            "{text}"
+        );
+        assert!(text.trim_end().ends_with('…'), "{text}");
+        let kept = text.chars().filter(|c| !c.is_whitespace()).count();
+        assert!(kept <= FAILURE + 1, "{kept}");
+    }
+
+    #[test]
+    fn a_check_too_long_for_its_row_wraps_under_its_mark() {
+        let theme = theme();
+        let check = CheckRow {
+            name: "integration tests on macOS".into(),
+            status: CheckStatus::Success,
+            approval: false,
+        };
+        let rows = rows_of(&check_lines(&check, 22, &theme));
+        assert_eq!(rows, ["✓ integration   Passed", "  tests on", "  macOS"]);
+        // Too narrow for the status beside the name, each takes rows of its own.
+        let rows = rows_of(&check_lines(&check, 10, &theme));
+        assert_eq!(rows, ["✓", "integratio", "n tests on", "macOS", "Passed"]);
+    }
+
+    #[test]
+    fn only_a_github_actions_run_awaits_approval() {
+        for (url, run) in [
+            ("https://github.com/o/r/actions/runs/12", true),
+            ("https://github.com/o/r/actions/runs/12/job/3", true),
+            (
+                "https://github.com/o/r/actions/runs/x/actions/runs/9/",
+                true,
+            ),
+            ("https://github.com/o/r/actions/runs/", false),
+            ("https://github.com/o/r/actions/runs/12x", false),
+            ("https://github.com/o/r/checks/12", false),
+        ] {
+            assert_eq!(is_workflow_run(url), run, "{url}");
+        }
     }
 }

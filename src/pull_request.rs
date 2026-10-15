@@ -45,7 +45,7 @@ const NAME: usize = 1024;
 const LINE: usize = 4096;
 /// The most bytes kept of a description or a remark. GitHub takes 65,536 characters, which
 /// is at most 262,144 bytes of UTF-8.
-const BODY: usize = 262_144;
+pub const BODY: usize = 262_144;
 /// The most checks kept. T3 reads at most ten pages of a hundred from GitHub.
 const MOST_CHECKS: usize = 1000;
 /// The most reviewers, labels, commit authors or people behind one reaction kept.
