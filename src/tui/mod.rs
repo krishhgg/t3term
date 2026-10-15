@@ -93,7 +93,8 @@ type WatchSetup = Box<dyn Fn(&str) -> mpsc::UnboundedReceiver<WatchEvent>>;
 /// as an action with the ask's ticket.
 type ReadPull = Box<dyn Fn(Reference, Ask)>;
 /// Reads a slice of a pull request's diff in the background as `DiffAsk` says, and sends the
-/// answer as an action with the ask's ticket.
+/// answer as an action with the ask's ticket. The details want only the answer to their newest
+/// ask, so a read stops the one under way before it.
 type ReadDiff = Box<dyn Fn(Reference, DiffAsk)>;
 /// Reads the next page of a review thread's remarks in the background as `CommentsAsk` says,
 /// and sends the answer as an action with the ask's ticket.
@@ -1023,15 +1024,23 @@ impl App {
                     read_pull_request(&client, &reference, &ask, send).await;
                 });
             }),
-            read_diff: Box::new(move |reference, ask: DiffAsk| {
-                let (client, answers) = (differ.clone(), diffs.clone());
-                tokio::spawn(async move {
-                    let (cursor, commit) = (ask.cursor.as_deref(), ask.commit.as_deref());
-                    let answer = read_diff(&client, &reference, cursor, commit).await;
-                    let ticket = ask.ticket;
-                    let _ = answers.send(ActionResult::PullRequestDiff { ticket, answer });
-                });
-            }),
+            read_diff: {
+                let under_way = std::cell::RefCell::new(None::<tokio::task::AbortHandle>);
+                Box::new(move |reference, ask: DiffAsk| {
+                    let (client, answers) = (differ.clone(), diffs.clone());
+                    let read = tokio::spawn(async move {
+                        let (cursor, commit) = (ask.cursor.as_deref(), ask.commit.as_deref());
+                        let answer = read_diff(&client, &reference, cursor, commit).await;
+                        let ticket = ask.ticket;
+                        let _ = answers.send(ActionResult::PullRequestDiff { ticket, answer });
+                    });
+                    // An ask comes only once the details have the answer to the last one or no
+                    // longer want it, as when another commit was picked, so that read stops.
+                    if let Some(before) = under_way.replace(Some(read.abort_handle())) {
+                        before.abort();
+                    }
+                })
+            },
             read_comments: Box::new(move |reference, ask: CommentsAsk| {
                 let (client, answers) = (pager.clone(), pages.clone());
                 tokio::spawn(async move {
@@ -15555,5 +15564,55 @@ mod tests {
         let sent: Value = serde_json::from_str(&t3.bodies()[0]).unwrap();
         assert_eq!(sent["cursor"], "2");
         assert_eq!(sent["commit"], "abc1234def");
+    }
+
+    #[tokio::test]
+    async fn the_apps_next_read_of_a_diff_stops_the_one_under_way() {
+        use crate::http::{Api, fake};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        // T3 answers one read at a time and holds the first back for a second, so the second
+        // read's answer comes after the first's unless the first stopped.
+        let body = json!({"patch": "", "truncated": false, "nextCursor": null});
+        let answer = fake::response("200 OK", &[], &body.to_string());
+        let reads = AtomicUsize::new(0);
+        let t3 = fake::Server::start(move |_| {
+            if reads.fetch_add(1, Ordering::SeqCst) == 0 {
+                std::thread::sleep(Duration::from_secs(1));
+            }
+            answer.clone()
+        });
+        let mut client = Client::offline();
+        client.api = Api::without_proxy(&t3.origin);
+        let (sender, mut results) = mpsc::unbounded_channel();
+        let app = App::new(
+            Arc::new(client),
+            Theme::new(Depth::TrueColor),
+            &Settings::default(),
+            sender,
+        );
+        let reference = Reference::new("p", Some("github.com"), "krishhgg/t3term", 31).unwrap();
+        let ask = |ticket, commit: &str| DiffAsk {
+            ticket,
+            host: "github.com".into(),
+            repository: "krishhgg/t3term".into(),
+            number: 31,
+            cursor: None,
+            commit: Some(commit.into()),
+        };
+        (app.read_diff)(reference.clone(), ask(7, "1111111aaaa"));
+        tokio::time::sleep(Duration::from_millis(200)).await;
+        (app.read_diff)(reference, ask(8, "2222222bbbb"));
+        let result = tokio::time::timeout(Duration::from_secs(5), results.recv())
+            .await
+            .expect("an answer within five seconds")
+            .expect("the answer");
+        let ActionResult::PullRequestDiff { ticket, .. } = result else {
+            panic!("an answer of another kind");
+        };
+        assert_eq!(ticket, 8);
+        assert!(results.try_recv().is_err());
+        let sent: Value = serde_json::from_str(&t3.bodies()[1]).unwrap();
+        assert_eq!(sent["commit"], "2222222bbbb");
     }
 }
