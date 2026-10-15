@@ -346,7 +346,7 @@ fn verdicts(comments: &[Comment], commits: &[Commit]) -> Vec<Verdict> {
         .max();
     // In the order each login first gave a verdict, as the desktop's map keeps them.
     let mut latest: Vec<(Option<i64>, Verdict)> = Vec::new();
-    let mut index: HashMap<&str, usize> = HashMap::new();
+    let mut index: HashMap<String, usize> = HashMap::new();
     for comment in comments {
         let Some(outcome) = comment.review_state.as_deref().and_then(Outcome::of) else {
             continue;
@@ -357,11 +357,18 @@ fn verdicts(comments: &[Comment], commits: &[Commit]) -> Vec<Verdict> {
             outcome,
             stale: matches!((at, newest), (Some(at), Some(newest)) if at < newest),
         };
-        let Some(author) = comment.author.as_ref() else {
+        // Keyed by the lowercased login, as the reviewers are matched, where the desktop keys
+        // by the login as sent. Otherwise a dismissal sent as `Octocat` would leave an
+        // approval sent as `octocat` standing.
+        let Some(key) = verdict
+            .reviewer
+            .as_ref()
+            .map(|reviewer| reviewer.key.clone())
+        else {
             latest.push((at, verdict));
             continue;
         };
-        match index.get(author.login.as_str()) {
+        match index.get(&key) {
             Some(&at_index) => {
                 let current = &mut latest[at_index];
                 // Not every host sends its reviews in order, so the newest wins.
@@ -370,7 +377,7 @@ fn verdicts(comments: &[Comment], commits: &[Commit]) -> Vec<Verdict> {
                 }
             }
             None => {
-                index.insert(author.login.as_str(), latest.len());
+                index.insert(key, latest.len());
                 latest.push((at, verdict));
             }
         }
@@ -571,20 +578,21 @@ fn instant(text: &str) -> Option<i64> {
 /// part of the code shown.
 fn without_html_comments(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
-    let mut fence: Option<char> = None;
+    let mut fence: Option<(char, usize)> = None;
     let mut in_comment = false;
     for line in text.split_inclusive('\n') {
         if !in_comment {
-            let mark = line.trim_start().chars().next();
-            let fenced =
-                line.trim_start().starts_with("```") || line.trim_start().starts_with("~~~");
-            match (fence, mark) {
-                (None, Some(mark)) if fenced => {
-                    fence = Some(mark);
+            match (fence, fence_of(line)) {
+                // A backtick fence's info string can't hold a backtick, or it is inline code.
+                (None, Some((mark, length, info))) if mark == '~' || !info.contains('`') => {
+                    fence = Some((mark, length));
                     out.push_str(line);
                     continue;
                 }
-                (Some(open), Some(mark)) if fenced && mark == open => {
+                // Only its own mark, at least as long and with nothing after it, closes a fence.
+                (Some((open, opened)), Some((mark, length, rest)))
+                    if mark == open && length >= opened && rest.trim().is_empty() =>
+                {
                     fence = None;
                     out.push_str(line);
                     continue;
@@ -622,6 +630,19 @@ fn without_html_comments(text: &str) -> String {
         }
     }
     out
+}
+
+/// The mark, the length and the rest of a code fence `line` starts with: three or more of the
+/// same backtick or tilde, as CommonMark reads one.
+fn fence_of(line: &str) -> Option<(char, usize, &str)> {
+    let line = line.trim_start();
+    let mark = line
+        .chars()
+        .next()
+        .filter(|mark| matches!(mark, '`' | '~'))?;
+    let rest = line.trim_start_matches(mark);
+    let length = line.len() - rest.len();
+    (length >= 3).then_some((mark, length, rest))
 }
 
 #[cfg(test)]
