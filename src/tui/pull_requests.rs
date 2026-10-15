@@ -3021,7 +3021,7 @@ fn slid(line: &Line<'static>, lead: usize, across: usize, width: usize) -> Line<
 
 /// A row of the Code tab's lines side by side, cut as `slid` cuts a row: the text of each side
 /// past its numbers and mark scrolled `across` and cut at the end of its side, the left one
-/// `left` columns wide, with the column between them kept.
+/// `left` columns wide, with the columns between them kept.
 fn slid_beside(
     line: &Line<'static>,
     lead: usize,
@@ -3036,9 +3036,10 @@ fn slid_beside(
     if shown < left {
         out.push(Span::raw(" ".repeat(left - shown)));
     }
-    out.extend(spans.get(SIDE + 1).cloned());
+    let between = spans.get(SIDE + 1).cloned();
+    let room = width.saturating_sub(left + between.as_ref().map_or(0, Span::width));
+    out.extend(between);
     let right = side(spans.get(SIDE + 2..).unwrap_or_default());
-    let room = width.saturating_sub(left + 1);
     out.extend(slid(&right, lead, across, room).spans);
     Line::from(out).style(line.style)
 }
@@ -7131,8 +7132,9 @@ mod tests {
         let mut pulls = conversing(remarks(1));
         assert!(!pulls.answer(1, Part::Done, now()));
         assert!(pulls.forward() && pulls.forward());
-        let lower: String = "abcdefghijklmnopqrstuvwxyz".repeat(3)[..60].to_string();
-        let upper = lower.to_uppercase();
+        // 50 letters removed and 60 added, which no 20 columns of repeat.
+        let letters = "abcdefghijklmnopqrstuvwxyz".repeat(3);
+        let (lower, upper) = (&letters[..50], letters[..60].to_uppercase());
         let patch = format!(
             "diff --git a/f.rs b/f.rs\n--- a/f.rs\n+++ b/f.rs\n@@ -1 +1 @@\n-{lower}\n+{upper}\n"
         );
@@ -7164,7 +7166,7 @@ mod tests {
         pulls.enter();
         assert_eq!(
             lines(&mut pulls),
-            ["1 - abcdefghijklmno│1 + ABCDEFGHIJKLMNOP"]
+            ["1 - abcdefghijklmno│ 1 + ABCDEFGHIJKLMNO"]
         );
         assert!(pulls.slides());
         // Both sides' text scrolls by the same columns, as the desktop's sides scroll together,
@@ -7173,16 +7175,16 @@ mod tests {
         assert_eq!(pulls.across, 20);
         assert_eq!(
             lines(&mut pulls),
-            ["1 - uvwxyzabcdefghi│1 + UVWXYZABCDEFGHIJ"]
+            ["1 - uvwxyzabcdefghi│ 1 + UVWXYZABCDEFGHI"]
         );
-        // The text stops once the end of the side whose text runs on furthest shows. The left
-        // side has 15 columns of text and the right 16, so the left one decides.
+        // The text stops once the end of the side whose text runs on furthest shows, here the
+        // right side's, so the left one's ends in blanks.
         pulls.sideways(true);
         pulls.sideways(true);
         assert_eq!(pulls.across, 45);
         assert_eq!(
             lines(&mut pulls),
-            ["1 - tuvwxyzabcdefgh│1 + TUVWXYZABCDEFGH"]
+            ["1 - tuvwx          │ 1 + TUVWXYZABCDEFGH"]
         );
         // One under the other, a row has 36 columns of text, so the text scrolls back as far as
         // it must.
@@ -7191,7 +7193,7 @@ mod tests {
         assert_eq!(
             lines(&mut pulls),
             [
-                "1 - yzabcdefghijklmnopqrstuvwxyzabcdefgh",
+                "1 - yzabcdefghijklmnopqrstuvwx",
                 "1 + YZABCDEFGHIJKLMNOPQRSTUVWXYZABCDEFGH"
             ]
         );
@@ -7203,7 +7205,7 @@ mod tests {
         let (red, green) = (Style::new().fg(Color::Red), Style::new().fg(Color::Green));
         let muted = Style::new().fg(Color::Gray);
         // As `beside` lays out a row unwrapped: the left side's number, mark and text, the
-        // padding to its 14 columns, the column between, then the right side's.
+        // padding to its 14 columns, the bar and space between, then the right side's.
         let row = |left: [&str; 3], right: &[&str]| {
             let mut spans = vec![
                 Span::raw(left[0].to_string()),
@@ -7212,7 +7214,7 @@ mod tests {
             ];
             let used: usize = left.iter().map(|text| text.width()).sum();
             spans.push(Span::raw(" ".repeat(14_usize.saturating_sub(used))));
-            spans.push(Span::styled("│", muted));
+            spans.push(Span::styled("│ ", muted));
             let styles = [Style::new(), Style::new(), green];
             for (text, style) in right.iter().zip(styles) {
                 spans.push(Span::styled(text.to_string(), style));
@@ -7223,32 +7225,32 @@ mod tests {
         let beside = |line: &Line<'static>, across, width| {
             slid_beside(line, 4, across, width, 14).to_string()
         };
-        assert_eq!(beside(&both, 0, 40), "1 - ab日本cdef│1 + xyz日w");
+        assert_eq!(beside(&both, 0, 40), "1 - ab日本cdef│ 1 + xyz日w");
         // Each side's text scrolls by the same columns, its number and mark kept, and stops at
         // the end of its side.
-        assert_eq!(beside(&both, 2, 40), "1 - 日本cdefgh│1 + z日w");
+        assert_eq!(beside(&both, 2, 40), "1 - 日本cdefgh│ 1 + z日w");
         // A wide character the left edge cuts shows as a space, and one the side's right edge
         // cuts doesn't show.
-        assert_eq!(beside(&both, 3, 40), "1 -  本cdefgh │1 + 日w");
-        assert_eq!(beside(&both, 4, 40), "1 - 本cdefgh  │1 +  w");
-        assert_eq!(beside(&both, 1, 40), "1 - b日本cdefg│1 + yz日w");
-        assert_eq!(beside(&both, 0, 22), "1 - ab日本cdef│1 + xyz");
-        assert_eq!(beside(&both, 30, 40), "1 -           │1 + ");
-        // The column between keeps its style, each side its own, and the row its own.
+        assert_eq!(beside(&both, 3, 40), "1 -  本cdefgh │ 1 + 日w");
+        assert_eq!(beside(&both, 4, 40), "1 - 本cdefgh  │ 1 +  w");
+        assert_eq!(beside(&both, 1, 40), "1 - b日本cdefg│ 1 + yz日w");
+        assert_eq!(beside(&both, 0, 22), "1 - ab日本cdef│ 1 + xy");
+        assert_eq!(beside(&both, 30, 40), "1 -           │ 1 + ");
+        // The bar keeps its style, each side its own, and the row its own.
         let slid = slid_beside(&both, 4, 2, 40, 14);
         assert_eq!(slid.style, Style::new().bg(Color::Blue));
         let style_of = |text: &str| {
             let span = slid.spans.iter().find(|span| span.content == text);
             span.map(|span| span.style)
         };
-        assert_eq!(style_of("│"), Some(muted));
+        assert_eq!(style_of("│ "), Some(muted));
         assert_eq!(style_of("日本cdefgh"), Some(red));
         assert_eq!(style_of("z日w"), Some(green));
         // A side with no line stays blank.
         let left = row(["", "", ""], &["1 ", "+ ", "xyz日w"]);
-        assert_eq!(beside(&left, 1, 40), "              │1 + yz日w");
+        assert_eq!(beside(&left, 1, 40), "              │ 1 + yz日w");
         let right = row(["1 ", "- ", "ab日本cdefgh"], &[]);
-        assert_eq!(beside(&right, 1, 40), "1 - b日本cdefg│");
+        assert_eq!(beside(&right, 1, 40), "1 - b日本cdefg│ ");
     }
 
     #[test]

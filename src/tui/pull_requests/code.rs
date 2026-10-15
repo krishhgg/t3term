@@ -102,8 +102,10 @@ const MOST_TEXTS: usize = 64;
 /// number, the mark and the text. The left side's are followed by one that pads it to its
 /// columns and one of `BETWEEN`, then come the right side's.
 pub(super) const SIDE: usize = 3;
-/// The column between the two sides of a row of the lines side by side.
-const BETWEEN: &str = "│";
+/// The columns between the two sides of a row of the lines side by side: a bar, then a space
+/// so the right side's numbers stand apart from it as the left side's stand apart from the
+/// details' edge.
+const BETWEEN: &str = "│ ";
 
 const LOADING: &str = "Loading pull request diff…";
 const LOADING_MORE: &str = "Loading more files…";
@@ -256,7 +258,8 @@ impl Slides {
                 Some(halves) => {
                     let (left, right) = row.spans.split_at(SIDE.min(row.spans.len()));
                     let right = right.get(2..).unwrap_or_default();
-                    (width(left) + 1 + halves.right).max(halves.left + 1 + width(right))
+                    let gap = BETWEEN.width();
+                    (width(left) + gap + halves.right).max(halves.left + gap + width(right))
                 }
             });
             self.widest = self.widest.max(widest.max().unwrap_or_default());
@@ -270,7 +273,7 @@ impl Slides {
 }
 
 /// The columns of the two sides of a row of the lines side by side, with `BETWEEN` in the
-/// column between them.
+/// columns between them.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 struct Halves {
     left: usize,
@@ -282,10 +285,11 @@ impl Halves {
     /// can't be as wide, or None where the left would leave no column for its text after its
     /// mark.
     fn of(width: usize) -> Option<Halves> {
-        let left = width.saturating_sub(1) / 2;
+        let gap = BETWEEN.width();
+        let left = width.saturating_sub(gap) / 2;
         (left >= 2).then(|| Halves {
             left,
-            right: width - 1 - left,
+            right: width - gap - left,
         })
     }
 }

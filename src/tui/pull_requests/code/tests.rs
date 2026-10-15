@@ -1260,19 +1260,19 @@ fn every_row_fits_its_width_and_hostile_text_is_cleaned() {
     // Side by side, a wide character that doesn't fit its side's last column goes to the next
     // row, and the column between the sides stays in line.
     code.act(Control::Layout, &[]);
-    let split = rows(&code, 31);
+    let split = rows(&code, 32);
     assert_eq!(
         split[8..13],
         [
-            "1       let x =│1       let x =",
-            "     \"界界界界 │     \"界界界界",
-            "    界界界界界 │    界界界界界",
-            "    界界界界界 │    界界界界界",
-            "    界界\";[2J  │    界界\";[2J",
+            "1       let x =│ 1       let x =",
+            "     \"界界界界 │      \"界界界界",
+            "    界界界界界 │     界界界界界",
+            "    界界界界界 │     界界界界界",
+            "    界界\";[2J  │     界界\";[2J",
         ]
     );
     for row in &split[8..19] {
-        let (left, _) = row.split_once(BETWEEN).unwrap();
+        let (left, _) = row.split_once('│').unwrap();
         assert_eq!(left.width(), 15, "{row:?}");
     }
     code.act(Control::Layout, &[]);
@@ -3465,15 +3465,16 @@ fn lines_stack_at_first_and_one_row_sets_them_side_by_side() {
         "",
         "⌄ M src/lib.rs +3 -4",
         "⋯ 8 unmodified lines",
-        " 9   fn keep() {}  │ 9   fn keep() {}",
-        "10 - let a = 1;    │10 + let b = 2;",
-        "11 - let c = 3;    │11 + let long = \"a l",
-        "                   │     ine that runs o",
-        "                   │     n well past for",
-        "                   │     ty columns\";",
+        " 9   fn keep() {}  │  9   fn keep() {}",
+        "10 - let a = 1;    │ 10 + let b = 2;",
+        "11 - let c = 3;    │ 11 + let long = \"a",
+        "                   │      line that runs",
+        "                   │       on well past",
+        "                   │      forty columns\"",
+        "                   │      ;",
         "12 - let d = 4;    │",
-        "13   fn end() {}   │12   fn end() {}",
-        "14 - last          │13 + final",
+        "13   fn end() {}   │ 12   fn end() {}",
+        "14 - last          │ 13 + final",
         // The note goes under the hunk's last row, on the side whose line has no end.
         "     No newline at │",
         "     end of file   │",
@@ -3505,27 +3506,27 @@ fn lines_stack_at_first_and_one_row_sets_them_side_by_side() {
 
     // Each side has the left side's room for its numbers, so the two always match. An odd
     // column goes to the right side.
-    let numbered = rows(&code, 27);
+    let numbered = rows(&code, 28);
     assert_eq!(
         numbered[10..12],
-        ["10 - let a = │10 + let b =", "     1;      │     2;"]
+        ["10 - let a = │ 10 + let b =", "     1;      │      2;"]
+    );
+    let narrow = rows(&code, 27);
+    assert_eq!(
+        narrow[10..12],
+        ["-let a = 1; │ +let b = 2;", "-let c = 3; │ +let long = \""]
     );
     let narrow = rows(&code, 26);
     assert_eq!(
         narrow[10..12],
-        ["-let a = 1; │+let b = 2;", "-let c = 3; │+let long = \""]
-    );
-    let narrow = rows(&code, 25);
-    assert_eq!(
-        narrow[10..12],
-        ["-let a = 1; │+let b = 2;", "-let c = 3; │+let long ="]
+        ["-let a = 1; │ +let b = 2;", "-let c = 3; │ +let long ="]
     );
     // A row too narrow for two sides with a column of text each shows the lines one under the
     // other.
-    assert_eq!(rows(&code, 5)[51..54], ["-l│+l", " e│ e", " t│ t"]);
-    let one_under_the_other = rows(&code, 4);
-    assert!(one_under_the_other.iter().all(|row| !row.contains(BETWEEN)));
-    assert_eq!(one_under_the_other[38..40], ["-let", "  a"]);
+    assert_eq!(rows(&code, 6)[41..44], ["-l│ +l", " e│  e", " t│  t"]);
+    let one_under_the_other = rows(&code, 5);
+    assert!(one_under_the_other.iter().all(|row| !row.contains('│')));
+    assert_eq!(one_under_the_other[42..45], ["-let", " a =", " 1;"]);
 
     // Stacked again, the rows are as before.
     code.act(Control::Layout, &[]);
@@ -3576,24 +3577,24 @@ fn threads_show_under_the_row_side_by_side_that_has_their_line() {
             format!("│   {text}"),
         ]
     };
-    assert_eq!(rows[10], "11 - let c = 3;    │11 + let long = \"a l");
-    assert_eq!(rows[13], "                   │     ty columns\";");
-    assert_eq!(rows[14..17], card("Why c?"));
-    assert_eq!(rows[17], "");
-    assert_eq!(rows[18..21], card("Too long."));
-    assert_eq!(rows[21], "12 - let d = 4;    │");
-    assert_eq!(rows[22..25], card("Why d?"));
-    assert_eq!(rows[25], "13   fn end() {}   │12   fn end() {}");
-    assert_eq!(rows[26..29], card("Ends here."));
+    assert_eq!(rows[10], "11 - let c = 3;    │ 11 + let long = \"a");
+    assert_eq!(rows[14], "                   │      ;");
+    assert_eq!(rows[15..18], card("Why c?"));
+    assert_eq!(rows[18], "");
+    assert_eq!(rows[19..22], card("Too long."));
+    assert_eq!(rows[22], "12 - let d = 4;    │");
+    assert_eq!(rows[23..26], card("Why d?"));
+    assert_eq!(rows[26], "13   fn end() {}   │ 12   fn end() {}");
+    assert_eq!(rows[27..30], card("Ends here."));
     assert_eq!(
-        rows[29..32],
+        rows[30..33],
         [
-            "14 - last          │13 + final",
+            "14 - last          │ 13 + final",
             "     No newline at │",
             "     end of file   │"
         ]
     );
-    assert_eq!(rows[32..35], card("Last one."));
+    assert_eq!(rows[33..36], card("Last one."));
     let threads: Vec<_> = targets
         .iter()
         .filter(|(_, control)| matches!(control, Control::Thread(_)))
@@ -3602,11 +3603,11 @@ fn threads_show_under_the_row_side_by_side_that_has_their_line() {
     assert_eq!(
         threads,
         [
-            (14..15, Control::Thread(1)),
-            (18..19, Control::Thread(0)),
-            (22..23, Control::Thread(2)),
-            (26..27, Control::Thread(3)),
-            (32..33, Control::Thread(4)),
+            (15..16, Control::Thread(1)),
+            (19..20, Control::Thread(0)),
+            (23..24, Control::Thread(2)),
+            (27..28, Control::Thread(3)),
+            (33..34, Control::Thread(4)),
         ]
     );
 
@@ -3625,7 +3626,7 @@ fn threads_show_under_the_row_side_by_side_that_has_their_line() {
     let rows = rows_of(&lines);
     assert_eq!(
         rows[10],
-        "11 - let c = 3;    │11 + let long = \"a line that runs on well past forty columns\";"
+        "11 - let c = 3;    │ 11 + let long = \"a line that runs on well past forty columns\";"
     );
     assert_eq!(rows[11], "│ ⌄ Open · 1 comment");
     assert_eq!(
@@ -3666,7 +3667,7 @@ fn unchanged_lines_side_by_side_show_their_number_on_each_side() {
     // Each side numbers a line as its file does, so past a line added the right side's
     // numbers run one ahead, and each side shows the text after the change.
     let side =
-        |old: u64, new: u64| format!("{old:>2}   {:<14}│{new:>2}   l{new}", format!("l{new}"));
+        |old: u64, new: u64| format!("{old:>2}   {:<14}│ {new:>2}   l{new}", format!("l{new}"));
     let mut whole_file: Vec<String> = [
         "1 file",
         "¶ Show whitespace changes",
@@ -3679,10 +3680,15 @@ fn unchanged_lines_side_by_side_show_their_number_on_each_side() {
     .map(String::from)
     .to_vec();
     whole_file.extend([side(1, 1), side(2, 2)]);
-    whole_file
-        .extend([" 3 - o3            │ 3 + l3", "                   │ 4 + l4"].map(String::from));
+    whole_file.extend(
+        [
+            " 3 - o3            │  3 + l3",
+            "                   │  4 + l4",
+        ]
+        .map(String::from),
+    );
     whole_file.extend((4..=8).map(|old| side(old, old + 1)));
-    whole_file.push(" 9 - o9            │10 + l10".into());
+    whole_file.push(" 9 - o9            │ 10 + l10".into());
     whole_file.extend((10..=13).map(|old| side(old, old + 1)));
     assert_eq!(rows(&code, 40), whole_file);
 
@@ -3691,7 +3697,7 @@ fn unchanged_lines_side_by_side_show_their_number_on_each_side() {
     code.act(Control::Wrap, &[]);
     let slid = sideways(&code, 40).2;
     assert_eq!(slid.runs, [(7..21, 5, Some(19))]);
-    assert_eq!(slid.widest, "13   l14".width() + 1 + 20);
+    assert_eq!(slid.widest, "13   l14".width() + BETWEEN.width() + 19);
 }
 
 #[test]
@@ -3723,13 +3729,13 @@ fn a_file_added_or_deleted_keeps_one_column_side_by_side() {
         shown[18..],
         [
             "⌄ M src/lib.rs +2 -1",
-            " 1   use std::fmt;      │ 1   use std::fmt;",
-            " 2 - fn old() {}        │ 2 + fn new() {}",
-            " 3   fn keep() {}       │ 3   fn keep() {}",
+            " 1   use std::fmt;      │  1   use std::fmt;",
+            " 2 - fn old() {}        │  2 + fn new() {}",
+            " 3   fn keep() {}       │  3   fn keep() {}",
             "⋯ 6 unmodified lines",
-            "10   fn a() {}          │10   fn a() {}",
-            "                        │11 + fn b() {}",
-            "11   fn c() {}          │12   fn c() {}",
+            "10   fn a() {}          │ 10   fn a() {}",
+            "                        │ 11 + fn b() {}",
+            "11   fn c() {}          │ 12   fn c() {}",
             "⋯ More unchanged context may be available",
             "",
             "⌄ R from.rs → to.rs",
@@ -3749,7 +3755,10 @@ fn a_file_added_or_deleted_keeps_one_column_side_by_side() {
             (23..26, 5, Some(24))
         ]
     );
-    assert_eq!(slid.widest, " 1   use std::fmt;".width() + 1 + 25);
+    assert_eq!(
+        slid.widest,
+        " 1   use std::fmt;".width() + BETWEEN.width() + 24
+    );
 }
 
 #[test]
@@ -3764,7 +3773,7 @@ fn the_lines_side_by_side_stay_so_through_reads_and_commits() {
     // A slice read later shows side by side too.
     let shown = rows(&code, 40);
     assert!(
-        shown.contains(&"1 - a              │1 + b".to_string()),
+        shown.contains(&"1 - a              │ 1 + b".to_string()),
         "{shown:#?}"
     );
 
@@ -3781,7 +3790,7 @@ fn the_lines_side_by_side_stay_so_through_reads_and_commits() {
     code.act(Control::File(0), &[]);
     assert_eq!(
         rows(&code, 40)[6..8],
-        ["⌄ M z +1 -1", "1 - a              │1 + b"]
+        ["⌄ M z +1 -1", "1 - a              │ 1 + b"]
     );
     code.act(Control::Layout, &[]);
     assert_eq!(rows(&code, 40)[6..9], ["⌄ M z +1 -1", "1 - a", "1 + b"]);
