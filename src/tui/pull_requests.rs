@@ -842,7 +842,9 @@ impl Default for Offset {
 /// number as T3 sent them, and the ticket its answer comes back with. `invalidate` says a
 /// person asked to read it from the host, so the read sends `pullRequests.invalidate` first.
 /// `updated` is the `updatedAt` of the detail the details show, for a read that only keeps
-/// them current: it reads the conversation only when the new detail's differs.
+/// them current: it reads the conversation only when the new detail's differs. `stack` says
+/// to read the stack once the detail says the host keeps stacks: every read but one that only
+/// keeps the details current does, and so does that one when the stack shown is stale.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Ask {
     pub ticket: u64,
@@ -851,15 +853,18 @@ pub(super) struct Ask {
     pub number: u64,
     pub invalidate: bool,
     pub updated: Option<String>,
+    pub stack: bool,
 }
 
-/// Part of what a host said of a pull request. A read sends its detail and its conversation as
-/// each arrives, then `Done`.
+/// Part of what a host said of a pull request. A read sends its detail, its conversation and,
+/// where the host keeps stacks, its stack, as each arrives, then `Done`.
 pub(super) enum Part {
     /// The answer to `pullRequests.detail`, or why it failed.
     Detail(Result<Box<pull_request::Detail>, String>),
     /// The answer to `pullRequests.activity`, or why it failed.
     Activity(Result<Box<pull_request::Activity>, String>),
+    /// The answer to `pullRequests.stack`, or why it failed.
+    Stack(Result<Option<Box<pull_request::Stack>>, String>),
     /// Both answers came.
     Done,
 }
@@ -901,6 +906,18 @@ struct Read {
     /// the detail, and the conversation only once the detail changed. It reads both when
     /// either answer failed or the last read missed one.
     live: bool,
+    /// The stack the host keeps the pull request in, as the last read of it found it. None
+    /// where it is in none, or nothing read it.
+    stack: Option<Box<StackView>>,
+    /// Set when the last read of the stack failed. The stack shown stays and may be out of
+    /// date, as the desktop keeps the stack it last read (pullRequestStackSnapshot.ts:51-73),
+    /// and opening the details again reads again.
+    stack_failed: bool,
+    /// When the last read of the stack came, finding one or none. None until one came.
+    stack_at: Option<i64>,
+    /// Set when the read again that `again` wants reads the stack too, though it only keeps
+    /// the details current.
+    stack_due: bool,
 }
 
 /// A read under way to replace a read's answers. It holds each answer until both came, so the
@@ -911,6 +928,23 @@ struct Next {
     at: i64,
     answer: Option<Result<Box<Summary>, String>>,
     conversation: Option<Result<Box<Conversation>, String>>,
+    stack: Option<StackRead>,
+}
+
+/// What a read of the stack found.
+enum StackRead {
+    /// The stack, or None where the pull request is in none, and when it came.
+    Read(Option<Box<StackView>>, i64),
+    Failed,
+}
+
+impl StackRead {
+    fn of(answer: Result<Option<Box<pull_request::Stack>>, String>, now: i64) -> StackRead {
+        match answer {
+            Ok(stack) => StackRead::Read(stack.map(|stack| Box::new(StackView::of(&stack))), now),
+            Err(_) => StackRead::Failed,
+        }
+    }
 }
 
 enum Answer<T> {
@@ -939,6 +973,10 @@ impl Read {
             echo: false,
             asked: now,
             live: false,
+            stack: None,
+            stack_failed: false,
+            stack_at: None,
+            stack_due: false,
         }
     }
 
@@ -949,7 +987,7 @@ impl Read {
         if self.next.is_some() {
             return true;
         }
-        if self.again || self.missed {
+        if self.again || self.missed || self.stack_failed {
             return false;
         }
         match (&self.answer, &self.conversation) {
@@ -989,6 +1027,24 @@ impl Read {
                 self.conversation = Answer::Failed(failure);
             }
             _ => {}
+        }
+        // A read that keeps the details current doesn't read the stack, which keeps the one
+        // shown, as the desktop's live refresh reads only the detail.
+        if let Some(stack) = next.stack {
+            self.take_stack(stack);
+        }
+    }
+
+    /// Takes what a read of the stack found. A stack that came replaces the one shown, and so
+    /// does finding the pull request in none. A failure keeps the one shown.
+    fn take_stack(&mut self, read: StackRead) {
+        match read {
+            StackRead::Read(stack, at) => {
+                self.stack = stack;
+                self.stack_failed = false;
+                self.stack_at = Some(at);
+            }
+            StackRead::Failed => self.stack_failed = true,
         }
     }
 }
@@ -1080,6 +1136,60 @@ impl Summary {
             markdown::render(&self.body, width, &styles, 0)
         };
         self.laid_out = Some((width, lines));
+    }
+}
+
+/// What the details show of the stack the host keeps a pull request in, as the desktop's stack
+/// menu lists it (apps/web/src/components/pullRequest/PullRequestStackMenu.tsx). Each text is
+/// cleaned and bounded once, when the answer arrives.
+struct StackView {
+    /// The stack's own number on the host.
+    number: u64,
+    /// The branch the bottom layer merges into.
+    base: String,
+    /// Bottom to top, as T3 sends them.
+    layers: Vec<LayerRow>,
+    /// Whether T3 sent more layers than t3term keeps, which leaves the top ones out.
+    cut: bool,
+}
+
+/// One pull request in a stack.
+struct LayerRow {
+    number: u64,
+    /// Its title, or its head branch where it has none, as the desktop's
+    /// `layer.title || layer.headBranch` (PullRequestStackLayerContent.tsx).
+    title: String,
+    branch: String,
+    state: State,
+}
+
+impl StackView {
+    fn of(stack: &pull_request::Stack) -> StackView {
+        let layers = stack.layers.iter().map(|layer| {
+            let branch = bounded(&layer.head_branch, NAME);
+            let title = layer.title.as_deref().map(|title| bounded(title, TITLE));
+            // An open draft is a draft, as the desktop's `resolvePullRequestState` reads it.
+            let state = match layer.state {
+                pull_request::State::Open if layer.is_draft == Some(true) => State::Draft,
+                pull_request::State::Open => State::Open,
+                pull_request::State::Merged => State::Merged,
+                pull_request::State::Closed => State::Closed,
+            };
+            LayerRow {
+                number: layer.number,
+                title: title
+                    .filter(|title| !title.is_empty())
+                    .unwrap_or(branch.clone()),
+                branch,
+                state,
+            }
+        });
+        StackView {
+            number: stack.number,
+            base: bounded(&stack.base, NAME),
+            layers: layers.collect(),
+            cut: stack.cut,
+        }
     }
 }
 
@@ -1548,6 +1658,7 @@ impl PullRequests {
                 at: now,
                 answer: None,
                 conversation: None,
+                stack: None,
             });
         } else {
             return None;
@@ -1557,6 +1668,7 @@ impl PullRequests {
         read.asked = now;
         let invalidate = std::mem::take(&mut read.invalidate);
         read.echo = invalidate;
+        let stack = std::mem::take(&mut read.stack_due) || updated.is_none();
         Some(Ask {
             ticket,
             host: read.host.clone(),
@@ -1564,6 +1676,7 @@ impl PullRequests {
             number: read.number,
             invalidate,
             updated,
+            stack,
         })
     }
 
@@ -1577,8 +1690,16 @@ impl PullRequests {
         };
         if let Some(read) = self.read.as_mut().filter(|read| read.key == entry.key) {
             if read.stands(now) {
-                // Its answers show, and the detail is read again unless it just came.
-                self.arrive(now);
+                // Its answers show, and the detail is read again unless it just came. A stack
+                // that came `FRESH` or more ago is read again with it, though the detail just
+                // came, as the desktop's stack query reads again when the details mount once
+                // it is stale (`Atom.swr` in packages/client-runtime/src/state/runtime.ts).
+                if self.stack_stale(now) {
+                    self.read.as_mut().expect("the shown read").stack_due = true;
+                    self.read_live(now);
+                } else {
+                    self.arrive(now);
+                }
                 return;
             }
             if read.answered() {
@@ -1711,6 +1832,14 @@ impl PullRequests {
         }
     }
 
+    /// Whether the details show a read that is done whose stack came `FRESH` or more before
+    /// `now`.
+    fn stack_stale(&self, now: i64) -> bool {
+        let read = self.read.as_ref().filter(|_| self.live_at().is_some());
+        let at = read.and_then(|read| read.stack_at);
+        at.is_some_and(|at| now.saturating_sub(at) >= FRESH)
+    }
+
     /// Wants the shown read again to keep it current, as `live` and `arrive` say: the detail,
     /// and the conversation only once it changed. A read that failed reads both, as a first
     /// read does, as the desktop's live refresh reads a detail it couldn't read.
@@ -1785,6 +1914,10 @@ impl PullRequests {
                     next.conversation = Some(answer.map_err(|failure| bounded(&failure, FAILURE)));
                     return false;
                 }
+                Part::Stack(answer) => {
+                    next.stack = Some(StackRead::of(answer, now));
+                    return false;
+                }
                 Part::Done => {
                     let next = read.next.take().expect("the read under way");
                     read.settle(next);
@@ -1807,6 +1940,7 @@ impl PullRequests {
                 Part::Activity(Err(failure)) => {
                     read.conversation = Answer::Failed(bounded(&failure, FAILURE));
                 }
+                Part::Stack(answer) => read.take_stack(StackRead::of(answer, now)),
                 Part::Done => {}
             }
         }
@@ -2291,12 +2425,19 @@ fn state_of(entry: &Entry, theme: &Theme) -> (&'static str, &'static str, Color)
     match &entry.synced {
         Synced::Waiting => ("○", "Waiting for host state", theme.muted),
         Synced::Unreadable => ("○", "Host state unreadable", theme.warning_fg),
-        Synced::Read(snapshot) => match snapshot.state {
+        Synced::Read(snapshot) => snapshot.state.shown(theme),
+    }
+}
+
+impl State {
+    /// A state's mark, its name and their color.
+    fn shown(self, theme: &Theme) -> (&'static str, &'static str, Color) {
+        match self {
             State::Open => ("●", "Open", theme.success),
             State::Draft => ("◌", "Draft", theme.muted),
             State::Merged => ("●", "Merged", theme.violet),
             State::Closed => ("●", "Closed", theme.error_fg),
-        },
+        }
     }
 }
 
@@ -2661,6 +2802,11 @@ fn host_lines(
         lines.push(Line::styled(clip(label, width), muted));
         lines.extend(rows);
     };
+    // The desktop shows the stack in the details' header, beside the merge controls.
+    if let Some(stack) = read.stack.as_deref() {
+        let (label, rows) = stack_lines(stack, entry.number, read.stack_failed, width, theme);
+        section(&label, rows);
+    }
     let conversation = match &read.conversation {
         Answer::Read(conversation) => Some(&**conversation),
         _ => None,
@@ -2746,6 +2892,87 @@ fn check_lines(check: &CheckRow, width: usize, theme: &Theme) -> Vec<Line<'stati
             row(left, right, width)
         })
         .collect()
+}
+
+/// The stack's label, which names it and where pull request `number` sits in it, as the
+/// desktop's stack button does (PullRequestStackMenu.tsx:130-146), and its rows: a note that
+/// it may be out of date where `stale`, then its layers from the top down, as the desktop's
+/// menu lists them (PullRequestStackLayers.tsx:17-38), then the branch the bottom one merges
+/// into.
+fn stack_lines(
+    stack: &StackView,
+    number: u64,
+    stale: bool,
+    width: usize,
+    theme: &Theme,
+) -> (String, Vec<Line<'static>>) {
+    let muted = Style::new().fg(theme.muted);
+    let size = stack.layers.len();
+    let label = match stack.layers.iter().position(|layer| layer.number == number) {
+        Some(at) => format!("Stack #{} · layer {} of {size}", stack.number, at + 1),
+        None => format!("Stack #{}", stack.number),
+    };
+    let mut lines = Vec::new();
+    if stale {
+        let note = "May be out of date: t3term couldn't read the stack again.";
+        lines.extend(whole(note, width, muted));
+    }
+    if stack.cut {
+        let note = "T3 sent more layers than t3term keeps, so the top ones are left out.";
+        lines.extend(whole(note, width, muted));
+    }
+    for layer in stack.layers.iter().rev() {
+        lines.extend(layer_lines(layer, layer.number == number, width, theme));
+    }
+    lines.extend(whole(&format!("↳ {}", stack.base), width, muted));
+    (label, lines)
+}
+
+/// A layer of a stack, as the desktop's `PullRequestStackLayerContent` shows it: its state's
+/// mark and its title, with `✓` at the right on the pull request the details show, then its
+/// number, its branch and its state.
+fn layer_lines(layer: &LayerRow, current: bool, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let (mark, state, color) = layer.state.shown(theme);
+    let title = match current {
+        true => Style::new().fg(theme.fg).add_modifier(Modifier::BOLD),
+        false => Style::new().fg(theme.fg),
+    };
+    let muted = Style::new().fg(theme.muted);
+    let about = format!("#{} · {} · {state}", layer.number, layer.branch);
+    let check = if current { "✓" } else { "" };
+    // The mark and a space at the left, and a space and the check at the right.
+    let room = width.saturating_sub(4);
+    if room < 4 {
+        let mut lines = whole(&format!("{mark} {} {check}", layer.title), width, title);
+        lines.extend(whole(&about, width, muted));
+        return lines;
+    }
+    let mut pieces = wrap(&layer.title, room);
+    if pieces.is_empty() {
+        pieces.push(String::new());
+    }
+    let mut lines: Vec<Line<'static>> = pieces
+        .iter()
+        .enumerate()
+        .map(|(at, piece)| {
+            let lead = match at {
+                0 => Span::styled(mark, Style::new().fg(color)),
+                _ => Span::raw(" "),
+            };
+            let left = vec![lead, Span::raw(" "), Span::styled(clip(piece, room), title)];
+            let right = match at {
+                0 => vec![Span::styled(check, Style::new().fg(theme.primary))],
+                _ => Vec::new(),
+            };
+            row(left, right, width)
+        })
+        .collect();
+    let room = width - 2;
+    lines.extend(wrap(&about, room).iter().map(|piece| {
+        let left = vec![Span::raw("  "), Span::styled(clip(piece, room), muted)];
+        row(left, Vec::new(), width)
+    }));
+    lines
 }
 
 #[cfg(test)]
@@ -3918,6 +4145,273 @@ mod tests {
         pulls.follow();
         assert!(!pulls.answer(1, Part::Detail(Err("late".into())), now()));
         assert!(pulls.read.is_none());
+    }
+
+    /// A stack as T3 sends it for link 31: a merged layer under it and a draft above it whose
+    /// title is empty.
+    fn stack_sent() -> Value {
+        json!({"id": "S_1", "number": 7, "url": "https://github.com/krishhgg/t3term/stacks/7",
+        "base": "master", "layers": [
+            {"number": 30, "title": "Lay the base", "headBranch": "base", "state": "merged"},
+            {"number": 31, "title": "Change 31", "isDraft": false, "headBranch": "feature",
+                "state": "open"},
+            {"number": 32, "title": "", "isDraft": true, "headBranch": "feature-32",
+                "state": "open"}
+        ]})
+    }
+
+    fn stack_part(stack: &Value) -> Part {
+        let stack = pull_request::Stack::read(stack).unwrap();
+        Part::Stack(Ok(Some(Box::new(stack))))
+    }
+
+    /// Link 31's details once its host answered, and `stack` came, if any.
+    fn read_with_stack(stack: Option<Part>) -> PullRequests {
+        let mut pulls = PullRequests::default();
+        let links = vec![link("krishhgg/t3term", 31, "feature", "master")];
+        pulls.set(list_of(&thread(links)));
+        pulls.toggle();
+        let ask = pulls.take_ask(true, now()).expect("a read");
+        let detail = Part::Detail(Ok(read_detail(&bare_detail())));
+        let activity = pull_request::Activity::read(&bare_activity()).unwrap();
+        let activity = Part::Activity(Ok(Box::new(activity)));
+        for part in [detail]
+            .into_iter()
+            .chain(stack)
+            .chain([activity, Part::Done])
+        {
+            pulls.answer(ask.ticket, part, now());
+        }
+        pulls
+    }
+
+    /// The details' stack section at `width`, from its label to the blank row before
+    /// Reviewers.
+    fn stack_rows(pulls: &mut PullRequests, width: usize) -> Vec<String> {
+        pulls.page(width, 500, now(), true, &theme());
+        let rows = detail_rows(pulls);
+        let Some(from) = rows.iter().position(|row| row.starts_with("Stack #")) else {
+            return Vec::new();
+        };
+        let to = rows[from..].iter().position(String::is_empty).unwrap() + from;
+        rows[from..to].to_vec()
+    }
+
+    #[test]
+    fn a_stack_lists_its_layers_from_the_top_and_checks_the_one_shown() {
+        let mut pulls = read_with_stack(Some(stack_part(&stack_sent())));
+        let rows = stack_rows(&mut pulls, 44);
+        let check = format!("● Change 31{}✓", " ".repeat(32));
+        assert_eq!(
+            rows,
+            [
+                "Stack #7 · layer 2 of 3",
+                // A layer without a title shows its branch, as the desktop's does.
+                "◌ feature-32",
+                "  #32 · feature-32 · Draft",
+                check.as_str(),
+                "  #31 · feature · Open",
+                "● Lay the base",
+                "  #30 · base · Merged",
+                "↳ master",
+            ]
+        );
+        // The section comes before the reviewers, as the desktop's header comes before its
+        // tabs, and after the time of the read.
+        let all = detail_rows(&pulls);
+        let label = all.iter().position(|row| row == "Stack #7 · layer 2 of 3");
+        let read = all
+            .iter()
+            .position(|row| row.starts_with("Read from github.com"));
+        assert!(read < label, "{all:#?}");
+
+        // Each mark is its state's color, and the pull request shown is bold and checked.
+        let theme = theme();
+        let lines = &pulls.detail.as_ref().unwrap().lines;
+        let at = |text: &str| {
+            let row = all.iter().position(|row| row.starts_with(text)).unwrap();
+            &lines[row].spans
+        };
+        let color = |spans: &[Span], content: &str| {
+            let span = spans.iter().find(|span| span.content == content).unwrap();
+            (span.style.fg, span.style.add_modifier)
+        };
+        let plain = Modifier::empty();
+        assert_eq!(color(at("◌ feature-32"), "◌"), (Some(theme.muted), plain));
+        assert_eq!(color(at("● Lay"), "●"), (Some(theme.violet), plain));
+        assert_eq!(color(at("● Change"), "●"), (Some(theme.success), plain));
+        let bold = Modifier::BOLD;
+        assert_eq!(color(at("● Change"), "Change 31"), (Some(theme.fg), bold));
+        assert_eq!(color(at("● Change"), "✓"), (Some(theme.primary), plain));
+        assert_eq!(color(at("● Lay"), "Lay the base"), (Some(theme.fg), plain));
+        let about = at("  #30");
+        assert_eq!(color(about, "#30 · base · Merged").0, Some(theme.muted));
+
+        // Without a stack the section isn't there.
+        let mut alone = read_with_stack(Some(Part::Stack(Ok(None))));
+        assert_eq!(stack_rows(&mut alone, 44), Vec::<String>::new());
+        let mut unasked = read_with_stack(None);
+        assert_eq!(stack_rows(&mut unasked, 44), Vec::<String>::new());
+    }
+
+    #[test]
+    fn a_stack_is_cleaned_and_fits_any_width() {
+        let mut sent = stack_sent();
+        sent["number"] = json!(70);
+        sent["base"] = json!("ma\u{1b}[31min");
+        sent["layers"][0]["title"] = json!("Lay\u{7}  the\nbase");
+        sent["layers"][2]["title"] = json!("   ");
+        sent["layers"][2]["headBranch"] = json!("x".repeat(2000));
+        // A stack that doesn't name the pull request shown has no place for it.
+        sent["layers"][1]["number"] = json!(41);
+        let view = StackView::of(&pull_request::Stack::read(&sent).unwrap());
+        assert_eq!(view.base, "ma[31min");
+        assert_eq!(view.layers[0].title, "Lay  the base");
+        assert_eq!(view.layers[2].title, view.layers[2].branch);
+        let cut = format!("{}…", "x".repeat(NAME));
+        assert_eq!(view.layers[2].branch, cut);
+        let mut pulls = read_with_stack(Some(stack_part(&sent)));
+        assert_eq!(stack_rows(&mut pulls, 44)[0], "Stack #70");
+        assert!(
+            !stack_rows(&mut pulls, 44)
+                .iter()
+                .any(|row| row.contains('✓'))
+        );
+
+        let mut pulls = read_with_stack(Some(stack_part(&stack_sent())));
+        for width in 0..=70 {
+            pulls.page(width, 500, now(), true, &theme());
+            let lines = &pulls.detail.as_ref().unwrap().lines;
+            for line in lines {
+                assert!(line.width() <= width, "{width}: {line:?}");
+            }
+            // The label is whole from here, and the check shows.
+            if width >= 23 {
+                let rows = stack_rows(&mut pulls, width);
+                assert!(rows.iter().any(|row| row.ends_with('✓')), "{width}");
+            }
+        }
+        let rows = stack_rows(&mut pulls, 23);
+        assert_eq!(
+            rows,
+            [
+                "Stack #7 · layer 2 of 3",
+                "◌ feature-32",
+                // A row that doesn't fit wraps under the title, not under the mark.
+                "  #32 · feature-32 ·",
+                "  Draft",
+                "● Change 31           ✓",
+                "  #31 · feature · Open",
+                "● Lay the base",
+                "  #30 · base · Merged",
+                "↳ master",
+            ]
+        );
+    }
+
+    #[test]
+    fn a_stack_read_again_replaces_the_one_shown_and_a_failure_keeps_it() {
+        let mut pulls = read_with_stack(Some(stack_part(&stack_sent())));
+        let full = stack_rows(&mut pulls, 44);
+        let read_again = |pulls: &mut PullRequests, stack: Option<Part>| {
+            assert!(pulls.refresh());
+            let ask = pulls.take_ask(true, now()).expect("a read again");
+            assert_eq!(ask.updated, None);
+            let detail = Part::Detail(Ok(read_detail(&bare_detail())));
+            let activity = pull_request::Activity::read(&bare_activity()).unwrap();
+            let activity = Part::Activity(Ok(Box::new(activity)));
+            for part in [detail].into_iter().chain(stack).chain([activity]) {
+                // A read again holds its answers until it is done.
+                assert!(!pulls.answer(ask.ticket, part, now()));
+            }
+            assert!(pulls.answer(ask.ticket, Part::Done, now()));
+        };
+
+        // A stack that couldn't be read again stays, with a note.
+        read_again(&mut pulls, Some(Part::Stack(Err("timed out".into()))));
+        let rows = stack_rows(&mut pulls, 44);
+        assert_eq!(rows[0], full[0]);
+        assert_eq!(
+            rows[1..3],
+            [
+                "May be out of date: t3term couldn't read the",
+                "stack again."
+            ]
+        );
+        assert_eq!(rows[3..], full[1..]);
+        // A failure isn't reused: opening the details again reads again.
+        pulls.back();
+        pulls.toggle();
+        let ask = pulls.take_ask(true, now()).expect("a read again");
+        assert_eq!(ask.updated, None);
+        let detail = Part::Detail(Ok(read_detail(&bare_detail())));
+        let activity = pull_request::Activity::read(&bare_activity()).unwrap();
+        let activity = Part::Activity(Ok(Box::new(activity)));
+        let mut moved = stack_sent();
+        moved["layers"][1]["state"] = json!("merged");
+        for part in [detail, stack_part(&moved), activity, Part::Done] {
+            pulls.answer(ask.ticket, part, now());
+        }
+        let rows = stack_rows(&mut pulls, 44);
+        assert_eq!(rows.len(), full.len());
+        assert_eq!(rows[4], "  #31 · feature · Merged");
+
+        // A read that keeps the details current reads no stack and keeps the one shown.
+        let later = now() + LIVE;
+        assert!(pulls.live(later, later));
+        let ask = pulls.take_ask(true, later).expect("a live read");
+        assert!(ask.updated.is_some());
+        let detail = Part::Detail(Ok(read_detail(&bare_detail())));
+        pulls.answer(ask.ticket, detail, later);
+        pulls.answer(ask.ticket, Part::Done, later);
+        assert_eq!(stack_rows(&mut pulls, 44)[4], "  #31 · feature · Merged");
+
+        // A read again that finds the pull request in no stack takes the stack away.
+        read_again(&mut pulls, Some(Part::Stack(Ok(None))));
+        assert_eq!(stack_rows(&mut pulls, 44), Vec::<String>::new());
+    }
+
+    /// The desktop's stack query reads again when the details mount once it is stale, while
+    /// its live refresh and focus read the detail alone.
+    #[test]
+    fn opening_the_details_again_reads_a_stack_that_came_a_minute_ago() {
+        let mut pulls = read_with_stack(Some(stack_part(&stack_sent())));
+        let reopen = |pulls: &mut PullRequests, at: i64| {
+            pulls.back();
+            pulls.toggle();
+            pulls.take_ask(true, at)
+        };
+        let detail_only = |pulls: &mut PullRequests, ask: &Ask, at: i64| {
+            let detail = Part::Detail(Ok(read_detail(&bare_detail())));
+            pulls.answer(ask.ticket, detail, at);
+            pulls.answer(ask.ticket, Part::Done, at);
+        };
+        // Within the minute, opening the details again reads the detail alone.
+        let at = now() + SOONEST;
+        let ask = reopen(&mut pulls, at).expect("a read on arrival");
+        assert!(ask.updated.is_some() && !ask.stack, "{ask:?}");
+        detail_only(&mut pulls, &ask, at);
+        // So does coming back to t3term, as the stack comes to a minute old.
+        let at = now() + FRESH - 1;
+        assert!(pulls.arrive(at));
+        let ask = pulls.take_ask(true, at).expect("a read on focus");
+        assert!(ask.updated.is_some() && !ask.stack, "{ask:?}");
+        detail_only(&mut pulls, &ask, at);
+        // Opening them once it is a minute old reads the stack too, though the detail just
+        // came. Opening them again while that read is under way asks for nothing more.
+        let at = at + 1;
+        let ask = reopen(&mut pulls, at).expect("a read with the stack");
+        assert!(ask.updated.is_some() && ask.stack, "{ask:?}");
+        assert_eq!(reopen(&mut pulls, at), None);
+        let mut moved = stack_sent();
+        moved["layers"][1]["state"] = json!("merged");
+        let detail = Part::Detail(Ok(read_detail(&bare_detail())));
+        for part in [detail, stack_part(&moved), Part::Done] {
+            pulls.answer(ask.ticket, part, at);
+        }
+        assert_eq!(stack_rows(&mut pulls, 44)[4], "  #31 · feature · Merged");
+        // Then the stack is fresh and the detail just came, so nothing is read.
+        assert_eq!(reopen(&mut pulls, at + 1), None);
     }
 
     #[test]
