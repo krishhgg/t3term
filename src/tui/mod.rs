@@ -10,6 +10,7 @@ mod banner;
 mod composer;
 mod details;
 mod environment;
+mod environments;
 mod label;
 mod lineage;
 mod markdown;
@@ -86,6 +87,12 @@ const KEPT_TITLE: usize = 16;
 /// Opens T3's worktree setup subscription for a thread: `Client::watch_worktree_setup`, or a
 /// test's stand-in.
 type WatchSetup = Box<dyn Fn(&str) -> mpsc::UnboundedReceiver<WatchEvent>>;
+
+/// Starts check `asked` of the saved environments for the Environments dialog, which sends
+/// what it found as `ActionResult::Environments`, and returns the handle that stops it. A test
+/// passes a stand-in that starts nothing.
+type CheckEnvironments =
+    Box<dyn Fn(u64, mpsc::UnboundedSender<ActionResult>) -> Option<tokio::task::AbortHandle>>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -324,6 +331,11 @@ enum ActionResult {
         /// One-message draft options this send took, such as ultrathink, to put back.
         reserved: Vec<(String, String)>,
     },
+    /// What check `asked` of the saved environments found, for the Environments dialog.
+    Environments {
+        asked: u64,
+        found: environments::Found,
+    },
 }
 
 /// An open model, effort or mode menu.
@@ -520,6 +532,10 @@ struct App {
     /// The whole screen the last frame drew, which a drag and `[` and `]` work out the
     /// sidebar's width against.
     screen: Rect,
+    /// The Environments dialog, which Alt+C and a click on the sidebar's environment open.
+    environments: environments::Dialog,
+    /// Starts a check of the saved environments for the dialog.
+    check_environments: CheckEnvironments,
     /// Opens the open thread's worktree setup subscription.
     watch_setup: WatchSetup,
     /// Set once T3 refuses the worktree setup subscription. T3 refuses it for the session or
@@ -766,6 +782,7 @@ impl App {
     ) -> App {
         let watcher = client.clone();
         let environment = Identity::new(client.runtime.label.as_deref(), &client.runtime.origin);
+        let current = client.runtime.environment_id.clone();
         App {
             client,
             theme,
@@ -824,6 +841,19 @@ impl App {
             sidebar_toggle: Rect::default(),
             details: Details::default(),
             screen: Rect::default(),
+            environments: environments::Dialog::default(),
+            check_environments: Box::new(move |asked, actions| {
+                // A unit test never reads the saved environments or reaches their servers.
+                if cfg!(test) {
+                    return None;
+                }
+                let current = current.clone();
+                let task = tokio::spawn(async move {
+                    let found = environments::check(current).await;
+                    let _ = actions.send(ActionResult::Environments { asked, found });
+                });
+                Some(task.abort_handle())
+            }),
             watch_setup: Box::new(move |thread_id: &str| watcher.watch_worktree_setup(thread_id)),
             setup_refused: false,
             quit: false,
@@ -1419,6 +1449,48 @@ impl App {
         }
     }
 
+    /// Opens the Environments dialog and starts its check, or closes it and stops the check.
+    /// Opening closes an open menu. A dialog of the details stays under it and has the
+    /// keyboard again once it closes.
+    fn toggle_environments(&mut self) {
+        if self.environments.is_open() {
+            self.environments.close();
+            return;
+        }
+        self.picker = None;
+        let asked = self.environments.open();
+        self.start_environments_check(asked);
+    }
+
+    fn start_environments_check(&mut self, asked: u64) {
+        let handle = (self.check_environments)(asked, self.actions.clone());
+        self.environments.started(asked, handle);
+    }
+
+    /// A key for the Environments dialog. Esc closes it, `r` checks the environments again,
+    /// and the arrows, `j`, `k`, Home, End, `g` and `G` choose among them.
+    fn on_environments_key(&mut self, key: KeyEvent) {
+        let plain = !key
+            .modifiers
+            .intersects(KeyModifiers::CONTROL | KeyModifiers::ALT);
+        match key.code {
+            KeyCode::Esc => self.environments.close(),
+            KeyCode::Char('r') if plain => {
+                let asked = self.environments.ask();
+                self.start_environments_check(asked);
+            }
+            KeyCode::Up => self.environments.select_by(-1),
+            KeyCode::Char('k') if plain => self.environments.select_by(-1),
+            KeyCode::Down => self.environments.select_by(1),
+            KeyCode::Char('j') if plain => self.environments.select_by(1),
+            KeyCode::Home => self.environments.choose(0),
+            KeyCode::Char('g') if plain => self.environments.choose(0),
+            KeyCode::End => self.environments.choose(self.environments.last()),
+            KeyCode::Char('G') if plain => self.environments.choose(self.environments.last()),
+            _ => {}
+        }
+    }
+
     /// The open thread's record for its details. While its watch is open, that is the
     /// projection's once the watch sends it, and the shell's copy until then. After the watch
     /// closes, the shell's copy, which still changes, comes first. A projection whose thread
@@ -1485,6 +1557,8 @@ impl App {
                 self.on_key(key);
                 true
             }
+            // The Environments dialog takes no text, and nothing under it gets a paste.
+            Event::Paste(_) if self.environments.is_open() => false,
             Event::Paste(text) => {
                 // An open menu covers the composer, so a paste goes to the model search or
                 // nowhere.
@@ -1529,6 +1603,33 @@ impl App {
                         // The wheel and the other buttons wait for the drag to end.
                         _ => return false,
                     }
+                }
+                // The Environments dialog takes the mouse. A click on its × or outside it closes
+                // it, a click on an environment chooses it, and the wheel over it moves the
+                // choice. Nothing reaches what it covers. Until a frame draws it after a
+                // change, it takes events and does nothing with them.
+                if self.environments.is_open() {
+                    let Some(drawn) = self.environments.drawn.clone() else {
+                        return false;
+                    };
+                    match mouse.kind {
+                        _ if click && inside(drawn.close) => self.environments.close(),
+                        _ if click && inside(drawn.area) => {
+                            let Some(index) = self.environments.row_at(mouse.row) else {
+                                return false;
+                            };
+                            self.environments.choose(index);
+                        }
+                        _ if click => self.environments.close(),
+                        MouseEventKind::ScrollUp if inside(drawn.area) => {
+                            self.environments.select_by(-1)
+                        }
+                        MouseEventKind::ScrollDown if inside(drawn.area) => {
+                            self.environments.select_by(1)
+                        }
+                        _ => return false,
+                    }
+                    return true;
                 }
                 // A dialog of the thread's details takes the mouse. A click on its × closes it,
                 // as does a click outside it, on the button too. A click on a tab, a pull
@@ -1603,6 +1704,11 @@ impl App {
                 }
                 if click && inside(self.sidebar_toggle) {
                     self.toggle_sidebar();
+                    return true;
+                }
+                // The environment under the sidebar's wordmark opens the saved environments.
+                if click && inside(self.sidebar.environment) {
+                    self.toggle_environments();
                     return true;
                 }
                 // The details' button opens and closes them. Their pane takes what lands on
@@ -1736,8 +1842,9 @@ impl App {
                 self.end_drag(false);
                 self.sidebar.border = Rect::default();
                 // The details' button and the details may have moved too, so they take no
-                // click until then.
+                // click until then, and neither does the Environments dialog.
                 self.details.resized();
+                self.environments.resized();
                 true
             }
             _ => false,
@@ -1764,6 +1871,18 @@ impl App {
             }
             KeyCode::Char('x') if ctrl => {
                 self.interrupt();
+                return;
+            }
+            // The saved environments, from any pane, an open menu or dialog included. C for
+            // connections, the desktop's name for the settings page that lists them, since
+            // Alt+E is the effort menu's.
+            KeyCode::Char('c') if alt => {
+                self.toggle_environments();
+                return;
+            }
+            // The dialog takes every other key, so nothing reaches what it covers.
+            _ if self.environments.is_open() => {
+                self.on_environments_key(key);
                 return;
             }
             // From any pane, an open menu included, and never typed into the composer.
@@ -2051,6 +2170,9 @@ impl App {
     fn on_action_result(&mut self, result: ActionResult) {
         match result {
             ActionResult::Info(text) => self.message = Some((text, false)),
+            ActionResult::Environments { asked, found } => {
+                self.environments.found(asked, found);
+            }
             ActionResult::Error(text) => self.message = Some((text, true)),
             ActionResult::Config { config, revision } => {
                 // A change from the subscription since the read was asked for is newer than
@@ -2845,6 +2967,16 @@ impl App {
                     .draw_dialog(frame, below, now, &self.environment, &self.theme)
             }
             None => self.details.forget_drawn(),
+        }
+        // Over everything else, under the title row as the details' dialog is.
+        if self.environments.is_open() {
+            let below = Rect {
+                y: area.y + inset,
+                height: area.height - inset,
+                ..area
+            };
+            self.environments
+                .draw(frame, below, &self.environment, &self.theme);
         }
     }
 
@@ -3746,7 +3878,8 @@ impl App {
             .as_ref()
             .is_some_and(|o| self.unsent.has_saved(&o.id));
         // Only Ctrl+B and the toggle bring a hidden sidebar back, so the keys lead with it.
-        let restore = if self.sidebar_hidden && self.picker.is_none() {
+        let dialog = self.environments.is_open();
+        let restore = if self.sidebar_hidden && self.picker.is_none() && !dialog {
             "Ctrl+B sidebar · "
         } else {
             ""
@@ -3757,13 +3890,14 @@ impl App {
             Span::styled("● ", Style::new().fg(color)),
             Span::styled(head, Style::new().fg(t.muted)),
         ];
-        if unsent && self.picker.is_none() && room > 0 {
+        if unsent && self.picker.is_none() && !dialog && room > 0 {
             let note = fit("Unsent message: Ctrl+R  ·  ", room);
             room -= note.width();
             spans.push(Span::styled(note, Style::new().fg(t.warning_fg)));
         }
         let hint;
         let keys = match (self.focus, self.picker.as_ref().map(|p| p.kind)) {
+            _ if self.environments.is_open() => environments::KEYS,
             (_, Some(Kind::Model)) => "Type to search · ↑↓ choose · Enter select · Esc close",
             (_, Some(_)) => "↑↓ choose · Enter select · Esc close",
             (Focus::Sidebar, None) => {
@@ -10345,7 +10479,7 @@ mod tests {
     }
 
     #[test]
-    fn the_environment_takes_no_clicks_and_moves_nothing() {
+    fn the_environment_opens_the_saved_environments_and_moves_nothing() {
         let mut app = tui_at(Some("Studio Mac"), "http://127.0.0.1:3773");
         let threads = vec![listed("a", "Alpha", "idle"), listed("b", "Bravo", "idle")];
         app.on_shell_event(shell_snapshot(threads));
@@ -10356,15 +10490,24 @@ mod tests {
         // The list starts under the blank row below the environment's.
         assert_eq!(app.sidebar.list.y, 4);
         let (border, list) = (app.sidebar.border, app.sidebar.list);
-        // A click on the dot, the environment or a blank row around them does what a click on
-        // the wordmark did.
-        for (x, y) in [(border.x - 2, 1), (5, 2), (5, 0), (5, 3)] {
+        // A click on the dot or a blank row around the environment does what a click on the
+        // wordmark did.
+        for (x, y) in [(border.x - 2, 1), (5, 0), (5, 3)] {
             mouse(&mut app, CLICK, x, y);
             assert_eq!(app.focus, Focus::Composer);
             assert!(app.open.is_none() && app.picker.is_none() && app.drag.is_none());
+            assert!(!app.environments.is_open());
             chrome(&mut app, 80, 24);
             assert_eq!((app.sidebar.border, app.sidebar.list), (border, list));
         }
+        // A click on the environment opens the saved environments and moves nothing else.
+        mouse(&mut app, CLICK, 5, 2);
+        assert!(app.environments.is_open());
+        assert_eq!(app.focus, Focus::Composer);
+        assert!(app.open.is_none() && app.picker.is_none() && app.drag.is_none());
+        chrome(&mut app, 80, 24);
+        assert_eq!((app.sidebar.border, app.sidebar.list), (border, list));
+        press(&mut app, KeyCode::Esc);
         // The edge still drags.
         mouse(&mut app, CLICK, border.x, 5);
         assert!(app.drag.is_some());
@@ -10372,13 +10515,14 @@ mod tests {
         assert!(app.drag.is_none());
 
         // Hidden, a click on the environment at the end of the breadcrumb's row leaves the
-        // sidebar hidden.
+        // sidebar hidden and opens nothing.
         ctrl_b(&mut app);
         let header = chrome(&mut app, 120, 24).header;
         let at = header.find("Studio").expect("the environment");
         let x = header[..at].width() as u16;
         mouse(&mut app, CLICK, x, 1);
         assert!(app.sidebar_hidden);
+        assert!(!app.environments.is_open());
         assert!(crate::settings::saved_in_test().sidebar_hidden);
         assert!(app.open.is_none() && app.picker.is_none() && app.drag.is_none());
         assert_eq!(app.composer.text(), "half a thought");
@@ -13564,5 +13708,209 @@ mod tests {
         assert_eq!(app.composer.text(), "half a reply");
         // None of it asked T3 for anything.
         assert_eq!(reads(&runtime), 0);
+    }
+
+    // ---- the Environments dialog ----
+
+    /// The TUI with a stand-in for the check of the saved environments, which counts the
+    /// checks it is asked for and starts none.
+    fn tui_counting_checks() -> (App, std::rc::Rc<std::cell::RefCell<Vec<u64>>>) {
+        let mut app = tui(&Settings::default());
+        let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let record = asked.clone();
+        app.check_environments = Box::new(move |number, _| {
+            record.borrow_mut().push(number);
+            None
+        });
+        (app, asked)
+    }
+
+    fn ready(name: &str, id: &str) -> crate::environments::Probe {
+        crate::environments::Probe {
+            name: name.into(),
+            default: false,
+            phase: crate::environments::Phase::Ready,
+            exit_code: 0,
+            code: None,
+            message: None,
+            environment_id: Some(id.into()),
+            label: Some(format!("{name} Mac")),
+            origin: Some("http://127.0.0.1:4000".into()),
+            server_version: Some("0.0.46-nightly".into()),
+        }
+    }
+
+    /// What check `asked` found: `names`, each ready on a server of its own.
+    fn found(app: &mut App, asked: u64, names: &[&str]) {
+        let probes: Vec<_> = names
+            .iter()
+            .map(|name| ready(name, &format!("env-{name}")))
+            .collect();
+        let saved = crate::environments::Environments::default();
+        let found = environments::Found::of(&saved, probes, &app.client.runtime.environment_id);
+        app.on_action_result(ActionResult::Environments { asked, found });
+    }
+
+    #[test]
+    fn alt_c_opens_the_environments_and_keys_go_nowhere_else_while_it_shows() {
+        let (mut app, asked) = tui_counting_checks();
+        app.focus = Focus::Composer;
+        app.composer.insert_str("draft");
+        // Opening closes an open menu.
+        app.open_picker(Kind::Mode);
+        alt(&mut app, 'c');
+        assert!(app.environments.is_open());
+        assert!(app.picker.is_none());
+        assert_eq!(*asked.borrow(), [1]);
+        let rows = screen(&mut app, 120, 36);
+        let status = rows.last().unwrap();
+        assert!(status.contains(environments::KEYS), "{status}");
+        assert!(
+            rows.iter()
+                .any(|row| row.contains("Checking the saved environments…"))
+        );
+
+        // Keys and a paste reach neither the composer nor the sidebar.
+        for code in [
+            KeyCode::Char('x'),
+            KeyCode::Enter,
+            KeyCode::Tab,
+            KeyCode::Backspace,
+            KeyCode::PageUp,
+        ] {
+            press(&mut app, code);
+        }
+        ctrl_b(&mut app);
+        alt(&mut app, 'b');
+        alt(&mut app, 'm');
+        assert!(!app.on_terminal_event(Event::Paste("pasted".into())));
+        assert_eq!(app.composer.text(), "draft");
+        assert_eq!(app.focus, Focus::Composer);
+        assert!(!app.sidebar_hidden);
+        assert!(!app.details.open);
+        assert!(app.picker.is_none());
+        assert!(app.environments.is_open());
+
+        // r checks again, and only the last check's result counts.
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(*asked.borrow(), [1, 2]);
+        found(&mut app, 1, &["stale"]);
+        let text = screen(&mut app, 120, 36).join("\n");
+        assert!(!text.contains("stale"), "{text}");
+        found(&mut app, 2, &["lab", "work"]);
+        let text = screen(&mut app, 120, 36).join("\n");
+        assert!(text.contains("● lab "), "{text}");
+        assert!(text.contains("● work "), "{text}");
+        assert!(!text.contains("checking…"), "{text}");
+
+        // Esc closes it and leaves the keyboard where it was. Alt+C opens it again with a
+        // check of its own, and closes it too.
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.environments.is_open());
+        assert_eq!(app.focus, Focus::Composer);
+        let text = screen(&mut app, 120, 36).join("\n");
+        assert!(!text.contains("Environments"), "{text}");
+        press(&mut app, KeyCode::Char('!'));
+        assert_eq!(app.composer.text(), "draft!");
+        alt(&mut app, 'c');
+        assert_eq!(*asked.borrow(), [1, 2, 3]);
+        assert!(
+            screen(&mut app, 120, 36)
+                .join("\n")
+                .contains("Checking the saved")
+        );
+        alt(&mut app, 'c');
+        assert!(!app.environments.is_open());
+        // What a closed dialog's check sends is dropped.
+        found(&mut app, 3, &["late"]);
+        assert!(!app.environments.is_open());
+    }
+
+    #[test]
+    fn the_environments_dialog_takes_the_mouse_and_opens_from_the_sidebar() {
+        let (mut app, asked) = tui_counting_checks();
+        // The sidebar's row under the wordmark opens it.
+        let rows = screen(&mut app, 120, 36);
+        let environment = app.sidebar.environment;
+        assert!(environment.width > 0, "{rows:#?}");
+        assert!(mouse(&mut app, CLICK, environment.x + 1, environment.y));
+        assert!(app.environments.is_open());
+        assert_eq!(*asked.borrow(), [1]);
+        found(&mut app, 1, &["alpha", "beta", "gamma"]);
+
+        // Until a frame draws it, a click does nothing.
+        assert!(!mouse(&mut app, CLICK, 119, 35));
+        assert!(app.environments.is_open());
+        screen(&mut app, 120, 36);
+        let drawn = app.environments.drawn.clone().unwrap();
+        // A click on an environment chooses it, and the wheel moves the choice.
+        let (y, index) = drawn.rows[2];
+        assert!(mouse(&mut app, CLICK, drawn.area.x + 3, y));
+        assert!(app.environments.is_open());
+        screen(&mut app, 120, 36);
+        assert_eq!(app.environments.row_at(y), Some(index));
+        let drawn = app.environments.drawn.clone().unwrap();
+        assert!(mouse(
+            &mut app,
+            MouseEventKind::ScrollUp,
+            drawn.area.x + 3,
+            y
+        ));
+        screen(&mut app, 120, 36);
+        // A click inside it but on no environment does nothing.
+        let title = drawn.area.y + 1;
+        assert!(!mouse(&mut app, CLICK, drawn.area.x + 3, title));
+        assert!(app.environments.is_open());
+
+        // A click on × closes it.
+        let drawn = app.environments.drawn.clone().unwrap();
+        assert!(mouse(&mut app, CLICK, drawn.close.x + 1, drawn.close.y));
+        assert!(!app.environments.is_open());
+
+        // A click outside it closes it, and reaches nothing under it.
+        alt(&mut app, 'c');
+        screen(&mut app, 120, 36);
+        let open_before = app.open.is_some();
+        let drawn = app.environments.drawn.clone().unwrap();
+        assert!(mouse(&mut app, CLICK, drawn.area.right() + 5, 30));
+        assert!(!app.environments.is_open());
+        assert_eq!(app.open.is_some(), open_before);
+        assert_eq!(app.focus, Focus::Sidebar);
+
+        // After a resize the dialog takes no click until it draws again.
+        alt(&mut app, 'c');
+        screen(&mut app, 120, 36);
+        app.on_terminal_event(Event::Resize(80, 24));
+        assert!(!mouse(&mut app, CLICK, 79, 23));
+        assert!(app.environments.is_open());
+        let rows = screen(&mut app, 80, 24);
+        assert!(
+            rows.iter().any(|row| row.contains("Environments")),
+            "{rows:#?}"
+        );
+        assert!(mouse(&mut app, CLICK, 79, 23));
+        assert!(!app.environments.is_open());
+
+        // A hidden sidebar draws no environment row to click.
+        ctrl_b(&mut app);
+        screen(&mut app, 120, 36);
+        assert_eq!(app.sidebar.environment, Rect::default());
+    }
+
+    #[test]
+    fn the_environments_dialog_covers_the_details_and_hands_them_back() {
+        let (mut app, _) = tui_counting_checks();
+        // Details too wide for a pane open as a dialog with the keyboard.
+        alt(&mut app, 'b');
+        screen(&mut app, 60, 24);
+        assert!(app.details_modal());
+        alt(&mut app, 'c');
+        assert!(app.environments.is_open());
+        // Esc closes the Environments dialog first, and the details have the keyboard again.
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.environments.is_open());
+        assert!(app.details_modal());
+        press(&mut app, KeyCode::Esc);
+        assert!(!app.details.open);
     }
 }

@@ -822,6 +822,9 @@ pub struct Sidebar {
     /// Whether the last frame drew the feed's dot by the wordmark, with the environment
     /// under it. Without it the breadcrumb's row shows them.
     drew_environment: bool,
+    /// The row under the wordmark the last frame drew the environment in, which a click
+    /// opens the Environments dialog from.
+    pub environment: Rect,
 }
 
 impl Sidebar {
@@ -1142,6 +1145,7 @@ impl Sidebar {
         self.drew_working = false;
         self.headings.clear();
         self.drew_environment = false;
+        self.environment = Rect::default();
     }
 
     /// Draws the wordmark, the environment and the shelves, keeping the highlight in view.
@@ -1197,10 +1201,8 @@ impl Sidebar {
             let identity = view
                 .environment
                 .spans(width, label, Style::new().fg(t.muted));
-            frame.render_widget(
-                Paragraph::new(Line::from(identity)),
-                Rect::new(inner.x, inner.y + inset + 1, inner.width, 1),
-            );
+            self.environment = Rect::new(inner.x, inner.y + inset + 1, inner.width, 1);
+            frame.render_widget(Paragraph::new(Line::from(identity)), self.environment);
         }
 
         let top = inner.y + 2 + 2 * inset;
