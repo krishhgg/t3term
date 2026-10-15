@@ -1448,6 +1448,9 @@ pub(super) struct PullRequests {
     /// The control in the Comments section or the Timeline that ↑ and ↓ chose, which Enter
     /// acts on.
     pick: Option<Control>,
+    /// The control whose first row the next frame of the Code tab shows at the top of the
+    /// details, as a file picked from the file tree shows.
+    reveal: Option<Control>,
     /// The tab of a link's details that shows while they have tabs, which starts over at the
     /// Summary each time they open.
     tab: Tab,
@@ -1490,6 +1493,7 @@ impl PullRequests {
         self.asking = false;
         self.shown = Shown::default();
         self.pick = None;
+        self.reveal = None;
         self.tab = Tab::Summary;
         self.kept = Default::default();
         self.mounted = false;
@@ -1787,6 +1791,12 @@ impl PullRequests {
                 Control::MoreCommits if !code.has(control, &commits) => {
                     Some(Control::Commit(listed))
                 }
+                // A file picked from the tree is chosen where it shows, at the top of the
+                // details, as the desktop scrolls the diff to it.
+                Control::TreeFile(at) => {
+                    self.reveal = Some(Control::File(at));
+                    Some(Control::File(at))
+                }
                 _ => Some(control),
             }
             .filter(|control| code.has(*control, &commits));
@@ -1975,6 +1985,7 @@ impl PullRequests {
             // link, the width and the minute are the same.
             self.shown = Shown::default();
             self.pick = None;
+            self.reveal = None;
             self.relay();
         }
     }
@@ -2684,6 +2695,18 @@ impl PullRequests {
         let (mut scroll, mut across) = (0, 0);
         if self.viewing {
             let total = self.prepare_detail(width, now, theme);
+            let reveal = self
+                .reveal
+                .take()
+                .filter(|_| self.tabs() == Some(Tab::Code));
+            let targets = self.detail.as_ref().map(|detail| &detail.targets);
+            let rows = targets
+                .into_iter()
+                .flatten()
+                .find(|(_, control)| Some(*control) == reveal);
+            if let Some((rows, _)) = rows {
+                self.scroll = Offset::Top(rows.start);
+            }
             // The row back to the list comes first.
             let last = total.saturating_sub(height.saturating_sub(1));
             scroll = match self.scroll {
@@ -6720,6 +6743,8 @@ mod tests {
         pulls.step(true);
         assert_eq!(pulls.action().as_deref(), Some("disable line wrapping"));
         pulls.step(true);
+        assert_eq!(pulls.action().as_deref(), Some("show file tree"));
+        pulls.step(true);
         assert_eq!(pulls.action().as_deref(), Some("expand file"));
         pulls.enter();
         let unfolded = |pulls: &mut PullRequests| {
@@ -7293,6 +7318,8 @@ mod tests {
         pulls.step(true);
         assert_eq!(pulls.pick, Some(Control::Wrap));
         pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::Tree));
+        pulls.step(true);
         assert_eq!(pulls.pick, Some(Control::File(0)));
         assert_eq!(pulls.action().as_deref(), Some("expand file"));
         pulls.enter();
@@ -7388,6 +7415,8 @@ mod tests {
         assert_eq!(pulls.pick, Some(Control::Layout));
         pulls.step(true);
         assert_eq!(pulls.pick, Some(Control::Wrap));
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::Tree));
         pulls.step(true);
         assert_eq!(pulls.pick, Some(Control::OffDiff));
         assert_eq!(
@@ -7534,7 +7563,7 @@ mod tests {
         pulls.page(60, 40, now(), true, &theme);
         let rows = detail_rows(&pulls);
         assert_eq!(
-            rows[at..at + 8],
+            rows[at..at + 9],
             [
                 "› Commit 0 · 0000000",
                 "1 file",
@@ -7542,6 +7571,7 @@ mod tests {
                 "⇊ Expand all files",
                 "◫ Split diff view",
                 "↵ Disable line wrapping",
+                "⊢ Show file tree",
                 "",
                 "› 1 conversation not on the current diff"
             ]
@@ -7616,7 +7646,7 @@ mod tests {
         assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
         assert!(pulls.answer_diff(2, Ok(added(0, 1, None)), now()));
         pulls.page(60, 40, now(), true, &theme);
-        for _ in 0..5 {
+        for _ in 0..6 {
             pulls.step(true);
         }
         assert_eq!(pulls.pick, Some(Control::File(0)));
@@ -7903,7 +7933,7 @@ mod tests {
         assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
         assert!(pulls.answer_diff(2, Ok(diff()), now()));
         pulls.page(60, 40, now(), true, &theme);
-        for _ in 0..5 {
+        for _ in 0..6 {
             pulls.step(true);
         }
         assert_eq!(pulls.pick, Some(Control::File(0)));

@@ -71,6 +71,15 @@
 //! text of those rows sideways while their numbers stay, as `Sideways` says, as the desktop's
 //! numbers stay while its lines scroll.
 //!
+//! A row under the wrap row shows the files in a tree, or hides it again, as the desktop's
+//! toolbar toggle does (PullRequestCodeTab.tsx:1299-1317). It starts hidden, as the desktop's
+//! `t3code.pullRequestFileTreeOpen` is false until changed. The details have no room for the
+//! desktop's tree beside the files, so it shows above them, as `tree` lays it out, under a row
+//! that counts its paths and one that closes every folder or opens them all. A folder's row
+//! opens or closes it, and a file's row unfolds the file and shows it at the top of the
+//! details, as the desktop's `revealFile` does (663-672). While slices are left, a row under the
+//! tree reads the next, as the desktop's footer does (1529-1554).
+//!
 //! Only the files unfolded are laid out, each once for each width. Each line of them is cleaned
 //! of control characters, its tabs set every `TAB` columns, and cut at `LINE` characters as it
 //! is.
@@ -92,6 +101,7 @@ use crate::pull_request::{
     self, ChangeType, FileContents, FilesViewed, Side, ViewedFilesStore, ViewedState, patch,
 };
 use crate::transcript::clusters;
+use tree::Tree;
 
 /// The columns between two tab stops in a line of the diff.
 const TAB: usize = 4;
@@ -150,6 +160,16 @@ const SPLIT: &str = "⊟ Stacked diff view";
 /// that turns back.
 const WRAPPED: &str = "↵ Disable line wrapping";
 const UNWRAPPED: &str = "↵ Enable line wrapping";
+/// The row that shows the file tree, and the one that hides it, after the desktop's `Show file
+/// tree` and `Hide file tree` with its icon of a folder's branches.
+const TREE_HIDDEN: &str = "⊢ Show file tree";
+const TREE_SHOWN: &str = "⊢ Hide file tree";
+/// The tree's row that closes every folder, and the one that opens them all, after the
+/// desktop's `Collapse all folders` and `Expand all folders` with the chevrons of the fold row.
+const FOLDERS_OPEN: &str = "⇈ Collapse all folders";
+const FOLDERS_FOLDED: &str = "⇊ Expand all folders";
+/// The tree's row that reads the next slice, as the desktop's footer says.
+const MORE_FILES: &str = "Load more files";
 const VIEWED_FAILED: &str = "t3term couldn't read which files you viewed.";
 const VIEWED_STALE: &str = "The viewed marks may be out of date: t3term couldn't read them again.";
 const VIEWED_SHORT: &str = "This change has more files than the host reports viewed marks for in one read, so the count is short.";
@@ -195,6 +215,12 @@ pub(super) struct Code {
     /// Whether the lines wrap: true at first, as the desktop's `wordWrap` setting is true until
     /// changed. Another diff picked from the commits keeps it, as the desktop's toggle does.
     wrap: bool,
+    /// Whether the file tree shows: false at first, as the desktop's
+    /// `t3code.pullRequestFileTreeOpen` is until changed.
+    tree: bool,
+    /// The paths of the tree's folders the reader closed. They open again when the tree hides
+    /// or another diff shows, as the desktop's tree starts over when it shows again.
+    folded: HashSet<String>,
     /// The rows of each unfolded file's lines, by its slice's place and its place in that
     /// slice, so a file is laid out again only when its slice, the width or its fold changes.
     bodies: HashMap<(usize, usize), Body>,
@@ -473,6 +499,8 @@ impl Code {
             whitespace: false,
             split: false,
             wrap: true,
+            tree: false,
+            folded: HashSet::new(),
             bodies: HashMap::new(),
             commit: None,
             commits_open: false,
@@ -705,9 +733,19 @@ impl Code {
         let open = self.commits_open && !commits.is_empty();
         match control {
             Control::File(at) => at < self.files.len(),
-            Control::Whitespace | Control::Folds | Control::Layout | Control::Wrap => {
-                !self.files.is_empty()
-            }
+            Control::Whitespace
+            | Control::Folds
+            | Control::Layout
+            | Control::Wrap
+            | Control::Tree => !self.files.is_empty(),
+            Control::Folders => self.shows_tree() && !self.tree().folders().is_empty(),
+            Control::Folder(first, parts) => self.tree_rows().iter().any(|row| {
+                matches!(row.kind, tree::Kind::Folder { first: f, parts: p, .. } if (f, p) == (first, parts))
+            }),
+            Control::TreeFile(at) => self.tree_rows().iter().any(|row| {
+                matches!(row.kind, tree::Kind::File { at: a, .. } if a == at)
+            }),
+            Control::MoreFiles => self.shows_tree() && self.offers_more(),
             Control::Retry => self.retries(),
             Control::Commits => !commits.is_empty(),
             Control::AllCommits => open,
@@ -789,10 +827,50 @@ impl Code {
                 self.wrap = !self.wrap;
                 self.bodies.clear();
             }
-            Control::Retry => {
+            Control::Tree => {
+                self.tree = !self.tree;
+                self.folded.clear();
+            }
+            // Every folder the other way, as the desktop's button sets each folder
+            // (fileTreeExpansion.ts:43-55).
+            Control::Folders => {
+                let folders = self.tree().folders();
+                match folders.iter().all(|path| !self.folded.contains(path)) {
+                    true => self.folded.extend(folders),
+                    false => self.folded.clear(),
+                }
+            }
+            Control::Folder(first, parts) => {
+                let path = self.tree_rows().into_iter().find_map(|row| match row.kind {
+                    tree::Kind::Folder {
+                        path,
+                        first: f,
+                        parts: p,
+                        ..
+                    } if (f, p) == (first, parts) => Some(path),
+                    _ => None,
+                });
+                if let Some(path) = path
+                    && !self.folded.remove(&path)
+                {
+                    self.folded.insert(path);
+                }
+            }
+            // A file folded unfolds, and one unfolded stays so.
+            Control::TreeFile(at) => {
+                let Some(path) = self.file(at).map(|(_, file)| file.path().to_string()) else {
+                    return false;
+                };
+                if !self.open(&path) && !self.toggled.remove(&path) {
+                    self.toggled.insert(path);
+                }
+            }
+            Control::Retry | Control::MoreFiles => {
                 if let Some((_, first)) = self.failed.take() {
                     self.again = first;
                     self.due = !first;
+                } else if control == Control::MoreFiles {
+                    self.near_end();
                 }
             }
             Control::Stretch(at, place) => self.widen(at, place),
@@ -934,6 +1012,7 @@ impl Code {
         self.bodies.clear();
         self.unfolded = false;
         self.toggled.clear();
+        self.folded.clear();
         self.contexts.clear();
         self.asked = None;
         self.failed = None;
@@ -978,6 +1057,23 @@ impl Code {
             Control::Layout => "show split diff view".to_string(),
             Control::Wrap if self.wrap => "disable line wrapping".to_string(),
             Control::Wrap => "enable line wrapping".to_string(),
+            Control::Tree if self.tree => "hide file tree".to_string(),
+            Control::Tree => "show file tree".to_string(),
+            Control::Folders if self.folders_open() => "collapse all folders".to_string(),
+            Control::Folders => "expand all folders".to_string(),
+            Control::Folder(first, parts) => {
+                let open = self.tree_rows().iter().any(|row| {
+                    matches!(row.kind, tree::Kind::Folder { first: f, parts: p, open: true, .. } if (f, p) == (first, parts))
+                });
+                if open {
+                    "collapse folder"
+                } else {
+                    "expand folder"
+                }
+                .to_string()
+            }
+            Control::TreeFile(_) => "go to file".to_string(),
+            Control::MoreFiles if self.failed.is_none() => "load more files".to_string(),
             Control::Commits if self.commits_open => "hide commits".to_string(),
             Control::Commits => "choose commit".to_string(),
             Control::AllCommits => "show all commits".to_string(),
@@ -1027,6 +1123,39 @@ impl Code {
     fn all_folded(&self) -> bool {
         let mut files = (0..self.files.len()).filter_map(|at| self.file(at));
         files.all(|(_, file)| !self.open(file.path()))
+    }
+
+    /// Whether the file tree shows: the reader showed it and the tab has files.
+    fn shows_tree(&self) -> bool {
+        self.tree && !self.files.is_empty()
+    }
+
+    /// The tree of the files shown.
+    fn tree(&self) -> Tree {
+        let files = (0..self.files.len()).filter_map(|at| self.file(at));
+        Tree::new(files.map(|(_, file)| (file.path(), file.status)))
+    }
+
+    /// The rows of the file tree that show, or none while it doesn't.
+    fn tree_rows(&self) -> Vec<tree::Row> {
+        match self.shows_tree() {
+            true => self.tree().rows(&self.folded),
+            false => Vec::new(),
+        }
+    }
+
+    /// Whether every folder of the file tree is open, so its row offers to close them all, as
+    /// the desktop's `areAllDirectoriesExpanded` says.
+    fn folders_open(&self) -> bool {
+        let folders = self.tree().folders();
+        !folders.is_empty() && folders.iter().all(|path| !self.folded.contains(path))
+    }
+
+    /// Whether the end of the file tree offers to read the next slice: there is one, and no
+    /// read of it is wanted or under way, or the last read failed, which it reads again.
+    fn offers_more(&self) -> bool {
+        let idle = self.asked.is_none() && !self.due;
+        self.next_cursor().is_some() && (self.failed.is_some() || idle)
     }
 
     /// Whether the tab lists files, rather than saying it has none: some slice came, and it
@@ -1308,6 +1437,16 @@ impl Code {
             let start = lines.len();
             lines.extend(whole(label, width, fg));
             targets.push((start..lines.len(), Control::Wrap));
+            let label = match self.tree {
+                true => TREE_SHOWN,
+                false => TREE_HIDDEN,
+            };
+            let start = lines.len();
+            lines.extend(whole(label, width, fg));
+            targets.push((start..lines.len(), Control::Tree));
+            if self.tree {
+                self.tree_lines(&mut lines, &mut targets, width, theme);
+            }
         }
         let placed = self.place(threads);
         // A thread, open as the reader left it, with its first row as the target that opens
@@ -1474,6 +1613,59 @@ impl Code {
             }
         }
         (lines, targets, sideways)
+    }
+
+    /// The file tree's rows, after a blank row: its count of paths, the row that closes every
+    /// folder or opens them all where it has one, a row for each folder and file that shows, and
+    /// while slices are left, the row that reads the next, as the desktop's footer has `Load
+    /// more files`, `Loading more files...` or `Retry` (PullRequestCodeTab.tsx:1529-1554).
+    fn tree_lines(
+        &self,
+        lines: &mut Vec<Line<'static>>,
+        targets: &mut Targets,
+        width: usize,
+        theme: &Theme,
+    ) {
+        let (fg, muted) = (Style::new().fg(theme.fg), Style::new().fg(theme.muted));
+        let tree = self.tree();
+        lines.push(Line::default());
+        let count = grouped(tree.count() as u64);
+        let parts = vec![Span::styled("Files", fg), Span::styled(count, muted)];
+        lines.extend(flowed(parts, " · ", width, theme));
+        if !tree.folders().is_empty() {
+            let label = match self.folders_open() {
+                true => FOLDERS_OPEN,
+                false => FOLDERS_FOLDED,
+            };
+            let start = lines.len();
+            lines.extend(whole(label, width, fg));
+            targets.push((start..lines.len(), Control::Folders));
+        }
+        for row in tree.rows(&self.folded) {
+            let control = match row.kind {
+                tree::Kind::Folder { first, parts, .. } => Control::Folder(first, parts),
+                tree::Kind::File { at, .. } => Control::TreeFile(at),
+            };
+            let start = lines.len();
+            lines.extend(tree::lines(&row, width, theme));
+            targets.push((start..lines.len(), control));
+        }
+        if self.next_cursor().is_none() {
+            return;
+        }
+        let start = lines.len();
+        match self.offers_more() {
+            true => {
+                let label = if self.failed.is_some() {
+                    "↻ Retry"
+                } else {
+                    MORE_FILES
+                };
+                lines.extend(whole(label, width, fg));
+                targets.push((start..lines.len(), Control::MoreFiles));
+            }
+            false => lines.extend(whole(LOADING_MORE, width, muted)),
+        }
     }
 
     /// The notes on the marks on files viewed: that the last read failed, with its reason, and
@@ -2347,6 +2539,7 @@ fn broken(text: &str, width: usize) -> Vec<String> {
 }
 
 mod order;
+mod tree;
 mod whitespace;
 
 #[cfg(test)]
