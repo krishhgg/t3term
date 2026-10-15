@@ -44,7 +44,7 @@ A `Stack` has the host's id, its own number, its page, the branch its bottom lay
 
 A diff comes a slice at a time, and a slice holds whole files. `next_cursor` is where the next slice starts, or `None` once the diff is whole, and the caller passes it back as `cursor` to read on. `truncated` says the host left something in the slice out, such as a binary file or a change too large to inline. `omitted` gives the host's own counts for files whose hunks it left out. T3's GitHub provider asks GitHub for the whole diff, up to 8 MiB, in one slice. Past that, or past the 300 files GitHub will diff, it reads 100 files a slice from GitHub's files API, and writes a file GitHub sends no patch for as its header alone (apps/server/src/pullRequest/GitHubPullRequestCli.ts:2206-2259, gitHubPullRequestJson.ts:3219-3266). T3 keeps a slice for 60 seconds under the `updatedAt` its last detail read gave, so once a detail read finds the pull request changed, the next slice comes from the host (apps/server/src/pullRequest/PullRequestService.ts:164, 3175-3215).
 
-`patch::Patch::read` splits a slice's patch into files, hunks and lines. A file has its paths before and after, its status (added, deleted, renamed or modified), whether git says it is binary, and the lines it adds and removes. A line has its kind, its numbers before and after the change, and its text as a range of the patch, so nothing is copied. The parser reads git's quoted paths with their escapes, the tab git puts after a path with a space, and a plain unified diff without `diff --git`. A line it can't place, such as a hunk header that isn't one or a hunk that ends before its header says, marks the file `unreadable`. The rest of the patch still reads.
+`patch::Patch::read` splits a slice's patch into files, hunks and lines. A file has its paths before and after, its status (added, deleted, renamed or modified), whether git says it is binary, and the lines it adds and removes. A line has its kind, its numbers before and after the change, and its text as a range of the patch, so nothing is copied. The parser reads git's quoted paths with their escapes, the tab git puts after a path with a space, and a plain unified diff without `diff --git`. A line it can't place, such as a hunk header that isn't one, marks the file `unreadable`. So does a hunk with fewer or more lines on a side than its header counts, including one the patch ends inside. The rest of the patch still reads.
 
 ## What an answer holds
 
@@ -75,11 +75,11 @@ Text is cut on a character boundary before anything else reads it, and lists are
 | A diff's answer | 16 MiB, twice the most T3 reads from GitHub at once |
 | Files a diff left out | 3,000 |
 | Files of one patch | 3,000 |
-| Lines of one patch's hunks | 200,000, in all its files |
+| Hunks of one patch and their lines | 200,000, in all its files, a hunk's header counting as a line |
 | A path in a patch | 4,096 bytes, as T3's `FilePath` |
 | Reviewers, labels, commit authors, people behind one reaction | 100 |
 
-A body that lost text says so with `Body::cut`, and a detail, an activity, a list of checks, a review thread or a stack that lost entries says so with its `cut` flag. A diff that named more files left out says so with `omitted_cut`, and a patch with more files with `files_cut`. A file whose lines are past the bound keeps its counts and says so with `lines_cut`. The bounds don't limit memory for the RPC reads. The connection's reader decodes each message whole first, and tungstenite 0.28 allows one of up to 64 MiB. `diff` reads its answer a chunk at a time and stops at 16 MiB, before any of it is decoded.
+A body that lost text says so with `Body::cut`, and a detail, an activity, a list of checks, a review thread or a stack that lost entries says so with its `cut` flag. A diff that named more files left out says so with `omitted_cut`, and a patch with more files with `files_cut`. A file whose hunks or lines are past the bound keeps its counts and says so with `lines_cut`. The bounds don't limit memory for the RPC reads. The connection's reader decodes each message whole first, and tungstenite 0.28 allows one of up to 64 MiB. `diff` reads its answer a chunk at a time and stops at 16 MiB, before any of it is decoded.
 
 ## Failures
 
