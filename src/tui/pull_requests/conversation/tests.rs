@@ -1214,6 +1214,10 @@ fn the_timeline_reads_as_the_desktops_does() {
     );
     assert!(conversation.has(Control::TimelineCommit(1), &shown));
     assert!(!conversation.has(Control::TimelineCommit(2), &shown));
+    // Until the detail lays the Timeline out, a commit opens nothing.
+    let parser = commit("a1b2c3d4e5f6", "Add the parser", &ago_at(500), None, None);
+    let unlaid = conversation_of(&activity(vec![], vec![], vec![parser]));
+    assert!(!unlaid.has(Control::TimelineCommit(0), &shown));
 
     // A run opens to each of its remarks, and stays open the other way round, where the
     // desktop's closes. Oldest first, a run's time is its oldest remark's.
