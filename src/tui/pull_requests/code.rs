@@ -350,8 +350,7 @@ impl Code {
         if viewed.asked.is_some() || viewed.again {
             return false;
         }
-        viewed.failed.is_some()
-            || (viewed.states.is_some() && now.saturating_sub(viewed.at) >= VIEWED_FRESH)
+        viewed.failed.is_some() || now.saturating_sub(viewed.at) >= VIEWED_FRESH
     }
 
     /// Notes that the marks on files viewed may be out of date, so they are read again.
@@ -1190,9 +1189,6 @@ impl Code {
             };
             lines.extend(whole(note, width, warning));
             lines.extend(whole(failure, width, muted));
-        }
-        if viewed.states.is_none() {
-            return;
         }
         if viewed.truncated {
             lines.extend(whole(VIEWED_SHORT, width, warning));

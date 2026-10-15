@@ -7153,7 +7153,9 @@ mod tests {
         assert_eq!(pulls.take_viewed_ask(true), Some(viewed_ask(3)));
         assert_eq!(pulls.take_viewed_ask(true), None);
         assert!(pulls.answer_diff(2, Ok(added(0, 3, None)), now()));
-        // An answer to another read is dropped.
+        pulls.page(40, 30, now(), true, &theme);
+        assert!(detail_rows(&pulls).contains(&"3 files".into()));
+        // An answer to another read is dropped, and the marks show once theirs came.
         assert!(!pulls.answer_viewed(9, viewed(&["f0.rs"]), now()));
         assert!(pulls.answer_viewed(3, viewed(&["f0.rs", "f2.rs"]), now()));
         assert!(!pulls.answer_viewed(3, viewed(&["f0.rs"]), now()));
@@ -7173,10 +7175,14 @@ mod tests {
             pulls.answer(ticket, Part::Activity(Ok(Box::new(activity))), now());
             pulls.answer(ticket, Part::Done, now());
         };
-        // A refresh number reads them again with the diff.
+        // A refresh number reads them again with the diff, once the Code shows.
+        assert!(pulls.back());
         assert!(pulls.refresh());
         let ask = pulls.take_ask(true, now()).expect("the read again");
         let ticket = ask.ticket;
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        assert_eq!(pulls.take_viewed_ask(true), None);
+        assert!(pulls.forward());
         assert_eq!(
             pulls.take_diff_ask(true, now()),
             Some(diff_ask(ticket + 1, None))

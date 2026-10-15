@@ -2485,14 +2485,16 @@ fn the_count_and_each_header_say_which_files_are_viewed() {
     assert!(more.take_viewed(2, marks(&[("old.txt", Viewed)], false, false), 0));
     assert_eq!(kept(&more, host, 60)[0], "5 files+ · 1 / 5 viewed");
 
-    // A diff with no files says nothing of marks.
+    // A diff with no files says nothing of marks, whether they came or failed.
     let mut empty = read(slice("", None), 0);
+    let none = ["0 files", "", "This pull request has no file changes."];
     assert!(empty.ask_viewed(2));
-    assert!(empty.take_viewed(2, Err("Down.".into()), 0));
-    assert_eq!(
-        kept(&empty, host, 60),
-        ["0 files", "", "This pull request has no file changes."]
-    );
+    assert!(empty.take_viewed(2, marks(&[("a.rs", Viewed)], true, true), 0));
+    assert_eq!(kept(&empty, host, 60), none);
+    empty.view_again();
+    assert!(empty.ask_viewed(3));
+    assert!(empty.take_viewed(3, Err("Down.".into()), 0));
+    assert_eq!(kept(&empty, host, 60), none);
 }
 
 #[test]
@@ -2510,6 +2512,17 @@ fn the_marks_keep_through_a_commits_diff_and_a_failure() {
             "t3term couldn't read which files you viewed.",
             "This host does not track it.",
         ]
+    );
+    let lines = kept_lines(&code, host, 60);
+    let theme = theme();
+    assert_eq!(color_of(&lines, VIEWED_FAILED), Some(theme.warning_fg));
+    let reason = color_of(&lines, "This host does not track it.");
+    assert_eq!(reason, Some(theme.muted));
+    // A detail that says nobody keeps them hides the failure too.
+    let hidden = kept(&code, None, 60);
+    assert!(
+        !hidden.iter().any(|row| row.contains("couldn't")),
+        "{hidden:#?}"
     );
     assert!(code.viewed_stale(0));
     code.view_again();
@@ -2543,6 +2556,14 @@ fn the_marks_keep_through_a_commits_diff_and_a_failure() {
     assert_eq!(code.ask(7), Some(None));
     assert_eq!(code.take(7, Ok(slice(PATCH, None)), 0), Some(true));
     assert_eq!(kept(&code, host, 60)[0], "5 files · 1 / 5 viewed");
+
+    // A reason past 1,024 characters is cut.
+    code.view_again();
+    assert!(code.ask_viewed(8));
+    assert!(code.take_viewed(8, Err("q".repeat(2_000)), 0));
+    let rows = kept(&code, host, 60);
+    let shown: usize = rows.iter().map(|row| row.matches('q').count()).sum();
+    assert_eq!(shown, 1_024);
 }
 
 #[test]
@@ -2560,6 +2581,9 @@ fn a_short_read_of_the_marks_says_the_count_is_short() {
             "",
         ]
     );
+    let lines = kept_lines(&code, host, 60);
+    let short = color_of(&lines, "marks for in one read, so the count is short.");
+    assert_eq!(short, Some(theme().warning_fg));
     code.view_again();
     assert!(code.ask_viewed(3));
     assert!(code.take_viewed(3, marks(&[], false, true), 0));
@@ -2591,21 +2615,30 @@ fn the_marks_are_read_once_at_a_time_and_again_when_stale() {
     assert!(!code.ask_viewed(2));
     assert!(code.take_viewed(1, marks(&[], false, false), 1_000));
     assert!(!code.ask_viewed(2));
-    // They go stale 15 seconds after they came.
+    // They go stale 15 seconds after they came, though not while they are wanted or a read
+    // of them is under way.
     assert!(!code.viewed_stale(15_999));
     assert!(code.viewed_stale(16_000));
-    // A read of the diff again reads them again, and one under way then is dropped.
+    code.view_again();
+    assert!(!code.viewed_stale(16_000));
+    assert!(code.ask_viewed(2));
+    assert!(!code.viewed_stale(16_000));
+    assert!(code.take_viewed(2, marks(&[], false, false), 16_000));
+    assert!(!code.viewed_stale(30_999));
+    // A read of the diff again reads them again. One under way then is dropped, and the next
+    // waits for it.
     code.again();
     assert!(!code.viewed_stale(60_000));
-    assert!(code.ask_viewed(2));
-    code.again();
-    assert!(!code.take_viewed(2, marks(&[], false, false), 0));
     assert!(code.ask_viewed(3));
-    assert!(code.take_viewed(3, marks(&[], false, false), 0));
+    code.again();
+    assert!(!code.ask_viewed(4));
+    assert!(!code.take_viewed(3, marks(&[], false, false), 0));
+    assert!(code.ask_viewed(4));
+    assert!(code.take_viewed(4, marks(&[], false, false), 0));
     // A failure is stale at once.
     code.view_again();
-    assert!(code.ask_viewed(4));
-    assert!(code.take_viewed(4, Err("Down.".into()), 0));
+    assert!(code.ask_viewed(5));
+    assert!(code.take_viewed(5, Err("Down.".into()), 0));
     assert!(code.viewed_stale(0));
 }
 

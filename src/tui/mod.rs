@@ -14456,8 +14456,8 @@ mod tests {
     #[test]
     fn the_code_tab_reads_the_viewed_marks_through_the_links_project() {
         let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
-        let _asked = note_reads(&mut app);
-        let _diffs = note_diffs(&mut app);
+        let asked = note_reads(&mut app);
+        let diffs = note_diffs(&mut app);
         let viewed = note_viewed(&mut app);
         press(&mut app, KeyCode::Enter);
         let mut detail = host_detail_sent();
@@ -14542,7 +14542,7 @@ mod tests {
         ];
         hear(&mut app, 4, parts);
         assert_eq!(*viewed.borrow(), [named(3), named(6)]);
-        let answer = Ok(Box::new(marks));
+        let answer = Ok(Box::new(marks.clone()));
         app.on_action_result(ActionResult::PullRequestViewed { ticket: 6, answer });
         assert!(app.details.moved);
         let rows = body_after(&mut app, 200, 50);
@@ -14559,6 +14559,48 @@ mod tests {
             !rows.iter().any(|row| row.contains("couldn't")),
             "{rows:#?}"
         );
+
+        // Showing the Code again 15 seconds after the marks came reads them again, though the
+        // diff is still fresh.
+        app.now = now_ms() + 16_000;
+        for _ in 0..3 {
+            press(&mut app, KeyCode::Left);
+        }
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Right);
+        let (reads, read_diffs) = (asked.borrow().len(), diffs.borrow().len());
+        assert!(app.details.pulls.forward());
+        assert!(app.read_opened_pull());
+        assert_eq!(viewed.borrow().len(), 3);
+        assert_eq!(viewed.borrow()[2].4, 8);
+        assert_eq!(asked.borrow().len(), reads);
+        assert_eq!(diffs.borrow().len(), read_diffs);
+        assert!(!app.read_opened_pull());
+
+        // `r` while that read is under way drops its answer, and reads them again once it
+        // came. The details' own read on arrival comes first, as `r` waits for it.
+        let parts = || {
+            let mut detail = host_detail_sent();
+            detail["capabilities"]["viewedFiles"] = json!("environment");
+            let detail = pull_request::Detail::read(&detail).unwrap();
+            let activity = pull_request::Activity::read(&host_activity_sent()).unwrap();
+            vec![
+                Part::Detail(Ok(Box::new(detail))),
+                Part::Activity(Ok(Box::new(activity))),
+                Part::Done,
+            ]
+        };
+        let arrival = asked.borrow().last().expect("the read on arrival").4;
+        hear(&mut app, arrival, parts());
+        press(&mut app, KeyCode::Char('r'));
+        let ticket = asked.borrow().last().expect("the read again").4;
+        assert!(ticket > arrival);
+        hear(&mut app, ticket, parts());
+        assert_eq!(viewed.borrow().len(), 3);
+        let answer = Ok(Box::new(marks));
+        app.on_action_result(ActionResult::PullRequestViewed { ticket: 8, answer });
+        assert_eq!(viewed.borrow().len(), 4);
+        assert!(viewed.borrow()[3].4 > ticket);
     }
 
     #[test]
