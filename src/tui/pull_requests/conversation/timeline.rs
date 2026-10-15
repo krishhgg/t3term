@@ -336,10 +336,13 @@ impl Timeline {
 
 /// The Timeline as the conversation's read stands and the reader opened it: that the read is
 /// under way or why it failed, or its header and then its rows with a blank row between each
-/// two, and the rows of each control among them.
+/// two, and the rows of each control among them. Where `opens` says the details offer the
+/// Code tab, a commit's rows show its own diff there, as the desktop's `CommitEvent` is a
+/// button that does (PullRequestTimelineTab.tsx:369-407, PullRequestDetailPanel.tsx:516-519).
 pub(in crate::tui::pull_requests) fn section(
     answer: &Answer<Conversation>,
     shown: &Shown,
+    opens: bool,
     width: usize,
     now: i64,
     theme: &Theme,
@@ -387,7 +390,12 @@ pub(in crate::tui::pull_requests) fn section(
             Row::Event(at) => {
                 let event = &timeline.events[*at];
                 let lines = timeline.event_lines(conversation, event, width, now, theme);
-                rows.item(lines, None);
+                match event.what {
+                    What::Commit(commit) if opens => {
+                        rows.control(lines, Control::TimelineCommit(commit));
+                    }
+                    _ => rows.item(lines, None),
+                }
             }
             Row::Run(run, events) => {
                 let mut events: Vec<&Event> = timeline.events[events.clone()].iter().collect();
