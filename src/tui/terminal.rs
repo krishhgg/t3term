@@ -30,6 +30,7 @@ use tokio::time::Instant;
 use unicode_width::UnicodeWidthStr;
 
 use super::label;
+use super::tasks::wrap;
 use super::theme::Theme;
 use crate::error::T3Error;
 use crate::rpc::{RpcClient, RpcError, StreamLimits};
@@ -374,8 +375,9 @@ impl Pane {
                 true
             }
             Happened::Wrote(Ok(())) => false,
-            // The stream sees the connection drop too, and attaches again.
-            Happened::Wrote(Err(TerminalError::Rpc(RpcError::Disconnected(_)))) => false,
+            Happened::Wrote(Err(TerminalError::Rpc(error))) if self.lost(&error) => false,
+            // A write T3 didn't answer in time may have reached the shell or not, so nothing
+            // after it goes either.
             Happened::Wrote(Err(error)) => {
                 self.input_failed = true;
                 self.refresh_access();
@@ -489,9 +491,12 @@ impl Pane {
             Link::Missing(note) => Some(note.clone()),
             _ => None,
         };
-        let lines = if let Some(note) = missing {
-            Some(self.missing_lines(note.as_deref(), theme))
-        } else if let Link::Stopped(reason) = &self.link {
+        if let Some(note) = missing {
+            let lines = self.missing_lines(note.as_deref(), theme);
+            frame.render_widget(Paragraph::new(lines).style(canvas), content);
+            return None;
+        }
+        let lines = if let Link::Stopped(reason) = &self.link {
             Some(vec![
                 Line::styled(format!(" {reason}"), Style::new().fg(theme.error_fg)),
                 Line::styled(" Enter attaches again.", Style::new().fg(theme.muted)),
@@ -637,17 +642,27 @@ impl Pane {
         (long.unwrap_or_else(|| short.to_string()), short, color)
     }
 
-    /// What a thread without a terminal shows: a line saying so, Start terminal, and why the
-    /// last start didn't happen. Notes where Start terminal is for clicks.
+    /// What a thread without a terminal shows, a row to each line: a line saying so, Start
+    /// terminal, and why the last start didn't happen. The first line shows only when it fits
+    /// whole above Start terminal. Notes where Start terminal is for clicks, so the rows are
+    /// wrapped here and drawn as they are.
     fn missing_lines(&mut self, note: Option<&str>, theme: &Theme) -> Vec<Line<'static>> {
         const START: &str = " Start terminal ";
         let content = self.content;
+        // Each row starts with a space, as the drawer's other messages do.
+        let width = usize::from(content.width.saturating_sub(1)).max(1);
+        let rows = |text: &str, style: Style| {
+            wrap(text, width)
+                .into_iter()
+                .map(move |row| Line::styled(format!(" {row}"), style))
+        };
         let mut lines = Vec::new();
-        if content.height > 1 {
-            lines.push(Line::styled(
-                " This thread has no terminal yet.",
-                Style::new().fg(theme.muted),
-            ));
+        let intro = rows(
+            "This thread has no terminal yet.",
+            Style::new().fg(theme.muted),
+        );
+        if intro.len() < usize::from(content.height) {
+            lines.extend(intro);
         }
         let button = Rect::new(
             content.x + 1,
@@ -668,10 +683,7 @@ impl Pane {
             Span::styled("  Enter", Style::new().fg(theme.muted)),
         ]));
         if let Some(note) = note {
-            lines.push(Line::styled(
-                format!(" {note}"),
-                Style::new().fg(theme.error_fg),
-            ));
+            lines.extend(rows(note, Style::new().fg(theme.error_fg)));
         }
         lines
     }
@@ -875,12 +887,14 @@ impl Pane {
     }
 
     /// Gives the emulator write access while input goes to the shell, so it queues replies to
-    /// live output only, and drops the input waiting when it doesn't.
+    /// live output only. When input doesn't go, drops the input waiting and the write on its
+    /// way, so the pieces of a paste not yet sent never go.
     fn refresh_access(&mut self) {
         let writable = self.writable();
         self.emulator.set_write_access(writable);
         if !writable {
             self.input.clear();
+            self.writing = None;
         }
     }
 
@@ -953,11 +967,21 @@ impl Pane {
         }
     }
 
+    /// Whether `error` comes from a connection that closed. The stream sees that too and
+    /// attaches again. A call T3 didn't answer in time fails as `Disconnected` too, but its
+    /// connection stays open, so nothing attaches again.
+    fn lost(&self, error: &RpcError) -> bool {
+        matches!(error, RpcError::Disconnected(_))
+            && self
+                .terminal
+                .as_ref()
+                .is_none_or(|terminal| terminal.is_closed())
+    }
+
     fn resized(&mut self, result: Result<(), RpcError>) {
         match result {
             Ok(()) => {}
-            // The stream sees the connection drop too, and attaches again.
-            Err(RpcError::Disconnected(_)) => {}
+            Err(error) if self.lost(&error) => {}
             // The size counts as sent, so a resize T3 refuses isn't sent again until the size
             // changes.
             Err(error) => {

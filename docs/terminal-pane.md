@@ -28,7 +28,7 @@ When even `Terminal` and the short state don't fit, the short state shows alone,
 | attaching | | t3term is connecting and waiting for the terminal's snapshot. The screen reads "Connecting to the thread's terminal…" until the first snapshot. |
 | starting | | T3 is starting the shell. Keys don't go to it yet. |
 | running | | Keys go to the shell. |
-| input stopped | | A write failed, so nothing more goes to the shell until a new snapshot. F4 twice attaches again. |
+| input stopped | | A write failed, or T3 didn't answer one within 30 seconds, so nothing more goes to the shell until a new snapshot. F4 twice attaches again. |
 | exited with N, read-only; exited on signal N, read-only; exited, read-only | exited | The shell ended. The screen stays and takes no input. |
 | failed, read-only | failed | T3 couldn't start or run the shell. When T3's `error` event carries a message, the screen's last row shows it in place of what the screen had there, cleaned and cut to the row, and so does a notice on the status line. A snapshot carries no message, so after the drawer attaches again the last row is the screen's own. |
 | closed, read-only | closed | T3 closed the terminal. |
@@ -74,7 +74,7 @@ The first time the drawer shows, it calls `Client::terminal_rpc`, which issues t
 | A key, a paste or a reply the program asked for | `terminal.write` with the text |
 | A snapshot, and a new size that held still for 100 ms | `terminal.resize` with the drawn columns and rows |
 
-An attach never sends a size, `restartIfNotRunning` or `providerInstanceId`. A terminal T3 doesn't have fails the attach with `TerminalSessionLookupError` (`Manager.ts:2722-2727`), and the drawer then shows "This thread has no terminal yet." with a Start terminal button.
+An attach never sends a size, `restartIfNotRunning` or `providerInstanceId`. A terminal T3 doesn't have fails the attach with `TerminalSessionLookupError` (`Manager.ts:2722-2727`), and the drawer then shows "This thread has no terminal yet." with a Start terminal button. In a narrow drawer that line wraps, and it shows only when it fits whole above the button. A click lands on the row the button is drawn on.
 
 This is where t3term differs from the desktop on purpose. The desktop's drawer attaches with a `cwd` each time it shows (`apps/web/src/components/ThreadTerminalDrawer.tsx:435-445`), so opening it starts a shell for a thread that has none. t3term asks first, because a shell runs commands on the reader's machine and F4 is easy to press.
 
@@ -82,7 +82,7 @@ Start terminal sends what the desktop sends. `Launch::for_thread` sets `cwd` to 
 
 A resize goes only while the shell runs, as on the desktop, which resizes only a running terminal (`ThreadTerminalDrawer.tsx:446-447`). An attach sends no size, so each snapshot sends the size the drawer last drew at once. A drawer no frame has drawn yet sends its size 100 ms after the first frame draws it. After that a new size waits until it holds still for 100 ms, and only the latest goes. One resize is on its way at a time, and a size drawn meanwhile goes after it. The size is the drawer's screen, its rows less the header, within 2 to 1000 columns and 1 to 500 rows. A refused resize puts T3's message on the status line and isn't sent again until the size changes.
 
-Writes go one at a time, in the order they came. Input that arrives while a write is on its way waits, and goes as the next write. t3term never sends a write again. A failed write stops input until the next snapshot, so the shell never gets keys out of order. A write the lost connection ends stops nothing and adds no notice, because the stream sees the same loss and attaches again, and the new snapshot starts input afresh.
+Writes go one at a time, in the order they came. Input that arrives while a write is on its way waits, and goes as the next write. t3term never sends a write again. A failed write stops input until the next snapshot, so the shell never gets keys out of order. So does a write T3 doesn't answer within 30 seconds while the connection stays open, since it may have reached the shell or not. A write the lost connection ends stops nothing and adds no notice, because the stream sees the same loss and attaches again, and the new snapshot starts input afresh. A resize T3 doesn't answer in time gets a notice, as a refused one does.
 
 ## The order of work
 
@@ -106,7 +106,7 @@ T3 turns a `started` event into a snapshot on the attach stream (`Manager.ts:427
 
 An event that names another thread or terminal is skipped, and so is anything before the stream's snapshot. After a snapshot, an event whose `sequence` is no higher than the last one applied is skipped, so a duplicate never applies twice. A `restarted` starts a new count, which may be lower. t3term sends no `afterSequence`, since T3 has none for terminals. Each attach starts with a snapshot of the whole history.
 
-Input and the emulator's replies go only while the stream is open, its snapshot has come, the shell is running and no write has failed. A key or paste at any other time sends nothing, and the status line says why, such as "The shell exited, so this terminal is read-only."
+Input and the emulator's replies go only while the stream is open, its snapshot has come, the shell is running and no write has failed. A key or paste at any other time sends nothing, and the status line says why, such as "The shell exited, so this terminal is read-only." When input stops, the input waiting is dropped, and so are the pieces of a paste on its way that haven't gone yet.
 
 ## Reconnecting and stopping
 
@@ -145,7 +145,7 @@ Claude Opus 5.5 writes the drawer, its tests and its fixture, and runs none of t
 
 The script needs Python's standard library and tmux, and nothing else. It serves invented threads and terminals from 127.0.0.1, runs no command, and starts t3term under `env -i` with its own HOME and T3CODE_HOME and `T3TERM_NO_SAVED_LOGIN=1`, so no real `~/.t3`, Keychain entry or T3 server takes part. Every file a run makes stays in one directory under `/tmp`, marked with a random nonce, and `stop` and `cleanup` act only on that directory and the processes and tmux socket the run recorded. The log keeps no token, ticket or typed text.
 
-`check` exits 1 and names each rule the run broke. The rules hold at every step: no request without its scope, no attach with a field the drawer never sends, no launch that differs from the thread's, no terminal RPC the drawer never sends, at most 8 chunks unacked, no Ack for a chunk or stream that isn't open, no write before the last one's answer, no write over 65,536 UTF-16 units, none of the hostile output's controls or hidden text in what t3term wrote or on screen, and a duplicate event shown at most once. What each step should show beyond those rules needs Sol's reading and the captures. The walkthrough's predictions aren't results.
+`check` exits 1 and names each rule the run broke. The rules hold at every step: no request without its scope, no attach with a field the drawer never sends, no launch that differs from the thread's, no terminal RPC the drawer never sends, at most 8 chunks unacked, no Ack for a chunk or stream that isn't open, no write before the last one's answer, no write over 65,536 UTF-16 units or that T3's schema refuses, none of the hostile output's controls or hidden text in what t3term wrote or on screen, and a duplicate event shown at most once. What each step should show beyond those rules needs Sol's reading and the captures. The walkthrough's predictions aren't results.
 
 ## Out of scope
 
@@ -163,6 +163,6 @@ The script needs Python's standard library and tmux, and nothing else. It serves
 - A write the connection drops partway through is lost, and t3term doesn't send it again.
 - The emulator drops a C1 control that comes as UTF-8, such as U+009B for CSI, and draws what follows it as text, so `\u{9b}0m` shows `0m`. Nothing of it reaches the terminal t3term runs in.
 - The drawer always attaches with `terminal:operate`. A session that held `terminal:read` alone would need `terminal.observe`, which the drawer doesn't use.
-- In a narrow drawer, the reason Start terminal gives wraps onto more rows, and the drawer cuts what doesn't fit.
+- In a narrow drawer, the reason Start terminal gives wraps onto more rows, and the drawer cuts the rows that don't fit.
 - The header measures clusters with t3term's own rule, which can differ from ratatui's for a rare sequence. A title that draws wider than measured loses its end, never the state.
 - This page shows no screenshot. [PR 41](https://github.com/krishhgg/t3term/pull/41) carries the captures from the fixture run, with every step of the walkthrough above.

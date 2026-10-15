@@ -511,6 +511,28 @@ async fn an_exited_failed_or_closed_shell_is_read_only() {
 }
 
 #[tokio::test]
+async fn a_shell_that_ends_during_a_paste_gets_none_of_the_pieces_left() {
+    let fake = Fake::new().await;
+    let mut pane = fake.pane();
+    let (mut socket, id) = running(&fake, &mut pane, "$ ").await;
+    // 200,000 bytes go in four pieces, each after T3 answers the one before.
+    pane.paste(&"x".repeat(200_000));
+    poll_once(&mut pane).await;
+    let first = recv(&mut socket).await;
+    let first = expect_request(&first, WRITE, with(json!({"data": "x".repeat(65_536)})));
+    // The shell exits before T3 answers the first piece.
+    let exited = event("exited", 2, json!({"exitCode": 0, "exitSignal": null}));
+    send(&mut socket, chunk(&id, json!([exited]))).await;
+    assert_eq!(step(&mut pane).await, "batch");
+    assert!(pane.writing.is_none());
+    send(&mut socket, done(&first)).await;
+    assert_eq!(fake.sent(&mut socket).await, [ack(&id)]);
+    // The answer has come, and the drawer runs again: no piece follows it.
+    poll_once(&mut pane).await;
+    assert_eq!(fake.sent(&mut socket).await, Vec::<Value>::new());
+}
+
+#[tokio::test]
 async fn a_starting_shell_takes_no_input_and_its_queries_get_no_reply() {
     let fake = Fake::new().await;
     let mut pane = fake.pane();
@@ -670,6 +692,55 @@ async fn a_dropped_connection_attaches_again_with_backoff_and_resends_no_input()
     assert_eq!(step(&mut pane).await, "resized");
     assert_eq!(fake.sent(&mut socket).await, Vec::<Value>::new());
     assert_eq!(fake.dials(), 2);
+}
+
+#[tokio::test]
+async fn a_write_without_an_answer_stops_input_unless_its_connection_closed() {
+    // T3 keeps the connection open but doesn't answer a write in time. It may have reached the
+    // shell or not, so nothing more goes until the drawer attaches again.
+    let fake = Fake::new().await;
+    let mut pane = fake.pane();
+    let (mut socket, _) = running(&fake, &mut pane, "$ ").await;
+    let late = |tag: &str| {
+        let reason = format!("T3 did not answer {tag} within 30 seconds");
+        RpcError::Disconnected(reason)
+    };
+    let wrote = Happened::Wrote(Err(TerminalError::Rpc(late(WRITE))));
+    assert!(pane.on_update(Update(wrote)));
+    let notice = pane.take_notice().unwrap();
+    let expected = "The terminal's input failed, and t3term sends no more until it attaches again: T3 connection lost: T3 did not answer terminal.write within 30 seconds";
+    assert_eq!(notice, expected);
+    let (_, rows) = draw(&mut pane, 80, 25);
+    assert!(
+        rows[0].starts_with(" Terminal · zsh · input stopped"),
+        "{rows:?}"
+    );
+    pane.key(&key(KeyCode::Char('a')));
+    let notice = pane.take_notice();
+    let expected = "The terminal's input failed. Press F4 twice to attach again.";
+    assert_eq!(notice.as_deref(), Some(expected));
+    // A resize T3 doesn't answer in time says so too.
+    pane.on_update(Update(Happened::Resized(Err(late(RESIZE)))));
+    let notice = pane.take_notice().unwrap();
+    assert!(
+        notice.starts_with("T3 didn't resize the terminal: "),
+        "{notice}"
+    );
+    poll_once(&mut pane).await;
+    assert_eq!(fake.sent(&mut socket).await, Vec::<Value>::new());
+
+    // When the connection closed, the stream ends too and the drawer attaches again, so a
+    // failed write or resize says nothing and stops nothing.
+    let fake = Fake::new().await;
+    let mut pane = fake.pane();
+    let (_socket, _) = running(&fake, &mut pane, "$ ").await;
+    fake.clients.borrow().last().unwrap().close();
+    let lost = || RpcError::Disconnected("connection closed".into());
+    let wrote = Happened::Wrote(Err(TerminalError::Rpc(lost())));
+    assert!(!pane.on_update(Update(wrote)));
+    pane.on_update(Update(Happened::Resized(Err(lost()))));
+    assert!(pane.take_notice().is_none());
+    assert!(!pane.input_failed);
 }
 
 #[tokio::test]
@@ -1290,6 +1361,54 @@ fn only_a_lost_connection_or_server_is_worth_another_attach() {
     ] {
         assert!(matches!(failure(&error), Failure::Stopped(_)), "{error:?}");
     }
+}
+
+#[test]
+fn start_terminal_takes_clicks_on_the_row_it_shows_at_every_size() {
+    const START: &str = " Start terminal ";
+    for width in 1..=40 {
+        for height in 1..=7 {
+            let mut pane = showing("zsh", Status::Running);
+            let note = "T3 hasn't said where this thread's project is.";
+            pane.link = Link::Missing(Some(note.into()));
+            let (buffer, area) = draw_inset(&mut pane, width, height);
+            let size = format!("{width}x{height}");
+            let start = pane.start;
+            let content = Rect {
+                y: area.y + 1,
+                height: height - 1,
+                ..area
+            };
+            if content.width < 2 || content.height == 0 {
+                assert!(start.is_empty(), "{size}: {start:?}");
+                continue;
+            }
+            assert_eq!(start.intersection(content), start, "{size}");
+            let drawn: String = (start.left()..start.right())
+                .map(|x| buffer[(x, start.y)].symbol())
+                .collect();
+            assert_eq!(drawn, START[..usize::from(start.width)], "{size}");
+            // The line above it shows whole or not at all, and never where Start terminal is.
+            // A word too long for a row breaks inside, so the check ignores spaces.
+            let intro: String = (content.top()..start.y)
+                .flat_map(|y| (content.left()..content.right()).map(move |x| (x, y)))
+                .map(|cell| buffer[cell].symbol())
+                .filter(|symbol| !symbol.trim().is_empty())
+                .collect();
+            assert!(
+                intro.is_empty() || intro == "Thisthreadhasnoterminalyet.",
+                "{size}: {intro:?}"
+            );
+        }
+    }
+    // At 24 columns the line above takes two rows, and Start terminal is on the third.
+    let mut pane = showing("zsh", Status::Running);
+    pane.link = Link::Missing(None);
+    let (_, rows) = draw(&mut pane, 24, 6);
+    assert_eq!(rows[1].trim_end(), " This thread has no");
+    assert_eq!(rows[2].trim_end(), " terminal yet.");
+    assert_eq!(rows[3].trim_end(), "  Start terminal   Enter");
+    assert_eq!(pane.start, Rect::new(1, 3, 16, 1));
 }
 
 #[test]
