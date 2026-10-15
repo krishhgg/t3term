@@ -1722,11 +1722,19 @@ impl App {
     /// Acts on a key, a paste or the mouse. When that opened a link's details, asks its host
     /// for the pull request.
     fn on_terminal_event(&mut self, event: Event) -> bool {
-        if matches!(event, Event::Key(_) | Event::Mouse(_) | Event::Paste(_)) {
-            self.input_at = now_ms().max(self.now);
+        let now = now_ms().max(self.now);
+        let input = matches!(event, Event::Key(_) | Event::Mouse(_) | Event::Paste(_));
+        let returned = input && now - self.input_at >= pull_requests::IDLE;
+        if input {
+            self.input_at = now;
         }
         let changed = self.on_input(event);
         self.read_opened_pull();
+        // Coming back after an idle spell reads what the details then show, once this input
+        // has done what it does.
+        if returned && self.pulls_project().is_some() && self.details.pulls.returned(now) {
+            self.read_opened_pull();
+        }
         changed
     }
 
@@ -13899,11 +13907,32 @@ mod tests {
         app.read_opened_pull();
         assert_eq!(reads(&asked).len(), 2);
         press(&mut app, KeyCode::Down);
-        assert_eq!(reads(&asked), [(1, None), (2, shown.clone()), (3, shown)]);
+        let three = [(1, None), (2, shown.clone()), (3, shown.clone())];
+        assert_eq!(reads(&asked), three);
         assert_eq!(app.live_at(), None);
         let detail = Part::Detail(Ok(Box::new(host_detail())));
         hear(&mut app, 3, vec![detail, Part::Done]);
         assert!(app.live_at().is_some());
+
+        // A key after six minutes without one reads at once, though five minutes haven't
+        // passed since the last read, as after a refresh number that read while you were away.
+        // A resize isn't you coming back.
+        app.input_at = app.now - pull_requests::IDLE;
+        assert_eq!(app.live_at(), None);
+        app.now += 30_000;
+        app.on_terminal_event(Event::Resize(200, 50));
+        assert_eq!(reads(&asked).len(), 3);
+        assert_eq!(app.live_at(), None);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(reads(&asked).len(), 4);
+        assert_eq!(reads(&asked)[3], (4, shown));
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        hear(&mut app, 4, vec![detail, Part::Done]);
+        assert!(app.live_at().is_some());
+        // Later keys while you use t3term wait for the five minutes.
+        app.now += 30_000;
+        press(&mut app, KeyCode::Up);
+        assert_eq!(reads(&asked).len(), 4);
 
         // Nothing is due once the environment no longer reads pull requests, so the event loop
         // doesn't wait on a time that passed.

@@ -80,6 +80,9 @@ const LIVE: i64 = 5 * 60_000;
 /// milliseconds, as the desktop's `LIVE_REFRESH_IDLE_AFTER_MS` (useLiveRefresh.ts:31). The
 /// next one reads them again at once when they are due.
 pub(super) const IDLE: i64 = 6 * 60_000;
+/// How soon after a read of a link was asked coming back to t3term reads it again, in
+/// milliseconds, as the desktop's `LIVE_REFRESH_MIN_INTERVAL_MS` (useLiveRefresh.ts:19).
+const SOONEST: i64 = 10_000;
 /// The most characters kept of why a read failed.
 const FAILURE: usize = 1024;
 
@@ -1674,9 +1677,7 @@ impl PullRequests {
     /// last key, click or wheel at `input` came `IDLE` or more before then, as the desktop
     /// stops its interval for a reader who left. The next one then reads it at once. The read
     /// reads the conversation again only when the detail's `updatedAt` changed, as the
-    /// desktop does (PullRequestDetailPanel.tsx:836-856). A read that failed is read again
-    /// too, as the desktop's interval refreshes a detail it couldn't read. Says whether it
-    /// wants a read.
+    /// desktop does (PullRequestDetailPanel.tsx:836-856). Says whether it wants a read.
     pub fn live(&mut self, now: i64, input: i64) -> bool {
         let Some(due) = self.live_at() else {
             return false;
@@ -1684,6 +1685,27 @@ impl PullRequests {
         if now < due || due.saturating_sub(input) >= IDLE {
             return false;
         }
+        self.read_live(now)
+    }
+
+    /// Reads the detail the details show again at `now`, when you come back to t3term after
+    /// `IDLE` or more without a key, click or wheel, as the desktop's `useLiveRefresh` reads
+    /// when its reader comes back. Not while its last read was asked for under `SOONEST` ago.
+    /// Says whether it wants a read.
+    pub fn returned(&mut self, now: i64) -> bool {
+        let Some(due) = self.live_at() else {
+            return false;
+        };
+        if now - (due - LIVE) < SOONEST {
+            return false;
+        }
+        self.read_live(now)
+    }
+
+    /// Wants the shown read again to keep it current, as `live` and `returned` say: the detail,
+    /// and the conversation only once it changed. A read that failed reads both, as a first
+    /// read does, as the desktop's live refresh reads a detail it couldn't read.
+    fn read_live(&mut self, now: i64) -> bool {
         let read = self.read.as_mut().expect("the shown read");
         if read.answered() {
             read.again = true;
@@ -4232,6 +4254,41 @@ mod tests {
         assert_eq!(pulls.live_at(), None);
         pulls.shown(true);
         assert_eq!(pulls.live_at(), Some(t4 + LIVE));
+    }
+
+    #[test]
+    fn coming_back_to_t3term_reads_the_details_again_unless_read_ten_seconds_ago() {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![link(
+            "krishhgg/t3term",
+            31,
+            "a",
+            "b",
+        )])));
+        let t0 = now();
+        assert!(!pulls.returned(t0));
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(true, t0).map(|ask| ask.ticket), Some(1));
+        assert!(!pulls.returned(t0 + LIVE));
+        let mut detail = bare_detail();
+        detail["updatedAt"] = json!("2026-10-13T11:00:00Z");
+        pulls.answer(1, Part::Detail(Ok(read_detail(&detail))), t0);
+        pulls.answer(1, Part::Done, t0);
+
+        // Well before the five minutes, coming back reads the detail again, though not within
+        // ten seconds of the last read.
+        assert!(!pulls.returned(t0 + SOONEST - 1));
+        assert!(pulls.returned(t0 + SOONEST));
+        let ask = pulls.take_ask(true, t0 + SOONEST).expect("a read again");
+        let updated = Some("2026-10-13T11:00:00Z".to_string());
+        assert_eq!((ask.ticket, ask.updated), (2, updated));
+        assert!(!pulls.returned(t0 + LIVE));
+        pulls.answer(2, Part::Done, t0 + SOONEST);
+        assert_eq!(pulls.live_at(), Some(t0 + SOONEST + LIVE));
+
+        // Not on the list.
+        pulls.back();
+        assert!(!pulls.returned(t0 + LIVE));
     }
 
     #[test]
