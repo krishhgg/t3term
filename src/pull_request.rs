@@ -68,7 +68,7 @@ pub const MOST_CONTENTS: usize = 2 * 1024 * 1024;
 /// The most marks on files viewed kept. T3 reads at most five pages of a hundred from GitHub
 /// (GitHubPullRequestCli.ts:373) and keeps at most 500 for a host that keeps none
 /// (PullRequestFilesViewed.ts:59).
-const MOST_VIEWED: usize = 1000;
+pub const MOST_VIEWED: usize = 1000;
 /// The longest path a mark on a file viewed names, in UTF-16 units, as T3's `FilePath` bounds
 /// it (packages/contracts/src/pullRequest.ts:1007-1016).
 const VIEWED_PATH: usize = 4096;

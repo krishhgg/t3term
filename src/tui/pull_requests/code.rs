@@ -43,6 +43,14 @@
 //! while a read of the diff again leaves the file's hunks as they were, and goes with another
 //! commit's diff.
 //!
+//! Where the detail says the host or T3 keeps the reader's marks on files viewed, the tab reads
+//! them through `pullRequests.filesViewed` once it first shows, again when it shows after
+//! `VIEWED_FRESH`, and again with the diff. The count of files says how many of them are
+//! viewed, and each file's header says `✓ Viewed`, or `Changed since viewed` where it was
+//! pushed to since, as the desktop's checkbox and its `Changed` say (PullRequestCodeTab.tsx:
+//! 832-870 and 1127-1180). The marks are the reader's whatever diff shows, the whole change's
+//! or a commit's.
+//!
 //! Only the files unfolded are laid out, each once for each width. Each line of them is cleaned
 //! of control characters, its tabs set every `TAB` columns, and cut at `LINE` characters as it
 //! is.
@@ -60,7 +68,9 @@ use super::super::theme::Theme;
 use super::super::{clip, row};
 use super::conversation::{Commit, Control, Shown, Targets, Thread};
 use super::{FAILURE, FRESH, flowed, grouped, whole};
-use crate::pull_request::{self, ChangeType, FileContents, Side, patch};
+use crate::pull_request::{
+    self, ChangeType, FileContents, FilesViewed, Side, ViewedFilesStore, ViewedState, patch,
+};
 use crate::transcript::clusters;
 
 /// The columns between two tab stops in a line of the diff.
@@ -91,6 +101,14 @@ const MORE_CONTEXT: &str = "More unchanged context may be available";
 const READING: &str = "Reading…";
 const UNMATCHED: &str =
     "This file's text doesn't match the diff, which may be out of date. r reads it again.";
+/// How long the marks on files viewed stay fresh, in milliseconds, as the desktop's query keeps
+/// them (packages/client-runtime/src/state/pullRequests.ts:301-305).
+const VIEWED_FRESH: i64 = 15_000;
+const VIEWED_FAILED: &str = "t3term couldn't read which files you viewed.";
+const VIEWED_STALE: &str = "The viewed marks may be out of date: t3term couldn't read them again.";
+const VIEWED_SHORT: &str = "This change has more files than the host reports viewed marks for in one read, so the count is short.";
+const VIEWED_MARK: &str = "✓ Viewed";
+const VIEWED_CHANGED: &str = "Changed since viewed";
 
 /// What the Code tab read of a pull request's diff.
 pub(super) struct Code {
@@ -127,6 +145,8 @@ pub(super) struct Code {
     commits_shown: usize,
     /// What the tab read of files' unchanged lines, in the order each was first wanted.
     contexts: Vec<Context>,
+    /// What the tab read of which files the reader marked viewed.
+    viewed: Viewed,
     /// How many times a file's rows were laid out for `bodies`.
     #[cfg(test)]
     pub(super) builds: usize,
@@ -161,6 +181,37 @@ struct Context {
     pressed: usize,
     /// How many lines of each run show from its start and from its end, by its place.
     shown: HashMap<usize, (u64, u64)>,
+}
+
+/// What the tab read of which files the reader marked viewed, as the desktop's
+/// `usePullRequestFilesViewed` holds it.
+struct Viewed {
+    /// Each file's state by path, as the last read that came named it, or None before one
+    /// came. A path named twice has the state named last, as the desktop's map keeps it.
+    states: Option<HashMap<String, ViewedState>>,
+    /// Whether the host had more files than the last read that came covered.
+    truncated: bool,
+    /// Whether t3term left marks of the last read that came out past its bound.
+    cut: bool,
+    /// The ticket of the read under way.
+    asked: Option<u64>,
+    /// Set when the marks are to be read: before the first read, and once they may be out of
+    /// date. A read under way then is dropped when it comes.
+    again: bool,
+    /// Why the last read failed, cleaned and bounded. The marks read before stay.
+    failed: Option<String>,
+    /// When the last read that came came, which `VIEWED_FRESH` counts from.
+    at: i64,
+}
+
+/// What the pull request's other reads give the tab: the review threads and the commits the
+/// conversation read lists, and who keeps the reader's marks on files viewed, as the detail's
+/// `capabilities.viewedFiles` says. None there hides the marks, as the desktop does.
+#[derive(Clone, Copy, Default)]
+pub(super) struct Reads<'a> {
+    pub threads: &'a [Thread],
+    pub commits: &'a [&'a Commit],
+    pub viewed: Option<ViewedFilesStore>,
 }
 
 /// A file's text after the change, as far as the tab read it.
@@ -257,6 +308,15 @@ impl Code {
             commits_open: false,
             commits_shown: COMMIT_PAGE,
             contexts: Vec::new(),
+            viewed: Viewed {
+                states: None,
+                truncated: false,
+                cut: false,
+                asked: None,
+                again: true,
+                failed: None,
+                at: 0,
+            },
             #[cfg(test)]
             builds: 0,
         }
@@ -274,9 +334,75 @@ impl Code {
         failed || (!self.slices.is_empty() && now.saturating_sub(self.at) >= FRESH)
     }
 
-    /// Notes that the diff may be out of date, so it is read again from its first slice.
+    /// Notes that the diff may be out of date, so it is read again from its first slice, and
+    /// the marks on files viewed with it, as the desktop's refresh token reads both again
+    /// (PullRequestCodeTab.tsx:431-441).
     pub(super) fn again(&mut self) {
         self.again = true;
+        self.viewed.again = true;
+    }
+
+    /// Whether showing the tab at `now` should read the marks on files viewed again: the last
+    /// read came `VIEWED_FRESH` or more ago, or failed, as the desktop's query reads stale marks
+    /// again when the tab mounts.
+    pub(super) fn viewed_stale(&self, now: i64) -> bool {
+        let viewed = &self.viewed;
+        if viewed.asked.is_some() || viewed.again {
+            return false;
+        }
+        viewed.failed.is_some()
+            || (viewed.states.is_some() && now.saturating_sub(viewed.at) >= VIEWED_FRESH)
+    }
+
+    /// Notes that the marks on files viewed may be out of date, so they are read again.
+    pub(super) fn view_again(&mut self) {
+        self.viewed.again = true;
+    }
+
+    /// Whether to read the marks on files viewed with `ticket`: they are wanted, and no read of
+    /// them is under way.
+    pub(super) fn ask_viewed(&mut self, ticket: u64) -> bool {
+        let viewed = &mut self.viewed;
+        if viewed.asked.is_some() || !viewed.again {
+            return false;
+        }
+        viewed.again = false;
+        viewed.asked = Some(ticket);
+        true
+    }
+
+    /// Takes the answer to read `ticket` of the marks on files viewed, which came at `now`. A
+    /// failure keeps the marks read before, as the desktop's query keeps its last answer. Says
+    /// whether what the tab shows may have changed. An answer to another read, or one that came
+    /// after the marks were wanted again, is dropped.
+    pub(super) fn take_viewed(
+        &mut self,
+        ticket: u64,
+        answer: Result<Box<FilesViewed>, String>,
+        now: i64,
+    ) -> bool {
+        let viewed = &mut self.viewed;
+        if viewed.asked.take_if(|asked| *asked == ticket).is_none() || viewed.again {
+            return false;
+        }
+        match answer {
+            Ok(read) => {
+                let states = read.files.into_iter().map(|file| (file.path, file.state));
+                viewed.states = Some(states.collect());
+                viewed.truncated = read.truncated;
+                viewed.cut = read.cut;
+                viewed.failed = None;
+                viewed.at = now;
+            }
+            Err(failure) => viewed.failed = Some(bounded(&failure, FAILURE)),
+        }
+        true
+    }
+
+    /// The state of the file at `path` with the reader, where the marks show.
+    fn viewed_state(&self, store: Option<ViewedFilesStore>, path: &str) -> Option<ViewedState> {
+        let states = self.viewed.states.as_ref().filter(|_| store.is_some())?;
+        states.get(path).copied()
     }
 
     /// The cursor of the slice to read with `ticket`, or `None` inside for the first, when one
@@ -800,18 +926,18 @@ impl Code {
         self.bodies = bodies;
     }
 
-    /// The tab's rows at `width`, with the rows of each control: the list of `commits`, newest
-    /// first, each file's header, each review thread's first row, the list of those off the
-    /// diff and Retry. First the row that picks the diff from `commits`, and its list while it
-    /// is open. Until the first slice came, or when its read failed, it says so. Then the count
-    /// of files, `+` while more are to be read, and a note when the host withheld part of the
-    /// diff. Then the list of `threads` off the diff, then each file with the threads on its
-    /// lines, and at the end `Loading more files…`, or Retry once that failed. `shown` says
-    /// which threads and whether the list are open.
+    /// The tab's rows at `width`, with the rows of each control: the list of the `reads`'
+    /// commits, newest first, each file's header, each review thread's first row, the list of
+    /// those off the diff and Retry. First the row that picks the diff from the commits, and
+    /// its list while it is open. Until the first slice came, or when its read failed, it says
+    /// so. Then the count of files, `+` while more are to be read, and how many are viewed
+    /// where the marks show, then a note when the host withheld part of the diff or the marks
+    /// are short or failed. Then the list of the review threads off the diff, then each file
+    /// with its mark and the threads on its lines, and at the end `Loading more files…`, or
+    /// Retry once that failed. `shown` says which threads and whether the list are open.
     pub(super) fn lay_out(
         &self,
-        threads: &[Thread],
-        commits: &[&Commit],
+        reads: Reads,
         shown: &Shown,
         width: usize,
         now: i64,
@@ -825,6 +951,9 @@ impl Code {
         }
         // Above the diff while it loads too, so the list that picked a commit stays where it
         // was while that commit's diff comes (PullRequestCodeTab.tsx:1322-1335).
+        let Reads {
+            threads, commits, ..
+        } = reads;
         self.scope_lines(commits, &mut lines, &mut targets, width, theme);
         if self.slices.is_empty() {
             let text = match &self.failed {
@@ -841,8 +970,26 @@ impl Code {
         } else {
             ""
         };
-        let count = format!("{} {noun}{more}", grouped(count as u64));
-        lines.extend(whole(&count, width, muted));
+        let mut parts = vec![Span::styled(
+            format!("{} {noun}{more}", grouped(count as u64)),
+            muted,
+        )];
+        // Once a read of the marks came, as the desktop's count of none before it would be
+        // wrong for a reader who viewed some.
+        let states = self.viewed.states.as_ref().filter(|_| count > 0);
+        if let Some((store, states)) = reads.viewed.zip(states) {
+            let viewed = (0..count)
+                .filter_map(|at| self.file(at))
+                .filter(|(_, file)| states.get(file.path()) == Some(&ViewedState::Viewed))
+                .count();
+            let whose = match store {
+                ViewedFilesStore::Host => "viewed",
+                ViewedFilesStore::Environment => "viewed in T3 Code",
+            };
+            let (viewed, count) = (grouped(viewed as u64), grouped(count as u64));
+            parts.push(Span::styled(format!("{viewed} / {count} {whose}"), muted));
+        }
+        lines.extend(flowed(parts, " · ", width, theme));
         let unread = self
             .slices
             .iter()
@@ -862,6 +1009,9 @@ impl Code {
                 grouped(patch::MOST_FILES as u64)
             );
             lines.extend(whole(&note, width, muted));
+        }
+        if reads.viewed.is_some() && count > 0 {
+            self.viewed_notes(&mut lines, width, theme);
         }
         if !self.lists_files() {
             lines.push(Line::default());
@@ -941,7 +1091,8 @@ impl Code {
                 (0, 0) => self.omitted.get(file.path()).copied().unwrap_or_default(),
                 counts => counts,
             };
-            lines.extend(header(file, open, counts, width, theme));
+            let mark = self.viewed_state(reads.viewed, file.path());
+            lines.extend(header(file, open, counts, mark, width, theme));
             targets.push((start..lines.len(), Control::File(at)));
             if open {
                 let withheld = self.omitted.contains_key(file.path());
@@ -1026,6 +1177,35 @@ impl Code {
     /// seven characters at the end, ✓ before the diff shown, and `Show more (N left)` while
     /// more are left, then a blank row. Nothing shows where there are no commits, as the
     /// desktop draws no menu with nothing to pick (PullRequestCodeTab.tsx:1067-1069).
+    /// The notes on the marks on files viewed: that the last read failed, with its reason, and
+    /// that the host or t3term left marks out, as the desktop's warnings beside its count say.
+    fn viewed_notes(&self, lines: &mut Vec<Line<'static>>, width: usize, theme: &Theme) {
+        let viewed = &self.viewed;
+        let warning = Style::new().fg(theme.warning_fg);
+        let muted = Style::new().fg(theme.muted);
+        if let Some(failure) = &viewed.failed {
+            let note = match viewed.states {
+                Some(_) => VIEWED_STALE,
+                None => VIEWED_FAILED,
+            };
+            lines.extend(whole(note, width, warning));
+            lines.extend(whole(failure, width, muted));
+        }
+        if viewed.states.is_none() {
+            return;
+        }
+        if viewed.truncated {
+            lines.extend(whole(VIEWED_SHORT, width, warning));
+        }
+        if viewed.cut {
+            let note = format!(
+                "T3 sent more viewed marks than the {} t3term reads, so the count may be short.",
+                grouped(pull_request::MOST_VIEWED as u64)
+            );
+            lines.extend(whole(&note, width, muted));
+        }
+    }
+
     fn scope_lines(
         &self,
         commits: &[&Commit],
@@ -1114,11 +1294,13 @@ fn entry(
 
 /// A file's header: a chevron that says whether it is unfolded, a letter for how it changed,
 /// its path, or both paths of a rename, then the lines it adds and removes unless both are 0,
-/// as the desktop's `PullRequestDiffStat` leaves out. The path wraps under itself.
+/// as the desktop's `PullRequestDiffStat` leaves out, and `mark`: `✓ Viewed`, or `Changed since
+/// viewed` for a file pushed to since. The path wraps under itself.
 fn header(
     file: &patch::File,
     open: bool,
     (additions, deletions): (u64, u64),
+    mark: Option<ViewedState>,
     width: usize,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
@@ -1170,15 +1352,32 @@ fn header(
         spans.push(Span::styled(piece, fg));
         lines.push(Line::from(spans));
     }
+    // The counts, then the mark, each after the last row where it fits and on a row of its
+    // own otherwise. The counts don't show where they can't fit whole, and the mark is cut.
+    let mut pieces = Vec::new();
     if !stat.is_empty() {
-        let stat_width: usize = stat.iter().map(|span| span.width()).sum();
+        pieces.push((" ", stat));
+    }
+    let mark = match mark {
+        Some(ViewedState::Viewed) => Some((VIEWED_MARK, theme.muted)),
+        Some(ViewedState::Dismissed) => Some((VIEWED_CHANGED, theme.warning_fg)),
+        Some(ViewedState::Unviewed) | None => None,
+    };
+    if let Some((mark, color)) = mark {
+        let joint = if pieces.is_empty() { " " } else { " · " };
+        let mark = clip(mark, width - indent);
+        pieces.push((joint, vec![Span::styled(mark, Style::new().fg(color))]));
+    }
+    for (joint, piece) in pieces {
+        let piece_width: usize = piece.iter().map(|span| span.width()).sum();
         let last = lines.last_mut().expect("a row for the path");
-        if last.width() + 1 + stat_width <= width {
-            last.spans.push(Span::raw(" "));
-            last.spans.extend(stat);
-        } else if indent + stat_width <= width {
+        if last.width() + joint.width() + piece_width <= width {
+            last.spans
+                .push(Span::styled(joint, Style::new().fg(theme.muted)));
+            last.spans.extend(piece);
+        } else if indent + piece_width <= width {
             let mut spans = vec![Span::raw(" ".repeat(indent))];
-            spans.extend(stat);
+            spans.extend(piece);
             lines.push(Line::from(spans));
         }
     }

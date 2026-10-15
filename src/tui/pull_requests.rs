@@ -40,13 +40,13 @@ use super::setup::{bounded, middle};
 use super::tasks::wrap;
 use super::theme::{Theme, age, parse_iso_ms, relative_time};
 use super::{clip, row, with_bg};
-use crate::pull_request::{self, BaseComparison, CheckStatus, Mergeability};
+use crate::pull_request::{self, BaseComparison, CheckStatus, Mergeability, ViewedFilesStore};
 use crate::transcript::without_controls;
 
 mod code;
 mod conversation;
 
-use code::Code;
+use code::{Code, Reads};
 use conversation::{Control, Conversation, Lifecycle, Reviewer, Shown, Targets};
 
 /// The most links read from a thread's record. The rest are counted and left unread.
@@ -967,6 +967,16 @@ pub(super) struct TextAsk {
     pub new_path: String,
 }
 
+/// What reading the reader's marks on files viewed names: the link's host, repository and
+/// number as T3 sent them, and the ticket its answer comes back with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct ViewedAsk {
+    pub ticket: u64,
+    pub host: String,
+    pub repository: String,
+    pub number: u64,
+}
+
 /// Part of what a host said of a pull request. A read sends its detail, its conversation and,
 /// where the host keeps stacks, its stack, as each arrives, then `Done`.
 pub(super) enum Part {
@@ -1208,6 +1218,9 @@ struct Summary {
     stacks: bool,
     /// Whether the host gives a diff, as the detail's `capabilities.diff` says.
     diff: bool,
+    /// Who keeps the reader's marks on files viewed, as the detail's
+    /// `capabilities.viewedFiles` says, or None where nobody does.
+    viewed_files: Option<ViewedFilesStore>,
 }
 
 /// One check on the pull request's head.
@@ -1254,6 +1267,7 @@ impl Summary {
             updated: detail.updated_at.clone(),
             stacks: detail.capabilities.stacks,
             diff: detail.capabilities.diff,
+            viewed_files: detail.capabilities.viewed_files,
         }
     }
 
@@ -2284,6 +2298,9 @@ impl PullRequests {
         if mount && code.stale(now) {
             code.again();
         }
+        if mount && code.viewed_stale(now) {
+            code.view_again();
+        }
         if read.invalidate || read.echo {
             return None;
         }
@@ -2321,6 +2338,50 @@ impl PullRequests {
             thread,
             cursor,
         })
+    }
+
+    /// The read of the reader's marks on files viewed that the Code tab wants, as
+    /// `Code::ask_viewed` says: once the tab first shows, when it shows again after the marks
+    /// went stale, and with each read of the diff again. None unless `enabled`, the tab shows
+    /// and the detail says the host or T3 keeps the marks. A read that sends
+    /// `pullRequests.invalidate` holds it, as it holds the diff.
+    pub fn take_viewed_ask(&mut self, enabled: bool) -> Option<ViewedAsk> {
+        if !enabled || !self.showing_read() || self.tabs() != Some(Tab::Code) {
+            return None;
+        }
+        let ticket = self.tickets + 1;
+        let read = self.read.as_mut().expect("the shown read");
+        let kept = matches!(&read.answer, Answer::Read(summary) if summary.viewed_files.is_some());
+        if !kept || read.invalidate || read.echo {
+            return None;
+        }
+        if !read.code.as_mut()?.ask_viewed(ticket) {
+            return None;
+        }
+        self.tickets = ticket;
+        Some(ViewedAsk {
+            ticket,
+            host: read.host.clone(),
+            repository: read.repository.clone(),
+            number: read.number,
+        })
+    }
+
+    /// Takes the answer to read `ticket` of the marks on files viewed, which came at `now`, or
+    /// why it failed. Says whether what the details show may have changed. An answer to a read
+    /// the details no longer hold is dropped.
+    pub fn answer_viewed(
+        &mut self,
+        ticket: u64,
+        answer: Result<Box<pull_request::FilesViewed>, String>,
+        now: i64,
+    ) -> bool {
+        let code = self.read.as_mut().and_then(|read| read.code.as_mut());
+        if !code.is_some_and(|code| code.take_viewed(ticket, answer, now)) {
+            return false;
+        }
+        self.relay();
+        true
     }
 
     /// The read of a file's text that Enter on a run of unchanged lines on the Code tab asked
@@ -3181,10 +3242,19 @@ fn detail_lines(
             Answer::Read(conversation) => (conversation.threads(), conversation.commits()),
             _ => (&[][..], Vec::new()),
         };
+        let viewed = match &read.answer {
+            Answer::Read(summary) => summary.viewed_files,
+            _ => None,
+        };
+        let reads = Reads {
+            threads,
+            commits: &commits,
+            viewed,
+        };
         // Until the tab asks for its first slice, it shows as it does while that read runs.
         let (code, controls) = match &read.code {
-            Some(code) => code.lay_out(threads, &commits, shown, width, now, theme),
-            None => Code::new().lay_out(threads, &commits, shown, width, now, theme),
+            Some(code) => code.lay_out(reads, shown, width, now, theme),
+            None => Code::new().lay_out(reads, shown, width, now, theme),
         };
         lines.extend(code);
         let moved = |rows: Range<usize>| rows.start + at..rows.end + at;
@@ -7026,6 +7096,150 @@ mod tests {
             1,
             "{rows:#?}"
         );
+    }
+
+    /// `bare_detail` with the reader's marks on files viewed kept by `store`.
+    fn viewed_detail(store: &str) -> Value {
+        let mut detail = bare_detail();
+        detail["capabilities"]["viewedFiles"] = json!(store);
+        detail
+    }
+
+    /// The read of the marks on files viewed of `bare_detail`'s pull request with `ticket`.
+    fn viewed_ask(ticket: u64) -> ViewedAsk {
+        ViewedAsk {
+            ticket,
+            host: "github.com".into(),
+            repository: "krishhgg/t3term".into(),
+            number: 31,
+        }
+    }
+
+    /// Marks that say the files at `paths` are viewed.
+    fn viewed(paths: &[&str]) -> Result<Box<pull_request::FilesViewed>, String> {
+        let files = paths
+            .iter()
+            .map(|path| pull_request::FileViewed {
+                path: path.to_string(),
+                state: pull_request::ViewedState::Viewed,
+            })
+            .collect();
+        Ok(Box::new(pull_request::FilesViewed {
+            files,
+            truncated: false,
+            cut: false,
+        }))
+    }
+
+    #[test]
+    fn the_code_reads_the_viewed_marks_where_the_detail_says_who_keeps_them() {
+        let theme = theme();
+        // A host that keeps none reads none.
+        let mut pulls = on_code();
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
+        assert_eq!(pulls.take_viewed_ask(true), None);
+
+        // Nothing reads them while the Summary or the Timeline shows.
+        let detail = viewed_detail("host");
+        let mut pulls = conversing_on(&detail, remarks(1));
+        assert!(!pulls.answer(1, Part::Done, now()));
+        assert_eq!(pulls.take_viewed_ask(true), None);
+        assert!(pulls.forward());
+        assert_eq!(pulls.take_viewed_ask(true), None);
+        assert!(pulls.forward());
+        // The Code reads them once it shows, unless reads are off, and once.
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
+        assert_eq!(pulls.take_viewed_ask(false), None);
+        assert_eq!(pulls.take_viewed_ask(true), Some(viewed_ask(3)));
+        assert_eq!(pulls.take_viewed_ask(true), None);
+        assert!(pulls.answer_diff(2, Ok(added(0, 3, None)), now()));
+        // An answer to another read is dropped.
+        assert!(!pulls.answer_viewed(9, viewed(&["f0.rs"]), now()));
+        assert!(pulls.answer_viewed(3, viewed(&["f0.rs", "f2.rs"]), now()));
+        assert!(!pulls.answer_viewed(3, viewed(&["f0.rs"]), now()));
+        pulls.page(40, 30, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(rows.contains(&"3 files · 2 / 3 viewed".into()), "{rows:#?}");
+        assert!(
+            rows.contains(&"› A f0.rs +1 -0 · ✓ Viewed".into()),
+            "{rows:#?}"
+        );
+        assert!(rows.contains(&"› A f1.rs +1 -0".into()), "{rows:#?}");
+
+        let finish = |pulls: &mut PullRequests, ticket, detail: &Value| {
+            let detail = Part::Detail(Ok(read_detail(detail)));
+            assert!(!pulls.answer(ticket, detail, now()));
+            let activity = pull_request::Activity::read(&remarks(1)).unwrap();
+            pulls.answer(ticket, Part::Activity(Ok(Box::new(activity))), now());
+            pulls.answer(ticket, Part::Done, now());
+        };
+        // A refresh number reads them again with the diff.
+        assert!(pulls.refresh());
+        let ask = pulls.take_ask(true, now()).expect("the read again");
+        let ticket = ask.ticket;
+        assert_eq!(
+            pulls.take_diff_ask(true, now()),
+            Some(diff_ask(ticket + 1, None))
+        );
+        assert_eq!(pulls.take_viewed_ask(true), Some(viewed_ask(ticket + 2)));
+        finish(&mut pulls, ticket, &detail);
+        assert!(pulls.answer_diff(ticket + 1, Ok(added(0, 3, None)), now()));
+        assert!(pulls.answer_viewed(ticket + 2, viewed(&["f1.rs"]), now()));
+        pulls.page(40, 30, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(rows.contains(&"3 files · 1 / 3 viewed".into()), "{rows:#?}");
+        assert!(
+            rows.contains(&"› A f1.rs +1 -0 · ✓ Viewed".into()),
+            "{rows:#?}"
+        );
+
+        // `r` reads them again once the read that sent `pullRequests.invalidate` is done, so
+        // T3 forgot the marks it held.
+        assert!(pulls.reload(now()));
+        assert_eq!(pulls.take_viewed_ask(true), None);
+        let ask = pulls.take_ask(true, now()).expect("the read again");
+        assert!(ask.invalidate);
+        assert_eq!(pulls.take_viewed_ask(true), None);
+        finish(&mut pulls, ask.ticket, &detail);
+        let ticket = ask.ticket;
+        assert_eq!(
+            pulls.take_diff_ask(true, now()),
+            Some(diff_ask(ticket + 1, None))
+        );
+        assert_eq!(pulls.take_viewed_ask(true), Some(viewed_ask(ticket + 2)));
+        assert!(pulls.answer_diff(ticket + 1, Ok(added(0, 3, None)), now()));
+        assert!(pulls.answer_viewed(ticket + 2, viewed(&[]), now()));
+
+        // Opening the details again reads them again once the Code shows, where they came 15
+        // seconds or more before, though the diff is still fresh.
+        let reopen = |pulls: &mut PullRequests, at: i64| {
+            pulls.back();
+            pulls.back();
+            pulls.back();
+            pulls.toggle();
+            // A read that keeps the details current finds the same detail.
+            if let Some(ask) = pulls.take_ask(true, at) {
+                finish(pulls, ask.ticket, &detail);
+            }
+            assert!(pulls.forward() && pulls.forward());
+            assert_eq!(pulls.take_diff_ask(true, at), None);
+            pulls.take_viewed_ask(true)
+        };
+        assert_eq!(reopen(&mut pulls, now() + 14_999), None);
+        let again = reopen(&mut pulls, now() + 15_000);
+        assert_eq!(again, Some(viewed_ask(pulls.tickets)));
+
+        // A detail that no longer says anybody keeps them hides them and reads none.
+        assert!(pulls.answer_viewed(pulls.tickets, viewed(&["f0.rs"]), now()));
+        assert!(pulls.reload(now()));
+        let ask = pulls.take_ask(true, now()).expect("the read again");
+        finish(&mut pulls, ask.ticket, &bare_detail());
+        assert!(pulls.take_diff_ask(true, now()).is_some());
+        assert_eq!(pulls.take_viewed_ask(true), None);
+        pulls.page(40, 30, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(rows.contains(&"3 files".into()), "{rows:#?}");
+        assert!(!rows.iter().any(|row| row.contains("iewed")), "{rows:#?}");
     }
 
     /// A diff of one file changed in place, whose hunks at lines 3, 254 and 256 leave runs of
