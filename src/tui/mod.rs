@@ -89,8 +89,8 @@ const KEPT_TITLE: usize = 16;
 /// test's stand-in.
 type WatchSetup = Box<dyn Fn(&str) -> mpsc::UnboundedReceiver<WatchEvent>>;
 /// Reads a pull request from its host in the background, and sends the answer as an action
-/// with the ticket it was given.
-type ReadPull = Box<dyn Fn(Reference, u64)>;
+/// with the ticket it was given. With `true`, it sends `pullRequests.invalidate` first.
+type ReadPull = Box<dyn Fn(Reference, u64, bool)>;
 /// Opens T3's `pullRequests.subscribeRefreshes`: `Client::watch_pull_request_refreshes`, or a
 /// test's stand-in.
 type WatchRefreshes = Box<dyn Fn() -> mpsc::UnboundedReceiver<WatchEvent>>;
@@ -595,13 +595,24 @@ impl Drop for Screen {
 /// conversation at once, as the desktop's panel asks for them. Gives `send` each answer as it
 /// comes, or why it failed, and then `Part::Done`. A sentence of T3's own, such as a host the
 /// server has no credentials for, reads as T3 wrote it. Any other failure of the detail says
-/// that the read failed, and the Comments section says that of the conversation.
-async fn read_pull_request(client: &Client, reference: &Reference, send: impl Fn(Part)) {
+/// that the read failed, and the Comments section says that of the conversation. With
+/// `invalidate`, it first sends `pullRequests.invalidate`, so T3 asks the host again rather
+/// than answer from its cache. When that fails, the reads still go and at worst answer from
+/// the cache, as the desktop's Refresh does (PullRequestDetailPanel.tsx:857-875).
+async fn read_pull_request(
+    client: &Client,
+    reference: &Reference,
+    invalidate: bool,
+    send: impl Fn(Part),
+) {
     fn failed(e: &dyn std::fmt::Display) -> String {
         format!("Couldn't read this pull request: {e}")
     }
     match client.rpc().await {
         Ok(rpc) => {
+            if invalidate {
+                let _ = pull_request::invalidate(&rpc, reference).await;
+            }
             let detail = async {
                 let answer = match pull_request::detail(&rpc, reference).await {
                     Ok(detail) => Ok(Box::new(detail)),
@@ -898,13 +909,13 @@ impl App {
             details: Details::default(),
             screen: Rect::default(),
             watch_setup: Box::new(move |thread_id: &str| watcher.watch_worktree_setup(thread_id)),
-            read_pull: Box::new(move |reference, ticket| {
+            read_pull: Box::new(move |reference, ticket, invalidate| {
                 let (client, answers) = (reader.clone(), answers.clone());
                 tokio::spawn(async move {
                     let send = |part| {
                         let _ = answers.send(ActionResult::PullRequest { ticket, part });
                     };
-                    read_pull_request(&client, &reference, send).await;
+                    read_pull_request(&client, &reference, invalidate, send).await;
                 });
             }),
             watch_refreshes: Box::new(move || refresher.watch_pull_request_refreshes()),
@@ -1199,7 +1210,7 @@ impl App {
         };
         let project = project.unwrap_or_default();
         match Reference::new(&project, Some(&ask.host), &ask.repository, ask.number) {
-            Ok(reference) => (self.read_pull)(reference, ask.ticket),
+            Ok(reference) => (self.read_pull)(reference, ask.ticket, ask.invalidate),
             Err(failure) => {
                 let failure = Part::Detail(Err(failure.to_string()));
                 self.details.answer_pull(ask.ticket, failure, now);
@@ -1594,6 +1605,10 @@ impl App {
             KeyCode::Char('g') if plain => self.details.scroll_home(),
             KeyCode::End => self.details.scroll_end(),
             KeyCode::Char('G') if plain => self.details.scroll_end(),
+            KeyCode::Char('r') if plain => {
+                // The caller asks for the read once the key is done.
+                self.details.reload(now_ms().max(self.now));
+            }
             _ => {}
         }
     }
@@ -13218,21 +13233,22 @@ mod tests {
     }
 
     /// What a read of a pull request named: the project, the host, the repository, the number
-    /// and the ticket.
-    type Noted = (String, String, String, u64, u64);
+    /// and the ticket, and whether it sent `pullRequests.invalidate` first.
+    type Noted = (String, String, String, u64, u64, bool);
 
     /// Replaces how `app` reads a pull request, so a read only notes what it named, and how it
     /// opens T3's refresh numbers, so they never come.
     fn note_reads(app: &mut App) -> std::rc::Rc<std::cell::RefCell<Vec<Noted>>> {
         let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let noted = asked.clone();
-        app.read_pull = Box::new(move |reference: Reference, ticket| {
+        app.read_pull = Box::new(move |reference: Reference, ticket, invalidate| {
             noted.borrow_mut().push((
                 reference.project_id().to_string(),
                 reference.host().unwrap_or_default().to_string(),
                 reference.repository().to_string(),
                 reference.number(),
                 ticket,
+                invalidate,
             ));
         });
         note_refreshes(app);
@@ -13342,7 +13358,8 @@ mod tests {
             let buffer = cells(app, 200, 50);
             text_in(&buffer, Rect::new(0, 49, 200, 1))
         };
-        // Until the host's detail came, the details have no tabs, and → leaves them be.
+        // Until the host's detail came, the details have no tabs, and → leaves them be. `r`
+        // waits for the read under way.
         press(&mut app, KeyCode::Right);
         assert!(app.details.pulls.viewing());
         assert_eq!(app.details.pulls.tabs(), None);
@@ -13358,7 +13375,7 @@ mod tests {
         ];
         hear(&mut app, 1, parts);
         let shown = status(&mut app);
-        let hint = "↑↓/PgUp scroll · → timeline · ← list · Esc leave";
+        let hint = "↑↓/PgUp scroll · → timeline · ← list · r refresh · Esc leave";
         assert!(shown.contains(hint), "{shown}");
         let rows = body_after(&mut app, 200, 50);
         // The pane is too narrow for where the link is in the list as well.
@@ -13369,7 +13386,7 @@ mod tests {
         assert_eq!(app.details.pulls.tabs(), Some(Tab::Timeline));
         let shown = status(&mut app);
         assert!(
-            shown.contains("↑↓/PgUp scroll · ← summary · Esc leave"),
+            shown.contains("↑↓/PgUp scroll · ← summary · r refresh · Esc leave"),
             "{shown}"
         );
         let rows = body_after(&mut app, 200, 50);
@@ -13427,7 +13444,14 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         let ask = |ticket| {
             let ask = ("p", "github.com", "krishhgg/t3term", 31, ticket);
-            (ask.0.into(), ask.1.into(), ask.2.into(), ask.3, ask.4)
+            (
+                ask.0.into(),
+                ask.1.into(),
+                ask.2.into(),
+                ask.3,
+                ask.4,
+                false,
+            )
         };
         assert_eq!(*asked.borrow(), [ask(1)]);
         let text = details_after(&mut app, 200, 50);
@@ -13719,6 +13743,52 @@ mod tests {
         app.read_opened_pull();
         assert!(app.refreshes.is_none());
         assert!(opened.borrow()[0].is_closed());
+    }
+
+    #[test]
+    fn r_reads_the_open_details_from_the_host_again() {
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        let asked = note_reads(&mut app);
+        let opened = note_refreshes(&mut app);
+        let number = |number: u64| WatchEvent::Item(json!(number));
+        let reads = |asked: &std::cell::RefCell<Vec<Noted>>| {
+            let asked = asked.borrow();
+            asked.iter().map(|ask| (ask.4, ask.5)).collect::<Vec<_>>()
+        };
+        let answered = |app: &mut App, ticket| {
+            let detail = Part::Detail(Ok(Box::new(host_detail())));
+            let activity = Part::Activity(Ok(Box::new(host_activity())));
+            hear(app, ticket, vec![detail, activity, Part::Done]);
+        };
+
+        // On the list, and while the first read is under way, `r` asks for nothing.
+        press(&mut app, KeyCode::Char('r'));
+        assert!(asked.borrow().is_empty());
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(reads(&asked), [(1, false)]);
+        assert!(!refresh_with(&mut app, &opened, number(5)));
+        answered(&mut app, 1);
+
+        // Once it is done, `r` reads from the host again, and the number that moves doesn't
+        // read once more.
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(reads(&asked), [(1, false), (2, true)]);
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Refreshing from github.com…"), "{text}");
+        assert!(!refresh_with(&mut app, &opened, number(6)));
+        answered(&mut app, 2);
+        assert_eq!(reads(&asked).len(), 2);
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Read from github.com just now"), "{text}");
+
+        // From the Timeline too. Ctrl+R is not `r`.
+        press(&mut app, KeyCode::Right);
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        app.on_terminal_event(Event::Key(ctrl_r));
+        assert_eq!(reads(&asked).len(), 2);
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(reads(&asked), [(1, false), (2, true), (3, true)]);
     }
 
     #[test]
