@@ -13640,12 +13640,42 @@ mod tests {
             named.4,
             named.5,
         );
-        assert_eq!(*diffs.borrow(), [named.clone()]);
+        assert_eq!(*diffs.borrow(), std::slice::from_ref(&named));
         let shown = status(&mut app);
         let hint = "↑↓/PgUp scroll · ← timeline · r refresh · Esc leave";
         assert!(shown.contains(hint), "{shown}");
         let rows = body_after(&mut app, 200, 50);
-        assert_eq!(rows[2].trim(), "Loading pull request diff…", "{rows:#?}");
+        let rows: Vec<&str> = rows[1..5].iter().map(|row| row.trim()).collect();
+        let loading = [
+            "#31 Bound titles",
+            "Open · Checks passing · Approved",
+            "",
+            "Loading pull request diff…",
+        ];
+        assert_eq!(rows, loading);
+
+        // The slice shows its files, folded, and Enter unfolds the one ↓ chose.
+        let diff = pull_request::Diff {
+            patch: "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n\
+                    @@ -1 +1 @@\n-old\n+new\n"
+                .into(),
+            truncated: false,
+            next_cursor: None,
+            omitted: Vec::new(),
+            omitted_cut: false,
+        };
+        let answer = Ok(Box::new(diff));
+        app.on_action_result(ActionResult::PullRequestDiff { ticket: 2, answer });
+        let rows = body_after(&mut app, 200, 50);
+        let text: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
+        assert_eq!(text[4..8], ["1 file", "", "› M src/lib.rs +1 -1", ""]);
+        press(&mut app, KeyCode::Down);
+        let shown = status(&mut app);
+        assert!(shown.contains("Enter expand file · "), "{shown}");
+        press(&mut app, KeyCode::Enter);
+        let rows = body_after(&mut app, 200, 50);
+        let text: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
+        assert_eq!(text[6..9], ["⌄ M src/lib.rs +1 -1", "1 - old", "1 + new"]);
         press(&mut app, KeyCode::Right);
         assert_eq!(app.details.pulls.tabs(), Some(Tab::Code));
         assert_eq!(*diffs.borrow(), [named]);

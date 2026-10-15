@@ -6139,4 +6139,315 @@ mod tests {
             assert_eq!(page.tabs, tabs, "{width}");
         }
     }
+
+    /// A slice of a diff that adds `files` files, `f{from}.rs` on, of a line each, and whose
+    /// next slice is `next`.
+    fn added(from: usize, files: usize, next: Option<&str>) -> Box<pull_request::Diff> {
+        let patch: String = (from..from + files)
+            .map(|n| {
+                format!(
+                    "diff --git a/f{n}.rs b/f{n}.rs\nnew file mode 100644\n--- /dev/null\n\
+                     +++ b/f{n}.rs\n@@ -0,0 +1 @@\n+line {n}\n"
+                )
+            })
+            .collect();
+        Box::new(pull_request::Diff {
+            patch,
+            truncated: false,
+            next_cursor: next.map(str::to_string),
+            omitted: Vec::new(),
+            omitted_cut: false,
+        })
+    }
+
+    /// The read of the diff of `bare_detail`'s pull request with `ticket`, for the slice at
+    /// `cursor`.
+    fn diff_ask(ticket: u64, cursor: Option<&str>) -> DiffAsk {
+        DiffAsk {
+            ticket,
+            host: "github.com".into(),
+            repository: "krishhgg/t3term".into(),
+            number: 31,
+            cursor: cursor.map(str::to_string),
+        }
+    }
+
+    /// `conversing`'s details on the Code tab, their read done.
+    fn on_code() -> PullRequests {
+        let mut pulls = conversing(remarks(1));
+        assert!(!pulls.answer(1, Part::Done, now()));
+        assert!(pulls.forward() && pulls.forward());
+        assert_eq!(pulls.tabs(), Some(Tab::Code));
+        pulls
+    }
+
+    #[test]
+    fn the_code_reads_its_first_slice_once_it_shows_and_the_next_near_the_end() {
+        let theme = theme();
+        // Nothing asks for the diff while the Summary or the Timeline shows.
+        let mut pulls = conversing(remarks(1));
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        assert!(pulls.forward());
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        assert!(pulls.forward());
+        // The Code asks for the first slice once it shows, unless reads are off, and once.
+        assert_eq!(pulls.take_diff_ask(false, now()), None);
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        pulls.page(40, 6, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert_eq!(rows[rows.len() - 2..], ["", "Loading pull request diff…"]);
+        assert!(!pulls.code_due());
+
+        // An answer to another read is dropped. The first slice shows its files, and the end
+        // of them coming within two pages of the view reads the next.
+        assert!(!pulls.answer_diff(3, Ok(added(0, 20, Some("c2"))), now()));
+        assert!(pulls.answer_diff(2, Ok(added(0, 20, Some("c2"))), now()));
+        pulls.page(40, 6, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert_eq!(rows[rows.len() - 2..], ["", "Loading more files…"]);
+        assert!(rows.contains(&"20 files+".to_string()), "{rows:#?}");
+        assert!(!pulls.code_due());
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        // With 5 rows in view, the end within 10 rows of the view's top reads the next.
+        let lines = rows.len();
+        pulls.move_by(lines as isize - 11);
+        pulls.page(40, 6, now(), true, &theme);
+        assert!(!pulls.code_due());
+        pulls.move_by(1);
+        pulls.page(40, 6, now(), true, &theme);
+        assert!(pulls.code_due());
+        assert_eq!(
+            pulls.take_diff_ask(true, now()),
+            Some(diff_ask(3, Some("c2")))
+        );
+        assert!(!pulls.code_due());
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+
+        // The last slice adds its files to the others, and no more are read.
+        assert!(pulls.answer_diff(3, Ok(added(20, 2, None)), now()));
+        pulls.page(40, 6, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(rows.contains(&"22 files".to_string()), "{rows:#?}");
+        assert!(rows[rows.len() - 1].contains("f21.rs"), "{rows:#?}");
+        pulls.move_by(100);
+        pulls.page(40, 6, now(), true, &theme);
+        assert!(!pulls.code_due());
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+
+        // Leaving the Code and coming back within a minute reads nothing again.
+        assert!(pulls.back() && pulls.forward());
+        assert_eq!(pulls.take_diff_ask(true, now() + FRESH), None);
+    }
+
+    #[test]
+    fn the_code_reads_its_diff_again_where_it_may_have_changed() {
+        let theme = theme();
+        let mut pulls = on_code();
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
+        assert!(pulls.answer_diff(2, Ok(added(0, 2, None)), now()));
+        // The first file unfolds, and stays so through the reads again.
+        pulls.page(40, 30, now(), true, &theme);
+        pulls.step(true);
+        assert_eq!(pulls.action().as_deref(), Some("expand file"));
+        pulls.enter();
+        let unfolded = |pulls: &mut PullRequests| {
+            pulls.page(40, 30, now(), true, &theme);
+            let rows = detail_rows(pulls);
+            rows.contains(&"⌄ A f0.rs +1 -0".to_string()) && rows.contains(&"1 + line 0".into())
+        };
+        assert!(unfolded(&mut pulls));
+        let answer = |pulls: &mut PullRequests, ticket, detail: &Value, conversation| {
+            let detail = Part::Detail(Ok(read_detail(detail)));
+            assert!(!pulls.answer(ticket, detail, now()));
+            if conversation {
+                let activity = pull_request::Activity::read(&remarks(1)).unwrap();
+                assert!(!pulls.answer(ticket, Part::Activity(Ok(Box::new(activity))), now()));
+            }
+            pulls.answer(ticket, Part::Done, now());
+        };
+
+        // A refresh number reads the diff again along with the detail. The files that come
+        // replace the others, so the file chosen goes.
+        assert!(pulls.refresh());
+        assert_eq!(pulls.take_ask(true, now()).map(|ask| ask.ticket), Some(3));
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(4, None)));
+        assert_eq!(pulls.pick, Some(Control::File(0)));
+        assert!(pulls.answer_diff(4, Ok(added(5, 1, None)), now()));
+        assert_eq!(pulls.pick, None);
+        pulls.page(40, 30, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(rows.contains(&"› A f5.rs +1 -0".to_string()), "{rows:#?}");
+        assert!(!rows.iter().any(|row| row.contains("f0.rs")), "{rows:#?}");
+        // Nor does an answer to an earlier read, or a second to the same.
+        assert!(!pulls.answer_diff(2, Ok(added(0, 2, None)), now()));
+        assert!(!pulls.answer_diff(4, Ok(added(0, 2, None)), now()));
+        // A detail that stayed the same reads nothing more.
+        answer(&mut pulls, 3, &bare_detail(), true);
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+
+        // `r` reads it again once the read that sent `pullRequests.invalidate` is done, so
+        // T3 forgot the diff it held.
+        assert!(pulls.reload(now()));
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        let ask = pulls.take_ask(true, now()).expect("the read again");
+        assert!(ask.invalidate);
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        let detail = Part::Detail(Ok(read_detail(&bare_detail())));
+        assert!(!pulls.answer(ask.ticket, detail, now()));
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        let activity = pull_request::Activity::read(&remarks(1)).unwrap();
+        pulls.answer(ask.ticket, Part::Activity(Ok(Box::new(activity))), now());
+        pulls.answer(ask.ticket, Part::Done, now());
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(6, None)));
+        assert!(pulls.answer_diff(6, Ok(added(0, 2, None)), now()));
+        assert!(unfolded(&mut pulls));
+
+        // A read that keeps the details current reads it again where `updatedAt` moved.
+        let at = now() + SOONEST;
+        assert!(pulls.arrive(at));
+        let ask = pulls.take_ask(true, at).expect("a live read");
+        answer(&mut pulls, ask.ticket, &bare_detail(), false);
+        assert_eq!(pulls.take_diff_ask(true, at), None);
+        let at = at + SOONEST;
+        assert!(pulls.arrive(at));
+        let ask = pulls.take_ask(true, at).expect("a live read");
+        let mut moved = bare_detail();
+        moved["updatedAt"] = json!("2026-10-13T12:00:00Z");
+        answer(&mut pulls, ask.ticket, &moved, true);
+        let ticket = ask.ticket + 1;
+        assert_eq!(pulls.take_diff_ask(true, at), Some(diff_ask(ticket, None)));
+        assert!(pulls.answer_diff(ticket, Ok(added(0, 2, None)), at));
+
+        // Opening the details again reads the diff again once the Code shows, where it came a
+        // minute or more before, as the desktop's query reads a stale diff when it mounts.
+        let reopen = |pulls: &mut PullRequests, at: i64| {
+            pulls.back();
+            pulls.back();
+            pulls.back();
+            pulls.toggle();
+            let ask = pulls.take_ask(true, at).expect("a read on arrival");
+            answer(pulls, ask.ticket, &moved, false);
+            assert_eq!(pulls.take_diff_ask(true, at), None);
+            assert!(pulls.forward() && pulls.forward());
+            pulls.take_diff_ask(true, at)
+        };
+        assert_eq!(reopen(&mut pulls, at + FRESH - 1), None);
+        let again = reopen(&mut pulls, at + FRESH);
+        assert_eq!(again, Some(diff_ask(pulls.tickets, None)));
+    }
+
+    #[test]
+    fn enter_or_a_click_unfolds_a_file_and_a_slice_that_failed_reads_again() {
+        let theme = theme();
+        let mut pulls = on_code();
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
+        // A first slice that failed says why, with nothing to choose, as the desktop does.
+        let failed = "Couldn't read this diff: timed out";
+        assert!(pulls.answer_diff(2, Err(failed.into()), now()));
+        pulls.page(40, 30, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert_eq!(rows[rows.len() - 2..], ["", failed]);
+        pulls.step(true);
+        assert_eq!((pulls.pick, pulls.action()), (None, None));
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        // `r` reads it again.
+        assert!(pulls.reload(now()));
+        let ask = pulls.take_ask(true, now()).expect("the read again");
+        pulls.answer(ask.ticket, Part::Done, now());
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(4, None)));
+        assert!(pulls.answer_diff(4, Ok(added(0, 2, Some("c2"))), now()));
+
+        // ↓ chooses a file, and Enter unfolds and folds it.
+        let page = pulls.page(40, 30, now(), true, &theme);
+        let at = |page: &Page, control| {
+            let spot = Some(Spot::Control(control));
+            page.rows
+                .iter()
+                .position(|row| *row == spot)
+                .expect("the row")
+        };
+        let second = at(page, Control::File(1));
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::File(0)));
+        assert_eq!(pulls.action().as_deref(), Some("expand file"));
+        pulls.enter();
+        assert_eq!(pulls.pick, Some(Control::File(0)));
+        assert_eq!(pulls.action().as_deref(), Some("collapse file"));
+        pulls.page(40, 30, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(rows.contains(&"1 + line 0".to_string()), "{rows:#?}");
+        pulls.enter();
+        pulls.page(40, 30, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(!rows.contains(&"1 + line 0".to_string()), "{rows:#?}");
+        // A click on a file's row unfolds it too.
+        assert!(pulls.click(4, second));
+        let page = pulls.page(40, 30, now(), true, &theme);
+        assert_eq!(rows_of(&page.lines[second + 1..second + 2]), ["1 + line 1"]);
+
+        // A later slice that failed offers Retry, which reads it again.
+        assert!(pulls.code_due());
+        assert_eq!(
+            pulls.take_diff_ask(true, now()),
+            Some(diff_ask(5, Some("c2")))
+        );
+        assert!(pulls.answer_diff(5, Err("timed out".into()), now()));
+        let page = pulls.page(40, 30, now(), true, &theme);
+        let retry = at(page, Control::Retry);
+        let rows = detail_rows(&pulls);
+        let failure = [
+            "",
+            "t3term couldn't read the rest of this",
+            "diff.",
+            "timed out",
+            "↻ Retry",
+        ];
+        assert_eq!(rows[rows.len() - 5..], failure);
+        assert!(!pulls.code_due());
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        // The click chose the second file, and ↓ from it chooses Retry.
+        assert_eq!(pulls.pick, Some(Control::File(1)));
+        pulls.step(true);
+        assert_eq!(pulls.action().as_deref(), Some("retry"));
+        pulls.enter();
+        assert_eq!(pulls.pick, None);
+        assert_eq!(
+            pulls.take_diff_ask(true, now()),
+            Some(diff_ask(6, Some("c2")))
+        );
+        assert!(pulls.answer_diff(6, Err("timed out".into()), now()));
+        pulls.page(40, 30, now(), true, &theme);
+        assert!(pulls.click(2, retry));
+        assert_eq!(
+            pulls.take_diff_ask(true, now()),
+            Some(diff_ask(7, Some("c2")))
+        );
+        assert!(pulls.answer_diff(7, Ok(added(2, 1, None)), now()));
+        pulls.page(40, 30, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(rows.contains(&"3 files".to_string()), "{rows:#?}");
+        assert!(!rows.iter().any(|row| row.contains("Retry")), "{rows:#?}");
+    }
+
+    #[test]
+    fn the_code_goes_where_the_host_stops_giving_a_diff() {
+        let mut pulls = on_code();
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
+        assert!(pulls.reload(now()));
+        let ask = pulls.take_ask(true, now()).expect("the read again");
+        let mut detail = bare_detail();
+        detail["capabilities"]["diff"] = json!(false);
+        let detail = Part::Detail(Ok(read_detail(&detail)));
+        pulls.answer(ask.ticket, detail, now());
+        let activity = pull_request::Activity::read(&remarks(1)).unwrap();
+        pulls.answer(ask.ticket, Part::Activity(Ok(Box::new(activity))), now());
+        assert_eq!(pulls.tabs(), Some(Tab::Code));
+        pulls.answer(ask.ticket, Part::Done, now());
+        // The reader sees the Summary, and the Timeline is the last tab.
+        assert_eq!(pulls.tabs(), Some(Tab::Summary));
+        assert!(!pulls.offers_code());
+        assert!(pulls.forward() && !pulls.forward());
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+    }
 }
