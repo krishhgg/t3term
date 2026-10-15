@@ -104,6 +104,10 @@ const UNMATCHED: &str =
 /// How long the marks on files viewed stay fresh, in milliseconds, as the desktop's query keeps
 /// them (packages/client-runtime/src/state/pullRequests.ts:301-305).
 const VIEWED_FRESH: i64 = 15_000;
+/// The row that unfolds every file, and the one that folds them all, after the desktop's
+/// `Expand all files` and `Collapse all files` with their chevrons.
+const FOLDED_ALL: &str = "⇊ Expand all files";
+const UNFOLDED_ANY: &str = "⇈ Collapse all files";
 const VIEWED_FAILED: &str = "t3term couldn't read which files you viewed.";
 const VIEWED_STALE: &str = "The viewed marks may be out of date: t3term couldn't read them again.";
 const VIEWED_SHORT: &str = "This change has more files than the host reports viewed marks for in one read, so the count is short.";
@@ -132,8 +136,13 @@ pub(super) struct Code {
     again: bool,
     /// Set when the end of the files came within a page of the view, so the next slice is read.
     due: bool,
-    /// The paths of the files unfolded, which stay unfolded when the diff is read again.
-    open: HashSet<String>,
+    /// Whether a file shows unfolded unless the reader folded it: false at first, as the
+    /// desktop's `diffFilesCollapsed` setting is true until changed, and set by Expand all
+    /// files, which a file read later follows too.
+    unfolded: bool,
+    /// The paths of the files the reader folded or unfolded apart from `unfolded`, which stay
+    /// so when the diff is read again.
+    toggled: HashSet<String>,
     /// The rows of each unfolded file's lines, by its slice's place and its place in that
     /// slice, so a file is laid out again only when its slice, the width or its fold changes.
     bodies: HashMap<(usize, usize), Body>,
@@ -302,7 +311,8 @@ impl Code {
             at: 0,
             again: true,
             due: false,
-            open: HashSet::new(),
+            unfolded: false,
+            toggled: HashSet::new(),
             bodies: HashMap::new(),
             commit: None,
             commits_open: false,
@@ -533,6 +543,7 @@ impl Code {
         let open = self.commits_open && !commits.is_empty();
         match control {
             Control::File(at) => at < self.files.len(),
+            Control::Folds => !self.files.is_empty(),
             Control::Retry => self.retries(),
             Control::Commits => !commits.is_empty(),
             Control::AllCommits => open,
@@ -551,7 +562,7 @@ impl Code {
         let &(slice, index) = self.files.get(at)?;
         let slice = &self.slices[slice];
         let file = &slice.patch.files[index];
-        if !self.open.contains(file.path()) {
+        if !self.open(file.path()) {
             return None;
         }
         let stretch = *stretches(file)?.get(place)?;
@@ -573,8 +584,9 @@ impl Code {
     }
 
     /// Does what `control` does, with `commits` newest first in the list: folds or unfolds a
-    /// file, reads again the slice whose read failed, opens or closes the list of commits,
-    /// lists more of them, or picks the diff the tab shows. Says whether that diff changed.
+    /// file or all of them, reads again the slice whose read failed, opens or closes the list
+    /// of commits, lists more of them, or picks the diff the tab shows. Says whether that diff
+    /// changed.
     pub(super) fn act(&mut self, control: Control, commits: &[&Commit]) -> bool {
         match control {
             Control::Commits => self.commits_open = !self.commits_open,
@@ -589,9 +601,15 @@ impl Code {
                 let Some(path) = self.file(at).map(|(_, file)| file.path().to_string()) else {
                     return false;
                 };
-                if !self.open.remove(&path) {
-                    self.open.insert(path);
+                if !self.toggled.remove(&path) {
+                    self.toggled.insert(path);
                 }
+            }
+            // Every file the other way, those read later too, as the desktop's toolbar sets
+            // its fold override and forgets each file's own (PullRequestCodeTab.tsx:675-681).
+            Control::Folds => {
+                self.unfolded = self.all_folded();
+                self.toggled.clear();
             }
             Control::Retry => {
                 if let Some((_, first)) = self.failed.take() {
@@ -736,7 +754,8 @@ impl Code {
         self.files.clear();
         self.omitted.clear();
         self.bodies.clear();
-        self.open.clear();
+        self.unfolded = false;
+        self.toggled.clear();
         self.contexts.clear();
         self.asked = None;
         self.failed = None;
@@ -770,9 +789,11 @@ impl Code {
             Control::File(at) => {
                 let open = self
                     .file(at)
-                    .is_some_and(|(_, file)| self.open.contains(file.path()));
+                    .is_some_and(|(_, file)| self.open(file.path()));
                 if open { "collapse file" } else { "expand file" }.to_string()
             }
+            Control::Folds if self.all_folded() => "expand all files".to_string(),
+            Control::Folds => "collapse all files".to_string(),
             Control::Commits if self.commits_open => "hide commits".to_string(),
             Control::Commits => "choose commit".to_string(),
             Control::AllCommits => "show all commits".to_string(),
@@ -800,6 +821,18 @@ impl Code {
         let &(slice, file) = self.files.get(at)?;
         let slice = &self.slices[slice];
         Some((&slice.diff.patch, &slice.patch.files[file]))
+    }
+
+    /// Whether the file at `path` shows unfolded.
+    fn open(&self, path: &str) -> bool {
+        self.unfolded != self.toggled.contains(path)
+    }
+
+    /// Whether every file shown is folded, as the desktop's `areAllDiffFilesCollapsed` says, so
+    /// the row offers to unfold them all. Only a tab with files has the row.
+    fn all_folded(&self) -> bool {
+        let mut files = (0..self.files.len()).filter_map(|at| self.file(at));
+        files.all(|(_, file)| !self.open(file.path()))
     }
 
     /// Whether the tab lists files, rather than saying it has none: some slice came, and it
@@ -854,7 +887,7 @@ impl Code {
         let mut showing = Vec::new();
         for (&at, on) in &placed.on {
             let (_, file) = self.file(at).expect("a file shown");
-            if self.open.contains(file.path()) {
+            if self.open(file.path()) {
                 showing.extend(on);
             }
         }
@@ -878,7 +911,7 @@ impl Code {
         let visible = |index: usize| {
             let on_open = placed.on.iter().any(|(&at, on)| {
                 let (_, file) = self.file(at).expect("a file shown");
-                on.contains(&index) && self.open.contains(file.path())
+                on.contains(&index) && self.open(file.path())
             });
             on_open || (shown.off_diff_open() && placed.off.contains(&index))
         };
@@ -905,7 +938,7 @@ impl Code {
         for &(at, place) in &self.files {
             let slice = &self.slices[at];
             let file = &slice.patch.files[place];
-            if !self.open.contains(file.path()) {
+            if !self.open(file.path()) {
                 continue;
             }
             let withheld = self.omitted.contains_key(file.path());
@@ -926,14 +959,15 @@ impl Code {
     }
 
     /// The tab's rows at `width`, with the rows of each control: the list of the `reads`'
-    /// commits, newest first, each file's header, each review thread's first row, the list of
-    /// those off the diff and Retry. First the row that picks the diff from the commits, and
-    /// its list while it is open. Until the first slice came, or when its read failed, it says
-    /// so. Then the count of files, `+` while more are to be read, and how many are viewed
-    /// where the marks show, then a note when the host withheld part of the diff or the marks
-    /// are short or failed. Then the list of the review threads off the diff, then each file
-    /// with its mark and the threads on its lines, and at the end `Loading more files…`, or
-    /// Retry once that failed. `shown` says which threads and whether the list are open.
+    /// commits, newest first, the row that unfolds or folds every file, each file's header,
+    /// each review thread's first row, the list of those off the diff and Retry. First the row
+    /// that picks the diff from the commits, and its list while it is open. Until the first
+    /// slice came, or when its read failed, it says so. Then the count of files, `+` while more
+    /// are to be read, and how many are viewed where the marks show, then a note when the host
+    /// withheld part of the diff or the marks are short or failed, then the row for every file.
+    /// Then the list of the review threads off the diff, then each file with its mark and the
+    /// threads on its lines, and at the end `Loading more files…`, or Retry once that failed.
+    /// `shown` says which threads and whether the list are open.
     pub(super) fn lay_out(
         &self,
         reads: Reads,
@@ -1022,6 +1056,17 @@ impl Code {
             lines.extend(whole(text, width, muted));
             return (lines, targets);
         }
+        // The toolbar's button that unfolds every file, or folds them all once one shows
+        // unfolded (PullRequestCodeTab.tsx:1239-1258).
+        if count > 0 {
+            let label = match self.all_folded() {
+                true => FOLDED_ALL,
+                false => UNFOLDED_ANY,
+            };
+            let start = lines.len();
+            lines.extend(whole(label, width, Style::new().fg(theme.fg)));
+            targets.push((start..lines.len(), Control::Folds));
+        }
         let placed = self.place(threads);
         // A thread, open as the reader left it, with its first row as the target that opens
         // and closes it, and `Load more comments` as the one that reads its next page.
@@ -1083,7 +1128,7 @@ impl Code {
         }
         for at in 0..self.files.len() {
             let (text, file) = self.file(at).expect("a file shown");
-            let open = self.open.contains(file.path());
+            let open = self.open(file.path());
             lines.push(Line::default());
             let start = lines.len();
             let counts = match (file.additions, file.deletions) {
