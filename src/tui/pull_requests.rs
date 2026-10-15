@@ -858,8 +858,10 @@ struct Read {
     /// The read's ticket, once it was asked for. A read waits without one while another is
     /// under way.
     ticket: Option<u64>,
-    /// The time it was asked for, or wanted while it waits.
-    asked: i64,
+    /// The time its detail came, which `FRESH` and the age the details show count from, as
+    /// the desktop's `Atom.swr` counts from its result's timestamp. Until then, the time it
+    /// was asked for, or wanted while it waits.
+    at: i64,
     answer: Answer<Summary>,
     conversation: Answer<Conversation>,
 }
@@ -878,7 +880,7 @@ impl Read {
         match (&self.answer, &self.conversation) {
             (Answer::Failed(_), _) | (_, Answer::Failed(_)) => false,
             (Answer::Reading, _) | (_, Answer::Reading) => true,
-            (Answer::Read(_), Answer::Read(_)) => now.saturating_sub(self.asked) < FRESH,
+            (Answer::Read(_), Answer::Read(_)) => now.saturating_sub(self.at) < FRESH,
         }
     }
 }
@@ -1411,7 +1413,7 @@ impl PullRequests {
         let read = self.read.as_mut().filter(|read| read.ticket.is_none())?;
         self.tickets += 1;
         read.ticket = Some(self.tickets);
-        read.asked = now;
+        read.at = now;
         self.running = read.ticket;
         Some(Ask {
             ticket: self.tickets,
@@ -1437,26 +1439,38 @@ impl PullRequests {
             repository: entry.ask_repository.clone(),
             number: entry.number,
             ticket: None,
-            asked: now,
+            at: now,
             answer: Answer::Reading,
             conversation: Answer::Reading,
         });
         self.relay();
     }
 
-    /// Drops a read that waits to be asked for, once nothing shows it or it can't be asked.
-    fn unqueue(&mut self) {
-        if self.read.as_ref().is_some_and(|read| read.ticket.is_none()) {
-            self.read = None;
-            self.relay();
+    /// Notes whether the details show the pull requests' tab. Once they don't, as when the
+    /// pane closes or the Thread tab shows, a read that waits to be asked for is dropped, so no
+    /// host is asked for a link nobody looks at, and showing them again wants it again.
+    pub fn shown(&mut self, shown: bool) {
+        if !shown && self.unqueue() {
+            self.asking = true;
         }
     }
 
-    /// Takes part of the answer to read `ticket`: the pull request's detail or conversation,
-    /// or why reading it failed. Says whether it is the read the details wait for. An answer
-    /// to an earlier read, or to a read of another thread's link, is dropped. Once the read is
-    /// done, another can be asked for.
-    pub fn answer(&mut self, ticket: u64, part: Part) -> bool {
+    /// Drops a read that waits to be asked for, once nothing shows it or it can't be asked.
+    /// Says whether there was one.
+    fn unqueue(&mut self) -> bool {
+        if self.read.as_ref().is_some_and(|read| read.ticket.is_none()) {
+            self.read = None;
+            self.relay();
+            return true;
+        }
+        false
+    }
+
+    /// Takes part of the answer to read `ticket`, which came at `now`: the pull request's
+    /// detail or conversation, or why reading it failed. Says whether it is the read the
+    /// details wait for. An answer to an earlier read, or to a read of another thread's link,
+    /// is dropped. Once the read is done, another can be asked for.
+    pub fn answer(&mut self, ticket: u64, part: Part, now: i64) -> bool {
         if let Part::Done = part {
             if self.running == Some(ticket) {
                 self.running = None;
@@ -1471,7 +1485,10 @@ impl PullRequests {
             return false;
         };
         match part {
-            Part::Detail(Ok(detail)) => read.answer = Answer::Read(Box::new(Summary::of(&detail))),
+            Part::Detail(Ok(detail)) => {
+                read.at = now;
+                read.answer = Answer::Read(Box::new(Summary::of(&detail)));
+            }
             Part::Detail(Err(failure)) => read.answer = Answer::Failed(bounded(&failure, FAILURE)),
             Part::Activity(Ok(activity)) => {
                 read.conversation = Answer::Read(Box::new(Conversation::of(&activity)));
@@ -2308,7 +2325,7 @@ fn host_lines(
         }
         Answer::Read(summary) => summary,
     };
-    let at = match age(read.asked, now).as_str() {
+    let at = match age(read.at, now).as_str() {
         "now" => "just now".to_string(),
         ago => format!("{ago} ago"),
     };
@@ -3533,9 +3550,10 @@ mod tests {
         pulls.set(list_of(&thread(vec![link])));
         pulls.toggle();
         let ask = pulls.take_ask(true, now()).expect("a read");
-        assert!(pulls.answer(ask.ticket, Part::Detail(answer)));
+        assert!(pulls.answer(ask.ticket, Part::Detail(answer), now()));
         let activity = pull_request::Activity::read(&bare_activity()).unwrap();
-        assert!(pulls.answer(ask.ticket, Part::Activity(Ok(Box::new(activity)))));
+        let activity = Part::Activity(Ok(Box::new(activity)));
+        assert!(pulls.answer(ask.ticket, activity, now()));
         pulls.page(width, 500, now(), true, &theme());
         let rows = detail_rows(&pulls);
         let from = rows
@@ -3583,9 +3601,9 @@ mod tests {
         assert_eq!(pulls.take_ask(true, now()), None);
         // An answer to another ticket is dropped. Another thread drops the read and its
         // answer.
-        assert!(!pulls.answer(2, Part::Detail(Err("other".into()))));
+        assert!(!pulls.answer(2, Part::Detail(Err("other".into())), now()));
         pulls.follow();
-        assert!(!pulls.answer(1, Part::Detail(Err("late".into()))));
+        assert!(!pulls.answer(1, Part::Detail(Err("late".into())), now()));
         assert!(pulls.read.is_none());
     }
 
@@ -3606,7 +3624,7 @@ mod tests {
         pulls.toggle();
         assert_eq!(pulls.take_ask(true, now()).map(|ask| ask.ticket), Some(1));
         // The detail alone leaves the conversation reading, and the read stands.
-        assert!(pulls.answer(1, Part::Detail(Ok(read_detail(&bare_detail())))));
+        assert!(pulls.answer(1, Part::Detail(Ok(read_detail(&bare_detail()))), now()));
         pulls.page(44, 60, now(), true, &theme());
         let rows = detail_rows(&pulls);
         assert!(
@@ -3615,8 +3633,8 @@ mod tests {
         );
         assert_eq!(reopen(&mut pulls, now()), None);
         // A conversation that failed says so, and the next open asks again.
-        assert!(pulls.answer(1, Part::Activity(Err("timed out".into()))));
-        assert!(!pulls.answer(1, Part::Done));
+        assert!(pulls.answer(1, Part::Activity(Err("timed out".into())), now()));
+        assert!(!pulls.answer(1, Part::Done, now()));
         pulls.page(44, 60, now(), true, &theme());
         let rows = detail_rows(&pulls);
         let failed = [
@@ -3631,10 +3649,10 @@ mod tests {
         assert_eq!(rows[at..at + 3], failed);
         assert_eq!(reopen(&mut pulls, now()), Some(2));
         // Both answers stand for a minute.
-        assert!(pulls.answer(2, Part::Detail(Ok(read_detail(&bare_detail())))));
+        assert!(pulls.answer(2, Part::Detail(Ok(read_detail(&bare_detail()))), now()));
         let activity = pull_request::Activity::read(&bare_activity()).unwrap();
-        assert!(pulls.answer(2, Part::Activity(Ok(Box::new(activity)))));
-        assert!(!pulls.answer(2, Part::Done));
+        assert!(pulls.answer(2, Part::Activity(Ok(Box::new(activity))), now()));
+        assert!(!pulls.answer(2, Part::Done, now()));
         assert_eq!(reopen(&mut pulls, now() + FRESH - 1), None);
         assert_eq!(reopen(&mut pulls, now() + FRESH), Some(3));
     }
@@ -3662,9 +3680,9 @@ mod tests {
         pulls.toggle();
         assert_eq!(pulls.take_ask(true, now()), None);
         // #31's answers are dropped, and #32 is asked for once #31's read is done.
-        assert!(!pulls.answer(1, Part::Detail(Err("late".into()))));
+        assert!(!pulls.answer(1, Part::Detail(Err("late".into())), now()));
         assert_eq!(pulls.take_ask(true, now()), None);
-        assert!(!pulls.answer(1, Part::Done));
+        assert!(!pulls.answer(1, Part::Done, now()));
         assert_eq!(numbers(pulls.take_ask(true, now())), Some((32, 2)));
         assert_eq!(pulls.take_ask(true, now()), None);
 
@@ -3680,8 +3698,74 @@ mod tests {
         pulls.back();
         pulls.toggle();
         assert_eq!(pulls.take_ask(true, now()), None);
-        assert!(!pulls.answer(2, Part::Done));
+        assert!(!pulls.answer(2, Part::Done, now()));
         assert_eq!(numbers(pulls.take_ask(true, now())), Some((40, 3)));
+    }
+
+    #[test]
+    fn a_read_that_waits_goes_while_the_tab_doesnt_show() {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![
+            link("krishhgg/t3term", 31, "feature", "master"),
+            link("krishhgg/t3term", 32, "b", "c"),
+        ])));
+        let numbers = |ask: Option<Ask>| ask.map(|ask| (ask.number, ask.ticket));
+        pulls.toggle();
+        assert_eq!(numbers(pulls.take_ask(true, now())), Some((31, 1)));
+        pulls.back();
+        pulls.move_by(1);
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(true, now()), None);
+        // The pane closes, or the Thread tab shows, while #32 waits, so it goes and #31's
+        // answer asks for nothing.
+        pulls.shown(false);
+        assert!(pulls.read.is_none());
+        assert!(!pulls.answer(1, Part::Detail(Err("late".into())), now()));
+        assert!(!pulls.answer(1, Part::Done, now()));
+        // Shown again, #32's details want it again.
+        pulls.shown(true);
+        assert_eq!(numbers(pulls.take_ask(true, now())), Some((32, 2)));
+        // A read under way stays, and so does an answer.
+        pulls.shown(false);
+        assert!(pulls.answer(2, Part::Detail(Ok(read_detail(&bare_detail()))), now()));
+        pulls.shown(false);
+        pulls.shown(true);
+        assert_eq!(pulls.take_ask(true, now()), None);
+        assert!(matches!(
+            pulls.read.as_ref().map(|read| &read.answer),
+            Some(Answer::Read(_))
+        ));
+    }
+
+    #[test]
+    fn an_answer_stands_for_a_minute_from_when_it_came() {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![link(
+            "krishhgg/t3term",
+            31,
+            "a",
+            "b",
+        )])));
+        let reopen = |pulls: &mut PullRequests, at: i64| {
+            pulls.back();
+            pulls.toggle();
+            pulls.take_ask(true, at).map(|ask| ask.ticket)
+        };
+        pulls.toggle();
+        let asked = now() - 45_000;
+        assert_eq!(pulls.take_ask(true, asked).map(|ask| ask.ticket), Some(1));
+        // The host took 45 seconds, and the details say when the answer came.
+        assert!(pulls.answer(1, Part::Detail(Ok(read_detail(&bare_detail()))), now()));
+        let activity = pull_request::Activity::read(&bare_activity()).unwrap();
+        assert!(pulls.answer(1, Part::Activity(Ok(Box::new(activity))), now()));
+        assert!(!pulls.answer(1, Part::Done, now()));
+        pulls.page(44, 30, now(), true, &theme());
+        let rows = detail_rows(&pulls);
+        assert!(rows.contains(&"Read from github.com just now".to_string()));
+        // Twenty seconds on, the answer stands.
+        assert_eq!(reopen(&mut pulls, now() + 20_000), None);
+        assert_eq!(reopen(&mut pulls, now() + FRESH - 1), None);
+        assert_eq!(reopen(&mut pulls, now() + FRESH), Some(2));
     }
 
     #[test]
@@ -3881,9 +3965,10 @@ mod tests {
         pulls.toggle();
         let ask = pulls.take_ask(true, now()).expect("a read");
         let detail = Part::Detail(Ok(read_detail(&bare_detail())));
-        assert!(pulls.answer(ask.ticket, detail));
+        assert!(pulls.answer(ask.ticket, detail, now()));
         let activity = pull_request::Activity::read(&activity).unwrap();
-        assert!(pulls.answer(ask.ticket, Part::Activity(Ok(Box::new(activity)))));
+        let activity = Part::Activity(Ok(Box::new(activity)));
+        assert!(pulls.answer(ask.ticket, activity, now()));
         pulls
     }
 
@@ -4140,7 +4225,7 @@ mod tests {
         assert_eq!(row, format!("← List{}1 of 1", " ".repeat(28)));
         assert!(tabs.is_empty());
         let detail = Part::Detail(Ok(read_detail(&bare_detail())));
-        assert!(pulls.answer(ask.ticket, detail));
+        assert!(pulls.answer(ask.ticket, detail, now()));
         assert_eq!(pulls.tabs(), Some(Tab::Summary));
         let (row, tabs) = head(&mut pulls, 40);
         assert_eq!(
@@ -4164,7 +4249,8 @@ mod tests {
         let rows = detail_rows(&pulls);
         assert_eq!(rows[rows.len() - 2..], ["", "Reading the conversation…"]);
         let activity = pull_request::Activity::read(&remarks(3)).unwrap();
-        assert!(pulls.answer(ask.ticket, Part::Activity(Ok(Box::new(activity)))));
+        let activity = Part::Activity(Ok(Box::new(activity)));
+        assert!(pulls.answer(ask.ticket, activity, now()));
         head(&mut pulls, 40);
         let rows = detail_rows(&pulls);
         // The fixture's remarks came before it opened.
