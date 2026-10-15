@@ -1493,7 +1493,6 @@ impl PullRequests {
         self.asking = false;
         self.shown = Shown::default();
         self.pick = None;
-        self.reveal = None;
         self.tab = Tab::Summary;
         self.kept = Default::default();
         self.mounted = false;
@@ -2695,10 +2694,7 @@ impl PullRequests {
         let (mut scroll, mut across) = (0, 0);
         if self.viewing {
             let total = self.prepare_detail(width, now, theme);
-            let reveal = self
-                .reveal
-                .take()
-                .filter(|_| self.tabs() == Some(Tab::Code));
+            let reveal = self.reveal.take();
             let targets = self.detail.as_ref().map(|detail| &detail.targets);
             let rows = targets
                 .into_iter()
@@ -7438,7 +7434,7 @@ mod tests {
         let rows = rows_of(&page.lines);
         assert_eq!(rows[rows.len() - 2..], ["⌄ A f9.rs +1 -0", "1 + line 9"]);
 
-        // Another tab doesn't take the reveal, nor does a frame after the details hid.
+        // A frame of another tab drops the reveal, so the Code shows again where it was.
         pulls.home();
         pulls.pick = Some(Control::TreeFile(10));
         pulls.enter();
@@ -7446,6 +7442,17 @@ mod tests {
         pulls.page(40, 20, now(), true, &theme);
         assert!(pulls.forward());
         pulls.page(40, 20, now(), true, &theme);
+        assert_eq!(pulls.scroll, Offset::Top(0));
+
+        // So do the details shown again before a frame, which start over from the top.
+        pulls.pick = Some(Control::TreeFile(10));
+        pulls.enter();
+        pulls.toggle();
+        pulls.toggle();
+        assert!(pulls.forward());
+        assert!(pulls.forward());
+        pulls.page(40, 20, now(), true, &theme);
+        assert_eq!(pulls.tabs(), Some(Tab::Code));
         assert_eq!(pulls.scroll, Offset::Top(0));
     }
 

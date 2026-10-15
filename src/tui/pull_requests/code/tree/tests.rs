@@ -99,10 +99,15 @@ fn a_path_shows_once_with_how_it_changed() {
         (1, "new.rs", Status::Added),
         (2, "link", Status::Added),
         (3, "new.rs", Status::Added),
+        (4, "last.rs", Status::Added),
     ]);
-    assert_eq!(tree.count(), 2);
+    assert_eq!(tree.count(), 3);
     let rows = tree.rows(&HashSet::new());
-    assert_eq!(outline(&rows), [(0, "link", 0), (0, "new.rs", 1)]);
+    // A path after those that came twice keeps its own place.
+    assert_eq!(
+        outline(&rows),
+        [(0, "link", 0), (0, "new.rs", 1), (0, "last.rs", 4)]
+    );
     assert_eq!(
         rows[0].kind,
         Kind::File {
@@ -147,6 +152,9 @@ fn a_path_of_many_parts_takes_no_stack() {
     let rows = tree.rows(&HashSet::new());
     assert_eq!(rows.len(), 4_000);
     assert_eq!((rows[3_998].depth, rows[3_999].depth), (1_999, 2_000));
+    // The indent takes at most half the row.
+    let line = lines(&rows[3_999], 40, &theme()).remove(0);
+    assert_eq!(line.to_string(), format!("{}M f", " ".repeat(20)));
 }
 
 #[test]
@@ -175,7 +183,7 @@ fn rows_fit_every_width_and_hostile_names_are_cleaned() {
     // letter.
     assert_eq!(text(&rows[1], 10), ["  A 漢字漢", "    字漢字", "    .rs"]);
     assert_eq!(text(&rows[2], 10), ["  D b.rs"]);
-    // The indent takes at most half the row.
+    // With two columns past the lead, each row holds one wide character.
     assert_eq!(
         text(&rows[1], 6),
         [

@@ -4202,6 +4202,95 @@ fn the_tree_ends_with_a_row_that_reads_the_next_slice_or_reads_it_again() {
     assert!(!code.has(Control::MoreFiles, &[]));
     code.act(Control::MoreFiles, &[]);
     assert_eq!(code.ask(4), None);
+
+    // While the diff is read again after a failure, the row still offers to read the slice
+    // again, as the files' own row does.
+    let mut code = read(slice(PATCH, Some("2")), 0);
+    code.act(Control::Tree, &[]);
+    code.near_end();
+    assert_eq!(code.ask(2), Some(Some("2".into())));
+    assert_eq!(code.take(2, Err("T3 timed out.".into()), 0), Some(false));
+    code.again();
+    assert_eq!(code.ask(3), Some(None));
+    assert_eq!(last(&code), "↻ Retry");
+    assert!(code.has(Control::Retry, &[]));
+}
+
+#[test]
+fn a_path_two_slices_have_shows_once_in_the_tree() {
+    // A file whose type changed is its removal and then its addition, and the host's slices
+    // can part the two. The tree shows the path once, modified, where its first part shows.
+    let added = "diff --git a/old.txt b/old.txt
+new file mode 120000
+--- /dev/null
++++ b/old.txt
+@@ -0,0 +1 @@
++target
+";
+    let mut code = read(slice(PATCH, Some("2")), 0);
+    code.act(Control::Tree, &[]);
+    code.near_end();
+    assert_eq!(code.ask(2), Some(Some("2".into())));
+    assert_eq!(code.take(2, Ok(slice(added, None)), 0), Some(false));
+    let shown = rows(&code, 40);
+    assert!(
+        shown.contains(&"› D old.txt +0 -1".to_string()),
+        "{shown:#?}"
+    );
+    assert!(
+        shown.contains(&"› A old.txt +1 -0".to_string()),
+        "{shown:#?}"
+    );
+    assert_eq!(
+        tree_of(&code),
+        [
+            "Files · 5",
+            FOLDERS_OPEN,
+            "⌄ docs",
+            "  A new.md",
+            "M logo.png",
+            "M old.txt",
+            "⌄ src",
+            "  M lib.rs",
+            "R to.rs",
+        ]
+    );
+    let (lines, targets) = laid(&code, 40);
+    let row = rows_of(&lines).iter().position(|row| row == "M old.txt");
+    let control = targets.iter().find(|(rows, _)| Some(rows.start) == row);
+    assert_eq!(
+        control.map(|(_, control)| *control),
+        Some(Control::TreeFile(2))
+    );
+}
+
+#[test]
+fn a_folder_s_row_closes_that_folder_and_not_the_one_around_it() {
+    let patch = "diff --git a/src/a/x.rs b/src/a/x.rs
+--- a/src/a/x.rs
++++ b/src/a/x.rs
+@@ -1 +1 @@
+-a
++b
+diff --git a/src/b.rs b/src/b.rs
+--- a/src/b.rs
++++ b/src/b.rs
+@@ -1 +1 @@
+-a
++b
+";
+    let mut code = read(slice(patch, None), 0);
+    code.act(Control::Tree, &[]);
+    assert_eq!(
+        tree_of(&code)[2..],
+        ["⌄ src", "  ⌄ a", "    M x.rs", "  M b.rs"]
+    );
+    // `src` and `src/a` start at the same file, and the parts of a folder's path tell them
+    // apart.
+    code.act(Control::Folder(0, 2), &[]);
+    assert_eq!(tree_of(&code)[2..], ["⌄ src", "  › a", "  M b.rs"]);
+    assert_eq!(code.action(Control::Folder(0, 2), &[]), "expand folder");
+    assert_eq!(code.action(Control::Folder(0, 1), &[]), "collapse folder");
 }
 
 #[test]

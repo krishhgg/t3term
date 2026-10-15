@@ -1145,14 +1145,15 @@ impl Code {
     }
 
     /// Whether every folder of the file tree is open, so its row offers to close them all, as
-    /// the desktop's `areAllDirectoriesExpanded` says.
+    /// the desktop's `areAllDirectoriesExpanded` says. Only a tree with folders has the row.
     fn folders_open(&self) -> bool {
         let folders = self.tree().folders();
-        !folders.is_empty() && folders.iter().all(|path| !self.folded.contains(path))
+        folders.iter().all(|path| !self.folded.contains(path))
     }
 
     /// Whether the end of the file tree offers to read the next slice: there is one, and no
-    /// read of it is wanted or under way, or the last read failed, which it reads again.
+    /// read of it is wanted or under way, or the last read failed, which it reads again even
+    /// while the diff is read again from its first slice, as the files' own row does.
     fn offers_more(&self) -> bool {
         let idle = self.asked.is_none() && !self.due;
         self.next_cursor().is_some() && (self.failed.is_some() || idle)
