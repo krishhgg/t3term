@@ -982,6 +982,18 @@ impl Details {
         }
     }
 
+    /// Takes a file's whole text, or why reading it failed, for the run of unchanged lines on
+    /// the Code tab of the details that asked for it with `ticket`.
+    pub fn answer_text(
+        &mut self,
+        ticket: u64,
+        answer: Result<Box<crate::pull_request::FileContents>, String>,
+    ) {
+        if self.pulls.answer_text(ticket, answer) {
+            self.moved = true;
+        }
+    }
+
     /// Takes a page of a review thread's remarks, or why reading it failed, for the thread of
     /// the details that asked for it with `ticket`.
     pub fn answer_comments(

@@ -55,7 +55,7 @@ use details::Details;
 use environment::{Feed, Identity};
 use markdown::Styles;
 use picker::{Item, Kind, Pick};
-use pull_requests::{Ask, CommentsAsk, DiffAsk, Part};
+use pull_requests::{Ask, CommentsAsk, DiffAsk, Part, TextAsk};
 use scroll::{Pin, Scroll};
 use sidebar::{Badges, Capabilities, Shelf, ShelfChoices, Sidebar, View};
 use theme::{Theme, duration_label, model_display_name, now_ms, parse_iso_ms, runtime_mode_label};
@@ -99,6 +99,9 @@ type ReadDiff = Box<dyn Fn(Reference, DiffAsk)>;
 /// Reads the next page of a review thread's remarks in the background as `CommentsAsk` says,
 /// and sends the answer as an action with the ask's ticket.
 type ReadComments = Box<dyn Fn(Reference, CommentsAsk)>;
+/// Reads a file's whole text in the background as `TextAsk` says, and sends the answer as an
+/// action with the ask's ticket.
+type ReadText = Box<dyn Fn(Reference, TextAsk)>;
 /// Opens T3's `pullRequests.subscribeRefreshes`: `Client::watch_pull_request_refreshes`, or a
 /// test's stand-in.
 type WatchRefreshes = Box<dyn Fn() -> mpsc::UnboundedReceiver<WatchEvent>>;
@@ -358,6 +361,11 @@ enum ActionResult {
         ticket: u64,
         answer: Result<Box<pull_request::CommentPage>, String>,
     },
+    /// A file's whole text, or why reading it failed, for the read with this ticket.
+    PullRequestText {
+        ticket: u64,
+        answer: Result<Box<pull_request::FileContents>, String>,
+    },
     /// A send that failed. The composer gets its text back.
     SendFailed {
         thread_id: String,
@@ -571,6 +579,8 @@ struct App {
     read_diff: ReadDiff,
     /// Reads the next page of the remarks of a review thread on that Code tab.
     read_comments: ReadComments,
+    /// Reads a file's whole text for the unchanged lines around its hunks on that Code tab.
+    read_text: ReadText,
     /// Opens T3's refresh numbers for pull requests.
     watch_refreshes: WatchRefreshes,
     /// T3's refresh numbers, open while the details hold a read of a link's pull request.
@@ -723,6 +733,26 @@ async fn read_comments(
     let rpc = client.rpc().await.map_err(|e| e.to_string())?;
     match pull_request::thread_comments(&rpc, reference, thread, cursor).await {
         Ok(page) => Ok(Box::new(page)),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Reads the whole text of a file of the pull request `reference` names, through
+/// `pullRequests.diffFileContents`, as the desktop's diff viewer does to show the unchanged
+/// lines around its hunks. The reason shows under the run of lines Enter was pressed on, so it
+/// is the error alone, and a sentence of T3's own reads as T3 wrote it.
+async fn read_text(
+    client: &Client,
+    reference: &Reference,
+    ask: &TextAsk,
+) -> Result<Box<pull_request::FileContents>, String> {
+    let rpc = client.rpc().await.map_err(|e| e.to_string())?;
+    let (old_path, new_path) = (ask.old_path.as_str(), ask.new_path.as_str());
+    let commit = ask.commit.as_deref();
+    let read =
+        pull_request::diff_file_contents(&rpc, reference, commit, ask.change, old_path, new_path);
+    match read.await {
+        Ok(contents) => Ok(Box::new(contents)),
         Err(e) => Err(e.to_string()),
     }
 }
@@ -954,6 +984,7 @@ impl App {
         let (reader, answers) = (client.clone(), actions.clone());
         let (differ, diffs) = (client.clone(), actions.clone());
         let (pager, pages) = (client.clone(), actions.clone());
+        let (texter, texts) = (client.clone(), actions.clone());
         let environment = Identity::new(client.runtime.label.as_deref(), &client.runtime.origin);
         App {
             client,
@@ -1047,6 +1078,14 @@ impl App {
                     let answer = read_comments(&client, &reference, &ask.thread, &ask.cursor).await;
                     let ticket = ask.ticket;
                     let _ = answers.send(ActionResult::PullRequestComments { ticket, answer });
+                });
+            }),
+            read_text: Box::new(move |reference, ask: TextAsk| {
+                let (client, answers) = (texter.clone(), texts.clone());
+                tokio::spawn(async move {
+                    let answer = read_text(&client, &reference, &ask).await;
+                    let ticket = ask.ticket;
+                    let _ = answers.send(ActionResult::PullRequestText { ticket, answer });
                 });
             }),
             watch_refreshes: Box::new(move || refresher.watch_pull_request_refreshes()),
@@ -1349,9 +1388,17 @@ impl App {
         {
             comments.push(ask);
         }
+        // So does each file's text that Enter on a run of unchanged lines wants.
+        let mut texts = Vec::new();
+        while let Some(ask) = shown
+            .then(|| self.details.pulls.take_text_ask(enabled))
+            .flatten()
+        {
+            texts.push(ask);
+        }
         self.follow_refreshes(enabled);
         let project = project.unwrap_or_default();
-        let asked = ask.is_some() || diff.is_some() || !comments.is_empty();
+        let asked = ask.is_some() || diff.is_some() || !comments.is_empty() || !texts.is_empty();
         if let Some(ask) = ask {
             match Reference::new(&project, Some(&ask.host), &ask.repository, ask.number) {
                 Ok(reference) => (self.read_pull)(reference, ask),
@@ -1377,6 +1424,15 @@ impl App {
                 Err(failure) => {
                     let failure = Err(failure.to_string());
                     self.details.answer_comments(ask.ticket, failure);
+                }
+            }
+        }
+        for ask in texts {
+            match Reference::new(&project, Some(&ask.host), &ask.repository, ask.number) {
+                Ok(reference) => (self.read_text)(reference, ask),
+                Err(failure) => {
+                    let failure = Err(failure.to_string());
+                    self.details.answer_text(ask.ticket, failure);
                 }
             }
         }
@@ -2485,6 +2541,9 @@ impl App {
             }
             ActionResult::PullRequestComments { ticket, answer } => {
                 self.details.answer_comments(ticket, answer);
+            }
+            ActionResult::PullRequestText { ticket, answer } => {
+                self.details.answer_text(ticket, answer);
             }
             ActionResult::PullRequestDiff { ticket, answer } => {
                 let now = now_ms().max(self.now);

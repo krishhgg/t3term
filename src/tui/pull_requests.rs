@@ -951,6 +951,22 @@ pub(super) struct CommentsAsk {
     pub cursor: String,
 }
 
+/// What reading a file's whole text after the change names, for the unchanged lines around its
+/// hunks: the link's host, repository and number as T3 sent them, the commit whose own diff the
+/// Code tab shows, or None for the whole change's, how the file changed, its paths before and
+/// after the change, and the ticket its answer comes back with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TextAsk {
+    pub ticket: u64,
+    pub host: String,
+    pub repository: String,
+    pub number: u64,
+    pub commit: Option<String>,
+    pub change: pull_request::ChangeType,
+    pub old_path: String,
+    pub new_path: String,
+}
+
 /// Part of what a host said of a pull request. A read sends its detail, its conversation and,
 /// where the host keeps stacks, its stack, as each arrives, then `Done`.
 pub(super) enum Part {
@@ -2305,6 +2321,55 @@ impl PullRequests {
             thread,
             cursor,
         })
+    }
+
+    /// The read of a file's text that Enter on a run of unchanged lines on the Code tab asked
+    /// for, while the details show the read. None unless `enabled`.
+    pub fn take_text_ask(&mut self, enabled: bool) -> Option<TextAsk> {
+        if !enabled || !self.showing_read() {
+            return None;
+        }
+        let ticket = self.tickets + 1;
+        let read = self.read.as_mut().expect("the shown read");
+        let code = read.code.as_mut()?;
+        let (change, old_path, new_path) = code.ask_text(ticket)?;
+        self.tickets = ticket;
+        Some(TextAsk {
+            ticket,
+            host: read.host.clone(),
+            repository: read.repository.clone(),
+            number: read.number,
+            commit: code.commit().map(str::to_string),
+            change,
+            old_path,
+            new_path,
+        })
+    }
+
+    /// Takes the answer to read `ticket` of a file's text, or why it failed. Says whether what
+    /// the details show changed. A run whose lines all show once it came goes, and so does
+    /// its choice. An answer to a read the details no longer hold is dropped.
+    pub fn answer_text(
+        &mut self,
+        ticket: u64,
+        answer: Result<Box<pull_request::FileContents>, String>,
+    ) -> bool {
+        let Some(read) = self.read.as_mut() else {
+            return false;
+        };
+        let Some(code) = read.code.as_mut() else {
+            return false;
+        };
+        if !code.take_text(ticket, answer) {
+            return false;
+        }
+        if let Some(pick @ Control::Stretch(..)) = self.pick
+            && !code.has(pick, &[])
+        {
+            self.pick = None;
+        }
+        self.relay();
+        true
     }
 
     /// Takes the answer to read `ticket` of a page of a review thread's remarks, or why it
