@@ -6563,6 +6563,8 @@ mod tests {
         // The first file unfolds, and stays so through the reads again.
         pulls.page(40, 30, now(), true, &theme);
         pulls.step(true);
+        assert_eq!(pulls.action().as_deref(), Some("show whitespace changes"));
+        pulls.step(true);
         assert_eq!(pulls.action().as_deref(), Some("expand all files"));
         pulls.step(true);
         assert_eq!(pulls.action().as_deref(), Some("expand file"));
@@ -6675,6 +6677,8 @@ mod tests {
         };
         assert_eq!(lines(&mut pulls), [false, false]);
         pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::Whitespace));
+        pulls.step(true);
         assert_eq!(pulls.pick, Some(Control::Folds));
         assert_eq!(pulls.action().as_deref(), Some("expand all files"));
         pulls.enter();
@@ -6691,6 +6695,50 @@ mod tests {
         assert_eq!(lines(&mut pulls), [false, false]);
         assert!(pulls.click(4, row));
         assert_eq!(lines(&mut pulls), [true, true]);
+    }
+
+    #[test]
+    fn enter_or_a_click_on_the_whitespace_row_shows_or_hides_those_changes() {
+        let theme = theme();
+        let mut pulls = on_code();
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
+        let patch = "diff --git a/f.rs b/f.rs\n--- a/f.rs\n+++ b/f.rs\n@@ -1 +1 @@\n-a  b\n+a b\n";
+        let diff = Box::new(pull_request::Diff {
+            patch: patch.into(),
+            truncated: false,
+            next_cursor: None,
+            omitted: Vec::new(),
+            omitted_cut: false,
+        });
+        assert!(pulls.answer_diff(2, Ok(diff), now()));
+        let lines = |pulls: &mut PullRequests| {
+            pulls.page(40, 30, now(), true, &theme);
+            let rows = detail_rows(pulls);
+            let line = |row: &&String| row.starts_with("1 ") && row.ends_with('b');
+            rows.iter().filter(line).cloned().collect::<Vec<_>>()
+        };
+        pulls.page(40, 30, now(), true, &theme);
+        pulls.step(true);
+        pulls.step(true);
+        pulls.enter();
+        assert_eq!(lines(&mut pulls), ["1   a b"]);
+        pulls.step(false);
+        assert_eq!(pulls.pick, Some(Control::Whitespace));
+        assert_eq!(pulls.action().as_deref(), Some("show whitespace changes"));
+        pulls.enter();
+        assert_eq!(pulls.pick, Some(Control::Whitespace));
+        assert_eq!(pulls.action().as_deref(), Some("hide whitespace changes"));
+        assert_eq!(lines(&mut pulls), ["1 - a  b", "1 + a b"]);
+        assert_eq!(pulls.take_diff_ask(true, now()), None, "nothing to read");
+
+        // A click on the row does the same.
+        let page = pulls.page(40, 30, now(), true, &theme);
+        let spot = Some(Spot::Control(Control::Whitespace));
+        let row = page.rows.iter().position(|row| *row == spot).unwrap();
+        assert!(pulls.click(4, row));
+        assert_eq!(lines(&mut pulls), ["1   a b"]);
+        assert!(pulls.click(4, row));
+        assert_eq!(lines(&mut pulls), ["1 - a  b", "1 + a b"]);
     }
 
     #[test]
@@ -6724,6 +6772,8 @@ mod tests {
                 .expect("the row")
         };
         let second = at(page, Control::File(1));
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::Whitespace));
         pulls.step(true);
         assert_eq!(pulls.pick, Some(Control::Folds));
         pulls.step(true);
@@ -6814,6 +6864,8 @@ mod tests {
         assert!(rows.contains(&label.to_string()), "{rows:#?}");
 
         // The list opens, and its thread shows its remark, laid out for the frame.
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::Whitespace));
         pulls.step(true);
         assert_eq!(pulls.pick, Some(Control::Folds));
         pulls.step(true);
@@ -6962,10 +7014,11 @@ mod tests {
         pulls.page(60, 40, now(), true, &theme);
         let rows = detail_rows(&pulls);
         assert_eq!(
-            rows[at..at + 5],
+            rows[at..at + 6],
             [
                 "› Commit 0 · 0000000",
                 "1 file",
+                "¶ Show whitespace changes",
                 "⇊ Expand all files",
                 "",
                 "› 1 conversation not on the current diff"
@@ -7041,6 +7094,7 @@ mod tests {
         assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
         assert!(pulls.answer_diff(2, Ok(added(0, 1, None)), now()));
         pulls.page(60, 40, now(), true, &theme);
+        pulls.step(true);
         pulls.step(true);
         pulls.step(true);
         assert_eq!(pulls.pick, Some(Control::File(0)));
@@ -7327,6 +7381,7 @@ mod tests {
         assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
         assert!(pulls.answer_diff(2, Ok(diff()), now()));
         pulls.page(60, 40, now(), true, &theme);
+        pulls.step(true);
         pulls.step(true);
         pulls.step(true);
         assert_eq!(pulls.pick, Some(Control::File(0)));
