@@ -140,6 +140,7 @@ impl Shown {
             }
             Control::OffDiff => self.off_diff_open = !self.off_diff_open,
             Control::File(_)
+            | Control::Folds
             | Control::Stretch(..)
             | Control::Retry
             | Control::More(_)
@@ -224,6 +225,8 @@ pub(super) enum Control {
     /// Unfolds or folds a file on the Code tab, by its place among the files shown. `code`
     /// acts on it, as on `Retry`.
     File(usize),
+    /// Unfolds every file of the Code tab, or folds them all once one shows unfolded.
+    Folds,
     /// Reads again the slice of the diff whose read failed, at the end of the Code tab.
     Retry,
     /// Opens or closes a review thread on the Code tab, by its place among the threads as T3
@@ -254,11 +257,12 @@ pub(super) enum Control {
 
 impl Control {
     /// Whether the Code tab's own state, rather than the conversation's, says what it does:
-    /// a file, a run of unchanged lines, Retry and the list of commits.
+    /// a file, the button that folds or unfolds them all, a run of unchanged lines, Retry and
+    /// the list of commits.
     pub(super) fn on_code(self) -> bool {
         matches!(
             self,
-            Control::File(_) | Control::Stretch(..) | Control::Retry
+            Control::File(_) | Control::Folds | Control::Stretch(..) | Control::Retry
         ) || self.on_commits()
     }
 
@@ -832,6 +836,7 @@ impl Conversation {
             Control::Run(at) => self.timeline.as_ref().is_some_and(|t| at < t.runs()),
             Control::TimelineCommit(at) => self.timeline.is_some() && at < self.commits.len(),
             Control::File(_)
+            | Control::Folds
             | Control::Stretch(..)
             | Control::Retry
             | Control::Thread(_)
@@ -889,6 +894,7 @@ impl Conversation {
                 None => "view commit".to_string(),
             },
             Control::File(_)
+            | Control::Folds
             | Control::Stretch(..)
             | Control::Retry
             | Control::Commits
