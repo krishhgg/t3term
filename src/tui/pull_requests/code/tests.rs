@@ -207,7 +207,9 @@ fn one_row_unfolds_every_file_and_folds_them_all_again() {
     let mut code = read(slice(PATCH, Some("2")), 0);
     assert!(code.has(Control::Folds, &[]));
     assert_eq!(rows(&code, 40)[1], "⇊ Expand all files");
-    assert_eq!(laid(&code, 40).1[0], (1..2, Control::Folds));
+    let (lines, targets) = laid(&code, 40);
+    assert_eq!(targets[0], (1..2, Control::Folds));
+    assert_eq!(color_of(&lines, "⇊ Expand all files"), Some(theme().fg));
     assert_eq!(code.action(Control::Folds, &[]), "expand all files");
     code.act(Control::File(2), &[]);
     assert_eq!(rows(&code, 40)[1], "⇈ Collapse all files");

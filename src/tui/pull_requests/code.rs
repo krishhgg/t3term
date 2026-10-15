@@ -828,11 +828,11 @@ impl Code {
         self.unfolded != self.toggled.contains(path)
     }
 
-    /// Whether files show and every one of them is folded, as the desktop's
-    /// `areAllDiffFilesCollapsed` says, so the toolbar offers to unfold them all.
+    /// Whether every file shown is folded, as the desktop's `areAllDiffFilesCollapsed` says, so
+    /// the row offers to unfold them all. Only a tab with files has the row.
     fn all_folded(&self) -> bool {
         let mut files = (0..self.files.len()).filter_map(|at| self.file(at));
-        !self.files.is_empty() && files.all(|(_, file)| !self.open(file.path()))
+        files.all(|(_, file)| !self.open(file.path()))
     }
 
     /// Whether the tab lists files, rather than saying it has none: some slice came, and it
