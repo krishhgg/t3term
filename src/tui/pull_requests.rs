@@ -40,6 +40,10 @@ use super::{clip, row, with_bg};
 use crate::pull_request::{self, BaseComparison, CheckStatus, Mergeability};
 use crate::transcript::without_controls;
 
+mod conversation;
+
+use conversation::{Conversation, Reviewer};
+
 /// The most links read from a thread's record. The rest are counted and left unread.
 const MOST_LINKS: usize = 1000;
 /// The most characters kept of a title.
@@ -798,7 +802,19 @@ pub(super) struct Ask {
     pub number: u64,
 }
 
-/// A read of one link's pull request from its host, with `pullRequests.detail`.
+/// Part of what a host said of a pull request. A read sends its detail and its conversation as
+/// each arrives, then `Done`.
+pub(super) enum Part {
+    /// The answer to `pullRequests.detail`, or why it failed.
+    Detail(Result<Box<pull_request::Detail>, String>),
+    /// The answer to `pullRequests.activity`, or why it failed.
+    Activity(Result<Box<pull_request::Activity>, String>),
+    /// Both answers came.
+    Done,
+}
+
+/// A read of one link's pull request from its host: `pullRequests.detail` and
+/// `pullRequests.activity` at once, as the desktop's panel asks for them.
 struct Read {
     key: Key,
     host: String,
@@ -809,24 +825,25 @@ struct Read {
     ticket: Option<u64>,
     /// The time it was asked for, or wanted while it waits.
     asked: i64,
-    answer: Answer,
+    answer: Answer<Summary>,
+    conversation: Answer<Conversation>,
 }
 
-enum Answer {
+enum Answer<T> {
     Reading,
-    Read(Box<Summary>),
+    Read(Box<T>),
     /// Why it failed, cleaned and bounded.
     Failed(String),
 }
 
 impl Read {
-    /// Whether opening the link's details again should leave it be: it is under way, or it
-    /// was answered within `FRESH` of `now`.
+    /// Whether opening the link's details again should leave it be: it is under way, or both
+    /// its answers came within `FRESH` of `now`. A failure of either is never reused.
     fn stands(&self, now: i64) -> bool {
-        match self.answer {
-            Answer::Reading => true,
-            Answer::Read(_) => now.saturating_sub(self.asked) < FRESH,
-            Answer::Failed(_) => false,
+        match (&self.answer, &self.conversation) {
+            (Answer::Failed(_), _) | (_, Answer::Failed(_)) => false,
+            (Answer::Reading, _) | (_, Answer::Reading) => true,
+            (Answer::Read(_), Answer::Read(_)) => now.saturating_sub(self.asked) < FRESH,
         }
     }
 }
@@ -841,7 +858,7 @@ struct Summary {
     behind: Option<Option<u64>>,
     /// The base branch, which the warning about being behind names.
     base: String,
-    reviewers: Vec<String>,
+    reviewers: Vec<Reviewer>,
     /// None where the pull request has no labels and the host offers none, which the desktop
     /// leaves out.
     labels: Option<Vec<String>>,
@@ -871,14 +888,7 @@ impl Summary {
             && detail.mergeability == Mergeability::Mergeable
             && detail.base_comparison == Some(BaseComparison::Behind))
         .then_some(detail.behind_by);
-        let reviewers = detail
-            .reviewers
-            .iter()
-            .map(|actor| match actor.is_bot {
-                true => format!("{} (bot)", bounded(&actor.login, NAME)),
-                false => bounded(&actor.login, NAME),
-            })
-            .collect();
+        let reviewers = detail.reviewers.iter().map(Reviewer::of).collect();
         let labels = (!detail.labels.is_empty() || detail.capabilities.labels).then(|| {
             let names = detail.labels.iter();
             names.map(|label| bounded(&label.name, NAME)).collect()
@@ -1207,6 +1217,7 @@ impl PullRequests {
             ticket: None,
             asked: now,
             answer: Answer::Reading,
+            conversation: Answer::Reading,
         });
         self.relay();
     }
@@ -1219,16 +1230,16 @@ impl PullRequests {
         }
     }
 
-    /// Takes the answer to read `ticket`: the pull request's detail, or why the read failed.
-    /// Says whether it is the read the details wait for. An answer to an earlier read, or to a
-    /// read of another thread's link, is dropped. Either way, another read can be asked for.
-    pub fn answer(
-        &mut self,
-        ticket: u64,
-        answer: Result<Box<pull_request::Detail>, String>,
-    ) -> bool {
-        if self.running == Some(ticket) {
-            self.running = None;
+    /// Takes part of the answer to read `ticket`: the pull request's detail or conversation,
+    /// or why reading it failed. Says whether it is the read the details wait for. An answer
+    /// to an earlier read, or to a read of another thread's link, is dropped. Once the read is
+    /// done, another can be asked for.
+    pub fn answer(&mut self, ticket: u64, part: Part) -> bool {
+        if let Part::Done = part {
+            if self.running == Some(ticket) {
+                self.running = None;
+            }
+            return false;
         }
         let Some(read) = self
             .read
@@ -1237,10 +1248,17 @@ impl PullRequests {
         else {
             return false;
         };
-        read.answer = match answer {
-            Ok(detail) => Answer::Read(Box::new(Summary::of(&detail))),
-            Err(failure) => Answer::Failed(bounded(&failure, FAILURE)),
-        };
+        match part {
+            Part::Detail(Ok(detail)) => read.answer = Answer::Read(Box::new(Summary::of(&detail))),
+            Part::Detail(Err(failure)) => read.answer = Answer::Failed(bounded(&failure, FAILURE)),
+            Part::Activity(Ok(activity)) => {
+                read.conversation = Answer::Read(Box::new(Conversation::of(&activity)));
+            }
+            Part::Activity(Err(failure)) => {
+                read.conversation = Answer::Failed(bounded(&failure, FAILURE));
+            }
+            Part::Done => {}
+        }
         self.relay();
         true
     }
@@ -1309,12 +1327,13 @@ impl PullRequests {
             let lines = match entries_of(self.list.as_ref()).get(index) {
                 Some(entry) => {
                     let read = self.read.as_mut().filter(|read| read.key == entry.key);
-                    if let Some(Read {
-                        answer: Answer::Read(summary),
-                        ..
-                    }) = read
-                    {
-                        summary.lay_out(width, theme);
+                    if let Some(read) = read {
+                        if let Answer::Read(summary) = &mut read.answer {
+                            summary.lay_out(width, theme);
+                        }
+                        if let Answer::Read(conversation) = &mut read.conversation {
+                            conversation.lay_out(width, theme);
+                        }
                     }
                     let read = self.read.as_ref().filter(|read| read.key == entry.key);
                     detail_lines(entry, read, width, now, theme)
@@ -1967,10 +1986,11 @@ fn host_lines(
         lines.push(Line::styled(clip(label, width), muted));
         lines.extend(rows);
     };
-    let reviewers = match summary.reviewers.is_empty() {
-        true => whole("None", width, muted),
-        false => whole(&summary.reviewers.join(", "), width, value),
+    let conversation = match &read.conversation {
+        Answer::Read(conversation) => Some(&**conversation),
+        _ => None,
     };
+    let reviewers = conversation::reviewer_lines(&summary.reviewers, conversation, width, theme);
     section("Reviewers", reviewers);
     if let Some(labels) = summary.labels.as_ref() {
         let labels = match labels.is_empty() {
@@ -2004,6 +2024,8 @@ fn host_lines(
         body.extend(whole(&note, width, muted));
     }
     section("Description", body);
+    let (label, comments) = conversation::lines(&read.conversation, width, now, theme);
+    section(&label, comments);
     lines
 }
 
@@ -3135,6 +3157,12 @@ mod tests {
         })
     }
 
+    /// An activity as T3 sends it for a pull request nobody has said anything on.
+    fn bare_activity() -> Value {
+        json!({"comments": [], "commentCount": 0, "commentsTruncated": false,
+            "reviewThreads": [], "commits": []})
+    }
+
     fn read_detail(detail: &Value) -> Box<pull_request::Detail> {
         Box::new(pull_request::Detail::read(detail).unwrap())
     }
@@ -3150,7 +3178,9 @@ mod tests {
         pulls.set(list_of(&thread(vec![link])));
         pulls.toggle();
         let ask = pulls.take_ask(true, now()).expect("a read");
-        assert!(pulls.answer(ask.ticket, answer));
+        assert!(pulls.answer(ask.ticket, Part::Detail(answer)));
+        let activity = pull_request::Activity::read(&bare_activity()).unwrap();
+        assert!(pulls.answer(ask.ticket, Part::Activity(Ok(Box::new(activity)))));
         pulls.page(width, 500, now(), &theme());
         let rows = detail_rows(&pulls);
         let from = rows
@@ -3198,10 +3228,60 @@ mod tests {
         assert_eq!(pulls.take_ask(true, now()), None);
         // An answer to another ticket is dropped. Another thread drops the read and its
         // answer.
-        assert!(!pulls.answer(2, Err("other".into())));
+        assert!(!pulls.answer(2, Part::Detail(Err("other".into()))));
         pulls.follow();
-        assert!(!pulls.answer(1, Err("late".into())));
+        assert!(!pulls.answer(1, Part::Detail(Err("late".into()))));
         assert!(pulls.read.is_none());
+    }
+
+    #[test]
+    fn a_read_stands_until_both_answers_came_and_neither_failed() {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![link(
+            "krishhgg/t3term",
+            31,
+            "a",
+            "b",
+        )])));
+        let reopen = |pulls: &mut PullRequests, at: i64| {
+            pulls.back();
+            pulls.toggle();
+            pulls.take_ask(true, at).map(|ask| ask.ticket)
+        };
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(true, now()).map(|ask| ask.ticket), Some(1));
+        // The detail alone leaves the conversation reading, and the read stands.
+        assert!(pulls.answer(1, Part::Detail(Ok(read_detail(&bare_detail())))));
+        pulls.page(44, 60, now(), &theme());
+        let rows = detail_rows(&pulls);
+        assert!(
+            rows.contains(&"Reading the conversation…".to_string()),
+            "{rows:#?}"
+        );
+        assert_eq!(reopen(&mut pulls, now()), None);
+        // A conversation that failed says so, and the next open asks again.
+        assert!(pulls.answer(1, Part::Activity(Err("timed out".into()))));
+        assert!(!pulls.answer(1, Part::Done));
+        pulls.page(44, 60, now(), &theme());
+        let rows = detail_rows(&pulls);
+        let failed = [
+            "Comments",
+            "Could not load pull request activity",
+            "timed out",
+        ];
+        let at = rows
+            .iter()
+            .position(|row| row == "Comments")
+            .expect("the section");
+        assert_eq!(rows[at..at + 3], failed);
+        assert_eq!(reopen(&mut pulls, now()), Some(2));
+        // Both answers stand for a minute.
+        assert!(pulls.answer(2, Part::Detail(Ok(read_detail(&bare_detail())))));
+        let activity = pull_request::Activity::read(&bare_activity()).unwrap();
+        assert!(pulls.answer(2, Part::Activity(Ok(Box::new(activity)))));
+        assert!(!pulls.answer(2, Part::Done));
+        assert_eq!(reopen(&mut pulls, now() + FRESH - 1), None);
+        assert_eq!(reopen(&mut pulls, now() + FRESH), Some(3));
     }
 
     #[test]
@@ -3226,8 +3306,10 @@ mod tests {
         assert!(pulls.read.is_none());
         pulls.toggle();
         assert_eq!(pulls.take_ask(true, now()), None);
-        // #31's answer is dropped, and #32 is asked for next.
-        assert!(!pulls.answer(1, Err("late".into())));
+        // #31's answers are dropped, and #32 is asked for once #31's read is done.
+        assert!(!pulls.answer(1, Part::Detail(Err("late".into()))));
+        assert_eq!(pulls.take_ask(true, now()), None);
+        assert!(!pulls.answer(1, Part::Done));
         assert_eq!(numbers(pulls.take_ask(true, now())), Some((32, 2)));
         assert_eq!(pulls.take_ask(true, now()), None);
 
@@ -3243,7 +3325,7 @@ mod tests {
         pulls.back();
         pulls.toggle();
         assert_eq!(pulls.take_ask(true, now()), None);
-        assert!(!pulls.answer(2, Err("late".into())));
+        assert!(!pulls.answer(2, Part::Done));
         assert_eq!(numbers(pulls.take_ask(true, now())), Some((40, 3)));
     }
 
@@ -3277,6 +3359,9 @@ mod tests {
             "",
             "Description",
             "No description provided.",
+            "",
+            "Comments (0)",
+            "No comments yet.",
             "",
         ];
         assert_eq!(rows, expected);
@@ -3315,7 +3400,8 @@ mod tests {
             "This branch is out-of-date with master.".into(),
             "".into(),
             "Reviewers".into(),
-            "octocat, greptile-apps[bot] (bot)".into(),
+            "octocat".into(),
+            "greptile-apps[bot] (bot)".into(),
             "".into(),
             "Labels".into(),
             "None".into(),
@@ -3334,6 +3420,9 @@ mod tests {
             "Why".into(),
             "".into(),
             "It reads the host.[2J".into(),
+            "".into(),
+            "Comments (0)".into(),
+            "No comments yet.".into(),
             "".into(),
         ];
         assert_eq!(rows, expected);
