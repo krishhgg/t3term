@@ -31,8 +31,10 @@ use super::super::markdown::{self, Styles};
 use super::super::setup::bounded;
 use super::super::theme::{Theme, age, parse_iso_ms};
 use super::super::{clip, row};
-use super::{Answer, NAME, grouped, whole};
-use crate::pull_request::{self, Actor, Comment, CommentKind, Commit, ReviewThread};
+use super::{Answer, NAME, flowed, grouped, whole};
+use crate::pull_request::{
+    self, Actor, Comment, CommentKind, Commit, Reaction, ReactionContent, ReviewThread,
+};
 use crate::transcript::without_controls;
 
 mod timeline;
@@ -302,8 +304,42 @@ struct Remark {
     resolved: bool,
     /// A finished remark's text on one row, as the desktop shows it until the remark opens.
     preview: String,
+    /// Its reactions, in the order T3 sent them.
+    reactions: Vec<Pill>,
     /// The text laid out at one width.
     laid_out: Option<(usize, Vec<Line<'static>>)>,
+}
+
+/// A reaction on a remark as the desktop's `PullRequestReactionBar` shows it: its emoji and how
+/// many people reacted with it.
+struct Pill {
+    text: String,
+    /// The reader reacted with it, which the desktop marks out.
+    mine: bool,
+}
+
+impl Pill {
+    fn of(reaction: &Reaction) -> Pill {
+        Pill {
+            text: format!("{} {}", emoji(reaction.content), reaction.count),
+            mine: reaction.viewer_reacted,
+        }
+    }
+}
+
+/// A reaction's emoji, as the desktop's `REACTION_EMOJI` gives them
+/// (pullRequestReactions.logic.ts).
+fn emoji(content: ReactionContent) -> &'static str {
+    match content {
+        ReactionContent::ThumbsUp => "👍",
+        ReactionContent::ThumbsDown => "👎",
+        ReactionContent::Laugh => "😄",
+        ReactionContent::Hooray => "🎉",
+        ReactionContent::Confused => "😕",
+        ReactionContent::Heart => "❤️",
+        ReactionContent::Rocket => "🚀",
+        ReactionContent::Eyes => "👀",
+    }
 }
 
 /// What a group of remarks says of them while it is closed, as the desktop's `CommentGroup`
@@ -619,6 +655,7 @@ impl Remark {
             body_cut: comment.body.cut,
             resolved: thread.is_some_and(|thread| thread.resolved),
             preview,
+            reactions: comment.reactions.iter().flatten().map(Pill::of).collect(),
             laid_out: None,
         }
     }
@@ -638,7 +675,7 @@ impl Remark {
         self.laid_out = Some((width, lines));
     }
 
-    /// Its rows: its header, the file and line it is on, and its text.
+    /// Its rows: its header, its reactions, the file and line it is on, and its text.
     fn lines(&self, width: usize, now: i64, theme: &Theme) -> Vec<Line<'static>> {
         let muted = Style::new().fg(theme.muted);
         let said = match &self.said {
@@ -650,15 +687,16 @@ impl Remark {
             None => None,
         };
         let mut lines = self.header(said, width, now, theme);
+        lines.extend(self.reacted(width, theme));
         lines.extend(self.place(width, theme));
         lines.extend(self.text(width, theme));
         lines
     }
 
     /// A finished remark's rows, as the desktop's `CollapsedComment` shows it: its header with
-    /// why it is finished, the file and line it is on, then its text on one row while it is
-    /// closed and its whole text once it opens. The second number is how many of the rows
-    /// open and close it: all of them while it is closed, and its header once it opens.
+    /// why it is finished, its reactions, the file and line it is on, then its text on one row
+    /// while it is closed and its whole text once it opens. The second number is how many of the
+    /// rows open and close it: all of them while it is closed, and its header once it opens.
     fn finished_lines(
         &self,
         open: bool,
@@ -675,6 +713,7 @@ impl Remark {
         let chevron = if open { "⌄" } else { "›" };
         let mut lines = self.header(Some((format!("{chevron} {why}"), muted)), width, now, theme);
         let header = lines.len();
+        lines.extend(self.reacted(width, theme));
         lines.extend(self.place(width, theme));
         if open {
             lines.extend(self.text(width, theme));
@@ -701,6 +740,26 @@ impl Remark {
         left.extend(said);
         let at = self.at.map(|at| (ago(at, now), muted));
         fitted(left, at, width)
+    }
+
+    /// Its reactions two columns apart, on as many rows as they take, with the reader's own in
+    /// the primary color, as the desktop's reaction bar marks them out. No row where it has
+    /// none, as the desktop hides an empty bar where the reader can't react, and t3term reacts
+    /// to nothing.
+    fn reacted(&self, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+        let pills = self
+            .reactions
+            .iter()
+            .map(|pill| {
+                let color = if pill.mine {
+                    theme.primary
+                } else {
+                    theme.muted
+                };
+                Span::styled(pill.text.clone(), Style::new().fg(color))
+            })
+            .collect();
+        flowed(pills, "  ", width, theme)
     }
 
     /// The file and line it is on, and whether that line is still in the diff.

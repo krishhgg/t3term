@@ -547,7 +547,7 @@ fn run_lines(
 
 /// A remark's rows in an open run, as the desktop's `ConversationCard` shows it: who wrote it,
 /// whether they reviewed or commented, and the review's state where it has one, then when and
-/// on which file, then its text.
+/// on which file, then its reactions and its text.
 fn card_lines(remark: &Remark, width: usize, now: i64, theme: &Theme) -> Vec<Line<'static>> {
     let muted = Style::new().fg(theme.muted);
     let strong = Style::new().fg(theme.fg).add_modifier(Modifier::BOLD);
@@ -564,6 +564,12 @@ fn card_lines(remark: &Remark, width: usize, now: i64, theme: &Theme) -> Vec<Lin
     let time = remark.at.map(|at| ago(at, now));
     let meta = time.into_iter().chain(remark.location()).collect();
     let mut lines = entry(Span::raw(" "), title, meta, width, theme);
+    let gutter = gutter(width);
+    for line in remark.reacted(width - gutter, theme) {
+        let mut spans = lead(Span::raw(" "), gutter, false);
+        spans.extend(line.spans);
+        lines.push(Line::from(spans));
+    }
     lines.extend(remark.text(width, theme));
     lines
 }
