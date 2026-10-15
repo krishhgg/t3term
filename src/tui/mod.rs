@@ -15514,4 +15514,46 @@ mod tests {
         // None of it asked T3 for anything.
         assert_eq!(reads(&runtime), 0);
     }
+
+    /// The app's reader sends T3 the slice's cursor and the commit a diff read names, and its
+    /// answer comes back with the ticket.
+    #[tokio::test]
+    async fn the_app_reads_a_slice_of_a_commits_diff_from_t3() {
+        use crate::http::{Api, fake};
+
+        let body = json!({"patch": "", "truncated": false, "nextCursor": null});
+        let answer = fake::response("200 OK", &[], &body.to_string());
+        let t3 = fake::Server::start(move |_| answer.clone());
+        let mut client = Client::offline();
+        client.api = Api::without_proxy(&t3.origin);
+        let (sender, mut results) = mpsc::unbounded_channel();
+        let app = App::new(
+            Arc::new(client),
+            Theme::new(Depth::TrueColor),
+            &Settings::default(),
+            sender,
+        );
+        let reference = Reference::new("p", Some("github.com"), "krishhgg/t3term", 31).unwrap();
+        let ask = DiffAsk {
+            ticket: 7,
+            host: "github.com".into(),
+            repository: "krishhgg/t3term".into(),
+            number: 31,
+            cursor: Some("2".into()),
+            commit: Some("abc1234def".into()),
+        };
+        (app.read_diff)(reference, ask);
+        let result = tokio::time::timeout(Duration::from_secs(5), results.recv())
+            .await
+            .expect("an answer within five seconds")
+            .expect("the answer");
+        let ActionResult::PullRequestDiff { ticket, answer } = result else {
+            panic!("an answer of another kind");
+        };
+        assert_eq!(ticket, 7);
+        assert_eq!(answer.map(|diff| diff.patch), Ok(String::new()));
+        let sent: Value = serde_json::from_str(&t3.bodies()[0]).unwrap();
+        assert_eq!(sent["cursor"], "2");
+        assert_eq!(sent["commit"], "abc1234def");
+    }
 }

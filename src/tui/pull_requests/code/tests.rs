@@ -1514,6 +1514,13 @@ fn the_list_of_commits_picks_the_diff_the_tab_reads() {
     assert_eq!(code.take(5, failure, 30), Some(true));
     let (rows, _) = scoped(&code, &conversation, &shown, 40);
     assert_eq!(rows, ["› All commits", "T3 couldn't read the diff."]);
+
+    // A commit picked after that reads its own diff, and the failure goes with the diff it
+    // was of.
+    code.act(Control::Commits, &commits);
+    assert!(code.act(Control::Commit(0), &commits));
+    let (rows, _) = scoped(&code, &conversation, &shown, 40);
+    assert_eq!(rows, ["› Newest · ccccccc", "Loading pull request diff…"]);
 }
 
 #[test]
@@ -1645,5 +1652,22 @@ fn the_list_of_commits_fits_every_width_and_cleans_its_headlines() {
             width >= 4 + 4 + 1 + 7,
             "{width}: {two:?}"
         );
+        // Where the width leaves no room beside the lead, the headline shows without it.
+        if (2..=4).contains(&width) {
+            assert!(two.starts_with('T'), "{width}: {two:?}");
+        }
     }
+
+    // The row closes the list as it opened it, and an open list has nothing to pick once the
+    // conversation lists no commits.
+    code.act(Control::Commits, &commits);
+    assert!(!code.has(Control::AllCommits, &commits));
+    let (rows, _) = scoped(&code, &conversation, &shown, 80);
+    assert_eq!(
+        rows[..2],
+        [format!("› {cleaned} · f00d]0;"), LOADING.into()]
+    );
+    code.act(Control::Commits, &commits);
+    assert!(code.has(Control::AllCommits, &commits));
+    assert!(!code.has(Control::AllCommits, &[]));
 }

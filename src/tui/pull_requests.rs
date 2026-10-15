@@ -6737,6 +6737,12 @@ mod tests {
             pulls.take_diff_ask(true, now()),
             Some(scoped(3, Some("0000000abc")))
         );
+        // An entry of the list closed picks nothing.
+        pulls.pick = Some(Control::Commit(1));
+        pulls.enter();
+        assert_eq!(pulls.pick, Some(Control::Commit(1)));
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        pulls.pick = Some(Control::Commits);
 
         // A commit's diff places no thread, and picking another closes the list of those
         // off the diff.
