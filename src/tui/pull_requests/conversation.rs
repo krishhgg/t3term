@@ -117,6 +117,7 @@ impl Shown {
                     self.runs_open.insert(key.to_string());
                 }
             }
+            Control::File(_) | Control::Retry => {}
         }
     }
 
@@ -165,6 +166,11 @@ pub(super) enum Control {
     /// Opens or closes a run of remarks on the Timeline, by its place among the runs newest
     /// first.
     Run(usize),
+    /// Unfolds or folds a file on the Code tab, by its place among the files shown. `code`
+    /// acts on it, as on `Retry`.
+    File(usize),
+    /// Reads again the slice of the diff whose read failed, at the end of the Code tab.
+    Retry,
 }
 
 impl Control {
@@ -577,6 +583,7 @@ impl Conversation {
             Control::Remark(at) => shown.finished_open && at < self.finished.len(),
             Control::TimelineOrder => self.timeline.is_some(),
             Control::Run(at) => self.timeline.as_ref().is_some_and(|t| at < t.runs()),
+            Control::File(_) | Control::Retry => false,
         }
     }
 
@@ -611,6 +618,7 @@ impl Conversation {
                 let open = self.timeline.as_ref().is_some_and(|t| t.open(at, shown));
                 toggle(open, "comments")
             }
+            Control::File(_) | Control::Retry => String::new(),
         }
     }
 }

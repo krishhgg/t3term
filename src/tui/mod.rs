@@ -55,7 +55,7 @@ use details::Details;
 use environment::{Feed, Identity};
 use markdown::Styles;
 use picker::{Item, Kind, Pick};
-use pull_requests::{Ask, Part};
+use pull_requests::{Ask, DiffAsk, Part};
 use scroll::{Pin, Scroll};
 use sidebar::{Badges, Capabilities, Shelf, ShelfChoices, Sidebar, View};
 use theme::{Theme, duration_label, model_display_name, now_ms, parse_iso_ms, runtime_mode_label};
@@ -92,6 +92,9 @@ type WatchSetup = Box<dyn Fn(&str) -> mpsc::UnboundedReceiver<WatchEvent>>;
 /// Reads a pull request from its host in the background as `Ask` says, and sends the answer
 /// as an action with the ask's ticket.
 type ReadPull = Box<dyn Fn(Reference, Ask)>;
+/// Reads a slice of a pull request's diff in the background as `DiffAsk` says, and sends the
+/// answer as an action with the ask's ticket.
+type ReadDiff = Box<dyn Fn(Reference, DiffAsk)>;
 /// Opens T3's `pullRequests.subscribeRefreshes`: `Client::watch_pull_request_refreshes`, or a
 /// test's stand-in.
 type WatchRefreshes = Box<dyn Fn() -> mpsc::UnboundedReceiver<WatchEvent>>;
@@ -339,6 +342,12 @@ enum ActionResult {
         ticket: u64,
         part: Part,
     },
+    /// A slice of a pull request's diff, or why reading it failed, for the read with this
+    /// ticket.
+    PullRequestDiff {
+        ticket: u64,
+        answer: Result<Box<pull_request::Diff>, String>,
+    },
     /// A send that failed. The composer gets its text back.
     SendFailed {
         thread_id: String,
@@ -548,6 +557,8 @@ struct App {
     watch_setup: WatchSetup,
     /// Reads the pull request whose details opened.
     read_pull: ReadPull,
+    /// Reads a slice of the diff of the pull request whose Code tab shows.
+    read_diff: ReadDiff,
     /// Opens T3's refresh numbers for pull requests.
     watch_refreshes: WatchRefreshes,
     /// T3's refresh numbers, open while the details hold a read of a link's pull request.
@@ -670,6 +681,21 @@ async fn read_pull_request(client: &Client, reference: &Reference, ask: &Ask, se
     send(Part::Done);
 }
 
+/// Reads the slice of the diff of the pull request `reference` names that `cursor` names, or the
+/// first, through T3's HTTP route, as the desktop's Code tab does. A sentence of T3's own, such
+/// as a host the server has no credentials for, reads as T3 wrote it, as for the detail.
+async fn read_diff(
+    client: &Client,
+    reference: &Reference,
+    cursor: Option<&str>,
+) -> Result<Box<pull_request::Diff>, String> {
+    match pull_request::diff(&client.api, reference, cursor).await {
+        Ok(diff) => Ok(Box::new(diff)),
+        Err(e @ PullRequestError::Rpc(_)) => Err(format!("Couldn't read this diff: {e}")),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
 async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>) -> Result<()> {
     let (actions, mut action_results) = mpsc::unbounded_channel();
     let mut shell_events = client.watch_shell(None);
@@ -687,6 +713,7 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
             terminal.draw(|frame| app.draw(frame))?;
             last_draw = Instant::now();
             dirty = false;
+            app.after_frame();
         }
         let redraw_at = tokio::time::Instant::from_std(last_draw + FRAME);
         // The sidebar's half reads the last frame drawn. A frame still waiting out the budget
@@ -894,6 +921,7 @@ impl App {
         let watcher = client.clone();
         let refresher = client.clone();
         let (reader, answers) = (client.clone(), actions.clone());
+        let (differ, diffs) = (client.clone(), actions.clone());
         let environment = Identity::new(client.runtime.label.as_deref(), &client.runtime.origin);
         App {
             client,
@@ -962,6 +990,14 @@ impl App {
                         let _ = answers.send(ActionResult::PullRequest { ticket, part });
                     };
                     read_pull_request(&client, &reference, &ask, send).await;
+                });
+            }),
+            read_diff: Box::new(move |reference, ask: DiffAsk| {
+                let (client, answers) = (differ.clone(), diffs.clone());
+                tokio::spawn(async move {
+                    let answer = read_diff(&client, &reference, ask.cursor.as_deref()).await;
+                    let ticket = ask.ticket;
+                    let _ = answers.send(ActionResult::PullRequestDiff { ticket, answer });
                 });
             }),
             watch_refreshes: Box::new(move || refresher.watch_pull_request_refreshes()),
@@ -1232,7 +1268,8 @@ impl App {
     /// (apps/web/src/components/pullRequest/ThreadPullRequestsPanel.tsx). Only an environment
     /// whose capabilities have `pullRequests` reads them. The details show the answer when it
     /// comes, and a reference T3's schema would refuse fails at once. While the details hold a
-    /// read, T3's refresh numbers say when to read it again. Says whether it asked for a read.
+    /// read, T3's refresh numbers say when to read it again. A slice of its diff that the Code
+    /// tab wants is asked for the same way. Says whether it asked for a read.
     fn read_opened_pull(&mut self) -> bool {
         let project = self.pulls_project();
         let enabled = project.is_some();
@@ -1248,20 +1285,41 @@ impl App {
         let ask = shown
             .then(|| self.details.pulls.take_ask(enabled, now))
             .flatten();
+        // The diff's read goes after the detail's, so a read that sends
+        // `pullRequests.invalidate` holds it.
+        let diff = shown
+            .then(|| self.details.pulls.take_diff_ask(enabled, now))
+            .flatten();
         self.follow_refreshes(enabled);
-        let Some(ask) = ask else {
-            return false;
-        };
         let project = project.unwrap_or_default();
-        match Reference::new(&project, Some(&ask.host), &ask.repository, ask.number) {
-            Ok(reference) => (self.read_pull)(reference, ask),
-            Err(failure) => {
-                let failure = Part::Detail(Err(failure.to_string()));
-                self.details.answer_pull(ask.ticket, failure, now);
-                self.details.answer_pull(ask.ticket, Part::Done, now);
+        let asked = ask.is_some() || diff.is_some();
+        if let Some(ask) = ask {
+            match Reference::new(&project, Some(&ask.host), &ask.repository, ask.number) {
+                Ok(reference) => (self.read_pull)(reference, ask),
+                Err(failure) => {
+                    let failure = Part::Detail(Err(failure.to_string()));
+                    self.details.answer_pull(ask.ticket, failure, now);
+                    self.details.answer_pull(ask.ticket, Part::Done, now);
+                }
             }
         }
-        true
+        if let Some(ask) = diff {
+            match Reference::new(&project, Some(&ask.host), &ask.repository, ask.number) {
+                Ok(reference) => (self.read_diff)(reference, ask),
+                Err(failure) => {
+                    let failure = Err(failure.to_string());
+                    self.details.answer_diff(ask.ticket, failure, now);
+                }
+            }
+        }
+        asked
+    }
+
+    /// Reads the Code tab's next slice once a frame showed the end of its files.
+    fn after_frame(&mut self) {
+        if self.details.pulls.code_due() {
+            self.read_opened_pull();
+        }
     }
 
     /// The project of the thread whose details show, which a read of its links names, while
@@ -2355,6 +2413,12 @@ impl App {
                 let now = now_ms().max(self.now);
                 self.details.answer_pull(ticket, part, now);
                 // A link opened while that read was under way is asked for once it is done.
+                self.read_opened_pull();
+            }
+            ActionResult::PullRequestDiff { ticket, answer } => {
+                let now = now_ms().max(self.now);
+                self.details.answer_diff(ticket, answer, now);
+                // A slice wanted while that one was under way is asked for once it came.
                 self.read_opened_pull();
             }
             ActionResult::Output {
@@ -13384,6 +13448,28 @@ mod tests {
             ));
         });
         note_refreshes(app);
+        note_diffs(app);
+        asked
+    }
+
+    /// What a read of a pull request's diff named: the project, the host, the repository,
+    /// the number, the ticket and the cursor of the slice.
+    type NotedDiff = (String, String, String, u64, u64, Option<String>);
+
+    /// Replaces how `app` reads a pull request's diff, so a read only notes what it named.
+    fn note_diffs(app: &mut App) -> std::rc::Rc<std::cell::RefCell<Vec<NotedDiff>>> {
+        let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let noted = asked.clone();
+        app.read_diff = Box::new(move |reference: Reference, ask: DiffAsk| {
+            noted.borrow_mut().push((
+                reference.project_id().to_string(),
+                reference.host().unwrap_or_default().to_string(),
+                reference.repository().to_string(),
+                reference.number(),
+                ask.ticket,
+                ask.cursor,
+            ));
+        });
         asked
     }
 
@@ -13485,6 +13571,7 @@ mod tests {
         use pull_requests::Tab;
         let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
         let _asked = note_reads(&mut app);
+        let diffs = note_diffs(&mut app);
         press(&mut app, KeyCode::Enter);
         let status = |app: &mut App| {
             let buffer = cells(app, 200, 50);
@@ -13507,28 +13594,28 @@ mod tests {
             let came = iso_at(now_ms() - hours * 3_600_000);
             activity["comments"][at]["createdAt"] = json!(came);
         }
-        let activity = pull_request::Activity::read(&activity).unwrap();
-        let parts = vec![
-            Part::Detail(Ok(Box::new(host_detail()))),
-            Part::Activity(Ok(Box::new(activity))),
-            Part::Done,
-        ];
-        hear(&mut app, 1, parts);
+        let answers = || {
+            let activity = pull_request::Activity::read(&activity).unwrap();
+            vec![
+                Part::Detail(Ok(Box::new(host_detail()))),
+                Part::Activity(Ok(Box::new(activity))),
+                Part::Done,
+            ]
+        };
+        hear(&mut app, 1, answers());
         let shown = status(&mut app);
         let hint = "↑↓/PgUp scroll · → timeline · ← list · r refresh · Esc leave";
         assert!(shown.contains(hint), "{shown}");
         let rows = body_after(&mut app, 200, 50);
         // The pane is too narrow for where the link is in the list as well.
-        assert_eq!(rows[0], "← List  Summary  Timeline");
+        assert_eq!(rows[0], "← List  Summary  Timeline  Code");
 
-        // → or `l` shows the Timeline, and ← or `h` the Summary, then the list.
+        // → or `l` shows the Timeline, then the Code, and ← or `h` a tab back, then the list.
         press(&mut app, KeyCode::Right);
         assert_eq!(app.details.pulls.tabs(), Some(Tab::Timeline));
         let shown = status(&mut app);
-        assert!(
-            shown.contains("↑↓/PgUp scroll · ← summary · r refresh · Esc leave"),
-            "{shown}"
-        );
+        let hint = "↑↓/PgUp scroll · → code · ← summary · r refresh · Esc leave";
+        assert!(shown.contains(hint), "{shown}");
         let rows = body_after(&mut app, 200, 50);
         let text: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
         for shown in [
@@ -13543,8 +13630,89 @@ mod tests {
         let header = header.expect("the header");
         assert_eq!(text[header + 1..header + 3], ["1 approval", "Newest first"]);
         assert!(!text.contains(&"Checks"), "{text:#?}");
+
+        // The Code asks for the diff's first slice, through the link's project and host, once
+        // it shows.
+        assert!(diffs.borrow().is_empty());
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.details.pulls.tabs(), Some(Tab::Code));
+        let named = ("p", "github.com", "krishhgg/t3term", 31, 2, None);
+        let named = (
+            named.0.to_string(),
+            named.1.to_string(),
+            named.2.to_string(),
+            named.3,
+            named.4,
+            named.5,
+        );
+        assert_eq!(*diffs.borrow(), std::slice::from_ref(&named));
+        let shown = status(&mut app);
+        let hint = "↑↓/PgUp scroll · ← timeline · r refresh · Esc leave";
+        assert!(shown.contains(hint), "{shown}");
+        let rows = body_after(&mut app, 200, 50);
+        let rows: Vec<&str> = rows[1..5].iter().map(|row| row.trim()).collect();
+        let loading = [
+            "#31 Bound titles",
+            "Open · Checks passing · Approved",
+            "",
+            "Loading pull request diff…",
+        ];
+        assert_eq!(rows, loading);
+        let diff = |patch: &str| {
+            Ok(Box::new(pull_request::Diff {
+                patch: patch.into(),
+                truncated: false,
+                next_cursor: None,
+                omitted: Vec::new(),
+                omitted_cut: false,
+            }))
+        };
+
+        // `r` reads the detail again after `pullRequests.invalidate`, then the diff once that
+        // read is done and the slice under way came, as the new read replaces it.
+        press(&mut app, KeyCode::Char('r'));
+        hear(&mut app, 3, answers());
+        assert_eq!(diffs.borrow().len(), 1);
+        let gone = diff("diff --git a/gone b/gone\n--- a/gone\n+++ b/gone\n@@ -1 +1 @@\n-a\n+b\n");
+        app.on_action_result(ActionResult::PullRequestDiff {
+            ticket: 2,
+            answer: gone,
+        });
+        let again = (
+            named.0.clone(),
+            named.1.clone(),
+            named.2.clone(),
+            31,
+            4,
+            None,
+        );
+        assert_eq!(*diffs.borrow(), [named.clone(), again.clone()]);
+        let rows = body_after(&mut app, 200, 50);
+        assert_eq!(rows[4].trim(), "Loading pull request diff…");
+
+        // The slice shows its files, folded, and Enter unfolds the one ↓ chose.
+        let answer = diff(
+            "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n\
+             @@ -1 +1 @@\n-old\n+new\n",
+        );
+        app.on_action_result(ActionResult::PullRequestDiff { ticket: 4, answer });
+        let rows = body_after(&mut app, 200, 50);
+        let text: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
+        assert_eq!(text[4..8], ["1 file", "", "› M src/lib.rs +1 -1", ""]);
+        press(&mut app, KeyCode::Down);
+        let shown = status(&mut app);
+        assert!(shown.contains("Enter expand file · "), "{shown}");
+        press(&mut app, KeyCode::Enter);
+        let rows = body_after(&mut app, 200, 50);
+        let text: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
+        assert_eq!(text[6..9], ["⌄ M src/lib.rs +1 -1", "1 - old", "1 + new"]);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.details.pulls.tabs(), Some(Tab::Code));
+        assert_eq!(*diffs.borrow(), [named, again]);
         for (code, tab, viewing) in [
-            (KeyCode::Char('l'), Some(Tab::Timeline), true),
+            (KeyCode::Char('h'), Some(Tab::Timeline), true),
+            (KeyCode::Char('l'), Some(Tab::Code), true),
+            (KeyCode::Left, Some(Tab::Timeline), true),
             (KeyCode::Left, Some(Tab::Summary), true),
             (KeyCode::Char('l'), Some(Tab::Timeline), true),
             (KeyCode::Char('h'), Some(Tab::Summary), true),
@@ -13566,10 +13734,50 @@ mod tests {
         assert!(mouse(&mut app, CLICK, body.x + 9, body.y));
         assert_eq!(app.details.pulls.tabs(), Some(Tab::Summary));
         cells(&mut app, 200, 50);
-        assert!(mouse(&mut app, CLICK, body.x + 18, body.y));
+        assert!(mouse(&mut app, CLICK, body.x + 28, body.y));
+        assert_eq!(app.details.pulls.tabs(), Some(Tab::Code));
         cells(&mut app, 200, 50);
         assert!(mouse(&mut app, CLICK, body.x + 1, body.y));
         assert!(!app.details.pulls.viewing());
+        // The diff came under a minute ago, so none of this read it again.
+        assert_eq!(diffs.borrow().len(), 2);
+    }
+
+    #[test]
+    fn a_frame_that_shows_the_end_of_the_code_reads_its_next_slice() {
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        let _asked = note_reads(&mut app);
+        let diffs = note_diffs(&mut app);
+        press(&mut app, KeyCode::Enter);
+        let parts = vec![
+            Part::Detail(Ok(Box::new(host_detail()))),
+            Part::Activity(Ok(Box::new(host_activity()))),
+            Part::Done,
+        ];
+        hear(&mut app, 1, parts);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        assert_eq!(diffs.borrow().len(), 1);
+        let diff = pull_request::Diff {
+            patch: "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -1 +1 @@\n-a\n+b\n".into(),
+            truncated: false,
+            next_cursor: Some("c2".into()),
+            omitted: Vec::new(),
+            omitted_cut: false,
+        };
+        let answer = Ok(Box::new(diff));
+        app.on_action_result(ActionResult::PullRequestDiff { ticket: 2, answer });
+        // Only a frame that shows the end of the files reads the next slice, once.
+        app.after_frame();
+        assert_eq!(diffs.borrow().len(), 1);
+        cells(&mut app, 200, 50);
+        app.after_frame();
+        app.after_frame();
+        let next = diffs.borrow().last().map(|ask| (ask.4, ask.5.clone()));
+        assert_eq!(
+            (diffs.borrow().len(), next),
+            (2, Some((3, Some("c2".into()))))
+        );
     }
 
     #[test]
