@@ -1064,7 +1064,7 @@ fn read_omitted(value: &Value) -> Result<Omitted, PullRequestError> {
     // T3's schema takes any number here, as GitHub's counts are whole numbers from 0. `as`
     // takes a negative count to 0 and drops a fraction.
     let count = |key: &str| match object.optional(key).and_then(Value::as_f64) {
-        Some(count) if count.is_finite() => Ok(count as u64),
+        Some(count) => Ok(count as u64),
         _ => Err(object.wrong(key)),
     };
     Ok(Omitted {

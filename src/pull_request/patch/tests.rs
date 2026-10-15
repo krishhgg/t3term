@@ -32,6 +32,21 @@ fn rows(patch: &str, file: &File) -> Vec<String> {
         .collect()
 }
 
+/// A file's status, paths, kind, hunks and counts on one line.
+fn about(file: &File) -> String {
+    let path = |path: &Option<String>| path.clone().unwrap_or("-".into());
+    format!(
+        "{:?} {} > {}{}, {} hunks +{} -{}",
+        file.status,
+        path(&file.old_path),
+        path(&file.new_path),
+        if file.binary { " binary" } else { "" },
+        file.hunks.len(),
+        file.additions,
+        file.deletions
+    )
+}
+
 #[test]
 fn a_modified_file_reads_its_hunks_with_each_line_numbered() {
     let patch = "diff --git a/src/main.rs b/src/main.rs
@@ -43,7 +58,7 @@ index 3b18e51..a1c2e3f 100644
 -use std::fs;
 +use std::fs::File;
 +use std::path::Path;
- 
+
  fn main() {
 @@ -20,2 +21,2 @@
 -    old();
@@ -115,64 +130,26 @@ HcmV?d00001
 diff --git a/script.sh b/script.sh
 old mode 100644
 new mode 100755
+diff --git a/empty b/empty
+new file mode 100644
+index 0000000..e69de29
+diff --git a/emptied b/emptied
+deleted file mode 100644
+index e69de29..0000000
 ";
     let read = Patch::read(patch);
-    let summary: Vec<_> = read
-        .files
-        .iter()
-        .map(|file| {
-            (
-                file.old_path.as_deref(),
-                file.new_path.as_deref(),
-                file.status,
-                file.binary,
-                file.hunks.len(),
-                file.additions,
-                file.deletions,
-            )
-        })
-        .collect();
+    let summary: Vec<_> = read.files.iter().map(about).collect();
     assert_eq!(
         summary,
         [
-            (None, Some("new.txt"), Status::Added, false, 1, 1, 0),
-            (Some("gone.txt"), None, Status::Deleted, false, 1, 0, 2),
-            (
-                Some("old name.rs"),
-                Some("new name.rs"),
-                Status::Renamed,
-                false,
-                0,
-                0,
-                0
-            ),
-            (
-                Some("logo.png"),
-                Some("logo.png"),
-                Status::Modified,
-                true,
-                0,
-                0,
-                0
-            ),
-            (
-                Some("icon.png"),
-                Some("icon.png"),
-                Status::Modified,
-                true,
-                0,
-                0,
-                0
-            ),
-            (
-                Some("script.sh"),
-                Some("script.sh"),
-                Status::Modified,
-                false,
-                0,
-                0,
-                0
-            ),
+            "Added - > new.txt, 1 hunks +1 -0",
+            "Deleted gone.txt > -, 1 hunks +0 -2",
+            "Renamed old name.rs > new name.rs, 0 hunks +0 -0",
+            "Modified logo.png > logo.png binary, 0 hunks +0 -0",
+            "Modified icon.png > icon.png binary, 0 hunks +0 -0",
+            "Modified script.sh > script.sh, 0 hunks +0 -0",
+            "Added - > empty, 0 hunks +0 -0",
+            "Deleted emptied > -, 0 hunks +0 -0",
         ]
     );
     assert_eq!(read.files[1].path(), "gone.txt");
@@ -281,9 +258,12 @@ fn line_ends_hunk_text_and_broken_hunks_are_handled() {
 +++ b/b.txt
 @@ -x +1 @@
 +lost
+diff --git a/c.txt b/c.txt
+--- a/c.txt
++++ b/c.txt
 @@ -1,3 +1,3 @@
  kept
-diff --git a/c.txt b/c.txt
+diff --git a/e.txt b/e.txt
 --- a/c.txt
 +++ b/c.txt
 @@ -1 +1 @@
@@ -291,11 +271,11 @@ diff --git a/c.txt b/c.txt
 +d
 ";
     let read = Patch::read(patch);
-    assert!(read.files[0].unreadable);
-    assert_eq!(read.files[0].hunks.len(), 1);
-    assert_eq!(read.files[0].hunks[0].lines.len(), 1);
-    assert!(!read.files[1].unreadable);
-    assert_eq!((read.files[1].additions, read.files[1].deletions), (1, 1));
+    let unreadable: Vec<_> = read.files.iter().map(|file| file.unreadable).collect();
+    assert_eq!(unreadable, [true, true, false]);
+    assert_eq!(read.files[0].hunks, []);
+    assert_eq!(read.files[1].hunks[0].lines.len(), 1);
+    assert_eq!((read.files[2].additions, read.files[2].deletions), (1, 1));
     for broken in [
         "@@ -1 +1",
         "@@ -1, +1 @@",
