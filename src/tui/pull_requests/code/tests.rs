@@ -1199,6 +1199,37 @@ fn pages_go_with_their_thread_when_the_conversation_is_read_again() {
     new.carry(&mut old);
     assert!(new.want_more(0));
     assert_eq!(new.take_wanted(1), Some(("t".into(), "fresh".into())));
+
+    // A thread whose pages ran out reads on from the read again's own cursor once the host
+    // counts more remarks than it holds, as after a reply, and holds each remark once.
+    let counted = |count: u64| {
+        let mut paged = thread("t", "a", Some(1), "right", false, &["First."]);
+        paged["commentCount"] = json!(count);
+        paged["nextCommentsCursor"] = json!("p2");
+        vec![paged]
+    };
+    let mut old = conversation(counted(3));
+    assert!(old.want_more(0));
+    assert_eq!(old.take_wanted(1), Some(("t".into(), "p2".into())));
+    assert!(old.take_page(1, Ok(&page(&["t-1", "t-2"], None))));
+    assert!(!old.want_more(0));
+    let mut same = conversation(counted(3));
+    same.carry(&mut old);
+    assert!(!same.want_more(0));
+    let mut replied = conversation(counted(4));
+    replied.carry(&mut same);
+    assert!(replied.want_more(0));
+    assert_eq!(replied.take_wanted(2), Some(("t".into(), "p2".into())));
+    assert!(replied.take_page(2, Ok(&page(&["t-1", "t-2", "t-3"], None))));
+    assert!(!replied.want_more(0));
+    let (rows, _) = with_threads(&code, &mut replied, &shown, 40);
+    for body in ["│   Remark t-1.", "│   Remark t-2.", "│   Remark t-3."] {
+        assert_eq!(
+            rows.iter().filter(|row| *row == body).count(),
+            1,
+            "{rows:#?}"
+        );
+    }
 }
 
 #[test]
