@@ -331,7 +331,8 @@ impl Pill {
 /// (pullRequestReactions.logic.ts), but for the heart. The desktop's ❤️ is ❤ and U+FE0F, which
 /// some terminals draw a column wide and others two, and ratatui 0.30 writes the cell after it
 /// without moving the cursor. Where the terminal draws it two wide, the rest of the row then
-/// lands a column to the right. ❤ alone is a column wide in every terminal.
+/// lands a column to the right. Without the selector, each one's width is its East Asian Width,
+/// as unicode-width counts it: one for the heart and two for the other seven.
 fn emoji(content: ReactionContent) -> &'static str {
     match content {
         ReactionContent::ThumbsUp => "👍",

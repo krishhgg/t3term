@@ -836,10 +836,11 @@ fn reactions(of: &[(&str, u64, bool)]) -> Value {
 }
 
 #[test]
-fn each_reactions_emoji_is_as_wide_in_every_terminal() {
+fn no_reactions_emoji_carries_a_variation_selector() {
     // An emoji with U+FE0F is a column wide in some terminals and two in others, and ratatui
     // writes the cell after it without moving the cursor, so the row would move in one or the
-    // other. Each of these is wide in every terminal but the heart, which is narrow in every one.
+    // other. Without it, an emoji's width is its East Asian Width, as unicode-width counts it:
+    // two for each of these but the heart, and one for the heart.
     let contents = [
         ("thumbs-up", 2),
         ("thumbs-down", 2),
