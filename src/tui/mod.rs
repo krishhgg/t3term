@@ -13381,6 +13381,41 @@ mod tests {
         })
     }
 
+    /// The time `ms` after the Unix epoch as T3 writes it, in UTC to the second.
+    fn iso_at(ms: i64) -> String {
+        let (days, second) = (ms.div_euclid(86_400_000), ms.rem_euclid(86_400_000) / 1000);
+        // The inverse of `parse_iso_ms`'s days from a civil date.
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = yoe + era * 400 + i64::from(month <= 2);
+        let (hour, minute) = (second / 3600, second / 60 % 60);
+        format!(
+            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{:02}Z",
+            second % 60
+        )
+    }
+
+    #[test]
+    fn iso_at_writes_the_time_parse_iso_ms_reads() {
+        for ms in [
+            0,
+            951_782_400_000,
+            1_709_164_800_000,
+            1_791_882_000_000,
+            4_107_542_399_000,
+            now_ms() / 1000 * 1000,
+        ] {
+            assert_eq!(parse_iso_ms(&iso_at(ms)), Some(ms), "{ms}");
+        }
+        assert_eq!(iso_at(1_791_882_000_000), "2026-10-13T09:00:00Z");
+    }
+
     /// Gives `app` the parts of read `ticket`'s answer, in order.
     fn hear(app: &mut App, ticket: u64, parts: Vec<Part>) {
         for part in parts {
@@ -13549,9 +13584,17 @@ mod tests {
             shown.contains("↑↓/PgUp scroll · ← list · Esc leave"),
             "{shown}"
         );
+        // The frames read the real clock, so the remark and the review came 26 and 25 hours
+        // before it, and the remark's age reads the same on any day.
+        let mut activity = host_activity_sent();
+        for (at, hours) in [(0, 26), (1, 25)] {
+            let came = iso_at(now_ms() - hours * 3_600_000);
+            activity["comments"][at]["createdAt"] = json!(came);
+        }
+        let activity = pull_request::Activity::read(&activity).unwrap();
         let parts = vec![
             Part::Detail(Ok(Box::new(host_detail()))),
-            Part::Activity(Ok(Box::new(host_activity()))),
+            Part::Activity(Ok(Box::new(activity))),
             Part::Done,
         ];
         hear(&mut app, 1, parts);
