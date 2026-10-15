@@ -30,6 +30,7 @@ use crate::tui::{clip, row};
 const GUTTER: usize = 2;
 
 /// When the pull request opened, and merged or closed, and who opened it, from its detail.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub(in crate::tui::pull_requests) struct Lifecycle {
     opened: Option<i64>,
     author: Option<String>,
@@ -130,6 +131,8 @@ pub(super) struct Timeline {
     opener: Option<String>,
     /// When the newest commit came. A verdict given before it is on earlier changes.
     newest: Option<i64>,
+    /// The opening and ending it was laid out with.
+    lifecycle: Lifecycle,
 }
 
 impl Timeline {
@@ -192,7 +195,18 @@ impl Timeline {
             keys,
             opener: conversation.author.clone().or(lifecycle.author.clone()),
             newest: conversation.commits.iter().filter_map(|c| c.at).max(),
+            lifecycle: lifecycle.clone(),
         }
+    }
+
+    /// Whether it was laid out with `lifecycle`.
+    pub(super) fn follows(&self, lifecycle: &Lifecycle) -> bool {
+        self.lifecycle == *lifecycle
+    }
+
+    /// Whether a run is known by `key`.
+    pub(super) fn has_key(&self, key: &str) -> bool {
+        self.keys.iter().any(|known| known == key)
     }
 
     /// How many runs of remarks it has.

@@ -1524,6 +1524,35 @@ async fn refresh_watch_passes_on_t3s_numbers_and_asks_the_same_again() {
 }
 
 #[tokio::test]
+async fn a_refresh_subscription_t3_ends_ends_the_watch_without_a_retry() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+
+    let server = tokio::spawn(async move {
+        let mut socket = accept(&listener).await;
+        let id = refresh_request(&mut socket).await;
+        send(&mut socket, chunk(&id, json!([3]))).await;
+        assert_eq!(recv(&mut socket).await, ack(&id));
+        let end = json!({"_tag": "Exit", "requestId": id, "exit": success(Value::Null)});
+        send(&mut socket, end).await;
+        // A retry would connect within the shortest wait, 250 ms.
+        let again = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await;
+        assert!(again.is_err(), "it subscribed again");
+    });
+
+    let mut events = spawn_pull_request_refresh_watch(dial(url));
+    match next_event(&mut events).await {
+        Some(WatchEvent::Item(item)) => assert_eq!(item, json!(3)),
+        other => panic!("expected the number, got {other:?}"),
+    }
+    assert!(next_event(&mut events).await.is_none(), "it retried");
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the server waited for a retry")
+        .unwrap();
+}
+
+#[tokio::test]
 async fn a_refused_refresh_subscription_ends_the_watch_without_a_retry() {
     let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
     let url = format!("ws://{}", listener.local_addr().unwrap());

@@ -1658,6 +1658,7 @@ impl PullRequests {
             (&read.answer, &mut read.conversation)
         {
             conversation.follow(&summary.lifecycle);
+            self.shown.prune(conversation);
         }
         // The rows move, so no control stays chosen.
         self.pick = None;
@@ -4584,6 +4585,41 @@ mod tests {
         assert!(pulls.back());
         assert!(!pulls.viewing());
         assert!(!pulls.back());
+    }
+
+    #[test]
+    fn a_read_again_forgets_the_open_runs_it_no_longer_has() {
+        let mut pulls = conversing(remarks(3));
+        let theme = theme();
+        assert!(!pulls.answer(1, Part::Done, now()));
+        // The Timeline's one run opens.
+        assert!(pulls.forward());
+        pulls.page(40, 24, now(), true, &theme);
+        pulls.step(true);
+        assert_eq!(pulls.action().as_deref(), Some("oldest first"));
+        pulls.page(40, 24, now(), true, &theme);
+        pulls.step(true);
+        assert_eq!(pulls.action().as_deref(), Some("show comments"));
+        pulls.enter();
+        assert_ne!(pulls.shown, Shown::default());
+
+        // A newer remark joins it, so it is another run, and the key of the one that went is
+        // forgotten.
+        assert!(pulls.refresh());
+        assert_eq!(pulls.take_ask(true, now()).map(|ask| ask.ticket), Some(2));
+        let mut activity = remarks(3);
+        let newer = json!({"id": "d", "kind": "issue-comment",
+            "author": {"login": "mona", "name": null}, "body": "Later",
+            "createdAt": "2026-10-13T01:00:00Z", "url": null, "path": null,
+            "reviewState": null});
+        activity["comments"].as_array_mut().unwrap().push(newer);
+        activity["commentCount"] = json!(5);
+        let activity = pull_request::Activity::read(&activity).unwrap();
+        let detail = Part::Detail(Ok(read_detail(&bare_detail())));
+        assert!(!pulls.answer(2, detail, now()));
+        assert!(!pulls.answer(2, Part::Activity(Ok(Box::new(activity))), now()));
+        assert!(pulls.answer(2, Part::Done, now()));
+        assert_eq!(pulls.shown, Shown::default());
     }
 
     #[test]

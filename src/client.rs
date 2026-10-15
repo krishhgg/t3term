@@ -528,6 +528,15 @@ enum Resume {
 }
 
 impl Resume {
+    /// Whether a subscription T3 ends with a successful `Exit` ends the watch, rather than
+    /// being asked for again. A dropped connection still asks again. T3's
+    /// `pullRequests.subscribeRefreshes` is `SubscriptionRef.changes`, which never ends on its
+    /// own (apps/server/src/pullRequest/PullRequestService.ts:3431), so the TUI follows no
+    /// refreshes for the rest of the session after one does, as it does after a refusal.
+    fn ends_for_good(self) -> bool {
+        matches!(self, Resume::Refreshes)
+    }
+
     /// Whether `item` shows the subscription working, so the next drop retries quickly.
     fn healthy(self, item: &Value) -> bool {
         match self {
@@ -690,6 +699,8 @@ fn watch(
                                     return;
                                 }
                                 Some(Err(e)) => break e.to_string(),
+                                // Dropping the sender tells the consumer the watch is over.
+                                None if resume.ends_for_good() => return,
                                 None => break "the server ended the subscription".to_string(),
                             }
                         },

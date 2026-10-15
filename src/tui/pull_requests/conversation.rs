@@ -117,6 +117,21 @@ impl Shown {
             }
         }
     }
+
+    /// Forgets the finished remarks and the Timeline's runs that were open and that
+    /// `conversation` no longer has, so what is kept stays within its size however often the
+    /// details read it again.
+    pub(super) fn prune(&mut self, conversation: &Conversation) {
+        let finished: HashSet<&str> = conversation
+            .finished
+            .iter()
+            .map(|remark| remark.id.as_str())
+            .collect();
+        self.opened.retain(|id| finished.contains(id.as_str()));
+        if let Some(timeline) = conversation.timeline.as_ref() {
+            self.runs_open.retain(|key| timeline.has_key(key));
+        }
+    }
 }
 
 /// `shown` and a page more, no more than `total` or a page.
@@ -439,9 +454,11 @@ impl Conversation {
     }
 
     /// Lays the Timeline out from the pull request's `lifecycle`, from its detail, unless it
-    /// already is.
+    /// already is. A read again that brings a new detail and keeps this conversation, as when
+    /// the conversation's read failed, lays it out again with the new opening and ending.
     pub(super) fn follow(&mut self, lifecycle: &Lifecycle) {
-        if self.timeline.is_none() {
+        let follows = self.timeline.as_ref();
+        if !follows.is_some_and(|timeline| timeline.follows(lifecycle)) {
             self.timeline = Some(Timeline::of(lifecycle, self));
         }
     }

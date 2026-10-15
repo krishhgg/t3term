@@ -1111,6 +1111,48 @@ fn an_open_run_stays_open_when_the_timeline_is_read_again_until_it_grows() {
     // A remark that joins the newest run makes it another run, which is closed.
     let again = merged_with(vec![comment], vec![]);
     assert_eq!(open(&again, &shown), ["show comments", "hide comments"]);
+
+    // The key of the run that is gone is forgotten once the new conversation is in, so reads
+    // again never pile keys up, and the run still open stays open.
+    let Answer::Read(conversation) = &again else {
+        unreachable!()
+    };
+    assert_eq!(shown.runs_open.len(), 2);
+    shown.prune(conversation);
+    assert_eq!(shown.runs_open.len(), 1);
+    assert_eq!(open(&again, &shown), ["show comments", "hide comments"]);
+}
+
+#[test]
+fn the_timeline_takes_a_new_ending_and_keeps_its_remarks_and_open_runs() {
+    let mut answer = merged();
+    let mut shown = Shown::default();
+    let Answer::Read(conversation) = &mut answer else {
+        unreachable!()
+    };
+    shown.act(Control::Run(1), conversation);
+    // Read while it was open, then again once it merged, as a read again whose conversation
+    // failed keeps the conversation it had.
+    conversation.follow(&lifecycle(
+        &ago_at(600),
+        Some("mona"),
+        Value::Null,
+        Value::Null,
+    ));
+    let (rows, _) = timeline_rows(&mut answer, &shown, 60);
+    assert!(!rows.contains(&"● Pull request merged".to_string()));
+    assert!(rows.contains(&"  One more.".to_string()), "{rows:#?}");
+    let Answer::Read(conversation) = &mut answer else {
+        unreachable!()
+    };
+    let ended = json!(ago_at(5));
+    conversation.follow(&lifecycle(&ago_at(600), Some("mona"), ended.clone(), ended));
+    let (rows, _) = timeline_rows(&mut answer, &shown, 60);
+    assert!(
+        rows.contains(&"● Pull request merged".to_string()),
+        "{rows:#?}"
+    );
+    assert!(rows.contains(&"  One more.".to_string()), "{rows:#?}");
 }
 
 #[test]
