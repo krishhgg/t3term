@@ -13898,6 +13898,49 @@ mod tests {
     }
 
     #[test]
+    fn a_drag_of_the_sidebar_ends_before_the_environments_dialog_opens() {
+        let (mut app, _) = tui_counting_checks();
+        screen(&mut app, 120, 36);
+        let edge = app.sidebar.border.x;
+        let drag = MouseEventKind::Drag(MouseButton::Left);
+        let up = MouseEventKind::Up(MouseButton::Left);
+        // Alt+C during a drag puts the width back, as any key does, and the moves and release
+        // after it reach the dialog alone.
+        assert!(!mouse(&mut app, CLICK, edge, 12));
+        assert!(mouse(&mut app, drag, edge + 10, 12));
+        alt(&mut app, 'c');
+        assert!(app.environments.is_open());
+        assert_eq!(app.drag, None);
+        screen(&mut app, 120, 36);
+        assert_eq!(app.sidebar.border.x, edge);
+        assert!(!mouse(&mut app, drag, edge + 20, 12));
+        assert!(!mouse(&mut app, up, edge + 20, 12));
+        screen(&mut app, 120, 36);
+        assert_eq!(app.sidebar.border.x, edge);
+        assert!(app.environments.is_open());
+        assert_eq!(crate::settings::saved_in_test().sidebar_width, None);
+
+        // A press during a drag ends it where it is, as it always does, before it opens the
+        // dialog from the sidebar's environment row. Nothing after that moves the edge.
+        alt(&mut app, 'c');
+        assert!(!app.environments.is_open());
+        screen(&mut app, 120, 36);
+        assert!(!mouse(&mut app, CLICK, edge, 12));
+        assert!(mouse(&mut app, drag, edge + 5, 12));
+        screen(&mut app, 120, 36);
+        let environment = app.sidebar.environment;
+        assert!(mouse(&mut app, CLICK, environment.x + 1, environment.y));
+        assert!(app.environments.is_open());
+        assert_eq!(app.drag, None);
+        let moved = app.sidebar.border.x;
+        assert_eq!(moved, edge + 5);
+        assert!(!mouse(&mut app, drag, edge + 20, 12));
+        assert!(!mouse(&mut app, up, edge + 20, 12));
+        screen(&mut app, 120, 36);
+        assert_eq!(app.sidebar.border.x, moved);
+    }
+
+    #[test]
     fn the_environments_dialog_covers_the_details_and_hands_them_back() {
         let (mut app, _) = tui_counting_checks();
         // Details too wide for a pane open as a dialog with the keyboard.

@@ -186,6 +186,12 @@ pub(super) struct Dialog {
     selected: usize,
     /// The first environment the list shows.
     scroll: usize,
+    /// The widest name the last check that counted found, in columns. Measured once when the
+    /// check's result comes, so a frame lays out only the rows it shows.
+    name_width: usize,
+    /// How many environment rows frames have laid out, so a test can count them.
+    #[cfg(test)]
+    laid_out: usize,
     /// What the last frame drew. None until a frame draws the dialog after a change, and the
     /// mouse acts on none of it until then.
     pub drawn: Option<Drawn>,
@@ -254,6 +260,7 @@ impl Dialog {
             .and_then(|old| old.saved().get(self.selected))
             .map(|saved| saved.name.clone());
         let saved = found.saved();
+        self.name_width = saved.iter().map(|s| s.name.width()).max().unwrap_or(0);
         self.selected = match kept {
             Some(name) => saved.iter().position(|s| s.name == name),
             None => saved.iter().position(|s| s.current),
@@ -332,26 +339,31 @@ impl Dialog {
         let text_width = usize::from(if bordered { width - 4 } else { width });
 
         let head = self.head(text_width, connected, t);
-        let list = self.list(text_width, t);
+        let stand_in = self.stand_in(text_width, t);
+        let listed = stand_in.is_none();
+        let count = stand_in.as_ref().map_or_else(|| self.count(), Vec::len);
         let facts = self.facts(text_width, t);
         // The list keeps its first rows before the chosen environment's facts take any, and
         // the facts give up their last rows before the list gives up more.
         let available = room.saturating_sub(frame_rows + head.len());
-        let list_min = list.len().min(LIST_MIN);
+        let list_min = count.min(LIST_MIN);
         let facts_shown = if facts.is_empty() {
             0
         } else {
             available.saturating_sub(list_min + 1).min(facts.len())
         };
         let list_room = available.saturating_sub(if facts_shown > 0 { facts_shown + 1 } else { 0 });
-        let list_shown = list.len().min(list_room);
-        let listed = matches!(self.found, Some(Found::Saved(ref saved)) if !saved.is_empty());
+        let list_shown = count.min(list_room);
         if listed {
             self.scroll = into_view(self.scroll, self.selected, list_shown)
-                .min(list.len().saturating_sub(list_shown));
+                .min(count.saturating_sub(list_shown));
         } else {
             self.scroll = 0;
         }
+        let list = match stand_in {
+            Some(lines) => lines.into_iter().take(list_shown).collect(),
+            None => self.rows(text_width, list_shown, t),
+        };
 
         let used = head.len() + list_shown + if facts_shown > 0 { facts_shown + 1 } else { 0 };
         let height = (used + frame_rows).min(room);
@@ -375,12 +387,8 @@ impl Dialog {
         let mut lines: Vec<Line<'static>> = Vec::with_capacity(used);
         lines.extend(head);
         let mut rows = Vec::with_capacity(list_shown);
-        for (index, line) in list
-            .into_iter()
-            .enumerate()
-            .skip(self.scroll)
-            .take(list_shown)
-        {
+        for (offset, line) in list.into_iter().enumerate() {
+            let index = self.scroll + offset;
             let y = inner.y + lines.len() as u16;
             if listed {
                 if y < inner.bottom() {
@@ -398,7 +406,7 @@ impl Dialog {
             lines.extend(facts.into_iter().take(facts_shown));
         }
         let above = listed && self.scroll > 0;
-        let below = listed && self.scroll + list_shown < self.count();
+        let below = listed && self.scroll + list_shown < count;
 
         frame.render_widget(Clear, area);
         let style = Style::new().fg(t.fg).bg(t.popover);
@@ -465,45 +473,46 @@ impl Dialog {
         lines
     }
 
-    /// A row for each saved environment, or the line that stands in for the list: the check
-    /// that hasn't ended, the file that didn't read, or a file that saves none.
-    fn list(&self, width: usize, t: &Theme) -> Vec<Line<'static>> {
+    /// The lines that stand in for the list when it has no environment to show: the check
+    /// that hasn't ended, the file that didn't read, or a file that saves none. None when
+    /// there are environments.
+    fn stand_in(&self, width: usize, t: &Theme) -> Option<Vec<Line<'static>>> {
         let muted = Style::new().fg(t.muted);
-        let saved = match &self.found {
+        let (text, style) = match &self.found {
             None => {
-                return vec![Line::styled(
-                    clip("Checking the saved environments…", width),
-                    muted,
-                )];
+                let checking = clip("Checking the saved environments…", width);
+                return Some(vec![Line::styled(checking, muted)]);
             }
-            Some(Found::Unreadable(message)) => {
-                let style = Style::new().fg(t.error_fg);
-                return wrap(message, width)
-                    .iter()
-                    .map(|piece| Line::styled(clip(piece, width), style))
-                    .collect();
-            }
-            Some(Found::Saved(saved)) if saved.is_empty() => {
-                return wrap(
-                    "No saved environments. `t3term environment add NAME --t3-home PATH` saves one, and r checks again.",
-                    width,
-                )
-                .iter()
-                .map(|piece| Line::styled(clip(piece, width), muted))
-                .collect();
-            }
-            Some(Found::Saved(saved)) => saved,
+            Some(Found::Unreadable(message)) => (message.as_str(), Style::new().fg(t.error_fg)),
+            Some(Found::Saved(saved)) if saved.is_empty() => (
+                "No saved environments. `t3term environment add NAME --t3-home PATH` saves one, and r checks again.",
+                muted,
+            ),
+            Some(Found::Saved(_)) => return None,
         };
-        let name_width = saved
+        let lines = wrap(text, width)
             .iter()
-            .map(|saved| saved.name.width())
-            .max()
-            .unwrap_or(0)
-            .min(width / 3);
-        saved
+            .map(|piece| Line::styled(clip(piece, width), style))
+            .collect();
+        Some(lines)
+    }
+
+    /// The rows of the `shown` environments from the first the list shows. A frame lays out
+    /// these and no others, however many are saved.
+    fn rows(&mut self, width: usize, shown: usize, t: &Theme) -> Vec<Line<'static>> {
+        let name_width = self.name_width.min(width / 3);
+        let saved = self.found.as_ref().map_or(&[][..], Found::saved);
+        let rows: Vec<Line<'static>> = saved
             .iter()
+            .skip(self.scroll)
+            .take(shown)
             .map(|saved| environment_row(saved, name_width, width, t))
-            .collect()
+            .collect();
+        #[cfg(test)]
+        {
+            self.laid_out += rows.len();
+        }
+        rows
     }
 
     /// The chosen environment's facts, for under the list: for a ready one its label and
@@ -1041,6 +1050,30 @@ mod tests {
         assert!(text.iter().any(|row| row.contains("nnn…")), "{text:#?}");
         let words = text.iter().filter(|row| row.contains("word word")).count();
         assert_eq!(words, MESSAGE_ROWS, "{text:#?}");
+    }
+
+    #[test]
+    fn a_frame_lays_out_only_the_rows_it_shows() {
+        let mut dialog = dialog(many(10_000));
+        for (width, height) in [(200, 50), (120, 36), (80, 24), (40, 12), (12, 5)] {
+            let before = dialog.laid_out;
+            let buffer = draw(&mut dialog, width, height);
+            let shown = dialog.drawn.as_ref().unwrap().rows.len();
+            assert!(shown > 0, "{width}x{height}: {:#?}", rows(&buffer));
+            assert_eq!(dialog.laid_out - before, shown, "{width}x{height}");
+        }
+        // At the end of the list too, and the names keep the width the whole list measured.
+        dialog.choose(9_999);
+        let before = dialog.laid_out;
+        let buffer = draw(&mut dialog, 120, 36);
+        let drawn = dialog.drawn.as_ref().unwrap();
+        assert_eq!(dialog.laid_out - before, drawn.rows.len());
+        assert_eq!(drawn.rows.last().map(|(_, index)| *index), Some(9_999));
+        let last = rows(&buffer)
+            .into_iter()
+            .find(|row| row.contains("env9999"))
+            .unwrap();
+        assert!(last.contains("env9999  ready"), "{last}");
     }
 
     #[test]
