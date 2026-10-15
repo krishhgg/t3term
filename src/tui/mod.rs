@@ -1472,7 +1472,8 @@ impl App {
 
     /// A key for the details while they have the keyboard. Esc closes a dialog. On a pane it
     /// gives the keyboard back and leaves the pane open. → or `l` shows the thread's pull
-    /// requests, and ← or `h` goes back: from a pull request's details to the list, and from
+    /// requests, or a pull request's Timeline in place of its Summary, and ← or `h` goes back:
+    /// from the Timeline to the Summary, from a pull request's details to the list, and from
     /// the list to the thread's tab. On the thread's tab the up and down arrows, `j` and `k`
     /// choose among Lineage's rows, and scroll the text past them or without them, and Enter
     /// acts on the chosen row. On the pull requests' tab they move along the pull requests, or
@@ -1489,8 +1490,8 @@ impl App {
             KeyCode::Esc => self.close_details(),
             KeyCode::Left => self.details.back(),
             KeyCode::Char('h') if plain => self.details.back(),
-            KeyCode::Right => self.details.show(details::Tab::PullRequests),
-            KeyCode::Char('l') if plain => self.details.show(details::Tab::PullRequests),
+            KeyCode::Right => self.details.forward(),
+            KeyCode::Char('l') if plain => self.details.forward(),
             KeyCode::Enter => {
                 if let Some(target) = self.details.enter() {
                     self.act_on_lineage(target);
@@ -13224,6 +13225,89 @@ mod tests {
         press(&mut app, KeyCode::Left);
         assert!(!app.details.pulls.viewing());
         assert!(!status(&mut app).contains("Enter hide"));
+    }
+
+    #[test]
+    fn the_arrows_and_a_click_show_a_links_timeline_and_the_keys_say_so() {
+        use pull_requests::Tab;
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        let _asked = note_reads(&mut app);
+        press(&mut app, KeyCode::Enter);
+        let status = |app: &mut App| {
+            let buffer = cells(app, 200, 50);
+            text_in(&buffer, Rect::new(0, 49, 200, 1))
+        };
+        // Until the host's detail came, the details have no tabs, and → leaves them be.
+        press(&mut app, KeyCode::Right);
+        assert!(app.details.pulls.viewing());
+        assert_eq!(app.details.pulls.tabs(), None);
+        let shown = status(&mut app);
+        assert!(
+            shown.contains("↑↓/PgUp scroll · ← list · Esc leave"),
+            "{shown}"
+        );
+        let parts = vec![
+            Part::Detail(Ok(Box::new(host_detail()))),
+            Part::Activity(Ok(Box::new(host_activity()))),
+            Part::Done,
+        ];
+        hear(&mut app, 1, parts);
+        let shown = status(&mut app);
+        let hint = "↑↓/PgUp scroll · → timeline · ← list · Esc leave";
+        assert!(shown.contains(hint), "{shown}");
+        let rows = body_after(&mut app, 200, 50);
+        // The pane is too narrow for where the link is in the list as well.
+        assert_eq!(rows[0], "← List  Summary  Timeline");
+
+        // → or `l` shows the Timeline, and ← or `h` the Summary, then the list.
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.details.pulls.tabs(), Some(Tab::Timeline));
+        let shown = status(&mut app);
+        assert!(
+            shown.contains("↑↓/PgUp scroll · ← summary · Esc leave"),
+            "{shown}"
+        );
+        let rows = body_after(&mut app, 200, 50);
+        let text: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
+        for shown in [
+            "✓ Octocat approved",
+            "› 1 comment",
+            "1 author · 1d ago",
+            "● Pull request opened",
+        ] {
+            assert!(text.contains(&shown), "{shown:?} in {text:#?}");
+        }
+        let header = text.iter().position(|row| *row == "2 comments · 0 commits");
+        let header = header.expect("the header");
+        assert_eq!(text[header + 1..header + 3], ["1 approval", "Newest first"]);
+        assert!(!text.contains(&"Checks"), "{text:#?}");
+        for (code, tab, viewing) in [
+            (KeyCode::Char('l'), Some(Tab::Timeline), true),
+            (KeyCode::Left, Some(Tab::Summary), true),
+            (KeyCode::Char('l'), Some(Tab::Timeline), true),
+            (KeyCode::Char('h'), Some(Tab::Summary), true),
+            (KeyCode::Left, None, false),
+            (KeyCode::Enter, Some(Tab::Summary), true),
+        ] {
+            press(&mut app, code);
+            assert_eq!(app.details.pulls.tabs(), tab, "{code:?}");
+            assert_eq!(app.details.pulls.viewing(), viewing, "{code:?}");
+            assert_eq!(app.details.tab(), details::Tab::PullRequests, "{code:?}");
+        }
+
+        // A click on a tab's name shows it, and one on `← List` shows the list.
+        cells(&mut app, 200, 50);
+        let body = app.details.drawn.expect("the pane").body;
+        assert!(mouse(&mut app, CLICK, body.x + 18, body.y));
+        assert_eq!(app.details.pulls.tabs(), Some(Tab::Timeline));
+        cells(&mut app, 200, 50);
+        assert!(mouse(&mut app, CLICK, body.x + 9, body.y));
+        assert_eq!(app.details.pulls.tabs(), Some(Tab::Summary));
+        cells(&mut app, 200, 50);
+        assert!(mouse(&mut app, CLICK, body.x + 18, body.y));
+        cells(&mut app, 200, 50);
+        assert!(mouse(&mut app, CLICK, body.x + 1, body.y));
+        assert!(!app.details.pulls.viewing());
     }
 
     #[test]

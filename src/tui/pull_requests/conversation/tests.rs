@@ -842,3 +842,381 @@ fn a_finished_remarks_row_reads_as_the_desktops_does() {
     let comments = "<!--".repeat(huge / 4);
     assert_eq!(preview(&comments), comments);
 }
+
+/// When a pull request opened `minutes` before `NOW`, who opened it, and when it merged or
+/// closed, as its detail says.
+fn lifecycle(opened: &str, author: Option<&str>, merged: Value, closed: Value) -> Lifecycle {
+    let detail = json!({
+        "provider": "github",
+        "capabilities": {"diff": true, "comment": true, "actions": [], "mergeMethods": [],
+            "search": true, "review": {"inlineComment": false, "reply": false,
+            "resolve": false, "verdicts": []},
+            "reviewers": {"request": false, "listCandidates": false}},
+        "viewerPermissions": {"actions": [], "comment": false, "resolve": false,
+            "verdicts": [], "requestReviewers": false},
+        "projectId": "p", "projectTitle": "Demo", "workspaceRoot": "/repo",
+        "repository": "krishhgg/t3term", "number": 31, "title": "Change 31", "body": " ",
+        "url": "https://github.com/krishhgg/t3term/pull/31",
+        "author": author.map(actor),
+        "state": "open", "isDraft": false, "mergeability": "unknown", "additions": 0,
+        "deletions": 0, "changedFiles": 0, "headBranch": "feature", "baseBranch": "master",
+        "createdAt": opened, "updatedAt": opened,
+        "mergedAt": merged, "closedAt": closed, "reviewers": [], "labels": [], "checks": [],
+        "mergeCapabilities": {"merge": false, "squash": false, "rebase": false}
+    });
+    Lifecycle::of(&pull_request::Detail::read(&detail).unwrap())
+}
+
+/// A commit, with the lines it adds and removes and its first author where given.
+fn commit(
+    oid: &str,
+    headline: &str,
+    at: &str,
+    counts: Option<(u64, u64)>,
+    by: Option<&str>,
+) -> Value {
+    let mut commit = json!({"oid": oid, "messageHeadline": headline, "committedDate": at});
+    if let Some((additions, deletions)) = counts {
+        commit["additions"] = json!(additions);
+        commit["deletions"] = json!(deletions);
+    }
+    if let Some(by) = by {
+        commit["authors"] = json!([actor(by)]);
+    }
+    commit
+}
+
+/// The Timeline's rows for `answer` at `width`, opened as `shown` says, and the rows of each
+/// control among them.
+fn timeline_rows(
+    answer: &mut Answer<Conversation>,
+    shown: &Shown,
+    width: usize,
+) -> (Vec<String>, Vec<(Range<usize>, Control)>) {
+    if let Answer::Read(conversation) = answer {
+        conversation.lay_out_timeline(width, &theme(), shown);
+    }
+    let section = timeline_section(answer, shown, width, now(), &theme());
+    (rows_of(&section.lines), section.targets)
+}
+
+/// A merged pull request with two commits, three verdicts and four other remarks.
+fn merged() -> Answer<Conversation> {
+    let review =
+        |id, who, minutes, state, body| remark(id, actor(who), &ago_at(minutes), Some(state), body);
+    let comment = |id, who, minutes, body| remark(id, actor(who), &ago_at(minutes), None, body);
+    let mut nit = comment("k2", "Lee", 250, "Nit.");
+    nit["kind"] = json!("review-comment");
+    nit["path"] = json!("src/a.rs");
+    let comments = vec![
+        review(
+            "r1",
+            "octocat",
+            400,
+            "CHANGES_REQUESTED",
+            "Please split this.",
+        ),
+        comment("k1", "hubot", 300, "Looks close."),
+        nit,
+        review("k3", "lee", 200, "COMMENTED", "One more."),
+        review("a1", "octocat", 60, "APPROVED", ""),
+        comment("k4", "hubot", 30, "Ship it."),
+    ];
+    let commits = vec![
+        commit(
+            "a1b2c3d4e5f6",
+            "Add the parser",
+            &ago_at(500),
+            Some((1200, 4)),
+            Some("mona"),
+        ),
+        commit("0f0f0f0f0f0f", "", &ago_at(120), Some((0, 0)), None),
+    ];
+    let mut conversation = conversation_of(&activity(comments, vec![], commits));
+    let ended = json!(ago_at(5));
+    conversation.follow(&lifecycle(&ago_at(600), Some("mona"), ended.clone(), ended));
+    Answer::Read(Box::new(conversation))
+}
+
+#[test]
+fn the_timeline_reads_as_the_desktops_does() {
+    let mut answer = merged();
+    let mut shown = Shown::default();
+    let (rows, targets) = timeline_rows(&mut answer, &shown, 60);
+    let expected = [
+        ends("6 comments · 2 commits · 1 approval", "Newest first", 60),
+        String::new(),
+        "● Pull request merged".to_string(),
+        "  5m ago".to_string(),
+        String::new(),
+        "› 1 comment".to_string(),
+        "  1 author · 30m ago".to_string(),
+        String::new(),
+        "✓ octocat approved".to_string(),
+        "  1h ago".to_string(),
+        String::new(),
+        "○ Untitled commit".to_string(),
+        "  0f0f0f0 · 2h ago".to_string(),
+        String::new(),
+        // `Lee` and `lee` are one author.
+        "› 3 comments".to_string(),
+        "  2 authors · 3h ago".to_string(),
+        String::new(),
+        // Given before the newest commit, so grey and saying so.
+        "✗ octocat changes requested, before the latest commits".to_string(),
+        "  6h ago".to_string(),
+        "  Please split this.".to_string(),
+        String::new(),
+        ends("○ Add the parser", "+1,200 -4", 60),
+        "  a1b2c3d · mona · 8h ago".to_string(),
+        String::new(),
+        "● mona Pull request opened".to_string(),
+        "  10h ago".to_string(),
+    ];
+    assert_eq!(rows, expected);
+    let controls = [
+        (0..1, Control::TimelineOrder),
+        (5..7, Control::Run(0)),
+        (14..16, Control::Run(1)),
+    ];
+    assert_eq!(targets, controls);
+    let Answer::Read(conversation) = &answer else {
+        unreachable!()
+    };
+    assert_eq!(
+        conversation.action(Control::TimelineOrder, &shown),
+        "oldest first"
+    );
+    assert_eq!(
+        conversation.action(Control::Run(1), &shown),
+        "show comments"
+    );
+    assert!(!conversation.has(Control::Run(2), &shown));
+
+    // A run opens to each of its remarks, and stays open the other way round, where the
+    // desktop's closes. Oldest first, a run's time is its oldest remark's.
+    shown.act(Control::Run(1), conversation);
+    shown.act(Control::TimelineOrder, conversation);
+    assert_eq!(
+        conversation.action(Control::TimelineOrder, &shown),
+        "newest first"
+    );
+    assert_eq!(
+        conversation.action(Control::Run(1), &shown),
+        "hide comments"
+    );
+    let (rows, targets) = timeline_rows(&mut answer, &shown, 60);
+    let expected = [
+        ends("6 comments · 2 commits · 1 approval", "Oldest first", 60),
+        String::new(),
+        "● mona Pull request opened".to_string(),
+        "  10h ago".to_string(),
+        String::new(),
+        ends("○ Add the parser", "+1,200 -4", 60),
+        "  a1b2c3d · mona · 8h ago".to_string(),
+        String::new(),
+        "✗ octocat changes requested, before the latest commits".to_string(),
+        "  6h ago".to_string(),
+        "  Please split this.".to_string(),
+        String::new(),
+        "⌄ 3 comments".to_string(),
+        "  2 authors · 5h ago".to_string(),
+        String::new(),
+        "  hubot commented".to_string(),
+        "  5h ago".to_string(),
+        "  Looks close.".to_string(),
+        String::new(),
+        "  Lee commented".to_string(),
+        "  4h ago · src/a.rs".to_string(),
+        "  Nit.".to_string(),
+        String::new(),
+        "  lee reviewed  Commented".to_string(),
+        "  3h ago".to_string(),
+        "  One more.".to_string(),
+        String::new(),
+        "○ Untitled commit".to_string(),
+        "  0f0f0f0 · 2h ago".to_string(),
+        String::new(),
+        "✓ octocat approved".to_string(),
+        "  1h ago".to_string(),
+        String::new(),
+        "› 1 comment".to_string(),
+        "  1 author · 30m ago".to_string(),
+        String::new(),
+        "● Pull request merged".to_string(),
+        "  5m ago".to_string(),
+    ];
+    assert_eq!(rows, expected);
+    let controls = [
+        (0..1, Control::TimelineOrder),
+        (12..14, Control::Run(1)),
+        (33..35, Control::Run(0)),
+    ];
+    assert_eq!(targets, controls);
+}
+
+#[test]
+fn the_timeline_fits_every_width() {
+    let mut answer = merged();
+    let (rows, targets) = timeline_rows(&mut answer, &Shown::default(), 30);
+    // The counts and the switch don't fit on one row. A verdict too wide for its row puts each
+    // piece on rows of its own, and a commit's counts still fit beside its headline.
+    let expected = [
+        "6 comments · 2 commits",
+        "1 approval",
+        "Newest first",
+        "",
+        "● Pull request merged",
+        "  5m ago",
+    ];
+    assert_eq!(rows[..6], expected);
+    assert_eq!(targets[0], (2..3, Control::TimelineOrder));
+    let verdict = rows.iter().position(|row| row == "✗ octocat").unwrap();
+    let expected = [
+        "✗ octocat",
+        "  changes requested, before",
+        "  the latest commits",
+        "  6h ago",
+        "  Please split this.",
+        "",
+        "○ Add the parser     +1,200 -4",
+    ];
+    assert_eq!(rows[verdict..verdict + 7], expected);
+
+    let mut shown = Shown::default();
+    shown.runs_open.extend([0, 1]);
+    for width in 0..=70 {
+        let (rows, targets) = timeline_rows(&mut answer, &shown, width);
+        for row in &rows {
+            // The Markdown renderer keeps 8 columns for text, and the details' page cuts what
+            // is wider than it shows.
+            assert!(row.width() <= width.max(8), "{width}: {row:?}");
+        }
+        assert!(targets.iter().all(|(rows_of, _)| rows_of.end <= rows.len()));
+        assert_eq!(targets.len(), if width == 0 { 0 } else { 3 }, "{width}");
+    }
+
+    // A commit's text is cleaned and bounded once.
+    let evil = format!("\u{1b}]52;c;x\u{7}{}", "w".repeat(5000));
+    let hostile = json!({"oid": "\u{9b}2Jabcdef0123", "messageHeadline": evil,
+        "committedDate": ago_at(5), "authors": [{"login": evil, "name": null}]});
+    let mut conversation = conversation_of(&activity(vec![], vec![], vec![hostile]));
+    conversation.follow(&lifecycle(&ago_at(60), None, Value::Null, Value::Null));
+    let mut answer = Answer::Read(Box::new(conversation));
+    for width in [1, 2, 3, 10, 40, 80] {
+        let (rows, _) = timeline_rows(&mut answer, &Shown::default(), width);
+        for row in &rows {
+            assert!(row.width() <= width, "{width}: {row:?}");
+            assert!(
+                !row.contains('\u{1b}') && !row.contains('\u{9b}'),
+                "{row:?}"
+            );
+        }
+    }
+    let (rows, _) = timeline_rows(&mut answer, &Shown::default(), 80);
+    assert!(rows[2].starts_with("○ ]52;c;xwww"), "{}", rows[2]);
+    assert_eq!(rows[3], "  2Jabcde ·", "the id cleaned, then cut");
+    // Two columns are too few to spare for the marks.
+    let (rows, _) = timeline_rows(&mut answer, &Shown::default(), 2);
+    assert!(rows.windows(2).any(|pair| pair == ["Pu", "ll"]), "{rows:?}");
+    assert!(
+        rows.iter().all(|row| !row.contains(['●', '○', '›'])),
+        "{rows:?}"
+    );
+}
+
+#[test]
+fn the_timeline_reads_how_the_pull_request_opened_and_ended() {
+    let none = Value::Null;
+    let at = |minutes| json!(ago_at(minutes));
+    let ends = |lifecycle: &Lifecycle, author: Option<&str>| {
+        let mut value = activity(vec![], vec![], vec![]);
+        if let Some(author) = author {
+            value["author"] = actor(author);
+        }
+        let mut conversation = conversation_of(&value);
+        conversation.follow(lifecycle);
+        let mut answer = Answer::Read(Box::new(conversation));
+        let (rows, _) = timeline_rows(&mut answer, &Shown::default(), 40);
+        rows[2..]
+            .iter()
+            .filter(|row| !row.is_empty())
+            .cloned()
+            .collect::<Vec<_>>()
+    };
+    // Merged wins over closed, as GitHub sets both on a merge.
+    let both = lifecycle(&ago_at(90), None, at(10), at(10));
+    let rows = [
+        "● Pull request merged",
+        "  10m ago",
+        "● Pull request opened",
+        "  1h ago",
+    ];
+    assert_eq!(ends(&both, None), rows);
+    let closed = lifecycle(&ago_at(90), Some("mona"), none.clone(), at(10));
+    let rows = [
+        "● Pull request closed",
+        "  10m ago",
+        "● mona Pull request opened",
+        "  1h ago",
+    ];
+    assert_eq!(ends(&closed, None), rows);
+    // The conversation's author stands in for the detail's.
+    let rows = [
+        "● Pull request closed",
+        "  10m ago",
+        "● hubot Pull request opened",
+        "  1h ago",
+    ];
+    assert_eq!(ends(&closed, Some("hubot")), rows);
+    // An empty time is no event, and a time that doesn't parse is one at no time, which comes
+    // last newest first.
+    let open = lifecycle(&ago_at(90), None, json!(""), json!(""));
+    assert_eq!(ends(&open, None), ["● Pull request opened", "  1h ago"]);
+    let odd = lifecycle("not a time", None, none, at(10));
+    let rows = [
+        "● Pull request closed",
+        "  10m ago",
+        "● Pull request opened",
+    ];
+    assert_eq!(ends(&odd, None), rows);
+}
+
+#[test]
+fn the_timeline_says_what_it_waits_for_and_what_it_left_out() {
+    let shown = Shown::default();
+    let (rows, targets) = timeline_rows(&mut Answer::Reading, &shown, 40);
+    assert_eq!(rows, ["Reading the conversation…"]);
+    assert!(targets.is_empty());
+    let mut failed = Answer::Failed("The host timed out.".to_string());
+    let (rows, _) = timeline_rows(&mut failed, &shown, 40);
+    assert_eq!(
+        rows,
+        [
+            "Could not load pull request activity",
+            "The host timed out."
+        ]
+    );
+    // Until the detail came there is no Timeline.
+    let empty = conversation_of(&activity(vec![], vec![], vec![]));
+    let mut empty = Answer::Read(Box::new(empty));
+    assert!(timeline_rows(&mut empty, &shown, 40).0.is_empty());
+
+    // An approval older than what T3 read would be missing, so none are counted.
+    let approved = remark("a", actor("octocat"), &ago_at(5), Some("APPROVED"), "");
+    let mut value = activity(vec![approved], vec![], vec![]);
+    value["commentsTruncated"] = json!(true);
+    value["commentCount"] = json!(1_234);
+    // More reviewers than t3term keeps.
+    let many: Vec<Value> = (0..101).map(|n| actor(&format!("r{n}"))).collect();
+    value["reviewers"] = json!(many);
+    let mut conversation = conversation_of(&value);
+    conversation.follow(&lifecycle(&ago_at(60), None, Value::Null, Value::Null));
+    let (rows, _) = timeline_rows(&mut Answer::Read(Box::new(conversation)), &shown, 60);
+    assert_eq!(
+        rows[0],
+        ends("1,234 comments · 0 commits", "Newest first", 60)
+    );
+    let cut = "T3 sent more comments, review threads, commits or reviewers than t3term keeps.";
+    assert_eq!(rows[rows.len() - 2..].join(" "), cut);
+}

@@ -1,6 +1,6 @@
 # Linked pull requests
 
-The thread details' Pull requests tab lists the pull requests T3 linked to the open thread. The list shows what T3 already sent with the thread. Opening a link's details also asks T3 for that pull request and its conversation, which T3 reads from its host, and shows what the desktop's Summary tab shows. Nothing writes. This page cites the T3 code each part follows and plans the reads that come next. The README's [Linked pull requests](../README.md#linked-pull-requests) section describes the keys and what each row shows.
+The thread details' Pull requests tab lists the pull requests T3 linked to the open thread. The list shows what T3 already sent with the thread. Opening a link's details also asks T3 for that pull request and its conversation, which T3 reads from its host, and shows what the desktop's Summary and Timeline tabs show. Nothing writes. This page cites the T3 code each part follows and plans the reads that come next. The README's [Linked pull requests](../README.md#linked-pull-requests) section describes the keys and what each row shows.
 
 Every T3 path below is in the T3 Code nightly v0.0.46-nightly.20261007.2787, commit `f570bd21663f56ce94c41829d3b7d72886e25a34`, built on October 7, 2026. Later nightlies may differ. [Linked pull requests verification](pull-request-panel-verification.md) records what Sol checked at `407566d`, `eac6096` and `13b7a29`, and at `1243427` after the merge with master, with seven captures.
 
@@ -72,6 +72,22 @@ On an environment whose capabilities have `pullRequests: true`, opening a link's
 
 The details read `Reading from github.com…` until T3 answers with the detail, and then `Read from github.com just now` or `3m ago`. A read that fails shows why in place of the summary: the sentence the desktop shows for a host T3 can't read, T3's own words for a pull request the host can't find, or `Couldn't read this pull request:` and the RPC client's error. The checks come before the description because the details can't fold a long description away, and the checks are what a reviewer looks at first. The Comments section comes last, after the description, as on the desktop.
 
+## The Timeline
+
+Once T3 has answered with the detail, a link's details have two tabs, as the desktop's panel shows its tabs only once it has the detail (apps/web/src/components/pullRequest/PullRequestDetailPanel.tsx:247-251). Their names sit on the row above the details, after `← List`: `← List  Summary  Timeline`, with the one that shows underlined. Where that row is too narrow, `1 of 3` at its end goes first and then the names are cut. → or `l` shows the Timeline, and ← or `h` goes from the Timeline back to the Summary and from the Summary to the list. A click on a name shows that tab, and a click on the rest of the row shows the list. Each tab keeps its own scroll while the other shows, and the details open again on the Summary from the top. The desktop's third tab, Code, isn't here.
+
+| Behavior | Desktop source | t3term |
+| --- | --- | --- |
+| Events | `buildPullRequestTimeline`, apps/web/src/components/pullRequest/pullRequestDetail.logic.ts:631-726: the opening, each commit, each remark, then the merge or else the close, newest first | The same events. Merged wins over closed, as GitHub sets both on a merge. An empty time is no event. t3term sorts by instant with each time's offset applied, where the desktop compares the strings, and a time that doesn't parse comes last newest first. Events at one time keep the desktop's order. |
+| Rows | `groupPullRequestTimelineConversations`, pullRequestDetail.logic.ts:590-609: a remark without a verdict joins the run of such remarks before it, and every other event is a row of its own | The same rows. |
+| Header | PullRequestDetailPanel.tsx:2623-2695: the comment count, the commits and the approvals that still stand, none when the host cut the conversation short (1539-1544), and `Newest first` or `Oldest first` | `12 comments · 4 commits · 2 approvals`, the approvals in green and left out at 0, then the switch at the end of the row, or on the row under the counts where both don't fit. The Timeline's order is its own, apart from the Comments section's, as the desktop keeps `timelineOrder` (506). |
+| Opening, merge and close | `LifecycleEvent`, apps/web/src/components/pullRequest/PullRequestTimelineTab.tsx:409-439 | `● mona Pull request opened`, `● Pull request merged` or `● Pull request closed` in green, violet or red, with when on the row under it. The opener is the conversation's author, else the detail's. |
+| A commit | `CommitEvent`, PullRequestTimelineTab.tsx:369-407 | `○` and the headline, or `Untitled commit`, with `+12 -3` at the end of the row unless the host counted neither or both are 0. Under it the first seven characters of its id, its first author's login, which stands in for the desktop's avatars, and when. |
+| A verdict | `ReviewVerdictEvent`, PullRequestTimelineTab.tsx:447-537, with `isPullRequestVerdictStale` (pullRequestDetail.logic.ts:502-507) | `✓ octocat approved`, `✗ octocat changes requested` or `– octocat review dismissed`, in the verdict's color. A verdict given before the newest commit is grey and adds the desktop's screen reader words, `, before the latest commits`. Under it, when and the file and line it is on, then its text, which always shows. |
+| A run of remarks | `ConversationGroup`, PullRequestTimelineTab.tsx:293-367, closed at first | `› 3 comments` in grey, and `2 authors · 6h ago` under it, the time of the first remark in the order shown. Enter or a click opens it, `⌄ 3 comments`, with each remark under it: `mona commented` or `hubot reviewed  Commented`, then when and where, then its text. |
+| Keys and clicks | Buttons with their own focus | ↑ and ↓ choose the order switch and the runs as they choose the Summary's buttons, and the status line says what Enter does: `oldest first`, `newest first`, `show comments` or `hide comments`. A commit does nothing, as it opens the desktop's Code tab. |
+| Waiting and failing | A ghost while the conversation is on its way, `PullRequestActivityUnavailableState` when it failed | `Reading the conversation…`, or `Could not load pull request activity` and the reason. |
+
 ## Next slices
 
 Each of these is its own pull request. Each only reads, and each starts a read only when you open something, never in a frame.
@@ -113,7 +129,7 @@ The desktop opens a link in its own pull request view only when the environment'
 
 1. **The host's summary.** Done: a link's details read `pullRequests.detail` and show what the Summary tab shows, as above.
 2. **The conversation.** Done: a link's details read `pullRequests.activity` with the detail and show the Comments section and each reviewer's verdict, as above.
-3. **The rest of the conversation.** Done in part: keys and clicks show older remarks 10 at a time, switch the order and open the bot and the resolved or dismissed groups, as above. The review threads, the commits and the reactions are next.
+3. **The rest of the conversation.** Done in part: keys and clicks show older remarks 10 at a time, switch the order and open the bot and the resolved or dismissed groups, as above. The commits show on the Timeline, as above. The review threads as threads and the reactions are next.
 4. **Refreshes.** While a page is open, t3term subscribes to `pullRequests.subscribeRefreshes` through `RpcClient::stream` (src/rpc.rs:227) and reads the open page again on each new number. It closes the stream when the page closes. A refresh key may send `pullRequests.invalidate` with the page's reference. That spends host requests and makes every reader read again, so t3term never sends it on its own.
 5. **The stack.** For a link with a GitHub stack, `pullRequests.stack` lists its layers and their states on the page.
 6. **The project's list.** `pullRequests.list` and `pullRequests.listStats` list a project's pull requests outside any thread. That is a separate view, after the page.
@@ -126,12 +142,16 @@ Linking, unlinking, watching, reviewing, commenting, merging and every other wri
 - Links match on their trimmed, lowercased host, repository and number. The desktop's key also takes the authority from the link's URL, which keeps a Forgejo port, and puts the repository in canonical form (threadPullRequests.ts:19-37). Two links the desktop counts as one can show as two here.
 - The legacy link's host is read from its URL's scheme and authority. The desktop's parser also recovers a Forgejo port or an Azure DevOps path, and this doesn't.
 - There is no key that copies the URL and no opener, so you select the URL in the terminal. A URL longer than a row wraps across rows, so a selection in the terminal can also pick up the line breaks and the text beside the card.
-- While a link's details show, a click on the Pull requests tab's name doesn't go back to the list. `← List`, Enter, ← or `h` do. Esc from the details closes the dialog or leaves the pane, as it does from the list.
+- While a link's details show, a click on the Pull requests tab's name doesn't go back to the list. `← List`, Enter, or ← or `h` from the Summary do. Esc from the details closes the dialog or leaves the pane, as it does from the list.
 - Text loses its control characters, but the printable rest of an escape sequence, such as `[31m` or `]52;c;`, still shows as text.
 - Until a frame has drawn a link's details, as between Enter and the next frame or after T3 changes the links, t3term doesn't know how many rows they take. A ↓ pressed in that moment isn't held at their end, and PgUp or PgDn moves one row. End, Home and ↑ after End work as they do after the frame.
 - A key pressed after T3 changes the links and before the next frame acts on what the last frame showed. ← from the details of a link T3 has just removed goes to the list, and the next frame shows the list without it.
-- The desktop's linking from a URL, unlinking, watch toggle, row menu and pull request page aren't here. A link's details show the Summary tab's reviewers, labels, checks, description and comments, and not its commits, files, review threads, reactions or actions.
+- The desktop's linking from a URL, unlinking, watch toggle, row menu and pull request page aren't here. A link's details show the Summary tab's reviewers, labels, checks, description and comments, and the Timeline, and not the Code tab's files, the review threads as threads, reactions or actions.
 - The groups show no avatars, and their authors are only counted.
+- A commit on the Timeline doesn't open, since t3term has no Code tab, and shows its first author's login where the desktop shows every author's avatar.
+- A run on the Timeline counts its authors by lowercased login and counts a deleted account as `ghost`, as the Summary's groups count them. The desktop's run counts logins as the host sent them and leaves out remarks with no author.
+- A run on the Timeline that is open stays open when the order switches. The desktop's runs close, because the switch makes each one anew.
+- A verdict on the Timeline names its file and line, with `Outdated`, where the desktop names its file.
 - When a frame hasn't drawn the details since a button acted, as between a click and the next frame, ↑ and ↓ scroll rather than choose.
 - Each remark's Markdown goes through the transcript's renderer, which shows HTML other than comments as text, such as a bot's `<details>` blocks.
 - A host's time without an offset reads as UTC, where the desktop's `Date.parse` reads it as local time.
