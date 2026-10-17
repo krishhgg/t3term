@@ -14,6 +14,11 @@
 //!
 //! Reading needs no lock. A change renames a whole file into place, so a reader finds the old
 //! file or the new one and never part of either.
+//!
+//! `probe` checks a saved environment's server the way `--environment NAME` does before it logs
+//! in, and stops there. It reads the T3 home and asks the server for its descriptor, and runs no
+//! `t3`, reads no Keychain item and opens no WebSocket. `probe_all` probes every saved
+//! environment, at most `MAX_PROBES` at once, and one that fails leaves the others as they are.
 
 use std::collections::BTreeMap;
 use std::fs::{File, OpenOptions};
@@ -21,16 +26,21 @@ use std::io::{self, Write};
 use std::path::{Path, PathBuf};
 
 use anyhow::Result;
+use futures_util::{StreamExt, stream};
 use serde::{Deserialize, Serialize};
 use serde_json::{Map, Value, json};
 
-use crate::discovery::{LocalTarget, Target, home_dir, local_origin};
-use crate::error::{err, err_exit, exit};
+use crate::discovery::{LocalTarget, Runtime, Target, discover_local, home_dir, local_origin};
+use crate::error::{T3Error, err, err_exit, exit};
 
 /// The kind `add` saves. A later t3term may save other kinds, such as a paired remote
 /// environment, and this one refuses to connect to those rather than guess how.
 const LOCAL: &str = "local";
 const MAX_NAME_LEN: usize = 32;
+
+/// How many saved environments `probe_all` checks at once. A check holds one connection, for at
+/// most the 2.5 seconds t3term waits for a descriptor.
+pub const MAX_PROBES: usize = 8;
 
 /// What `environments.json` holds.
 #[derive(Debug, Clone, Default, PartialEq, Serialize, Deserialize)]
@@ -123,6 +133,147 @@ pub async fn target(named: Option<&str>) -> Result<Target> {
             ),
         )),
     }
+}
+
+/// What a probe of a saved environment found.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Phase {
+    /// The server answered at the environment's origin with the environment id its T3 home
+    /// holds, on orchestration protocol 2. Nothing has logged in, and a login can still fail.
+    Ready,
+    /// The check failed with exit code 5, `T3_SERVER_UNAVAILABLE`: nothing listens at the
+    /// origin, no answer came within 2.5 seconds, or the home records no server or a record
+    /// t3term can't read.
+    Offline,
+    /// The check failed any other way, such as an entry this t3term can't use, a redirect,
+    /// another environment's id, an answer that isn't a descriptor or is over 256 KiB, or
+    /// another protocol.
+    Blocked,
+}
+
+impl Phase {
+    /// The phase as `environment status --json` writes it.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Phase::Ready => "ready",
+            Phase::Offline => "offline",
+            Phase::Blocked => "blocked",
+        }
+    }
+}
+
+/// One saved environment, as a probe of its server found it.
+#[derive(Debug, Clone, PartialEq)]
+pub struct Probe {
+    pub name: String,
+    /// Whether it is the saved default.
+    pub default: bool,
+    pub phase: Phase,
+    /// 0 when Ready, else the exit code of the error that stopped the check.
+    pub exit_code: i32,
+    /// Offline and Blocked only: that error's code and message.
+    pub code: Option<&'static str>,
+    pub message: Option<String>,
+    /// Ready only: the environment id, label and server version the descriptor reported, and
+    /// the origin t3term reached the server at.
+    pub environment_id: Option<String>,
+    pub label: Option<String>,
+    pub origin: Option<String>,
+    pub server_version: Option<String>,
+}
+
+impl Probe {
+    /// What `checked`, the result of the checks before a login, says about environment `name`.
+    /// The phase follows the error's exit code, so a refusal added later is Blocked unless it
+    /// exits 5.
+    fn new(name: &str, default: bool, checked: Result<Runtime>) -> Probe {
+        let mut probe = Probe {
+            name: name.to_string(),
+            default,
+            phase: Phase::Ready,
+            exit_code: 0,
+            code: None,
+            message: None,
+            environment_id: None,
+            label: None,
+            origin: None,
+            server_version: None,
+        };
+        match checked {
+            Ok(runtime) => {
+                probe.environment_id = Some(runtime.environment_id);
+                probe.label = runtime.label;
+                probe.origin = Some(runtime.origin);
+                probe.server_version = Some(runtime.server_version);
+            }
+            Err(error) => {
+                // An error without a code, such as a home read that panicked, is a failure, as
+                // `main` reports one.
+                let (code, exit_code) = match error.downcast_ref::<T3Error>() {
+                    Some(t3) => (t3.code, t3.exit_code),
+                    None => ("ERROR", exit::FAILURE),
+                };
+                probe.phase = match exit_code {
+                    exit::UNAVAILABLE => Phase::Offline,
+                    _ => Phase::Blocked,
+                };
+                probe.exit_code = exit_code;
+                probe.code = Some(code);
+                probe.message = Some(error.to_string());
+            }
+        }
+        probe
+    }
+
+    /// The probe as `environment status --json` prints it: every field, null where it doesn't
+    /// apply, and each value as the server or the error gave it.
+    pub fn to_json(&self) -> Value {
+        json!({
+            "name": self.name,
+            "default": self.default,
+            "phase": self.phase.as_str(),
+            "code": self.code,
+            "message": self.message,
+            "environmentId": self.environment_id,
+            "label": self.label,
+            "origin": self.origin,
+            "serverVersion": self.server_version,
+        })
+    }
+}
+
+/// The server of the saved environment `name`, once it has passed every check `--environment
+/// NAME` makes before a login.
+async fn reach(name: &str, entry: &Map<String, Value>) -> Result<Runtime> {
+    let local = parse_local(name, entry)?;
+    let runtime = discover_local(&local)
+        .await
+        .map_err(|unreached| unreached.error)?;
+    runtime.require_supported_protocol()?;
+    Ok(runtime)
+}
+
+/// What `run` gives for each of `items`, in the order of `items`. At most `limit` run at once,
+/// and the next starts as soon as any one ends, so a server slow to answer holds up one place
+/// and not the others.
+async fn at_most<T, R, F>(
+    limit: usize,
+    items: impl IntoIterator<Item = T>,
+    mut run: impl FnMut(T) -> F,
+) -> Vec<R>
+where
+    F: Future<Output = R>,
+{
+    let mut done: Vec<(usize, R)> = stream::iter(items.into_iter().enumerate())
+        .map(|(index, item)| {
+            let running = run(item);
+            async move { (index, running.await) }
+        })
+        .buffer_unordered(limit)
+        .collect()
+        .await;
+    done.sort_unstable_by_key(|(index, _)| *index);
+    done.into_iter().map(|(_, result)| result).collect()
 }
 
 /// The saved environments, or none when there is no file.
@@ -228,6 +379,32 @@ impl Environments {
         }
         self.default = Some(name.to_string());
         Ok(())
+    }
+
+    /// Checks the server of the saved environment `name` once, as `--environment NAME` does
+    /// before it logs in, and stops there. Fails only when `name` breaks the naming rule or
+    /// isn't saved, with the error `--environment NAME` gives. Any other failure is in the
+    /// probe.
+    pub async fn probe(&self, name: &str) -> Result<Probe> {
+        check_name(name)?;
+        let entry = self.environments.get(name).ok_or_else(|| not_found(name))?;
+        let default = self.default.as_deref() == Some(name);
+        Ok(Probe::new(name, default, reach(name, entry).await))
+    }
+
+    /// `probe` of every saved environment, in name order, with at most `MAX_PROBES` at once.
+    /// A saved name that breaks the naming rule is Blocked with the error `probe` gives.
+    pub async fn probe_all(&self) -> Vec<Probe> {
+        at_most(MAX_PROBES, self.environments.keys(), |name| async move {
+            match self.probe(name).await {
+                Ok(probe) => probe,
+                Err(error) => {
+                    let default = self.default.as_deref() == Some(name.as_str());
+                    Probe::new(name, default, Err(error))
+                }
+            }
+        })
+        .await
     }
 }
 
@@ -393,7 +570,12 @@ fn update_at<T>(path: &Path, change: impl FnOnce(&mut Environments) -> Result<T>
 
 #[cfg(test)]
 mod tests {
-    use std::sync::mpsc;
+    use std::cell::Cell;
+    use std::io::{BufRead, BufReader};
+    use std::net::TcpListener;
+    use std::pin::pin;
+    use std::sync::{Arc, Condvar, Mutex, mpsc};
+    use std::task::{Context, Poll, Waker};
     use std::thread;
     use std::time::Duration;
 
@@ -684,5 +866,344 @@ mod tests {
             path.ends_with(".config/t3term/environments.json"),
             "{path:?}"
         );
+    }
+
+    /// A T3 home in `dir` that holds `environment_id`, as a server started with `--base-dir`
+    /// there leaves it. It records no server, so a probe reaches one only at a saved origin.
+    fn t3_home(dir: &Path, name: &str, environment_id: &str) -> PathBuf {
+        let home = dir.join(name);
+        std::fs::create_dir_all(home.join("userdata")).unwrap();
+        let id = format!("{environment_id}\n");
+        std::fs::write(home.join("userdata").join("environment-id"), id).unwrap();
+        home
+    }
+
+    /// The descriptor of `environment_id` on protocol 2, with the fields t3term reads
+    /// (ExecutionEnvironmentDescriptor in packages/contracts/src/environment.ts at T3 f570bd21).
+    fn descriptor(environment_id: &str) -> Value {
+        json!({"environmentId": environment_id, "label": "Fake", "serverVersion": "0.0.0-test",
+            "capabilities": {}, "orchestrationProtocolVersion": 2})
+    }
+
+    /// The head of each request a fake server received: its lines, in lowercase.
+    type Heads = Arc<Mutex<Vec<Vec<String>>>>;
+
+    /// Serves `descriptor` on 127.0.0.1 and returns the origin and the heads of the requests.
+    /// Each request is answered once `hold` returns.
+    fn serve(descriptor: Value, hold: impl Fn() + Send + 'static) -> (String, Heads) {
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let heads = Heads::default();
+        let seen = heads.clone();
+        thread::spawn(move || {
+            for stream in listener.incoming() {
+                let Ok(mut stream) = stream else { continue };
+                let mut reader = BufReader::new(stream.try_clone().unwrap());
+                let mut head = Vec::new();
+                let mut line = String::new();
+                while reader.read_line(&mut line).is_ok_and(|n| n > 2) {
+                    head.push(line.trim_end().to_lowercase());
+                    line.clear();
+                }
+                seen.lock().unwrap().push(head);
+                hold();
+                let body = descriptor.to_string();
+                let _ = write!(
+                    stream,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: {}\r\nConnection: close\r\n\r\n{body}",
+                    body.len()
+                );
+            }
+        });
+        (origin, heads)
+    }
+
+    #[tokio::test]
+    async fn each_saved_environment_is_probed_alone_and_none_logs_in() {
+        crate::keychain::fake::reset(false);
+        let dir = tempfile::tempdir().unwrap();
+        let (origin, heads) = serve(descriptor("env-a"), || {});
+        let a = t3_home(dir.path(), "a", "env-a");
+        let down = t3_home(dir.path(), "down", "env-down");
+        // Every entry but `down` names the running server, so only the checks before a request
+        // keep the others from it. `Upper` breaks the naming rule, as a hand edit might.
+        let file = json!({"default": "down", "environments": {
+            "Upper": {"kind": "local", "t3Home": a, "origin": origin},
+            "a": {"kind": "local", "t3Home": a, "origin": origin},
+            "down": {"kind": "local", "t3Home": down},
+            "kindless": {"t3Home": a, "origin": origin},
+            "paired": {"kind": "paired", "t3Home": a, "origin": origin},
+        }});
+        let saved: Environments = serde_json::from_value(file).unwrap();
+        let probes = saved.probe_all().await;
+        let found: Vec<_> = probes
+            .iter()
+            .map(|p| (p.name.as_str(), p.default, p.phase, p.code, p.exit_code))
+            .collect();
+        let usage = exit::USAGE;
+        assert_eq!(
+            found,
+            [
+                (
+                    "Upper",
+                    false,
+                    Phase::Blocked,
+                    Some("ENVIRONMENT_NAME_INVALID"),
+                    usage
+                ),
+                ("a", false, Phase::Ready, None, 0),
+                (
+                    "down",
+                    true,
+                    Phase::Offline,
+                    Some("T3_SERVER_UNAVAILABLE"),
+                    5
+                ),
+                (
+                    "kindless",
+                    false,
+                    Phase::Blocked,
+                    Some("ENVIRONMENT_INVALID"),
+                    usage
+                ),
+                (
+                    "paired",
+                    false,
+                    Phase::Blocked,
+                    Some("ENVIRONMENT_UNSUPPORTED"),
+                    4
+                ),
+            ]
+        );
+        let ready = Probe {
+            name: "a".into(),
+            default: false,
+            phase: Phase::Ready,
+            exit_code: 0,
+            code: None,
+            message: None,
+            environment_id: Some("env-a".into()),
+            label: Some("Fake".into()),
+            origin: Some(origin.clone()),
+            server_version: Some("0.0.0-test".into()),
+        };
+        assert_eq!(probes[1], ready);
+        // A probe that failed says why, and reports nothing of a server.
+        for probe in probes.iter().filter(|probe| probe.phase != Phase::Ready) {
+            assert!(probe.message.as_deref().is_some_and(|m| !m.is_empty()));
+            let server = [&probe.environment_id, &probe.label, &probe.origin];
+            assert_eq!(server, [&None, &None, &None], "{probe:?}");
+            assert_eq!(probe.server_version, None, "{probe:?}");
+        }
+
+        // `probe` fails for a name `--environment` refuses or doesn't find, as it fails there.
+        let error = saved.probe("Upper").await.unwrap_err();
+        assert_eq!(code(error), ("ENVIRONMENT_NAME_INVALID", exit::USAGE));
+        let error = saved.probe("missing").await.unwrap_err();
+        assert_eq!(code(error), ("ENVIRONMENT_NOT_FOUND", exit::NOT_FOUND));
+        assert_eq!(saved.probe("a").await.unwrap(), ready);
+
+        // The server was asked for its descriptor once by each probe of `a`, with no
+        // credential, and nothing asked the Keychain.
+        let heads = heads.lock().unwrap().clone();
+        assert_eq!(heads.len(), 2, "{heads:?}");
+        for head in &heads {
+            assert_eq!(head[0], "get /.well-known/t3/environment http/1.1");
+            let credential = ["authorization:", "cookie:", "dpop:"];
+            let sent = head
+                .iter()
+                .find(|line| credential.iter().any(|c| line.starts_with(c)));
+            assert_eq!(sent, None, "{head:?}");
+        }
+        assert_eq!(crate::keychain::fake::calls(), Vec::<Vec<String>>::new());
+    }
+
+    /// A server whose descriptor is over 256 KiB blocks its own environment, and the one beside
+    /// it is still ready.
+    #[tokio::test]
+    async fn a_descriptor_over_256_kib_blocks_only_its_environment() {
+        crate::keychain::fake::reset(false);
+        let dir = tempfile::tempdir().unwrap();
+        let (a_origin, _) = serve(descriptor("env-a"), || {});
+        // A key t3term ignores makes the body longer than the cap, though it would parse.
+        let mut long = descriptor("env-long");
+        long["padding"] = json!("x".repeat(256 * 1024));
+        let (long_origin, long_heads) = serve(long, || {});
+        let a = t3_home(dir.path(), "a", "env-a");
+        let long_home = t3_home(dir.path(), "long", "env-long");
+        let file = json!({"environments": {
+            "a": {"kind": "local", "t3Home": a, "origin": a_origin},
+            "long": {"kind": "local", "t3Home": long_home, "origin": long_origin},
+        }});
+        let saved: Environments = serde_json::from_value(file).unwrap();
+        let probes = saved.probe_all().await;
+        let found: Vec<_> = probes
+            .iter()
+            .map(|p| (p.name.as_str(), p.phase, p.code, p.exit_code))
+            .collect();
+        let invalid = Some("T3_DESCRIPTOR_INVALID");
+        assert_eq!(
+            found,
+            [
+                ("a", Phase::Ready, None, 0),
+                ("long", Phase::Blocked, invalid, exit::REJECTED)
+            ]
+        );
+        // The message gives the cap and none of the body.
+        let message = probes[1].message.as_deref().unwrap_or_default();
+        assert!(message.contains("longer than 256 KiB"), "{message}");
+        assert!(!message.contains("xxx"), "{message}");
+        assert_eq!(probes[1].label, None);
+        assert_eq!(long_heads.lock().unwrap().len(), 1);
+        assert_eq!(crate::keychain::fake::calls(), Vec::<Vec<String>>::new());
+    }
+
+    /// Holds each fake server's answer until the test lets it go.
+    #[derive(Default)]
+    struct Gate {
+        held: Mutex<Held>,
+        changed: Condvar,
+    }
+
+    #[derive(Default)]
+    struct Held {
+        /// The servers whose request arrived, in the order they arrived.
+        arrived: Vec<usize>,
+        released: Vec<usize>,
+        /// Requests that arrived and wait for an answer, now and at most.
+        waiting: usize,
+        most_waiting: usize,
+    }
+
+    impl Gate {
+        /// Server `index` has a request. Returns once the test lets it answer.
+        fn hold(&self, index: usize) {
+            let mut held = self.held.lock().unwrap();
+            held.arrived.push(index);
+            held.waiting += 1;
+            held.most_waiting = held.most_waiting.max(held.waiting);
+            self.changed.notify_all();
+            let not_yet = |held: &mut Held| !held.released.contains(&index);
+            let mut held = self.changed.wait_while(held, not_yet).unwrap();
+            held.waiting -= 1;
+        }
+
+        /// The servers whose request arrived, once there are `count`. Panics after 10 seconds,
+        /// so a probe that never comes fails the test rather than hang it.
+        fn arrived(&self, count: usize) -> Vec<usize> {
+            let held = self.held.lock().unwrap();
+            let wait = Duration::from_secs(10);
+            let few = |held: &mut Held| held.arrived.len() < count;
+            let (held, _) = self.changed.wait_timeout_while(held, wait, few).unwrap();
+            let arrived = held.arrived.len();
+            assert!(arrived >= count, "{arrived} of {count} requests arrived");
+            held.arrived.clone()
+        }
+
+        fn release(&self, index: usize) {
+            self.held.lock().unwrap().released.push(index);
+            self.changed.notify_all();
+        }
+    }
+
+    #[tokio::test]
+    async fn probes_run_at_most_max_probes_at_once_and_report_in_name_order() {
+        crate::keychain::fake::reset(false);
+        let dir = tempfile::tempdir().unwrap();
+        let gate = Arc::new(Gate::default());
+        let count = MAX_PROBES + 2;
+        let mut environments = BTreeMap::new();
+        for index in 0..count {
+            let id = format!("env-{index}");
+            let gate = gate.clone();
+            let (origin, _) = serve(descriptor(&id), move || gate.hold(index));
+            let name = format!("e{index:02}");
+            let home = t3_home(dir.path(), &name, &id);
+            let entry = json!({"kind": "local", "t3Home": home, "origin": origin});
+            environments.insert(name, serde_json::from_value(entry).unwrap());
+        }
+        let saved = Environments {
+            environments,
+            ..Environments::default()
+        };
+        let answer = tokio::task::spawn_blocking({
+            let gate = gate.clone();
+            move || {
+                // MAX_PROBES requests arrive before any has an answer. Then each answer lets
+                // one more start. The latest is answered first, so the probes end out of name
+                // order.
+                let mut arrived = gate.arrived(MAX_PROBES);
+                while arrived.len() < count {
+                    gate.release(arrived[arrived.len() - 1]);
+                    arrived = gate.arrived(arrived.len() + 1);
+                }
+                for index in arrived {
+                    gate.release(index);
+                }
+            }
+        });
+        let (probes, answered) = tokio::join!(saved.probe_all(), answer);
+        answered.unwrap();
+
+        let found: Vec<_> = probes
+            .iter()
+            .map(|probe| {
+                (
+                    probe.name.clone(),
+                    probe.phase,
+                    probe.environment_id.clone(),
+                )
+            })
+            .collect();
+        let expected: Vec<_> = (0..count)
+            .map(|i| (format!("e{i:02}"), Phase::Ready, Some(format!("env-{i}"))))
+            .collect();
+        assert_eq!(found, expected);
+        let most_waiting = gate.held.lock().unwrap().most_waiting;
+        assert_eq!(most_waiting, MAX_PROBES, "requests waiting at once");
+        assert_eq!(crate::keychain::fake::calls(), Vec::<Vec<String>>::new());
+    }
+
+    /// Polls `at_most` by hand, so what has started is known after each poll without waiting on
+    /// a clock.
+    #[test]
+    fn at_most_starts_one_more_only_when_one_ends_and_keeps_the_order() {
+        let started = Cell::new(0);
+        let (mut answers, receivers): (Vec<_>, Vec<_>) = (0..5)
+            .map(|_| {
+                let (send, receive) = tokio::sync::oneshot::channel::<()>();
+                (Some(send), receive)
+            })
+            .unzip();
+        let all = at_most(3, receivers.into_iter().enumerate(), |(index, receive)| {
+            let started = &started;
+            async move {
+                started.set(started.get() + 1);
+                let _ = receive.await;
+                index
+            }
+        });
+        let mut all = pin!(all);
+        let mut context = Context::from_waker(Waker::noop());
+        let mut answer = |index: usize| answers[index].take().unwrap().send(()).unwrap();
+
+        assert!(all.as_mut().poll(&mut context).is_pending());
+        assert_eq!(started.get(), 3, "the first three start together");
+        assert!(all.as_mut().poll(&mut context).is_pending());
+        assert_eq!(started.get(), 3, "and no more while they run");
+        answer(1);
+        assert!(all.as_mut().poll(&mut context).is_pending());
+        assert_eq!(started.get(), 4, "one ended, so one more started");
+        answer(3);
+        assert!(all.as_mut().poll(&mut context).is_pending());
+        assert_eq!(started.get(), 5);
+        answer(4);
+        answer(2);
+        assert!(all.as_mut().poll(&mut context).is_pending());
+        answer(0);
+        match all.as_mut().poll(&mut context) {
+            Poll::Ready(order) => assert_eq!(order, [0, 1, 2, 3, 4]),
+            Poll::Pending => panic!("every item has ended"),
+        }
     }
 }
