@@ -43,13 +43,86 @@ pub struct SendReceipt {
     pub dispatch_mode: &'static str,
 }
 
+/// A login in progress, as `Client::connect_with` takes it.
+type Login<'a> = Pin<Box<dyn Future<Output = Result<Session>> + Send + 'a>>;
+
+/// `Session::login`, in the shape `Client::connect_with` takes.
+fn log_in<'a>(runtime: &'a Runtime, scopes: &'a [Scope], ttl: &'a str) -> Login<'a> {
+    Box::pin(Session::login(runtime, scopes, ttl))
+}
+
+/// Stops unless the server discovery found reports `expected` as its environment id.
+fn require_environment(runtime: &Runtime, expected: &str) -> Result<()> {
+    if runtime.environment_id == expected {
+        return Ok(());
+    }
+    Err(err_exit(
+        "ENVIRONMENT_CHANGED",
+        exit::REJECTED,
+        format!(
+            "The server t3term found reports environment id {:?}, but {expected:?} was expected. t3term stopped before logging in. Check the environments again and choose one.",
+            runtime.environment_id
+        ),
+    ))
+}
+
 impl Client {
     /// Finds the server `target` names and logs in to it. The client then talks to that server
     /// alone, and reconnects to the same origin after a drop.
     pub async fn connect(target: &Target, scopes: &[Scope], ttl: &str) -> Result<Client> {
+        Client::connect_with(target, None, scopes, ttl, log_in).await
+    }
+
+    /// `connect`, to the server of environment `environment_id` alone, such as the one a probe
+    /// showed before the user chose it. Discovery runs as it does for `connect`, with every
+    /// check it makes. The id the server's descriptor reports is then compared with
+    /// `environment_id` as given, untrimmed, before the protocol check and before any login.
+    ///
+    /// Another id stops with `ENVIRONMENT_CHANGED`, exit 4. No saved login is looked up, no
+    /// `t3` runs, no session is issued and no other server is tried. A blank `environment_id`
+    /// stops with `ENVIRONMENT_ID_MISSING`, exit 2, before t3term reads a file or reaches a
+    /// server. A match logs in once with `scopes` and `ttl`, as `connect` does.
+    ///
+    /// The check covers the descriptor discovery read. A server that takes over the origin
+    /// after it would get the login, as it would from `connect`. Dropping the future while it
+    /// logs in can kill a `t3` that has issued a session t3term hasn't recorded yet, which then
+    /// stays valid until its TTL ends. A caller that gives up on a connection lets this finish
+    /// and drops the client it returns.
+    pub async fn connect_expected(
+        target: &Target,
+        environment_id: &str,
+        scopes: &[Scope],
+        ttl: &str,
+    ) -> Result<Client> {
+        if environment_id.trim().is_empty() {
+            return Err(err_exit(
+                "ENVIRONMENT_ID_MISSING",
+                exit::USAGE,
+                "The expected environment id is blank, so t3term can't check which server answers. It stopped before reading a T3 home or reaching a server.",
+            ));
+        }
+        Client::connect_with(target, Some(environment_id), scopes, ttl, log_in).await
+    }
+
+    /// `connect` and `connect_expected`. Outside tests `login` is `log_in`. A test passes a
+    /// stand-in that records its calls, so it can count logins without running `t3` or
+    /// reaching the Keychain.
+    async fn connect_with<L>(
+        target: &Target,
+        expected: Option<&str>,
+        scopes: &[Scope],
+        ttl: &str,
+        login: L,
+    ) -> Result<Client>
+    where
+        L: for<'a> FnOnce(&'a Runtime, &'a [Scope], &'a str) -> Login<'a>,
+    {
         let runtime = discovery::discover(target).await?;
+        if let Some(expected) = expected {
+            require_environment(&runtime, expected)?;
+        }
         runtime.require_supported_protocol()?;
-        let session = Session::login(&runtime, scopes, ttl).await?;
+        let session = login(&runtime, scopes, ttl).await?;
         let api = Api::new(&runtime, session.token());
         Ok(Client {
             runtime,
@@ -696,6 +769,7 @@ fn delivered_sequence(item: &Value) -> Option<u64> {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::path::{Path, PathBuf};
 
     use futures_util::{SinkExt, StreamExt};
     use tokio::io::{AsyncReadExt, AsyncWriteExt};
@@ -706,6 +780,10 @@ mod tests {
     use tokio_tungstenite::tungstenite::protocol::Role;
 
     use super::*;
+    use crate::discovery::LocalTarget;
+    use crate::error::T3Error;
+    use crate::http::fake;
+    use crate::keychain;
     use crate::projection::Applied::{Duplicate, Snapshot, Synchronized};
     use crate::projection::{Applied, apply_config};
 
@@ -1039,5 +1117,316 @@ mod tests {
             .await
             .expect("the server saw every interrupt")
             .unwrap();
+    }
+
+    // The tests below run `connect` and `connect_expected` against fake servers on 127.0.0.1
+    // and T3 homes in temporary directories. Discovery and every check before a login run as
+    // they do outside tests. A stand-in for `Session::login` counts the logins, so no test runs
+    // `t3` or reaches the Keychain.
+
+    const OPERATE: &[Scope] = &[Scope::Read, Scope::Operate];
+
+    /// What a stand-in login was called with.
+    #[derive(Debug, PartialEq)]
+    struct LoginCall {
+        environment_id: String,
+        origin: String,
+        t3_home: PathBuf,
+        scopes: Vec<Scope>,
+        ttl: String,
+    }
+
+    /// `Client::connect_with` with a stand-in for `Session::login`. The stand-in records each
+    /// call and returns a session no server issued, named for the environment it was called for
+    /// and carrying the scopes it was given.
+    async fn connect_recorded(
+        target: &Target,
+        expected: Option<&str>,
+        scopes: &[Scope],
+        ttl: &str,
+    ) -> (Result<Client>, Vec<LoginCall>) {
+        let mut logins = Vec::new();
+        let connected =
+            Client::connect_with(target, expected, scopes, ttl, |runtime, scopes, ttl| {
+                logins.push(LoginCall {
+                    environment_id: runtime.environment_id.clone(),
+                    origin: runtime.origin.clone(),
+                    t3_home: runtime.t3_home.clone(),
+                    scopes: scopes.to_vec(),
+                    ttl: ttl.to_string(),
+                });
+                let mut session = Session::offline();
+                session.id = format!("stand-in for {}", runtime.environment_id);
+                session.scopes = scopes.to_vec();
+                Box::pin(std::future::ready(anyhow::Ok(session)))
+            })
+            .await;
+        (connected, logins)
+    }
+
+    fn code(error: &anyhow::Error) -> Option<(&'static str, i32)> {
+        error
+            .downcast_ref::<T3Error>()
+            .map(|e| (e.code, e.exit_code))
+    }
+
+    /// A descriptor of `environment_id` on orchestration protocol `protocol`, as T3 sends one.
+    fn descriptor(environment_id: &str, protocol: u64) -> String {
+        let descriptor = json!({
+            "environmentId": environment_id,
+            "label": "Studio Mac",
+            "serverVersion": "0.0.0",
+            "orchestrationProtocolVersion": protocol,
+        });
+        fake::response("200 OK", &[], &descriptor.to_string())
+    }
+
+    /// A server on 127.0.0.1 that answers every request with `answer`.
+    fn serve(answer: String) -> fake::Server {
+        fake::Server::start(move |_| answer.clone())
+    }
+
+    /// A T3 home in a temporary directory that holds `environment_id` and records a server at
+    /// `origin`, as T3 writes them.
+    fn home_of(environment_id: &str, origin: &str) -> tempfile::TempDir {
+        let home = tempfile::tempdir().unwrap();
+        let state_dir = home.path().join("userdata");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let id = format!("{environment_id}\n");
+        std::fs::write(state_dir.join("environment-id"), id).unwrap();
+        let record = json!({"version": 1, "pid": 1, "origin": origin});
+        std::fs::write(state_dir.join("server-runtime.json"), record.to_string()).unwrap();
+        home
+    }
+
+    /// Saved environment `b` with its T3 home at `home`, at `origin` when given, else at the
+    /// origin its home records.
+    fn environment_b(home: &Path, origin: Option<&str>) -> Target {
+        Target::Local(LocalTarget {
+            name: "b".into(),
+            t3_home: home.to_path_buf(),
+            origin: origin.map(str::to_string),
+        })
+    }
+
+    /// The user chose environment `b` when its probe showed `env-a`. Before the switch, `b`'s
+    /// home was made again for another server: it holds `env-b` now and records that server,
+    /// whose descriptor says `env-b`. Discovery accepts that, since the home and the server
+    /// agree, so only the expected id stops the login. That holds with the origin saved and
+    /// with the origin read from the home's record.
+    #[tokio::test]
+    async fn a_saved_environment_that_changed_since_its_probe_gets_no_login() {
+        keychain::fake::reset(false);
+        let b = serve(descriptor("env-b", 2));
+        let home = home_of("env-b", &b.origin);
+        for origin in [None, Some(b.origin.as_str())] {
+            let target = environment_b(home.path(), origin);
+            let (connected, logins) =
+                connect_recorded(&target, Some("env-a"), OPERATE, "12h").await;
+            let error = connected.err().expect("another environment");
+            let changed = Some(("ENVIRONMENT_CHANGED", exit::REJECTED));
+            assert_eq!(code(&error), changed, "{origin:?}");
+            assert_eq!(
+                error.to_string(),
+                "The server t3term found reports environment id \"env-b\", but \"env-a\" was expected. t3term stopped before logging in. Check the environments again and choose one."
+            );
+            assert!(logins.is_empty(), "{origin:?}: {logins:?}");
+            // The public call stops there too, before the login looks up the Keychain.
+            let connected = Client::connect_expected(&target, "env-a", OPERATE, "12h").await;
+            let error = connected.err().expect("another environment");
+            assert_eq!(code(&error), changed, "{origin:?}");
+            // Without an expected id, as `connect` runs it, the same target logs in to env-b.
+            let (connected, logins) = connect_recorded(&target, None, OPERATE, "12h").await;
+            assert_eq!(connected.unwrap().runtime.environment_id, "env-b");
+            assert_eq!(logins.len(), 1, "{origin:?}");
+        }
+        assert_eq!(b.paths(), ["/.well-known/t3/environment"; 6]);
+        assert_eq!(keychain::fake::calls(), Vec::<Vec<String>>::new());
+    }
+
+    /// The TUI started on `env-a`, found by discovery at the origin `T3TERM_ORIGIN` names. That
+    /// server has stopped, so discovery now finds the server the T3 home records, `env-b`. A
+    /// connect that expects `env-a` refuses it, and refuses `env-b` answering at
+    /// `T3TERM_ORIGIN` itself.
+    #[tokio::test]
+    async fn discovery_that_finds_another_server_gets_no_login() {
+        let b = serve(descriptor("env-b", 2));
+        let home = home_of("env-b", &b.origin);
+        // Nothing listens there, so the system refuses the connection.
+        let stopped = "http://127.0.0.1:1";
+        for named in [stopped, b.origin.as_str()] {
+            discovery::fake::discover_from(Some(named), home.path());
+            let (connected, logins) =
+                connect_recorded(&Target::Discover, Some("env-a"), OPERATE, "12h").await;
+            let error = connected.err().expect("another environment");
+            let changed = Some(("ENVIRONMENT_CHANGED", exit::REJECTED));
+            assert_eq!(code(&error), changed, "{named}");
+            assert!(logins.is_empty(), "{named}: {logins:?}");
+            // Without an expected id, discovery logs in to whichever server answered first.
+            let (connected, logins) =
+                connect_recorded(&Target::Discover, None, OPERATE, "12h").await;
+            assert_eq!(connected.unwrap().runtime.environment_id, "env-b");
+            assert_eq!(logins.len(), 1, "{named}");
+        }
+        assert_eq!(b.paths(), ["/.well-known/t3/environment"; 4]);
+    }
+
+    /// A server that reports the expected id gets one login, with the scopes and TTL given.
+    /// The client is built as `connect` builds it, from the server discovery found and the
+    /// session that login returned.
+    #[tokio::test]
+    async fn the_expected_environment_gets_one_login_with_the_scopes_and_ttl_given() {
+        let a = serve(descriptor("env-a", 2));
+        let home = home_of("env-a", &a.origin);
+        // A T3 home that records no server, so discovery finds env-a only at `T3TERM_ORIGIN`.
+        let empty = tempfile::tempdir().unwrap();
+        discovery::fake::discover_from(Some(a.origin.as_str()), empty.path());
+        let cases = [
+            (environment_b(home.path(), None), home.path()),
+            (Target::Discover, empty.path()),
+        ];
+        for (target, t3_home) in cases {
+            let (connected, logins) =
+                connect_recorded(&target, Some("env-a"), &[Scope::Read], "10m").await;
+            let client = connected.unwrap();
+            let call = LoginCall {
+                environment_id: "env-a".into(),
+                origin: a.origin.clone(),
+                t3_home: t3_home.to_path_buf(),
+                scopes: vec![Scope::Read],
+                ttl: "10m".into(),
+            };
+            assert_eq!(logins, [call], "{target:?}");
+            assert_eq!(client.runtime.environment_id, "env-a");
+            assert_eq!(client.runtime.origin, a.origin);
+            assert_eq!(client.runtime.t3_home, t3_home.to_path_buf());
+            assert_eq!(client.runtime.label.as_deref(), Some("Studio Mac"));
+            assert_eq!(client.api.origin, a.origin);
+            assert_eq!(client.session.id, "stand-in for env-a");
+            assert_eq!(client.scopes(), [Scope::Read]);
+            assert!(client.rpc.try_lock().unwrap().is_none());
+        }
+        assert_eq!(a.paths(), ["/.well-known/t3/environment"; 2]);
+    }
+
+    /// Each check discovery and the protocol make still stops the connect with its own code,
+    /// and none of them logs in. A home that holds another id stops it even when the server
+    /// reports the id the caller expects, so an expected id never overrules the home.
+    #[tokio::test]
+    async fn the_checks_before_a_login_keep_their_codes() {
+        let elsewhere = serve(descriptor("env-a", 2));
+        let location = format!("location: {}/.well-known/t3/environment", elsewhere.origin);
+        let rejected = |error_code| Some((error_code, exit::REJECTED));
+        let cases = [
+            (
+                "env-a",
+                descriptor("env-a", 1),
+                "env-a",
+                rejected("T3_PROTOCOL_UNSUPPORTED"),
+            ),
+            (
+                "env-a",
+                fake::response("302 Found", &[location.as_str()], ""),
+                "env-a",
+                rejected("T3_REDIRECTED"),
+            ),
+            (
+                "env-a",
+                fake::response("500 Internal Server Error", &[], "{}"),
+                "env-a",
+                rejected("T3_DESCRIPTOR_INVALID"),
+            ),
+            (
+                "env-a",
+                fake::response("200 OK", &[], "not json"),
+                "env-a",
+                rejected("T3_DESCRIPTOR_INVALID"),
+            ),
+            (
+                "env-a",
+                descriptor("env-b", 2),
+                "env-b",
+                rejected("T3_ENVIRONMENT_MISMATCH"),
+            ),
+            // Another id on another protocol. The id is checked first.
+            (
+                "env-b",
+                descriptor("env-b", 1),
+                "env-a",
+                rejected("ENVIRONMENT_CHANGED"),
+            ),
+            // The server closes the connection without an answer.
+            (
+                "env-a",
+                String::new(),
+                "env-a",
+                Some(("T3_SERVER_UNAVAILABLE", exit::UNAVAILABLE)),
+            ),
+        ];
+        for (held, answer, expected, stopped) in cases {
+            let answering = serve(answer);
+            let home = home_of(held, &answering.origin);
+            let target = environment_b(home.path(), None);
+            let (connected, logins) =
+                connect_recorded(&target, Some(expected), OPERATE, "12h").await;
+            let error = connected.err().expect("a failed check");
+            assert_eq!(code(&error), stopped);
+            assert!(logins.is_empty(), "{stopped:?}: {logins:?}");
+            let paths = answering.paths();
+            assert_eq!(paths, ["/.well-known/t3/environment"], "{stopped:?}");
+        }
+        assert_eq!(elsewhere.paths(), Vec::<String>::new());
+    }
+
+    /// The expected id is compared as given. With a space or a line break around it, in
+    /// another case or cut short, it isn't the server's id and gets no login.
+    #[tokio::test]
+    async fn the_expected_id_is_compared_as_given() {
+        let a = serve(descriptor("env-a", 2));
+        let home = home_of("env-a", &a.origin);
+        let target = environment_b(home.path(), None);
+        for expected in [" env-a", "env-a ", "env-a\n", "ENV-A", "env-"] {
+            let (connected, logins) =
+                connect_recorded(&target, Some(expected), OPERATE, "12h").await;
+            let error = connected.err().expect("another id");
+            let changed = Some(("ENVIRONMENT_CHANGED", exit::REJECTED));
+            assert_eq!(code(&error), changed, "{expected:?}");
+            assert!(logins.is_empty(), "{expected:?}: {logins:?}");
+        }
+        let (connected, _) = connect_recorded(&target, Some("env-a\n"), OPERATE, "12h").await;
+        let error = connected.err().expect("another id");
+        assert!(
+            error.to_string().contains("but \"env-a\\n\" was expected"),
+            "{error}"
+        );
+    }
+
+    /// A blank expected id stops the connect before t3term reads a T3 home or reaches a server.
+    /// The home doesn't exist, which would stop discovery of `b` with another code, and the
+    /// server both targets name sees no connection.
+    #[tokio::test]
+    async fn a_blank_expected_id_stops_before_anything_is_read_or_reached() {
+        keychain::fake::reset(false);
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        listener.set_nonblocking(true).unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("missing");
+        discovery::fake::discover_from(Some(origin.as_str()), &missing);
+        let targets = [
+            environment_b(&missing, Some(origin.as_str())),
+            Target::Discover,
+        ];
+        for target in &targets {
+            for blank in ["", " ", "\t\n"] {
+                let connected = Client::connect_expected(target, blank, OPERATE, "12h").await;
+                let error = connected.err().expect("a blank id");
+                let missing_id = Some(("ENVIRONMENT_ID_MISSING", exit::USAGE));
+                assert_eq!(code(&error), missing_id, "{target:?} {blank:?}");
+            }
+        }
+        let accepted = listener.accept().map_err(|error| error.kind());
+        assert_eq!(accepted.err(), Some(std::io::ErrorKind::WouldBlock));
+        assert_eq!(keychain::fake::calls(), Vec::<Vec<String>>::new());
     }
 }
