@@ -606,6 +606,14 @@ class Server(socketserver.ThreadingMixIn, http.server.HTTPServer):
     allow_reuse_address = True
     block_on_close = False
 
+    def server_bind(self):
+        # HTTPServer's own also sets server_name from socket.getfqdn, a reverse DNS lookup of
+        # 127.0.0.1. On CI's macOS runners it hung past start's 10 s for every server after the
+        # first. Nothing here reads the name.
+        socketserver.TCPServer.server_bind(self)
+        self.server_name = '127.0.0.1'
+        self.server_port = self.server_address[1]
+
 
 def serve(root: Path, run: dict, fixture_class) -> int:
     """Runs the server in the foreground until a signal or --max-seconds, then writes
