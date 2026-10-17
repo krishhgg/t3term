@@ -17,7 +17,7 @@ Read the file for a feature before you drive it, and fix the file when a drive s
 | Linked pull requests: the details' Pull requests tab | [linked-pull-requests.md](linked-pull-requests.md) | `links` |
 | Lineage: related threads, forks and agents in the details | [lineage.md](lineage.md) | `lineage` |
 | CLI: commands, `--json` and exit codes against a fake server | [cli.md](cli.md) | `links` |
-| Saved environments: the `environment` commands, `environment status` and the descriptor cap | [environments.md](environments.md) | `links` |
+| Saved environments: the `environment` commands, `environment status`, the descriptor cap and the TUI's Environments dialog | [environments.md](environments.md) | `links` |
 
 ## Not mapped yet
 
