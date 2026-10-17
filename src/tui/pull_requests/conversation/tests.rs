@@ -47,17 +47,33 @@ fn conversation_of(value: &Value) -> Conversation {
     Conversation::of(&pull_request::Activity::read(value).unwrap())
 }
 
-/// The Comments section's label and rows for `conversation` at `width`.
-fn section(conversation: Conversation, width: usize) -> (String, Vec<String>) {
-    let mut conversation = conversation;
-    conversation.lay_out(width, &theme());
-    let (label, lines) = lines(
-        &Answer::Read(Box::new(conversation)),
-        width,
-        now(),
-        &theme(),
-    );
-    (label, rows_of(&lines))
+/// The Comments section's heading row and the rows under it for `conversation` at `width`, as
+/// it first shows.
+fn read_section(conversation: Conversation, width: usize) -> (String, Vec<String>) {
+    let mut answer = Answer::Read(Box::new(conversation));
+    let (mut rows, _) = opened(&mut answer, &Shown::default(), width);
+    let heading = rows.remove(0);
+    (heading, rows)
+}
+
+/// The Comments section's rows for `answer` at `width`, opened as `shown` says, and the rows
+/// of each control among them.
+fn opened(
+    answer: &mut Answer<Conversation>,
+    shown: &Shown,
+    width: usize,
+) -> (Vec<String>, Vec<(Range<usize>, Control)>) {
+    if let Answer::Read(conversation) = answer {
+        conversation.lay_out(width, &theme(), shown);
+    }
+    let section = section(answer, shown, width, now(), &theme());
+    (rows_of(&section.lines), section.targets)
+}
+
+/// `left` and `right` at the two ends of a row `width` columns wide.
+fn ends(left: &str, right: &str, width: usize) -> String {
+    let gap = width - left.chars().count() - right.chars().count();
+    format!("{left}{}{right}", " ".repeat(gap))
 }
 
 /// `minutes` before `NOW`, as a host writes it. No test goes back past the day before.
@@ -226,38 +242,45 @@ fn remarks_split_into_the_recent_window_bots_and_finished_ones() {
         "isResolved": true, "isOutdated": false,
         "comments": [{"id": "t1", "author": null, "body": "", "createdAt": NOW, "url": null}]});
     let conversation = conversation_of(&activity(comments, vec![thread], vec![]));
-    let shown: Vec<&str> = conversation
-        .recent
+    let ids = |remarks: &[Remark]| remarks.iter().map(|r| r.id.clone()).collect::<Vec<_>>();
+    let active: Vec<String> = (0..14).map(|n| format!("c{n}")).collect();
+    assert_eq!(ids(&conversation.active), active);
+    assert_eq!(ids(&conversation.bots), ["b1", "b2"]);
+    assert_eq!(ids(&conversation.finished), ["t1", "d1"]);
+
+    let (heading, rows) = read_section(conversation, 60);
+    assert_eq!(heading, ends("Comments (18)", "Newest first", 60));
+    let shown: Vec<&str> = rows
         .iter()
-        .map(|r| r.body.as_deref().unwrap())
+        .filter(|row| row.starts_with("  Remark"))
+        .map(|row| row.trim())
         .collect();
     let newest: Vec<String> = (4..14).rev().map(|n| format!("Remark {n}")).collect();
     assert_eq!(shown, newest);
-    assert_eq!(
-        (conversation.older, conversation.bots, conversation.finished),
-        (4, 2, 2)
-    );
-
-    let (label, rows) = section(conversation, 60);
-    assert_eq!(label, "Comments (18)");
     let tail = [
         "",
-        "4 older comments not shown.",
-        "2 bot comments not shown.",
-        "2 resolved or dismissed comments not shown.",
+        "+ Show 4 older comments (4 hidden)",
+        "",
+        "› 2 bot comments",
+        "2 authors · Latest 8h ago",
+        "",
+        "› 2 resolved or dismissed comments",
+        "2 authors · Latest 8h ago",
     ];
-    assert_eq!(rows[rows.len() - 4..], tail);
+    assert_eq!(rows[rows.len() - 8..], tail);
 
-    // One of each is counted in the singular, and with no human remark the counts come
+    // One of each is counted in the singular, and with no human remark the groups come
     // first.
-    let comments = vec![
-        remark("b1", actor("ci[bot]"), NOW, None, "Bot"),
-        remark("d1", actor("lee"), NOW, dismissed, ""),
-    ];
-    let (_, rows) = section(conversation_of(&activity(comments, vec![], vec![])), 60);
+    let mut on_file = remark("b1", actor("ci[bot]"), &ago_at(5), None, "Bot");
+    on_file["path"] = json!("src/a.rs");
+    let comments = vec![on_file, remark("d1", actor("lee"), "never", dismissed, "")];
+    let (_, rows) = read_section(conversation_of(&activity(comments, vec![], vec![])), 60);
     let only = [
-        "1 bot comment not shown.",
-        "1 resolved or dismissed comment not shown.",
+        "› 1 bot comment",
+        "1 author · 1 file · Latest 5m ago",
+        "",
+        "› 1 resolved or dismissed comment",
+        "1 author",
     ];
     assert_eq!(rows, only);
 }
@@ -293,15 +316,12 @@ fn a_remark_shows_its_author_time_verdict_place_and_text() {
     let thread = json!({"id": "th", "path": "src/new.rs", "line": 42, "side": "right",
         "isResolved": false, "isOutdated": true,
         "comments": [{"id": "rc", "author": null, "body": "", "createdAt": NOW, "url": null}]});
-    let (label, rows) = section(
+    let (heading, rows) = read_section(
         conversation_of(&activity(comments, vec![thread], vec![])),
         40,
     );
-    assert_eq!(label, "Comments (5)");
-    let line = |left: &str, right: &str| {
-        let gap = " ".repeat(40 - left.chars().count() - right.chars().count());
-        format!("{left}{gap}{right}")
-    };
+    assert_eq!(heading, ends("Comments (5)", "Newest first", 40));
+    let line = |left: &str, right: &str| ends(left, right, 40);
     let expected = [
         line("mona  Changes requested", "5m ago"),
         "  Please split this.".to_string(),
@@ -321,13 +341,18 @@ fn a_remark_shows_its_author_time_verdict_place_and_text() {
     ];
     assert_eq!(rows, expected);
 
-    // Too narrow for the whole header: the author takes a row and the rest fit under it.
+    // Too narrow for the whole header: the author takes a row and the rest fit under it. The
+    // order switch doesn't fit beside the heading either, so it takes the row under it.
     let split = review("r", "mona", "CHANGES_REQUESTED", "Please split this.");
-    let (_, rows) = section(conversation_of(&activity(vec![split], vec![], vec![])), 24);
-    assert_eq!(
-        rows,
-        ["mona", "Changes requested 5m ago", "  Please split this."]
-    );
+    let (heading, rows) = read_section(conversation_of(&activity(vec![split], vec![], vec![])), 24);
+    assert_eq!(heading, "Comments (1)");
+    let expected = [
+        "Newest first",
+        "mona",
+        "Changes requested 5m ago",
+        "  Please split this.",
+    ];
+    assert_eq!(rows, expected);
 }
 
 #[test]
@@ -408,22 +433,24 @@ fn each_reviewer_shows_their_last_verdict() {
 
 #[test]
 fn the_comments_section_says_what_it_waits_for_and_what_it_left_out() {
-    let theme = theme();
-    let (label, rows) = lines(&Answer::Reading, 40, now(), &theme);
-    assert_eq!(label, "Comments");
-    assert_eq!(rows_of(&rows), ["Reading the conversation…"]);
-    let failed = Answer::Failed("The host timed out.".to_string());
-    let (label, rows) = lines(&failed, 40, now(), &theme);
-    assert_eq!(label, "Comments");
+    let (rows, targets) = opened(&mut Answer::Reading, &Shown::default(), 40);
+    assert_eq!(rows, ["Comments", "Reading the conversation…"]);
+    assert!(targets.is_empty());
+    let mut failed = Answer::Failed("The host timed out.".to_string());
+    let (rows, targets) = opened(&mut failed, &Shown::default(), 40);
     let expected = [
+        "Comments",
         "Could not load pull request activity",
         "The host timed out.",
     ];
-    assert_eq!(rows_of(&rows), expected);
+    assert_eq!(rows, expected);
+    assert!(targets.is_empty());
 
-    let (label, rows) = section(conversation_of(&activity(vec![], vec![], vec![])), 40);
-    assert_eq!(label, "Comments (0)");
-    assert_eq!(rows, ["No comments yet."]);
+    // With nothing to order, there is no switch.
+    let mut empty = Answer::Read(Box::new(conversation_of(&activity(vec![], vec![], vec![]))));
+    let (rows, targets) = opened(&mut empty, &Shown::default(), 40);
+    assert_eq!(rows, ["Comments (0)", "No comments yet."]);
+    assert!(targets.is_empty());
 
     let mut value = activity(
         vec![remark("c", actor("mona"), NOW, None, "Hi")],
@@ -432,8 +459,8 @@ fn the_comments_section_says_what_it_waits_for_and_what_it_left_out() {
     );
     value["commentCount"] = json!(1_234);
     value["commentsTruncated"] = json!(true);
-    let (label, rows) = section(conversation_of(&value), 200);
-    assert_eq!(label, "Comments (1,234)");
+    let (heading, rows) = read_section(conversation_of(&value), 200);
+    assert_eq!(heading, ends("Comments (1,234)", "Newest first", 200));
     let note = "This conversation is longer than this page reads in one go. The most recent 1 \
                 are here; open it on the host to read the rest.";
     assert_eq!(rows[0], note);
@@ -442,7 +469,7 @@ fn the_comments_section_says_what_it_waits_for_and_what_it_left_out() {
     let mut value = activity(vec![], vec![], vec![]);
     let many: Vec<Value> = (0..101).map(|n| actor(&format!("r{n}"))).collect();
     value["reviewers"] = json!(many);
-    let (_, rows) = section(conversation_of(&value), 200);
+    let (_, rows) = read_section(conversation_of(&value), 200);
     let cut = "T3 sent more comments, review threads, commits or reviewers than t3term keeps.";
     assert_eq!(rows.last().map(String::as_str), Some(cut));
 }
@@ -461,7 +488,8 @@ fn hostile_and_huge_remarks_are_cleaned_bounded_and_fit_every_width() {
     hostile["path"] = json!(format!("src/\u{9b}31m{}", "p".repeat(5000)));
     let value = activity(vec![hostile], vec![], vec![]);
     for width in [1, 2, 3, 10, 40, 80] {
-        let (_, rows) = section(conversation_of(&value), width);
+        let (heading, mut rows) = read_section(conversation_of(&value), width);
+        rows.insert(0, heading);
         for row in &rows {
             // The Markdown renderer keeps 8 columns for text, and the details' page cuts what
             // is wider than it shows.
@@ -476,7 +504,7 @@ fn hostile_and_huge_remarks_are_cleaned_bounded_and_fit_every_width() {
         assert!(joined.contains("Weird[31m state") || width < 20, "{joined}");
     }
     let conversation = conversation_of(&value);
-    let hostile = &conversation.recent[0];
+    let hostile = &conversation.active[0];
     assert_eq!(
         hostile.author.chars().count(),
         NAME + 1,
@@ -487,7 +515,7 @@ fn hostile_and_huge_remarks_are_cleaned_bounded_and_fit_every_width() {
     // A remark T3 sent longer than t3term keeps says so.
     let mut long = remark("l", actor("mona"), NOW, None, "");
     long["body"] = json!("y ".repeat(pull_request::BODY));
-    let (_, rows) = section(conversation_of(&activity(vec![long], vec![], vec![])), 200);
+    let (_, rows) = read_section(conversation_of(&activity(vec![long], vec![], vec![])), 200);
     let note = "Cut short: T3 sent a comment longer than the 262,144 bytes t3term keeps.";
     assert_eq!(rows.last().map(String::as_str), Some(note));
 }
@@ -502,13 +530,329 @@ fn each_remark_is_laid_out_once_for_each_width() {
         "Some **bold** words.",
     )];
     let mut conversation = conversation_of(&activity(comments, vec![], vec![]));
-    conversation.lay_out(30, &theme());
-    let first = conversation.recent[0].laid_out.as_ref().unwrap().1.as_ptr();
-    conversation.lay_out(30, &theme());
+    let shown = Shown::default();
+    conversation.lay_out(30, &theme(), &shown);
+    let first = conversation.active[0].laid_out.as_ref().unwrap().1.as_ptr();
+    conversation.lay_out(30, &theme(), &shown);
     assert_eq!(
-        conversation.recent[0].laid_out.as_ref().unwrap().1.as_ptr(),
+        conversation.active[0].laid_out.as_ref().unwrap().1.as_ptr(),
         first
     );
-    conversation.lay_out(31, &theme());
-    assert_eq!(conversation.recent[0].laid_out.as_ref().unwrap().0, 31);
+    conversation.lay_out(31, &theme(), &shown);
+    assert_eq!(conversation.active[0].laid_out.as_ref().unwrap().0, 31);
+}
+
+/// `count` remarks by `login`, the newest last, each `Remark n` on `path` where there is one.
+fn by(login: &str, count: usize, path: Option<&str>) -> Vec<Value> {
+    (0..count)
+        .map(|n| {
+            let mut remark = remark(
+                &format!("{login}{n}"),
+                actor(login),
+                &ago_at(100 - n as i64),
+                None,
+                &format!("Remark {n}"),
+            );
+            remark["path"] = json!(path);
+            remark
+        })
+        .collect()
+}
+
+/// The remarks among `rows`, by their text.
+fn remarks_in(rows: &[String]) -> Vec<&str> {
+    rows.iter()
+        .filter(|row| row.starts_with("  Remark"))
+        .map(|row| row.trim())
+        .collect()
+}
+
+/// The rows of `control` among `targets`, which it has once.
+fn rows_of_control(targets: &[(Range<usize>, Control)], control: Control) -> Range<usize> {
+    let mut found = targets.iter().filter(|(_, c)| *c == control);
+    let (rows, _) = found.next().expect("the control");
+    assert!(found.next().is_none(), "{control:?} twice");
+    rows.clone()
+}
+
+/// `Remark from` to `Remark to`, newest first unless `oldest_first`.
+fn names(from: usize, to: usize, oldest_first: bool) -> Vec<String> {
+    let mut names: Vec<String> = (from..=to).map(|n| format!("Remark {n}")).collect();
+    if !oldest_first {
+        names.reverse();
+    }
+    names
+}
+
+#[test]
+fn show_older_and_the_order_switch_page_the_active_remarks_as_the_desktop_does() {
+    let value = activity(by("mona", 25, None), vec![], vec![]);
+    let conversation = conversation_of(&value);
+    let at = |shown: &Shown| {
+        let mut answer = Answer::Read(Box::new(conversation_of(&value)));
+        opened(&mut answer, shown, 60)
+    };
+    let mut shown = Shown::default();
+    assert_eq!(conversation.action(Control::Order, &shown), "oldest first");
+    assert_eq!(conversation.action(Control::Older, &shown), "show 10 older");
+    assert!(!conversation.has(Control::Recent, &shown));
+
+    // The 10 most recent, newest first, with Show older after them. Only the switch and the
+    // button do anything.
+    let (rows, targets) = at(&shown);
+    assert_eq!(remarks_in(&rows), names(15, 24, false));
+    assert_eq!(rows[0], ends("Comments (25)", "Newest first", 60));
+    assert_eq!(rows_of_control(&targets, Control::Order), 0..1);
+    let older = rows_of_control(&targets, Control::Older);
+    assert_eq!(
+        rows[older.clone()],
+        ["+ Show 10 older comments (15 hidden)"]
+    );
+    assert_eq!((older.end, targets.len()), (rows.len(), 2));
+
+    // 10 more, then the last 5, then the 10 most recent again.
+    shown.act(Control::Older, &conversation);
+    assert_eq!(conversation.action(Control::Older, &shown), "show 5 older");
+    let recent_action = conversation.action(Control::Recent, &shown);
+    assert_eq!(recent_action, "show only 10 recent");
+    let (rows, targets) = at(&shown);
+    assert_eq!(remarks_in(&rows), names(5, 24, false));
+    let older = rows_of_control(&targets, Control::Older);
+    let recent = rows_of_control(&targets, Control::Recent);
+    assert_eq!(rows[older.clone()], ["+ Show 5 older comments (5 hidden)"]);
+    assert_eq!(rows[recent.clone()], ["Show only 10 recent comments"]);
+    assert_eq!(recent.start, older.end + 1);
+    shown.act(Control::Older, &conversation);
+    assert!(!conversation.has(Control::Older, &shown));
+    let (rows, _) = at(&shown);
+    assert_eq!(remarks_in(&rows), names(0, 24, false));
+    // Another press past the last changes nothing.
+    let all = shown.clone();
+    shown.act(Control::Older, &conversation);
+    assert_eq!(shown, all);
+    shown.act(Control::Recent, &conversation);
+    assert_eq!(shown, Shown::default());
+
+    // Oldest first, Show older comes before the remarks, which read from the oldest shown.
+    shown.act(Control::Order, &conversation);
+    assert_eq!(conversation.action(Control::Order, &shown), "newest first");
+    let (rows, targets) = at(&shown);
+    assert_eq!(rows[0], ends("Comments (25)", "Oldest first", 60));
+    assert_eq!(rows_of_control(&targets, Control::Older), 1..2);
+    assert_eq!(remarks_in(&rows), names(15, 24, true));
+    shown.act(Control::Older, &conversation);
+    let (rows, targets) = at(&shown);
+    assert_eq!(remarks_in(&rows), names(5, 24, true));
+    assert_eq!(rows_of_control(&targets, Control::Recent).end, rows.len());
+}
+
+#[test]
+fn the_bots_group_opens_to_its_recent_remarks_and_shows_older_ones() {
+    let mut comments = by("mona", 1, None);
+    let mut bots = by("ci[bot]", 12, Some("src/a.rs"));
+    bots[0]["path"] = json!("src/b.rs");
+    bots[1]["path"] = json!("");
+    bots[2]["author"] = json!({"login": "greptile-apps", "name": null, "isBot": true});
+    comments.extend(bots);
+    let value = activity(comments, vec![], vec![]);
+    let mut conversation = conversation_of(&value);
+    let at = |shown: &Shown| {
+        let mut answer = Answer::Read(Box::new(conversation_of(&value)));
+        opened(&mut answer, shown, 60)
+    };
+    let mut shown = Shown::default();
+    assert_eq!(
+        conversation.action(Control::Bots, &shown),
+        "show bot comments"
+    );
+
+    // Closed, the group says who wrote what, on how many files, and when the latest came.
+    // None of its remarks is laid out.
+    let (rows, targets) = at(&shown);
+    let group = rows_of_control(&targets, Control::Bots);
+    let closed = ["› 12 bot comments", "2 authors · 2 files · Latest 1h ago"];
+    assert_eq!(rows[group.clone()], closed);
+    assert_eq!(group.end, rows.len());
+    conversation.lay_out(60, &theme(), &shown);
+    assert!(conversation.bots.iter().all(|r| r.laid_out.is_none()));
+
+    // Open, its 10 most recent show under it with Show older after them.
+    shown.act(Control::Bots, &conversation);
+    assert_eq!(
+        conversation.action(Control::Bots, &shown),
+        "hide bot comments"
+    );
+    let (rows, targets) = at(&shown);
+    assert_eq!(rows[group.start], "⌄ 12 bot comments");
+    let mut bots = names(2, 11, false);
+    bots.insert(0, "Remark 0".to_string());
+    assert_eq!(remarks_in(&rows), bots);
+    let older = rows_of_control(&targets, Control::OlderBots);
+    assert_eq!(
+        rows[older.clone()],
+        ["+ Show 2 older bot comments (2 hidden)"]
+    );
+    assert_eq!(older.end, rows.len());
+    assert_eq!(
+        conversation.action(Control::OlderBots, &shown),
+        "show 2 older"
+    );
+    conversation.lay_out(60, &theme(), &shown);
+    let laid_out: Vec<bool> = conversation
+        .bots
+        .iter()
+        .map(|r| r.laid_out.is_some())
+        .collect();
+    let mut expected = vec![false, false];
+    expected.extend([true; 10]);
+    assert_eq!(laid_out, expected);
+
+    // Every one, then the 10 most recent again, and closed the buttons go.
+    shown.act(Control::OlderBots, &conversation);
+    let (rows, targets) = at(&shown);
+    assert_eq!(remarks_in(&rows).len(), 13);
+    let recent = rows_of_control(&targets, Control::RecentBots);
+    assert_eq!(rows[recent], ["Show only 10 recent bot comments"]);
+    assert!(!conversation.has(Control::OlderBots, &shown));
+    shown.act(Control::RecentBots, &conversation);
+    assert!(conversation.has(Control::OlderBots, &shown));
+    shown.act(Control::Bots, &conversation);
+    assert!(!conversation.has(Control::OlderBots, &shown));
+    assert!(!conversation.has(Control::RecentBots, &shown));
+    let (rows, _) = at(&shown);
+    assert_eq!(rows[group], closed);
+}
+
+#[test]
+fn finished_remarks_open_one_at_a_time_from_a_row_of_their_text() {
+    let mut on_thread = remark(
+        "r1",
+        actor("octocat"),
+        &ago_at(30),
+        None,
+        "> [!NOTE]\n> See **[the docs](https://example.com)** for `parse`.",
+    );
+    on_thread["kind"] = json!("review-comment");
+    let dismissed = remark(
+        "d1",
+        actor("lee"),
+        &ago_at(10),
+        Some("DISMISSED"),
+        "<!-- bot -->",
+    );
+    let thread = json!({"id": "th", "path": "src/a.rs", "line": 3, "side": "right",
+        "isResolved": true, "isOutdated": false,
+        "comments": [{"id": "r1", "author": null, "body": "", "createdAt": NOW, "url": null}]});
+    let value = activity(vec![on_thread, dismissed], vec![thread], vec![]);
+    let conversation = conversation_of(&value);
+    let at = |shown: &Shown| {
+        let mut answer = Answer::Read(Box::new(conversation_of(&value)));
+        opened(&mut answer, shown, 40)
+    };
+    let mut shown = Shown::default();
+    let (rows, targets) = at(&shown);
+    let group = rows_of_control(&targets, Control::Finished);
+    let closed = [
+        "› 2 resolved or dismissed comments",
+        "2 authors · Latest 10m ago",
+    ];
+    assert_eq!(rows[group.clone()], closed);
+    assert!(!conversation.has(Control::Remark(0), &shown));
+    assert_eq!(
+        conversation.action(Control::Finished, &shown),
+        "show resolved"
+    );
+
+    // Open, each shows why it is finished, and its text on one row. Each of its rows opens it.
+    shown.act(Control::Finished, &conversation);
+    assert_eq!(
+        conversation.action(Control::Finished, &shown),
+        "hide resolved"
+    );
+    let (rows, targets) = at(&shown);
+    let expected = [
+        "⌄ 2 resolved or dismissed comments",
+        "2 authors · Latest 10m ago",
+        "",
+        &ends("lee  › Review dismissed", "10m ago", 40),
+        "",
+        &ends("octocat  › Resolved", "30m ago", 40),
+        "src/a.rs:3",
+        "See the docs for parse.",
+    ];
+    assert_eq!(rows[group.start..], expected);
+    let dismissed = rows_of_control(&targets, Control::Remark(1));
+    let resolved = rows_of_control(&targets, Control::Remark(0));
+    assert_eq!(dismissed, group.start + 3..group.start + 4);
+    assert_eq!(resolved, group.start + 5..group.start + 8);
+    assert_eq!(
+        conversation.action(Control::Remark(0), &shown),
+        "show comment"
+    );
+
+    // Open, its whole text shows and only its header closes it again.
+    shown.act(Control::Remark(0), &conversation);
+    assert_eq!(
+        conversation.action(Control::Remark(0), &shown),
+        "hide comment"
+    );
+    let (rows, targets) = at(&shown);
+    let resolved = rows_of_control(&targets, Control::Remark(0));
+    assert_eq!(resolved.len(), 1);
+    assert_eq!(
+        rows[resolved.start],
+        ends("octocat  ⌄ Resolved", "30m ago", 40)
+    );
+    assert_eq!(rows[resolved.start + 1], "src/a.rs:3");
+    // The Markdown renderer shows the alert as a quote and the link with its address.
+    let text = rows[resolved.start + 2..].join(" ");
+    assert!(text.contains("▎ [!NOTE]"), "{text}");
+    assert!(
+        text.contains("See the docs (https://example.com)"),
+        "{text}"
+    );
+    shown.act(Control::Remark(0), &conversation);
+    assert_eq!(
+        at(&shown).0.last().map(String::as_str),
+        Some("See the docs for parse.")
+    );
+    // Oldest first, the resolved one comes first.
+    shown.act(Control::Order, &conversation);
+    let (rows, _) = at(&shown);
+    assert_eq!(
+        rows[group.start + 3],
+        ends("octocat  › Resolved", "30m ago", 40)
+    );
+}
+
+#[test]
+fn a_finished_remarks_row_reads_as_the_desktops_does() {
+    let cases = [
+        ("<!-- bot -->Looks **good**", "Looks good"),
+        ("> [!WARNING]\n> Careful here.", "Careful here."),
+        ("![logo](x.png) and [docs](https://a/b)", "logo and docs"),
+        (
+            "# Title\n\n- one\n* two\n\n```rust\nlet x = 1;\n```",
+            "Title one two rust let x = 1;",
+        ),
+        // A link's text may span rows, and empty or unfinished ones stay.
+        ("[a\nb](c) [](x) [y] [z](", "a b [](x) [y] [z]("),
+        ("[a [b](c)", "a [b"),
+        ("```\n<!-- even in code -->\n```after", "after"),
+        ("<!-- never closed", "<!-- never closed"),
+        ("[!NOTE]", ""),
+        ("> [!NOTÉ]", "[!NOTÉ]"),
+        ("  >> ## -* Deep", "Deep"),
+    ];
+    for (text, row) in cases {
+        assert_eq!(preview(text), row, "{text:?}");
+    }
+    // Each step takes time in proportion to the text, however hostile.
+    let huge = pull_request::BODY;
+    let brackets = format!("{}]x", "[".repeat(huge));
+    assert_eq!(preview(&brackets), brackets);
+    let opens = "[a](".repeat(huge / 4);
+    assert_eq!(preview(&opens), opens);
+    let comments = "<!--".repeat(huge / 4);
+    assert_eq!(preview(&comments), comments);
 }
