@@ -54,13 +54,27 @@ def version_of(binary: Path) -> str:
     return (result.stdout or result.stderr).strip() or f'unknown (exit {result.returncode})'
 
 
+def image_uuid(binary: Path):
+    """The binary's LC_UUID, which ld makes from a hash of the linked image. Two builds of the same
+    sources in /tmp/t3v-target share it, and a binary copied from another commit's build carries
+    that build's. None when otool can't read it."""
+    try:
+        result = subprocess.run(['otool', '-l', str(binary)], capture_output=True, text=True, timeout=30)
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    found = re.search(r'cmd LC_UUID\s+cmdsize \d+\s+uuid ([0-9A-F-]{36})', result.stdout)
+    return found.group(1) if found else None
+
+
 def describe_binary(path: Path) -> dict:
     """What run.json records of the binary a run starts."""
     stat = path.stat()
     value = {'path': str(path), 'size': stat.st_size, 'mtimeNs': stat.st_mtime_ns, 'mtime': iso(stat.st_mtime_ns // 10**6),
-             'version': version_of(path), 'commit': None}
+             'version': version_of(path), 'uuid': image_uuid(path), 'commit': None}
     built = read_json(path.parent / 'built.json')
-    if path.parent.parent == BIN_ROOT and isinstance(built, dict) and SHA.match(str(built.get('sha'))):
+    # By real path: --binary arrives resolved, and /tmp is a link to /private/tmp on macOS.
+    in_bin_root = os.path.realpath(path.parent.parent) == os.path.realpath(BIN_ROOT)
+    if in_bin_root and isinstance(built, dict) and SHA.match(str(built.get('sha'))):
         value['commit'] = built['sha']
         value['builtFrom'] = built.get('rev')
         return value
@@ -108,20 +122,32 @@ def build(rev: str, repo=None) -> Path:
     if not shutil.which('cargo'):
         die('cargo is not on PATH; install Rust 1.95.0 (rustup) to build', 2)
     private_dir(TARGET)
-    scratch = Path(os.path.realpath(tempfile.mkdtemp(prefix='t3v-build-', dir='/tmp')))
-    tree = scratch / 'tree'
-    print(f't3v: building {rev} ({sha[:12]}) in {tree}', file=sys.stderr)
-    git(repo, 'worktree', 'add', '--detach', '--quiet', str(tree), sha)
-    try:
-        # One build at a time in the shared target directory, so a second build can't replace
-        # target/debug/t3term before the first copies it.
-        with open(TARGET / '.t3v-build.lock', 'w') as lock:
-            fcntl.flock(lock, fcntl.LOCK_EX)
+    # One build at a time in the shared target directory, so a second build can't replace
+    # target/debug/t3term before the first copies it. The lock comes before the checkout. Cargo
+    # calls a crate fresh when its sources are older than its last build, and every build of
+    # t3term shares one fingerprint here, so a tree checked out while another build ran would
+    # look built already, and t3v would copy that other commit's binary.
+    with open(TARGET / '.t3v-build.lock', 'w') as lock:
+        fcntl.flock(lock, fcntl.LOCK_EX)
+        if out.is_file():
+            return out
+        scratch = Path(os.path.realpath(tempfile.mkdtemp(prefix='t3v-build-', dir='/tmp')))
+        tree = scratch / 'tree'
+        print(f't3v: building {rev} ({sha[:12]}) in {tree}', file=sys.stderr)
+        git(repo, 'worktree', 'add', '--detach', '--quiet', str(tree), sha)
+        try:
             env = dict(os.environ, CARGO_TARGET_DIR=str(TARGET))
-            result = subprocess.run(['cargo', 'build', '--locked'], cwd=tree, env=env, stdout=sys.stderr,
-                                    stdin=subprocess.DEVNULL)
-            if result.returncode != 0:
+            cargo = subprocess.Popen(['cargo', 'build', '--locked'], cwd=tree, env=env, stdout=sys.stderr,
+                                     stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True)
+            compiled = False
+            for line in cargo.stderr:
+                sys.stderr.write(line)
+                compiled = compiled or line.lstrip().startswith('Compiling t3term v')
+            if cargo.wait() != 0:
                 die(f'cargo build --locked failed at {sha[:12]}; its output is above', 1)
+            if not compiled:
+                die(f'cargo reused an earlier build instead of compiling {sha[:12]}, so t3v copied nothing; '
+                    f'run `t3v build {sha[:12]}` again', 1)
             toolchain = subprocess.run(['rustc', '--version'], cwd=tree, capture_output=True, text=True)
             out.parent.mkdir(parents=True, exist_ok=True)
             partial = out.with_name(f't3term.partial-{os.getpid()}')
@@ -129,9 +155,9 @@ def build(rev: str, repo=None) -> Path:
             write_json(out.parent / 'built.json', {'sha': sha, 'rev': rev, 'toolchain': toolchain.stdout.strip(),
                                                    'builtAt': iso(now_ms()), 'repo': str(repo)}, mode=0o644)
             os.replace(partial, out)
-    finally:
-        subprocess.run(['git', '-C', str(repo), 'worktree', 'remove', '--force', str(tree)], capture_output=True)
-        shutil.rmtree(scratch, ignore_errors=True)
+        finally:
+            subprocess.run(['git', '-C', str(repo), 'worktree', 'remove', '--force', str(tree)], capture_output=True)
+            shutil.rmtree(scratch, ignore_errors=True)
     return out
 
 

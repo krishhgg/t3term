@@ -101,7 +101,8 @@ Clean up failed attempts too. `ls -d /tmp/t3v-run-*` lists runs still on disk. R
 ## Helpers
 
 - `t3v env` prints the `env -i` line that runs t3term against the run. Add a subcommand to drive the CLI: `eval "$($T3V env) --json threads"`. Each CLI command issues and revokes its own session, and `check` covers them. The line has its own `t3`, so the server knows those sessions are the CLI's and `t3v expect` keeps describing the TUI. `check` searches only the evidence directory for leaked tokens, so redirect CLI output into the evidence directory `start` printed to have it searched. smoke keeps every recipe's output in its `smoke.log` there.
-- `t3v build REV [--repo PATH]` prints the path of a cached build of any commit.
+- `t3v build REV [--repo PATH]` prints the path of a cached build of any commit. It builds one commit at a time and checks out the commit only once it holds the build lock, because cargo would take a tree checked out during another build for one already built. It stops without caching anything when cargo didn't compile t3term.
+- run.json's `binary` records the build's `commit` and its `uuid`, the LC_UUID ld makes from a hash of the linked image. Builds of the same sources share a uuid, so two commits with different sources and one uuid mean one binary is a copy of the other.
 - `t3v status` summarizes the event log, the live server and the screen.
 - `t3v mark NAME` notes where `raw.ansi` ends, and `status` then reports `controlLeaksSinceMark`.
 - `t3v restart` keeps the run's HOME, so it tests what t3term saved in `~/.config/t3term/settings.json`.
