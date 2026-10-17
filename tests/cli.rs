@@ -10,7 +10,8 @@ use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Condvar, Mutex};
+use std::time::Duration;
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -2449,4 +2450,470 @@ fn environments_are_saved_listed_renamed_and_removed_without_a_server() {
     assert_error(&added, 1, "ENVIRONMENTS_UNREADABLE");
     let text = std::fs::read_to_string(home.environments_path()).unwrap();
     assert_eq!(text, r#"{"default": "#);
+}
+
+/// The keys of each environment `environment status --json` reports, in order, and no others.
+const PROBE_KEYS: [&str; 9] = [
+    "name",
+    "default",
+    "phase",
+    "code",
+    "message",
+    "environmentId",
+    "label",
+    "origin",
+    "serverVersion",
+];
+
+/// A row of plain `environment status`, as it starts: the default's marker, the name and the
+/// phase.
+fn status_row(default: bool, name: &str, phase: &str) -> String {
+    let marker = if default { '*' } else { ' ' };
+    format!("{marker} {name:<12} {phase:<7}  ")
+}
+
+#[test]
+fn environment_status_probes_each_saved_environment_by_its_descriptor_alone() {
+    // A is the saved default, the server T3CODE_HOME records and the one T3TERM_ORIGIN names,
+    // so a probe that fell back to anything would ask A again.
+    let home = Home::new();
+    let t3 = home.logging_t3();
+    let a = serve_environment("env-a", THREAD_A);
+    home.record_server(&a.origin);
+    let a_home = home.t3_home("env a/.t3", Some("env-a"), Some(&a.origin));
+
+    // Down records no server, and imposter's server answers for another home. Moved redirects
+    // every request to a server no environment names. Old runs protocol 1, garbled answers with
+    // a body that isn't JSON, and unverified's home holds no environment id.
+    let other = serve_environment("env-other", THREAD_B);
+    let (target, target_paths) = fake_server(protocol_2_descriptor());
+    let redirect = move |path: &str| Some(Reply::Redirect(302, format!("{target}{path}")));
+    let (moved, moved_paths) = serve_replies(redirect, |_| {});
+    let mut descriptor = protocol_2_descriptor();
+    descriptor["orchestrationProtocolVersion"] = json!(1);
+    let (old, old_paths) = fake_server(descriptor);
+    let (garbled, garbled_paths) = serve_replies(|_| Some(raw("200 OK", "not json")), |_| {});
+    let fresh = serve_environment("env-fresh", THREAD_B);
+    let down = home.t3_home("down/.t3", Some("env-down"), None);
+    let imposter = home.t3_home("imposter/.t3", Some("env-mine"), Some(&other.origin));
+    let moved_home = home.t3_home("moved/.t3", Some("env-moved"), Some(&moved));
+    let old_home = home.t3_home("old/.t3", Some("env-test"), Some(&old));
+    let garbled_home = home.t3_home("garbled/.t3", Some("env-garbled"), Some(&garbled));
+    let unverified = home.t3_home("unverified/.t3", None, Some(&fresh.origin));
+    let local = |t3_home: &Path| json!({"kind": "local", "t3Home": t3_home});
+    // The file lists them out of name order, and every report lists them by name.
+    home.save_environments(&json!({"default": "a", "environments": {
+        "unverified": local(&unverified),
+        "paired": {"kind": "paired", "t3Home": a_home},
+        "old": local(&old_home),
+        "moved": local(&moved_home),
+        "kindless": {"t3Home": a_home},
+        "imposter": local(&imposter),
+        "garbled": local(&garbled_home),
+        "down": local(&down),
+        "a": local(&a_home),
+    }}));
+    let saved = std::fs::read(home.environments_path()).unwrap();
+    let near_a = |args: &[&str]| {
+        let mut command = home.command(args, &t3);
+        command.env("T3TERM_ORIGIN", &a.origin);
+        command.output().expect("run t3term")
+    };
+    let expected = [
+        ("a", "ready", None, 0),
+        ("down", "offline", Some("T3_SERVER_UNAVAILABLE"), 5),
+        ("garbled", "blocked", Some("T3_DESCRIPTOR_INVALID"), 4),
+        ("imposter", "blocked", Some("T3_ENVIRONMENT_MISMATCH"), 4),
+        ("kindless", "blocked", Some("ENVIRONMENT_INVALID"), 2),
+        ("moved", "blocked", Some("T3_REDIRECTED"), 4),
+        ("old", "blocked", Some("T3_PROTOCOL_UNSUPPORTED"), 4),
+        ("paired", "blocked", Some("ENVIRONMENT_UNSUPPORTED"), 4),
+        (
+            "unverified",
+            "blocked",
+            Some("T3_ENVIRONMENT_UNVERIFIED"),
+            4,
+        ),
+    ];
+
+    // Every environment is reported in name order, whatever the others found, and the command
+    // exits 0.
+    let status = near_a(&["--json", "environment", "status"]);
+    assert_eq!(status.status.code(), Some(0), "{status:?}");
+    let report = json_stdout(&status);
+    assert_eq!(report["ok"], true, "{report}");
+    assert_eq!(report["default"], "a", "{report}");
+    let probes = report["environments"]
+        .as_array()
+        .expect("environments")
+        .clone();
+    let found: Vec<(&str, &str, Option<&str>)> = probes
+        .iter()
+        .map(|p| (text(&p["name"]), text(&p["phase"]), p["code"].as_str()))
+        .collect();
+    let wanted: Vec<(&str, &str, Option<&str>)> = expected
+        .iter()
+        .map(|(name, phase, code, _)| (*name, *phase, *code))
+        .collect();
+    assert_eq!(found, wanted);
+    // Each probe has the same keys and no others. Only a ready one reports its server, and
+    // only one that failed has a message.
+    for probe in &probes {
+        let keys: Vec<&str> = probe
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(keys, PROBE_KEYS, "{probe}");
+    }
+    let ready = json!({"name": "a", "default": true, "phase": "ready", "code": null,
+        "message": null, "environmentId": "env-a", "label": "Fake", "origin": a.origin,
+        "serverVersion": "0.0.0-test"});
+    assert_eq!(probes[0], ready);
+    for probe in &probes[1..] {
+        assert_eq!(probe["default"], false, "{probe}");
+        assert!(!text(&probe["message"]).is_empty(), "{probe}");
+        for key in ["environmentId", "label", "origin", "serverVersion"] {
+            assert_eq!(probe[key], Value::Null, "{probe}");
+        }
+    }
+
+    // Plain, each environment has a row: the origin and label when ready, or the error's
+    // message and code.
+    let status = near_a(&["environment", "status"]);
+    assert_eq!(status.status.code(), Some(0), "{status:?}");
+    let (out, err) = printed(&status);
+    assert_eq!(err, "");
+    let rows: Vec<&str> = out.lines().collect();
+    assert_eq!(rows.len(), expected.len(), "{out}");
+    let a_row = status_row(true, "a", "ready") + &format!("{}  Fake", a.origin);
+    assert_eq!(rows[0], a_row);
+    for (row, &(name, phase, code, _)) in rows.iter().zip(&expected).skip(1) {
+        assert!(row.starts_with(&status_row(false, name, phase)), "{row}");
+        assert!(row.ends_with(&format!(" [{}]", code.unwrap())), "{row}");
+    }
+
+    // With a name, it prints one object that holds that probe and, when the check failed, the
+    // error, and it exits with that error's code.
+    for (probe, &(name, _, code, exit_code)) in probes.iter().zip(&expected) {
+        let status = near_a(&["--json", "environment", "status", name]);
+        assert_eq!(status.status.code(), Some(exit_code), "{name}: {status:?}");
+        assert!(
+            !printed(&status).0.contains("token-test"),
+            "{name}: {status:?}"
+        );
+        let report = json_stdout(&status);
+        let keys: Vec<&str> = report
+            .as_object()
+            .unwrap()
+            .keys()
+            .map(String::as_str)
+            .collect();
+        assert_eq!(report["default"], "a", "{report}");
+        assert_eq!(report["environments"], json!([probe]), "{report}");
+        match code {
+            None => {
+                assert_eq!(keys, ["ok", "default", "environments"], "{report}");
+                assert_eq!(report["ok"], true, "{report}");
+            }
+            Some(code) => {
+                assert_eq!(keys, ["ok", "error", "default", "environments"], "{report}");
+                assert_eq!(report["ok"], false, "{report}");
+                let error = json!({"code": code, "message": probe["message"]});
+                assert_eq!(report["error"], error, "{report}");
+            }
+        }
+    }
+    // A name that isn't saved, or that breaks the naming rule, fails as `--environment` does,
+    // and no probe is printed.
+    let refusals = [
+        ("missing", 3, "ENVIRONMENT_NOT_FOUND"),
+        ("Missing", 2, "ENVIRONMENT_NAME_INVALID"),
+    ];
+    for (name, exit_code, code) in refusals {
+        let status = near_a(&["--json", "environment", "status", name]);
+        assert_error(&status, exit_code, code);
+        assert_eq!(json_stdout(&status).get("environments"), None);
+    }
+
+    // Each server reached was asked for its descriptor alone, once by each run that probed it,
+    // and for no session, ticket or WebSocket. A was asked for nothing more, and the server moved
+    // redirects to was asked for nothing. Unverified's server was never reached, since its home
+    // holds no id to check it against. No session was issued, and the file is as it was.
+    let descriptor = "/.well-known/t3/environment";
+    assert_eq!(*a.paths.lock().unwrap(), [descriptor; 3]);
+    assert_eq!(*other.paths.lock().unwrap(), [descriptor; 3]);
+    assert_eq!(*moved_paths.lock().unwrap(), [descriptor; 3]);
+    assert_eq!(*old_paths.lock().unwrap(), [descriptor; 3]);
+    assert_eq!(*garbled_paths.lock().unwrap(), [descriptor; 3]);
+    assert!(a.requests.lock().unwrap().is_empty());
+    assert!(target_paths.lock().unwrap().is_empty());
+    assert!(fresh.paths.lock().unwrap().is_empty());
+    assert_eq!(home.t3_log(), "");
+    assert_eq!(std::fs::read(home.environments_path()).unwrap(), saved);
+}
+
+/// A string value as a server sent it, or "" for any other value.
+fn text(value: &Value) -> &str {
+    value.as_str().unwrap_or_default()
+}
+
+#[test]
+fn environment_status_prints_server_text_without_control_characters() {
+    // A label, and the id a server reports for another home, each with an Esc sequence, a C1
+    // code and a line break that would start a row of its own. The label also has an OSC that
+    // would set the clipboard.
+    let home = Home::new();
+    let label = "Studio\u{1b}]52;c;Zm9v\u{7} Mac\u{9b}31m\r\n  b  ready  fake";
+    let stranger = "env-\u{1b}[2Jother\u{85}\nrow";
+    let mut descriptor = protocol_2_descriptor();
+    descriptor["environmentId"] = json!("env-a");
+    descriptor["label"] = json!(label);
+    let (a, _) = fake_server(descriptor);
+    let mut descriptor = protocol_2_descriptor();
+    descriptor["environmentId"] = json!(stranger);
+    let (c, _) = fake_server(descriptor);
+    let a_home = home.t3_home("a/.t3", Some("env-a"), Some(&a));
+    let c_home = home.t3_home("c/.t3", Some("env-c"), Some(&c));
+    let local = |t3_home: &Path| json!({"kind": "local", "t3Home": t3_home});
+    home.save_environments(&json!({"environments": {"a": local(&a_home), "c": local(&c_home)}}));
+
+    // `--json` keeps each value as the server sent it, as escapes.
+    let status = home.run_ok(&["--json", "environment", "status"]);
+    assert_printable(printed(&status).0);
+    let report = json_stdout(&status);
+    assert_eq!(report["environments"][0]["label"], label);
+    let message = text(&report["environments"][1]["message"]);
+    assert!(message.contains(stranger), "{message}");
+
+    // Plain, each keeps to its row without its controls. A line break reads as a space.
+    let status = home.run_ok(&["environment", "status"]);
+    let (out, err) = printed(&status);
+    assert_printable(out);
+    assert_eq!(err, "");
+    let rows: Vec<&str> = out.lines().collect();
+    assert_eq!(rows.len(), 2, "{out}");
+    let cleaned = "Studio]52;c;Zm9v Mac31m   b  ready  fake";
+    assert_eq!(
+        rows[0],
+        status_row(false, "a", "ready") + &format!("{a}  {cleaned}")
+    );
+    assert!(
+        rows[1].starts_with(&status_row(false, "c", "blocked")),
+        "{}",
+        rows[1]
+    );
+    let mismatch = format!("The server at {c} is environment env-[2Jother  row, but");
+    assert!(rows[1].contains(&mismatch), "{}", rows[1]);
+    assert!(
+        rows[1].ends_with(" [T3_ENVIRONMENT_MISMATCH]"),
+        "{}",
+        rows[1]
+    );
+}
+
+#[test]
+fn environment_status_with_no_environments_or_a_file_that_does_not_parse() {
+    // With no file, or a file that saves none, there is nothing to check, which isn't a
+    // failure, and no name is saved.
+    let home = Home::new();
+    for file in [None, Some(json!({"environments": {}}))] {
+        if let Some(file) = &file {
+            home.save_environments(file);
+        }
+        let status = home.run_ok(&["--json", "environment", "status"]);
+        let none = json!({"ok": true, "default": null, "environments": []});
+        assert_eq!(json_stdout(&status), none);
+        let status = home.run_ok(&["environment", "status"]);
+        assert_eq!(printed(&status), ("No saved environments to check.\n", ""));
+        let status = home.run(&["--json", "environment", "status", "a"]);
+        assert_error(&status, 3, "ENVIRONMENT_NOT_FOUND");
+        assert_eq!(
+            home.environments_path().exists(),
+            file.is_some(),
+            "{file:?}"
+        );
+    }
+
+    // A file that doesn't parse fails the command, with a name or without, and stays as it
+    // was. A name that breaks the rule is refused before the file is read, as `--environment`
+    // refuses it.
+    let broken = r#"{"default": "#;
+    std::fs::write(home.environments_path(), broken).unwrap();
+    let status = home.run(&["--json", "environment", "status"]);
+    assert_error(&status, 1, "ENVIRONMENTS_UNREADABLE");
+    let status = home.run(&["--json", "environment", "status", "a"]);
+    assert_error(&status, 1, "ENVIRONMENTS_UNREADABLE");
+    let status = home.run(&["--json", "environment", "status", "A"]);
+    assert_error(&status, 2, "ENVIRONMENT_NAME_INVALID");
+    let kept = std::fs::read_to_string(home.environments_path()).unwrap();
+    assert_eq!(kept, broken);
+}
+
+#[test]
+fn environment_status_probes_saved_environments_at_the_same_time() {
+    // Each server holds its answer until both requests have arrived. A status that probed one
+    // environment after the other would get no answer from the first within the 2.5 seconds
+    // t3term waits for a descriptor, and report it offline.
+    let home = Home::new();
+    let arrived = Arc::new((Mutex::new(0_usize), Condvar::new()));
+    let mut file = json!({"environments": {}});
+    for name in ["a", "b"] {
+        let id = format!("env-{name}");
+        let mut descriptor = protocol_2_descriptor();
+        descriptor["environmentId"] = json!(id);
+        let arrived = arrived.clone();
+        let (origin, _) = serve(move |_| {
+            let (count, changed) = &*arrived;
+            let mut count = count.lock().unwrap();
+            *count += 1;
+            changed.notify_all();
+            // The wait ends after 10 seconds, so a probe that never comes can't hold this
+            // server's thread for good.
+            let alone = |count: &mut usize| *count < 2;
+            let wait = Duration::from_secs(10);
+            drop(changed.wait_timeout_while(count, wait, alone).unwrap());
+            Some(descriptor.clone())
+        });
+        let t3_home = home.t3_home(&format!("{name}/.t3"), Some(&id), Some(&origin));
+        file["environments"][name] = json!({"kind": "local", "t3Home": t3_home});
+    }
+    home.save_environments(&file);
+
+    let status = home.run_ok(&["--json", "environment", "status"]);
+    let report = json_stdout(&status);
+    let phases: Vec<&str> = report["environments"]
+        .as_array()
+        .expect("environments")
+        .iter()
+        .map(|probe| text(&probe["phase"]))
+        .collect();
+    assert_eq!(phases, ["ready", "ready"], "{report}");
+    assert_eq!(*arrived.0.lock().unwrap(), 2);
+}
+
+/// The longest descriptor body t3term reads, as docs/environment-connections.md gives it.
+const DESCRIPTOR_CAP: usize = 256 * 1024;
+
+/// The descriptor of `environment_id` on protocol 2, with `padding`, a key t3term ignores, long
+/// enough that the JSON is `size` bytes.
+fn padded_descriptor(environment_id: &str, size: usize) -> String {
+    let mut descriptor = protocol_2_descriptor();
+    descriptor["environmentId"] = json!(environment_id);
+    descriptor["padding"] = json!("");
+    let unpadded = descriptor.to_string().len();
+    descriptor["padding"] = json!("x".repeat(size - unpadded));
+    let text = descriptor.to_string();
+    assert_eq!(text.len(), size);
+    text
+}
+
+/// A 200 response that sends `body`, which is ASCII, in chunks of 4 KiB and declares no length.
+fn chunked(body: &str) -> Reply {
+    let head = "HTTP/1.1 200 OK\r\nTransfer-Encoding: chunked\r\nConnection: close\r\n\r\n";
+    let mut text = head.to_string();
+    for chunk in body.as_bytes().chunks(4096) {
+        let chunk = std::str::from_utf8(chunk).expect("an ASCII body");
+        text.push_str(&format!("{:x}\r\n{chunk}\r\n", chunk.len()));
+    }
+    text.push_str("0\r\n\r\n");
+    Reply::Raw(text)
+}
+
+#[test]
+fn a_descriptor_over_256_kib_blocks_its_environment_alone_and_gets_no_login() {
+    // A is a working server. Fits sends a descriptor of exactly 256 KiB in chunks, with no
+    // length. Long declares a descriptor one byte longer, and flood sends one in chunks. Each
+    // would parse.
+    let home = Home::new();
+    let t3 = home.logging_t3();
+    let a = serve_environment("env-a", THREAD_A);
+    let a_home = home.t3_home("a/.t3", Some("env-a"), Some(&a.origin));
+    let local = |t3_home: &Path| json!({"kind": "local", "t3Home": t3_home});
+    let mut file = json!({"default": "a", "environments": {"a": local(&a_home)}});
+    let over = DESCRIPTOR_CAP + 1;
+    let answers = [
+        (
+            "fits",
+            chunked(&padded_descriptor("env-fits", DESCRIPTOR_CAP)),
+        ),
+        ("flood", chunked(&padded_descriptor("env-flood", over))),
+        ("long", raw("200 OK", &padded_descriptor("env-long", over))),
+    ];
+    let mut servers = Vec::new();
+    for (name, answer) in answers {
+        let (origin, paths) = serve_replies(move |_| Some(answer.clone()), |_| {});
+        let id = format!("env-{name}");
+        let t3_home = home.t3_home(&format!("{name}/.t3"), Some(&id), Some(&origin));
+        file["environments"][name] = local(&t3_home);
+        servers.push((origin, paths));
+    }
+    home.save_environments(&file);
+    let run = |args: &[&str]| home.run_with(args, &t3);
+
+    // One run finds A and fits ready, and the two over the cap blocked. Each blocked message
+    // gives the cap and none of the body.
+    let status = run(&["--json", "environment", "status"]);
+    assert_eq!(status.status.code(), Some(0), "{status:?}");
+    let report = json_stdout(&status);
+    let probes = report["environments"]
+        .as_array()
+        .expect("environments")
+        .clone();
+    let found: Vec<(&str, &str, Option<&str>)> = probes
+        .iter()
+        .map(|p| (text(&p["name"]), text(&p["phase"]), p["code"].as_str()))
+        .collect();
+    let invalid = Some("T3_DESCRIPTOR_INVALID");
+    let expected = [
+        ("a", "ready", None),
+        ("fits", "ready", None),
+        ("flood", "blocked", invalid),
+        ("long", "blocked", invalid),
+    ];
+    assert_eq!(found, expected);
+    for probe in &probes[2..] {
+        let message = text(&probe["message"]);
+        assert!(message.contains("longer than 256 KiB"), "{message}");
+        assert!(!message.contains("xxx"), "{message}");
+    }
+
+    // Named, each over the cap exits 4 with that error, and a command sent to it stops before
+    // a login.
+    for name in ["flood", "long"] {
+        let status = run(&["--json", "environment", "status", name]);
+        assert_eq!(status.status.code(), Some(4), "{name}: {status:?}");
+        let report = json_stdout(&status);
+        let code = &report["error"]["code"];
+        assert_eq!(*code, "T3_DESCRIPTOR_INVALID", "{name}: {report}");
+        let threads = run(&["--json", "--environment", name, "threads"]);
+        assert_error(&threads, 4, "T3_DESCRIPTOR_INVALID");
+    }
+    assert_eq!(home.t3_log(), "");
+
+    // A is still ready, and a command sent to it logs in and runs.
+    let status = run(&["--json", "environment", "status", "a"]);
+    assert_eq!(status.status.code(), Some(0), "{status:?}");
+    let threads = run(&["--json", "--environment", "a", "threads"]);
+    assert_eq!(listed_ids(&threads), [THREAD_A]);
+    let mut logins = session_log(a_home.to_str().unwrap(), READ_SCOPE);
+    assert_eq!(home.t3_log(), logins);
+
+    // Discovery passes over a server whose descriptor is too long, as it passes over one that
+    // doesn't answer, and goes on to the server T3CODE_HOME records.
+    home.record_server(&a.origin);
+    let mut discover = home.command(&["--json", "threads"], &t3);
+    discover.env("T3TERM_ORIGIN", &servers[2].0);
+    assert_eq!(listed_ids(&discover.output().unwrap()), [THREAD_A]);
+    let ambient = home.0.path().join(".t3");
+    logins += &session_log(ambient.to_str().unwrap(), READ_SCOPE);
+    assert_eq!(home.t3_log(), logins);
+
+    // Fits was asked for its descriptor once. Flood and long were asked for theirs alone, once
+    // by each run that reached them.
+    let descriptor = "/.well-known/t3/environment";
+    assert_eq!(*servers[0].1.lock().unwrap(), [descriptor]);
+    assert_eq!(*servers[1].1.lock().unwrap(), [descriptor; 3]);
+    assert_eq!(*servers[2].1.lock().unwrap(), [descriptor; 4]);
 }

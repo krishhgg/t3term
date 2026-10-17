@@ -384,7 +384,7 @@ impl Drawer {
 fn status_color(status: StepStatus, theme: &Theme) -> Color {
     match status {
         StepStatus::Completed => theme.emerald,
-        StepStatus::Running => theme.primary,
+        StepStatus::Running => theme.focus,
         StepStatus::Pending => theme.border_strong,
     }
 }

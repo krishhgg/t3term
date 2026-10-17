@@ -43,7 +43,7 @@ T3V_RUN=$BASE $T3V keys Enter
 
 | Scenario | World | Ready text | Feature files |
 |---|---|---|---|
-| `links` | Project "Linked Desk" with 8 threads, one for each state of a thread's linked pull requests: every state, one open link, an emptied list, the old single link, no field, 1,005 links, hostile text and an unreadable list | `Mixed: every state` | sidebar, connection, thread-details, linked-pull-requests, cli |
+| `links` | Project "Linked Desk" with 8 threads, one for each state of a thread's linked pull requests: every state, one open link, an emptied list, the old single link, no field, 1,005 links, hostile text and an unreadable list | `Mixed: every state` | sidebar, connection, thread-details, linked-pull-requests, pull-request-page, cli, environments, transcript, appearance |
 | `lineage` | Project "Lineage Desk" with 10 threads that fork, start agents and transfer context: a parent, forks running and done, archived forks and parents, 134 agents of which 124 are done, and a thread with no relations | `Main: open me first` | lineage |
 | `terminal` | Projects "Terminal Desk" and "Rootless Desk" with 8 threads, one for each state of the terminal drawer: running with history, no terminal yet, no worktree, exited, failed, busy, 8 MiB of history and no workspace root. The fake shell answers what the drawer types. Needs a build with the drawer (#41) | `Running: a shell` | none until the drawer merges |
 
@@ -101,7 +101,8 @@ Clean up failed attempts too. `ls -d /tmp/t3v-run-*` lists runs still on disk. R
 ## Helpers
 
 - `t3v env` prints the `env -i` line that runs t3term against the run. Add a subcommand to drive the CLI: `eval "$($T3V env) --json threads"`. Each CLI command issues and revokes its own session, and `check` covers them. The line has its own `t3`, so the server knows those sessions are the CLI's and `t3v expect` keeps describing the TUI. `check` searches only the evidence directory for leaked tokens, so redirect CLI output into the evidence directory `start` printed to have it searched. smoke keeps every recipe's output in its `smoke.log` there.
-- `t3v build REV [--repo PATH]` prints the path of a cached build of any commit.
+- `t3v build REV [--repo PATH]` prints the path of a cached build of any commit. It builds one commit at a time and checks out the commit only once it holds the build lock, because cargo would take a tree checked out during another build for one already built. It stops without caching anything when cargo's JSON messages call the t3term binary fresh, which means cargo didn't build it.
+- run.json's `binary` records the build's `commit` and its `uuid`, the LC_UUID ld makes from a hash of the linked image. Builds of the same sources in one target directory share a uuid. Two commits with different sources and one uuid are a clue, not proof, that one binary is a copy of the other: a change that doesn't reach the binary, such as one to a test, keeps the uuid. Check whether the changed files are compiled into it.
 - `t3v status` summarizes the event log, the live server and the screen.
 - `t3v mark NAME` notes where `raw.ansi` ends, and `status` then reports `controlLeaksSinceMark`.
 - `t3v restart` keeps the run's HOME, so it tests what t3term saved in `~/.config/t3term/settings.json`.

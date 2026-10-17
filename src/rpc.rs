@@ -24,6 +24,7 @@ use tokio::sync::{Mutex, Notify, mpsc, oneshot};
 use tokio::task::JoinHandle;
 use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::discovery::{PROTOCOL_QUERY_PARAM, PROTOCOL_VERSION};
 use crate::error::{T3Error, exit};
@@ -42,6 +43,18 @@ const CLOSE_LIMIT: Duration = Duration::from_secs(1);
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 /// No frame at all for this long means the socket is dead even if TCP has not noticed.
 const SILENCE_LIMIT: Duration = Duration::from_secs(30);
+/// The largest WebSocket message t3term reads, tungstenite's default. T3 sends each message
+/// in one frame, since Effect's RPC server hands each response to `ws.send` and ws doesn't
+/// split it. A terminal history full of escapes can pass tungstenite's default 16 MiB frame
+/// limit as JSON, so a frame here may take the whole message limit.
+const MAX_MESSAGE_BYTES: usize = 64 << 20;
+
+/// tungstenite's defaults, with a frame allowed as many bytes as a message.
+fn socket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_MESSAGE_BYTES))
+}
 
 #[derive(Debug, Clone)]
 pub enum RpcError {
@@ -52,6 +65,9 @@ pub enum RpcError {
         tag: String,
         message: String,
         error_tag: Option<String>,
+        /// The failure's error as T3 encoded it, for a caller that reads its fields. Null when
+        /// the request died instead of failing. Boxed to keep the error small.
+        error: Box<Value>,
     },
     /// T3 sent what t3term can't follow: a `Defect`, a `ClientProtocolError`, a bounded
     /// stream's `Chunk` without a `values` array, or a frame t3term can't parse, a binary one
@@ -240,7 +256,10 @@ impl RpcClient {
     }
 
     pub async fn connect_url(url: &str) -> Result<RpcClient> {
-        let (socket, _) = tokio_tungstenite::connect_async(url)
+        // `false` leaves Nagle's algorithm on, as `connect_async` does.
+        let connecting =
+            tokio_tungstenite::connect_async_with_config(url, Some(socket_config()), false);
+        let (socket, _) = connecting
             .await
             .map_err(|e| RpcError::Disconnected(format!("could not open the WebSocket: {e}")))?;
         Ok(RpcClient::run(socket).0)
@@ -694,6 +713,11 @@ async fn handle_message(message: Value, pending: &PendingMap, ack: &mpsc::Unboun
     }
 }
 
+/// What a failure says when T3's error carries no message of its own.
+pub(crate) fn rejected(tag: &str) -> String {
+    format!("T3 rejected {tag}.")
+}
+
 /// Reads the most useful message out of an encoded Effect `Exit` failure.
 fn failure(tag: &str, exit: &Value) -> RpcError {
     let reasons = exit
@@ -717,7 +741,7 @@ fn failure(tag: &str, exit: &Value) -> RpcError {
     let base = text(fail, "detail")
         .or_else(|| text(fail, "message"))
         .or_else(|| defect.and_then(Value::as_str).map(str::to_string))
-        .unwrap_or_else(|| format!("T3 rejected {tag}."));
+        .unwrap_or_else(|| rejected(tag));
     let cause = fail
         .and_then(|f| f.get("cause"))
         .and_then(|c| c.get("message"))
@@ -730,6 +754,7 @@ fn failure(tag: &str, exit: &Value) -> RpcError {
         tag: tag.to_string(),
         message,
         error_tag: text(fail, "_tag"),
+        error: Box::new(fail.cloned().unwrap_or(Value::Null)),
     }
 }
 
@@ -781,6 +806,23 @@ mod tests {
                 return;
             }
         }
+    }
+
+    /// A frame may be as large as a message, and both stay capped at 64 MiB. The rest is
+    /// tungstenite's default.
+    #[test]
+    fn a_frame_may_take_the_whole_64_mib_a_message_may() {
+        let config = socket_config();
+        assert_eq!(config.max_message_size, Some(64 << 20));
+        assert_eq!(config.max_frame_size, Some(64 << 20));
+        let default = WebSocketConfig::default();
+        assert_eq!(config.read_buffer_size, default.read_buffer_size);
+        assert_eq!(config.write_buffer_size, default.write_buffer_size);
+        assert_eq!(config.max_write_buffer_size, default.max_write_buffer_size);
+        assert_eq!(
+            config.accept_unmasked_frames,
+            default.accept_unmasked_frames
+        );
     }
 
     /// However a bounded stream ends, the reader forgets its route, so the map of requests

@@ -15,8 +15,12 @@ Read the file for a feature before you drive it, and fix the file when a drive s
 | Environment and connection: the feed dot, the thread watch, reconnects | [connection.md](connection.md) | `links` |
 | Thread details: opening, pane or dialog, tabs, the Thread tab's facts | [thread-details.md](thread-details.md) | `links` |
 | Linked pull requests: the details' Pull requests tab | [linked-pull-requests.md](linked-pull-requests.md) | `links` |
+| Pull request page: what a link's details read from its host | [pull-request-page.md](pull-request-page.md) | `links` |
 | Lineage: related threads, forks and agents in the details | [lineage.md](lineage.md) | `lineage` |
 | CLI: commands, `--json` and exit codes against a fake server | [cli.md](cli.md) | `links` |
+| Saved environments: the `environment` commands, `environment status` and the descriptor cap | [environments.md](environments.md) | `links` |
+| Transcript: how a thread's replies draw | [transcript.md](transcript.md) | `links` |
+| Appearance: Alt+Shift+A, System, Light and Dark, and the light colors | [appearance.md](appearance.md) | `links` |
 
 ## Not mapped yet
 
@@ -27,4 +31,4 @@ These have no file yet, because master doesn't have them, no scenario serves wha
 - **The tasks drawer:** needs a `todo_list` plan on the open thread's current run.
 - **The worktree setup card:** the fake server answers `subscribeWorktreeSetup` with null only.
 - **The thread error and provider status banners:** need a failed run's error, a provider session error, or a provider that isn't ready.
-- **The transcript and composer:** reachable in `links` (scrolling, `t`, typing, the model, effort and mode menus) but not yet written up.
+- **The composer and the transcript's keys:** reachable in `links` (scrolling, `t`, typing, the model, effort and mode menus) but not yet written up. transcript.md covers only how replies draw.

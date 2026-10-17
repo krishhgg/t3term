@@ -2,7 +2,7 @@
 
 ## Sub-features
 
-- **Commands.** `doctor`, `projects`, `threads`, `read`, `watch`, `send`, `wait`, `requests`, `approve`, `interrupt`, `models`, `settings`, `logout` and `environment list|add|rename|remove|default`. With no command, t3term opens the TUI. README.md's "It's a CLI too" section is the contract.
+- **Commands.** `doctor`, `projects`, `threads`, `read`, `watch`, `send`, `wait`, `requests`, `approve`, `interrupt`, `models`, `settings`, `logout` and `environment list|status|add|rename|remove|default`. With no command, t3term opens the TUI. [environments.md](environments.md) drives the `environment` commands. README.md's "It's a CLI too" section is the contract.
 - **`--json`.** stdout carries only JSON: one object a command, or one a line for `watch`. Errors are `{"ok": false, "error": {"code", "message"}}`.
 - **Exit codes.** 0 success, 1 failure, 2 usage, 3 not found, 4 rejected or unsupported protocol, 5 server unavailable, 6 timeout, 7 waiting for an approval or answer. A signal gives 130 (Ctrl+C), 129 (SIGHUP) or 143 (SIGTERM).
 - **Sessions.** Each command issues a temporary session through `t3 auth session issue` and revokes it before it exits, unless a saved login is in use.
