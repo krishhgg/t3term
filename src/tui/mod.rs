@@ -25,8 +25,10 @@ mod sidebar;
 mod tasks;
 mod theme;
 mod unsent;
+mod wide_emoji;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Stdout;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -36,11 +38,12 @@ use crossterm::event::{
     EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use futures_util::StreamExt;
-use ratatui::Frame;
+use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::{Frame, Terminal};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
@@ -48,6 +51,7 @@ use unicode_width::UnicodeWidthStr;
 use crate::client::{Client, IfBusy, WatchEvent};
 use crate::models::Choice;
 use crate::projection::{Applied, ShellState, ThreadState, apply_config, is_active_status, status};
+use crate::pull_request::{self, PullRequestError, Reference};
 use crate::settings::{AppearanceMode, Settings};
 use crate::transcript::{self, BlockKind, ChangeLine};
 use composer::Composer;
@@ -55,6 +59,7 @@ use details::Details;
 use environment::{Feed, Identity};
 use markdown::Styles;
 use picker::{Item, Kind, Pick};
+use pull_requests::Part;
 use scroll::{Pin, Scroll};
 use sidebar::{Badges, Capabilities, Shelf, ShelfChoices, Sidebar, View};
 use theme::{
@@ -91,6 +96,9 @@ const KEPT_TITLE: usize = 16;
 /// Opens T3's worktree setup subscription for a thread: `Client::watch_worktree_setup`, or a
 /// test's stand-in.
 type WatchSetup = Box<dyn Fn(&str) -> mpsc::UnboundedReceiver<WatchEvent>>;
+/// Reads a pull request from its host in the background, and sends the answer as an action
+/// with the ticket it was given.
+type ReadPull = Box<dyn Fn(Reference, u64)>;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -320,6 +328,12 @@ enum ActionResult {
     Sent {
         note: String,
     },
+    /// What a link's host said of its pull request, or why the read failed, for the read with
+    /// this ticket.
+    PullRequest {
+        ticket: u64,
+        part: Part,
+    },
     /// A send that failed. The composer gets its text back.
     SendFailed {
         thread_id: String,
@@ -544,6 +558,8 @@ struct App {
     screen: Rect,
     /// Opens the open thread's worktree setup subscription.
     watch_setup: WatchSetup,
+    /// Reads the pull request whose details opened.
+    read_pull: ReadPull,
     /// Set once T3 refuses the worktree setup subscription. T3 refuses it for the session or
     /// the server, never for one thread, so no thread asks again.
     setup_refused: bool,
@@ -551,7 +567,7 @@ struct App {
 }
 
 pub async fn run(client: Arc<Client>) -> Result<()> {
-    let mut screen = Screen(Some(ratatui::init()));
+    let mut screen = Screen(Some(init()));
     crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
     let Some(terminal) = screen.0.as_mut() else {
         return Ok(());
@@ -559,9 +575,31 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
     event_loop(terminal, client).await
 }
 
+/// The terminal the TUI draws on: ratatui's crossterm backend on stdout, through
+/// [`WideEmoji`](wide_emoji::WideEmoji).
+type Term = Terminal<wide_emoji::WideEmoji<CrosstermBackend<Stdout>>>;
+
+/// `ratatui::init` with the backend `Term` names: a panic hook that puts the terminal back,
+/// raw mode and the alternate screen. Like it, it panics when the terminal can't be set up.
+fn init() -> Term {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        ratatui::restore();
+        hook(info);
+    }));
+    let set_up = || -> std::io::Result<Term> {
+        crossterm::terminal::enable_raw_mode()?;
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+        Terminal::new(wide_emoji::WideEmoji(CrosstermBackend::new(
+            std::io::stdout(),
+        )))
+    };
+    set_up().expect("failed to initialize terminal")
+}
+
 /// Owns the terminal while the TUI runs and puts it back when dropped, including when main
 /// drops the TUI after a signal.
-struct Screen(Option<ratatui::DefaultTerminal>);
+struct Screen(Option<Term>);
 
 impl Drop for Screen {
     fn drop(&mut self) {
@@ -582,7 +620,39 @@ impl Drop for Screen {
     }
 }
 
-async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>) -> Result<()> {
+/// Reads the pull request `reference` names from its host through T3: its detail and its
+/// conversation at once, as the desktop's panel asks for them. Gives `send` each answer as it
+/// comes, or why it failed, and then `Part::Done`. A sentence of T3's own, such as a host the
+/// server has no credentials for, reads as T3 wrote it. Any other failure of the detail says
+/// that the read failed, and the Comments section says that of the conversation.
+async fn read_pull_request(client: &Client, reference: &Reference, send: impl Fn(Part)) {
+    fn failed(e: &dyn std::fmt::Display) -> String {
+        format!("Couldn't read this pull request: {e}")
+    }
+    match client.rpc().await {
+        Ok(rpc) => {
+            let detail = async {
+                let answer = match pull_request::detail(&rpc, reference).await {
+                    Ok(detail) => Ok(Box::new(detail)),
+                    Err(e @ PullRequestError::Rpc(_)) => Err(failed(&e)),
+                    Err(e) => Err(e.to_string()),
+                };
+                send(Part::Detail(answer));
+            };
+            let activity = async {
+                let answer = pull_request::activity(&rpc, reference).await;
+                send(Part::Activity(
+                    answer.map(Box::new).map_err(|e| e.to_string()),
+                ));
+            };
+            tokio::join!(detail, activity);
+        }
+        Err(e) => send(Part::Detail(Err(failed(&e)))),
+    }
+    send(Part::Done);
+}
+
+async fn event_loop(terminal: &mut Term, client: Arc<Client>) -> Result<()> {
     let (actions, mut action_results) = mpsc::unbounded_channel();
     let mut shell_events = client.watch_shell(None);
     // Dropped when the loop ends, which ends the subscription.
@@ -799,6 +869,7 @@ impl App {
         actions: mpsc::UnboundedSender<ActionResult>,
     ) -> App {
         let watcher = client.clone();
+        let (reader, answers) = (client.clone(), actions.clone());
         let environment = Identity::new(client.runtime.label.as_deref(), &client.runtime.origin);
         App {
             client,
@@ -863,6 +934,15 @@ impl App {
             details: Details::default(),
             screen: Rect::default(),
             watch_setup: Box::new(move |thread_id: &str| watcher.watch_worktree_setup(thread_id)),
+            read_pull: Box::new(move |reference, ticket| {
+                let (client, answers) = (reader.clone(), answers.clone());
+                tokio::spawn(async move {
+                    let send = |part| {
+                        let _ = answers.send(ActionResult::PullRequest { ticket, part });
+                    };
+                    read_pull_request(&client, &reference, send).await;
+                });
+            }),
             setup_refused: false,
             quit: false,
         }
@@ -1109,11 +1189,53 @@ impl App {
     /// Whether the environment links pull requests to threads, as its capabilities'
     /// `threadPullRequests` says, from the same descriptor as `capabilities`.
     fn links_supported(&self) -> bool {
+        self.environment_can("threadPullRequests")
+    }
+
+    /// Whether the environment's capabilities turn `capability` on, from the same descriptor
+    /// as `capabilities`.
+    fn environment_can(&self, capability: &str) -> bool {
         let capabilities = match self.config.as_ref() {
             Some(config) => &config["environment"]["capabilities"],
             None => &self.client.runtime.capabilities,
         };
-        capabilities["threadPullRequests"] == Value::Bool(true)
+        capabilities[capability] == Value::Bool(true)
+    }
+
+    /// Asks the host for the pull request of the link whose details just opened, through the
+    /// open thread's project, as the desktop's panel reads a link
+    /// (apps/web/src/components/pullRequest/ThreadPullRequestsPanel.tsx). Only an environment
+    /// whose capabilities have `pullRequests` reads them. The details show the answer when it
+    /// comes, and a reference T3's schema would refuse fails at once.
+    fn read_opened_pull(&mut self) {
+        let project = match self.details_record() {
+            details::Record::Found(thread) => thread
+                .get("projectId")
+                .and_then(Value::as_str)
+                .map(str::to_string),
+            _ => None,
+        };
+        let enabled = project.is_some() && self.environment_can("pullRequests");
+        // A read that waits goes once its details don't show.
+        let shown = self.details.shows_pulls();
+        self.details.pulls.shown(shown);
+        if !shown {
+            return;
+        }
+        // The last frame's time can be long past, and a test can move it on.
+        let now = now_ms().max(self.now);
+        let Some(ask) = self.details.pulls.take_ask(enabled, now) else {
+            return;
+        };
+        let project = project.unwrap_or_default();
+        match Reference::new(&project, Some(&ask.host), &ask.repository, ask.number) {
+            Ok(reference) => (self.read_pull)(reference, ask.ticket),
+            Err(failure) => {
+                let failure = Part::Detail(Err(failure.to_string()));
+                self.details.answer_pull(ask.ticket, failure, now);
+                self.details.answer_pull(ask.ticket, Part::Done, now);
+            }
+        }
     }
 
     /// Hides or shows the sidebar and remembers it, as Ctrl+B and the desktop's Mod+B do. Focus
@@ -1517,7 +1639,15 @@ impl App {
 
     // ---- input ----
 
+    /// Acts on a key, a paste or the mouse. When that opened a link's details, asks its host
+    /// for the pull request.
     fn on_terminal_event(&mut self, event: Event) -> bool {
+        let changed = self.on_input(event);
+        self.read_opened_pull();
+        changed
+    }
+
+    fn on_input(&mut self, event: Event) -> bool {
         match event {
             Event::Key(key) if key.kind != KeyEventKind::Release => {
                 self.on_key(key);
@@ -2162,6 +2292,12 @@ impl App {
                         true
                     });
                 }
+            }
+            ActionResult::PullRequest { ticket, part } => {
+                let now = now_ms().max(self.now);
+                self.details.answer_pull(ticket, part, now);
+                // A link opened while that read was under way is asked for once it is done.
+                self.read_opened_pull();
             }
             ActionResult::Output {
                 item_id,
@@ -11245,8 +11381,14 @@ mod tests {
     /// `details_tui` on an environment that links pull requests to threads, with thread `t`
     /// linked to `links`.
     fn pulls_tui(links: Vec<Value>, sidebar_hidden: bool) -> App {
+        let capabilities = json!({"threadPullRequests": true});
+        pulls_tui_on(links, sidebar_hidden, capabilities)
+    }
+
+    /// `pulls_tui` on an environment with `capabilities`.
+    fn pulls_tui_on(links: Vec<Value>, sidebar_hidden: bool, capabilities: Value) -> App {
         let mut client = Client::offline();
-        client.runtime.capabilities = json!({"threadPullRequests": true});
+        client.runtime.capabilities = capabilities;
         let settings = Settings {
             sidebar_hidden,
             ..Settings::default()
@@ -12074,7 +12216,7 @@ mod tests {
                     let whole = text_in(&buffer, buffer.area);
                     assert!(!whole.contains("evil"), "{whole}");
                 }
-                app.details.toggle_pull();
+                assert_eq!(app.details.enter(), None);
                 assert_eq!(app.details.pulls.viewing(), !viewing);
             }
             // The links were read once for every frame at every size, a thousand of them.
@@ -13058,6 +13200,382 @@ mod tests {
             app.on_shell_event(thread_updated(2 + i, fork));
         }
         app
+    }
+
+    /// A pull request's detail as T3 sends it for #31: behind its base by three commits, with
+    /// a reviewer, a label, a check that passed and one that runs, and a description.
+    fn host_detail() -> pull_request::Detail {
+        let detail = json!({
+            "provider": "github",
+            "capabilities": {"diff": true, "comment": true, "actions": [], "mergeMethods": [],
+                "search": true, "review": {"inlineComment": false, "reply": false,
+                "resolve": false, "verdicts": []},
+                "reviewers": {"request": false, "listCandidates": false}, "labels": true},
+            "viewerPermissions": {"actions": [], "comment": false, "resolve": false,
+                "verdicts": [], "requestReviewers": false},
+            "projectId": "p", "projectTitle": "Demo", "workspaceRoot": "/repo",
+            "repository": "krishhgg/t3term", "number": 31, "title": "Bound titles",
+            "body": "Adds a **drawer**.\n\nSecond paragraph.",
+            "url": "https://github.com/krishhgg/t3term/pull/31", "author": null,
+            "state": "open", "isDraft": false, "mergeability": "mergeable", "additions": 3,
+            "deletions": 1, "changedFiles": 1, "headBranch": "feature-31",
+            "baseBranch": "master", "createdAt": "2026-10-13T08:00:00Z",
+            "updatedAt": "2026-10-13T11:00:00Z", "mergedAt": null, "closedAt": null,
+            "reviewers": [{"login": "octocat", "name": null, "isBot": false}],
+            "labels": [{"name": "ui", "color": "ededed"}],
+            "checks": [
+                {"name": "macOS", "status": "success", "description": null,
+                    "url": "https://github.com/krishhgg/t3term/actions/runs/1/job/2"},
+                {"name": "Greptile Review", "status": "pending", "description": null,
+                    "url": null}
+            ],
+            "mergeCapabilities": {"merge": true, "squash": true, "rebase": true},
+            "baseComparison": "behind", "behindBy": 3
+        });
+        pull_request::Detail::read(&detail).unwrap()
+    }
+
+    /// The conversation on `host_detail`'s pull request: a remark, then octocat's approval
+    /// under another casing of their login.
+    fn host_activity() -> pull_request::Activity {
+        let activity = json!({
+            "reviewers": [{"login": "octocat", "name": null, "isBot": false}],
+            "comments": [
+                {"id": "c1", "kind": "issue-comment", "author": {"login": "mona",
+                    "name": null}, "body": "Looks close.<!-- bot: state -->",
+                    "createdAt": "2026-10-13T09:00:00Z", "url": null, "path": null,
+                    "reviewState": null},
+                {"id": "r1", "kind": "review", "author": {"login": "Octocat", "name": null},
+                    "body": "", "createdAt": "2026-10-13T10:00:00Z", "url": null,
+                    "path": null, "reviewState": "APPROVED"}
+            ],
+            "commentCount": 2, "commentsTruncated": false, "reviewThreads": [], "commits": []
+        });
+        pull_request::Activity::read(&activity).unwrap()
+    }
+
+    /// Gives `app` the parts of read `ticket`'s answer, in order.
+    fn hear(app: &mut App, ticket: u64, parts: Vec<Part>) {
+        for part in parts {
+            app.on_action_result(ActionResult::PullRequest { ticket, part });
+        }
+    }
+
+    /// What a read of a pull request named: the project, the host, the repository, the number
+    /// and the ticket.
+    type Noted = (String, String, String, u64, u64);
+
+    /// Replaces how `app` reads a pull request, so a read only notes what it named.
+    fn note_reads(app: &mut App) -> std::rc::Rc<std::cell::RefCell<Vec<Noted>>> {
+        let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let noted = asked.clone();
+        app.read_pull = Box::new(move |reference: Reference, ticket| {
+            noted.borrow_mut().push((
+                reference.project_id().to_string(),
+                reference.host().unwrap_or_default().to_string(),
+                reference.repository().to_string(),
+                reference.number(),
+                ticket,
+            ));
+        });
+        asked
+    }
+
+    /// `pulls_tui` on an environment that also reads pull requests from their hosts, with
+    /// the pane open on the pull requests' tab and the keyboard in it.
+    fn readable_pulls_tui(links: Vec<Value>) -> App {
+        let capabilities = json!({"threadPullRequests": true, "pullRequests": true});
+        let mut app = pulls_tui_on(links, false, capabilities);
+        app.focus = Focus::Transcript;
+        cells(&mut app, 200, 50);
+        alt(&mut app, 'b');
+        cells(&mut app, 200, 50);
+        let tab = app.details.drawn.expect("the pane").tabs[1];
+        assert!(mouse(&mut app, CLICK, tab.x, tab.y));
+        cells(&mut app, 200, 50);
+        app
+    }
+
+    #[test]
+    fn the_arrows_enter_and_a_click_open_a_links_bot_comments_and_the_keys_say_so() {
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        let _asked = note_reads(&mut app);
+        press(&mut app, KeyCode::Enter);
+        let activity = json!({
+            "comments": [
+                {"id": "c1", "kind": "issue-comment", "author": {"login": "mona",
+                    "name": null}, "body": "Looks close.", "createdAt": "2026-10-13T09:00:00Z",
+                    "url": null, "path": null, "reviewState": null},
+                {"id": "b1", "kind": "issue-comment", "author": {"login": "ci[bot]",
+                    "name": null}, "body": "Beep.", "createdAt": "2026-10-13T10:00:00Z",
+                    "url": null, "path": null, "reviewState": null}
+            ],
+            "commentCount": 2, "commentsTruncated": false, "reviewThreads": [], "commits": []
+        });
+        let activity = pull_request::Activity::read(&activity).unwrap();
+        let parts = vec![
+            Part::Detail(Ok(Box::new(host_detail()))),
+            Part::Activity(Ok(Box::new(activity))),
+            Part::Done,
+        ];
+        hear(&mut app, 1, parts);
+        cells(&mut app, 200, 50);
+        let status = |app: &mut App| {
+            let buffer = cells(app, 200, 50);
+            text_in(&buffer, Rect::new(0, 49, 200, 1))
+        };
+        assert!(!status(&mut app).contains("Enter "));
+
+        // From the end, ↑ chooses the bots' group, and the keys lead with what Enter does.
+        press(&mut app, KeyCode::End);
+        cells(&mut app, 200, 50);
+        press(&mut app, KeyCode::Up);
+        let shown = status(&mut app);
+        assert!(shown.contains("Enter show bot comments · "), "{shown}");
+        press(&mut app, KeyCode::Enter);
+        assert!(app.details.pulls.viewing());
+        let shown = status(&mut app);
+        assert!(shown.contains("Enter hide bot comments · "), "{shown}");
+        let rows = body_after(&mut app, 200, 50);
+        let group = rows
+            .iter()
+            .position(|row| row.trim() == "⌄ 1 bot comment")
+            .expect("the open group");
+        assert!(
+            rows[group..].iter().any(|row| row.trim() == "Beep."),
+            "{rows:#?}"
+        );
+
+        // A click on the group closes it.
+        let body = app.details.drawn.expect("the pane").body;
+        let y = body.y + group as u16;
+        assert!(mouse(&mut app, CLICK, body.x + 2, y));
+        let rows = body_after(&mut app, 200, 50);
+        assert_eq!(rows[group].trim(), "› 1 bot comment");
+        assert!(!rows.iter().any(|row| row.trim() == "Beep."), "{rows:#?}");
+        // ← shows the list, and its keys say nothing of Enter's control.
+        press(&mut app, KeyCode::Left);
+        assert!(!app.details.pulls.viewing());
+        assert!(!status(&mut app).contains("Enter hide"));
+    }
+
+    #[test]
+    fn opening_a_links_details_reads_its_pull_request_from_its_host() {
+        let links = vec![linked(31, "Bound titles"), linked(32, "Lineage")];
+        let mut app = readable_pulls_tui(links);
+        let asked = note_reads(&mut app);
+        assert!(asked.borrow().is_empty());
+
+        // Enter shows #31's details and asks T3 for it through the thread's project, naming
+        // the link's host so T3 routes it. The details say the read is under way.
+        press(&mut app, KeyCode::Enter);
+        let ask = |ticket| {
+            let ask = ("p", "github.com", "krishhgg/t3term", 31, ticket);
+            (ask.0.into(), ask.1.into(), ask.2.into(), ask.3, ask.4)
+        };
+        assert_eq!(*asked.borrow(), [ask(1)]);
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Reading from github.com…"), "{text}");
+
+        // The detail shows the Summary tab's sections, and the Comments section waits for the
+        // conversation.
+        hear(&mut app, 1, vec![Part::Detail(Ok(Box::new(host_detail())))]);
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Reading the conversation…"), "{text}");
+
+        // With the conversation, the sections come before the link's own. The pane is narrow,
+        // so its rows are read as one text, each row a word apart.
+        let activity = Part::Activity(Ok(Box::new(host_activity())));
+        hear(&mut app, 1, vec![activity, Part::Done]);
+        let rows = body_after(&mut app, 200, 120);
+        let text = rows
+            .iter()
+            .map(|row| row.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(!text.contains("Reading from"), "{text}");
+        assert!(!text.contains("bot: state"), "{text}");
+        let order = [
+            "#31 Bound titles",
+            "Read from github.com just now",
+            "This branch is out-of-date with master by 3 commits.",
+            "Reviewers",
+            "octocat",
+            "Approved",
+            "Labels",
+            "ui",
+            "Checks",
+            "✓ macOS",
+            "○ Greptile Review",
+            "Description",
+            "Adds a drawer.",
+            "Second paragraph.",
+            "Comments (2)",
+            "Octocat",
+            "Approved",
+            "mona",
+            "Looks close.",
+            "URL",
+            "Linked by the agent",
+        ];
+        let mut from = 0;
+        for shown in order {
+            let at = text[from..].find(shown);
+            assert!(at.is_some(), "{shown:?} after byte {from} in {text}");
+            from += at.unwrap_or_default() + shown.len();
+        }
+        for row in &rows {
+            if row.contains("✓ macOS") {
+                assert!(row.contains("Passed"), "{row}");
+            }
+            if row.contains("○ Greptile Review") {
+                assert!(row.contains("Running"), "{row}");
+            }
+        }
+
+        // Back to the list and in again within the minute shows that answer without asking.
+        // An answer to a read the details no longer wait for changes nothing.
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(asked.borrow().len(), 1);
+        hear(&mut app, 7, vec![Part::Detail(Err("stale".into()))]);
+        let again = details_after(&mut app, 200, 50);
+        assert!(
+            again.contains("octocat") && !again.contains("stale"),
+            "{again}"
+        );
+
+        // A minute on, opening them reads again, and the first read's late answer is dropped.
+        app.now += 61_000;
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(asked.borrow().last(), Some(&ask(2)));
+        hear(&mut app, 1, vec![Part::Detail(Ok(Box::new(host_detail())))]);
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Reading from github.com…"), "{text}");
+
+        // A failed read says why, and opening the details again asks at once.
+        let failure = "Couldn't read this pull request: \u{1b}]52;c;bad\u{7}lost";
+        hear(
+            &mut app,
+            2,
+            vec![Part::Detail(Err(failure.into())), Part::Done],
+        );
+        let rows = body_after(&mut app, 200, 120);
+        let text = rows
+            .iter()
+            .map(|row| row.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("Couldn't read this pull request: ]52;c;badlost"),
+            "{text}"
+        );
+        assert!(!text.contains("octocat"), "{text}");
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(asked.borrow().last(), Some(&ask(3)));
+
+        // Another link opened while #31's read is under way waits for it, and says it reads.
+        // Only the last read is kept, so #31's answer is dropped and #32 is asked for once
+        // #31's read is done.
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(asked.borrow().last(), Some(&ask(3)));
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Reading from github.com…"), "{text}");
+        hear(&mut app, 3, vec![Part::Detail(Ok(Box::new(host_detail())))]);
+        assert_eq!(asked.borrow().len(), 3);
+        hear(&mut app, 3, vec![Part::Done]);
+        let last = asked.borrow().last().cloned().expect("a read");
+        assert_eq!((last.3, last.4), (32, 4));
+        let text = details_after(&mut app, 200, 50);
+        assert!(
+            text.contains("Reading from github.com…") && !text.contains("octocat"),
+            "{text}"
+        );
+
+        // A link opened and left while #32's read is under way is never asked for.
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Left);
+        hear(
+            &mut app,
+            4,
+            vec![Part::Detail(Err("late".into())), Part::Done],
+        );
+        assert_eq!(asked.borrow().len(), 4);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(asked.borrow().last(), Some(&ask(5)));
+
+        // A link that waits goes when the pane closes, so #31's answer asks for nothing, and
+        // opening the pane on its details again asks for it.
+        let numbers = |asked: &std::cell::RefCell<Vec<Noted>>| {
+            let asked = asked.borrow();
+            asked.iter().map(|ask| (ask.3, ask.4)).collect::<Vec<_>>()
+        };
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        alt(&mut app, 'b');
+        assert!(!app.details.open);
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        hear(&mut app, 5, vec![detail, Part::Done]);
+        assert_eq!(asked.borrow().len(), 5);
+        alt(&mut app, 'b');
+        assert_eq!(numbers(&asked).last(), Some(&(32, 6)));
+
+        // So does one that waits when the Thread tab shows. A click on the tab's name puts
+        // the keyboard back in the pane.
+        cells(&mut app, 200, 50);
+        let tabs = app.details.drawn.expect("the pane").tabs;
+        assert!(mouse(&mut app, CLICK, tabs[1].x, tabs[1].y));
+        cells(&mut app, 200, 50);
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Up);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(asked.borrow().len(), 6);
+        cells(&mut app, 200, 50);
+        assert!(mouse(&mut app, CLICK, tabs[0].x, tabs[0].y));
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        hear(&mut app, 6, vec![detail, Part::Done]);
+        assert_eq!(asked.borrow().len(), 6);
+        cells(&mut app, 200, 50);
+        assert!(mouse(&mut app, CLICK, tabs[1].x, tabs[1].y));
+        assert_eq!(numbers(&asked).last(), Some(&(31, 7)));
+    }
+
+    #[test]
+    fn a_link_is_read_only_where_the_environment_reads_pull_requests() {
+        // Without `pullRequests` in the environment's capabilities, the details show what T3
+        // synced and ask for nothing, as the desktop's panel offers no page.
+        let capabilities = json!({"threadPullRequests": true});
+        let mut app = pulls_tui_on(vec![linked(31, "Bound titles")], false, capabilities);
+        let asked = note_reads(&mut app);
+        app.focus = Focus::Transcript;
+        cells(&mut app, 200, 50);
+        alt(&mut app, 'b');
+        cells(&mut app, 200, 50);
+        let tab = app.details.drawn.expect("the pane").tabs[1];
+        assert!(mouse(&mut app, CLICK, tab.x, tab.y));
+        cells(&mut app, 200, 50);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.details.pulls.viewing());
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Linked by the agent"), "{text}");
+        assert!(!text.contains("Reading from"), "{text}");
+        assert!(asked.borrow().is_empty());
+
+        // A click that opens the details reads as Enter does.
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        let asked = note_reads(&mut app);
+        let drawn = app.details.drawn.expect("the pane");
+        let (x, y) = (drawn.body.x + 1, drawn.body.y);
+        assert!(mouse(&mut app, CLICK, x, y));
+        assert!(app.details.pulls.viewing());
+        assert_eq!(asked.borrow().len(), 1);
     }
 
     #[test]

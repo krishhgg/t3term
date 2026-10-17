@@ -6,7 +6,7 @@
 - **States.** `Open` and `Merged` and `Closed` use `●`, `Draft` uses `◌`. A link the host hasn't synced shows `○`, `Waiting for host state` and the repository as its title. `Host state unreadable` marks a snapshot that can't be read.
 - **Stacks.** The bottom layer reads `Stack of N` for a stack the host keeps, or `N chained` for links chained by branch. Each layer above is indented two more columns.
 - **Empty and broken.** `No linked pull requests` with `Pull requests the agent opens from this thread land here.`, `Linked pull requests unreadable` when the field isn't a list, and `Linked pull requests unavailable` with `This environment does not support multiple linked pull requests.` when the environment lacks the capability. Dismissed stack layers are hidden.
-- **A link's details.** `← List` at the top with `2 of 3` on the right, the heading `#N title`, then `URL`, `Repository`, `Branches`, `Author` and `Activity` (`Linked by the agent · 2h ago`, `Updated …`, `Synced …`), and for a stack a note such as `GitHub stack of N: merging a layer lands the ones below it.`
+- **A link's details.** `← List` at the top with `2 of 3` on the right, the heading `#N title`, then `URL`, `Repository`, `Branches`, `Author` and `Activity` (`Linked by the agent · 2h ago`, `Updated …`, `Synced …`), and for a stack a note such as `GitHub stack of N: merging a layer lands the ones below it.` On an environment whose capabilities have `pullRequests`, they also read the pull request from its host, which [pull-request-page.md](pull-request-page.md) covers.
 - **Older threads.** A thread with only the old single `linkedPullRequest` field shows that one link.
 
 ## How to get to it (user POV)
