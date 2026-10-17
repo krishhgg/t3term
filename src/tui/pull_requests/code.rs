@@ -61,7 +61,7 @@
 //! (packages/contracts/src/settings.ts:53-55). A row under the fold row sets the lines before
 //! the change on the left and those after it on the right, or stacks them again, as the
 //! desktop's toolbar toggle group does (PullRequestCodeTab.tsx:1259-1278). The lines pair as
-//! @pierre/diffs pairs them, as `pairs` says, and a file added or deleted keeps one column.
+//! @pierre/diffs pairs them, as `align` says, and a file added or deleted keeps one column.
 //! Unwrapped, both sides' text scrolls sideways by the same columns.
 //!
 //! The lines wrap at first, as the desktop's `wordWrap` setting is true until changed
@@ -2061,7 +2061,7 @@ fn body(
         }
         after = first + hunk.old_count;
         let Some(halves) = halves else {
-            for line in &hunk.lines {
+            for line in align::stacked(text, &hunk.lines) {
                 let rows = line_rows(text, line, gutter, width, wrap, theme);
                 slides.add(&mut lines, rows, wrap);
                 let end = lines.len();
@@ -2077,7 +2077,7 @@ fn body(
             }
             continue;
         };
-        for pair in pairs(&hunk.lines) {
+        for pair in align::pairs(text, &hunk.lines) {
             let rows = beside(text, pair, gutter, halves, wrap, theme);
             slides.add(&mut lines, rows, wrap);
             marks.push(Mark {
@@ -2132,40 +2132,6 @@ fn body(
 
 /// A line of a hunk, or none, on each side of a row of the lines side by side.
 type Pair<'a> = (Option<&'a patch::Line>, Option<&'a patch::Line>);
-
-/// A hunk's lines in the rows they take side by side: a line in context beside itself, and in
-/// each run of lines changed, those removed beside those added, the first beside the first,
-/// with nothing beside the rest of the longer side. @pierre/diffs 1.5.2 counts every line
-/// removed or added between two in context as one run, in whatever order they come
-/// (utils/parsePatchFiles.js:182-205), and pairs its lines so (utils/iterateOverDiff.js:213
-/// and 443-446).
-fn pairs(lines: &[patch::Line]) -> Vec<Pair<'_>> {
-    fn pair<'a>(
-        rows: &mut Vec<Pair<'a>>,
-        removed: &mut Vec<&'a patch::Line>,
-        added: &mut Vec<&'a patch::Line>,
-    ) {
-        let count = removed.len().max(added.len());
-        rows.extend((0..count).map(|at| (removed.get(at).copied(), added.get(at).copied())));
-        removed.clear();
-        added.clear();
-    }
-    let mut rows = Vec::new();
-    let (mut removed, mut added) = (Vec::new(), Vec::new());
-    for line in lines {
-        match line.kind {
-            patch::Kind::Context => {
-                pair(&mut rows, &mut removed, &mut added);
-                rows.push((Some(line), Some(line)));
-            }
-            patch::Kind::Removed => removed.push(line),
-            patch::Kind::Added => added.push(line),
-            patch::Kind::NoNewline => {}
-        }
-    }
-    pair(&mut rows, &mut removed, &mut added);
-    rows
-}
 
 /// Whether the last line of a hunk's side before the change, and of its side after, has no
 /// line end, as @pierre/diffs reads the note: after a line in context it is both sides', and
@@ -2605,6 +2571,7 @@ fn broken(text: &str, width: usize) -> Vec<String> {
     rows
 }
 
+mod align;
 mod order;
 mod tree;
 mod whitespace;

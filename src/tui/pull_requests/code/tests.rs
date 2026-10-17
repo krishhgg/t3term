@@ -368,7 +368,9 @@ fn whitespace_starts_hidden_and_one_row_shows_it() {
     );
     assert_eq!(targets[0], (1..5, Control::Whitespace));
 
-    // The row shows the patch's lines in every file, laid out again, and hides them again.
+    // The row shows the patch's lines in every file, laid out again, and hides them again. A
+    // run of lines changed shows its lines removed before those added, as pierre stacks them,
+    // though the patch has them in turn.
     code.prepare(40, &theme());
     let builds = code.builds;
     assert!(!code.act(Control::Whitespace, &[]), "the diff is the same");
@@ -397,8 +399,8 @@ fn whitespace_starts_hidden_and_one_row_shows_it() {
             "⌄ M src/lib.rs +2 -2",
             "1   use std::fmt;",
             "2 - fn a() {",
-            "2 + fn a()  {",
             "3 -     old();",
+            "2 + fn a()  {",
             "3 +     new();",
             "4   }",
         ]
@@ -3803,6 +3805,47 @@ fn the_numbers_side_by_side_fit_an_unchanged_line_s_old_place() {
     assert_eq!(
         rows(&code, 40)[8..],
         removed.chain(kept).collect::<Vec<_>>()
+    );
+}
+
+#[test]
+fn a_change_pairs_its_most_alike_lines_and_stacks_them_so() {
+    // `run(2);` is more like `run(1);` than `setup();` is, so pierre pairs those two and shows
+    // `setup();` first, beside nothing.
+    let patch = "diff --git a/src/run.rs b/src/run.rs
+--- a/src/run.rs
++++ b/src/run.rs
+@@ -1,3 +1,4 @@
+ fn main() {
+-    run(1);
++    setup();
++    run(2);
+ }
+";
+    let mut code = read(slice(patch, None), 0);
+    code.act(Control::File(0), &[]);
+    assert_eq!(
+        rows(&code, 40)[7..13],
+        [
+            "⌄ M src/run.rs +2 -1",
+            "1   fn main() {",
+            "2 +     setup();",
+            "2 -     run(1);",
+            "3 +     run(2);",
+            "4   }",
+        ]
+    );
+    code.act(Control::Layout, &[]);
+    assert_eq!(
+        rows(&code, 40)[7..13],
+        [
+            "⌄ M src/run.rs +2 -1",
+            "1   fn main() {    │ 1   fn main() {",
+            "                   │ 2 +     setup();",
+            "2 -     run(1);    │ 3 +     run(2);",
+            "3   }              │ 4   }",
+            "⋯ More unchanged context may be",
+        ]
     );
 }
 
