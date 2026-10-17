@@ -2,18 +2,20 @@
 section at the end of the thread details (src/tui/lineage.rs and src/tui/details.rs).
 
 What t3term reads. The details end with Lineage, after the facts and one blank row: the threads
-related to the open one. A thread's parent comes from the run it was forked from, else its
-lineage. Its forks and agents come from the shell's threads whose parent it is. Its agents also
-come from its projection's subagents, and other related threads from its projection's context
-transfers, which run from it or to it. The first edge to a thread speaks for it. Rows go in three
-groups: related threads, agents at work, and Previous agents, which starts closed. The parent
-comes first, then the thread a fork merges back to, then the newest. Each group shows 6 rows, then
-12 more for each Show more. A row opens while the shell lists the thread unarchived, and otherwise
-its title is muted and Enter says the thread is unavailable. The heading counts agents running,
-and those without a thread yet while the watch can still hear them end. Once the watch closes, an
-agent or transfer it last heard at work reads as unknown, and the shell's copy speaks for each
-thread it lists. t3term asks T3 for nothing to show Lineage, so choosing rows, paging and opening
-Previous agents leave rpcRequestsByTag as it was. Opening a related thread adds one subscribeThread.
+related to the open one. A thread's parent comes from the run it was forked from, else its lineage.
+Its forks and agents come from the shell's threads whose parent it is. Its agents also come from
+its projection's subagents, and other related threads from its projection's context transfers,
+which run from it or to it. The first edge to a thread speaks for it, so an agent whose thread the
+shell lists shows its thread's run, and `t3v agent ID STATUS` changes its word only with --via
+thread or both. Rows go in three groups: related threads, agents at work, and Previous agents,
+which starts closed. The parent comes first, then the thread a fork merges back to, then the
+newest. Each group shows 6 rows, then 12 more for each Show more. A row opens while the shell lists
+the thread unarchived, and otherwise its title is muted and Enter says the thread is unavailable.
+The heading counts agents running, and those without a thread yet while the watch can still hear
+them end. Once the watch closes, an agent or transfer it last heard at work reads as unknown, and
+the shell's copy speaks for each thread it lists. t3term asks T3 for nothing to show Lineage, so
+choosing rows, paging and opening Previous agents leave rpcRequestsByTag as it was. Opening a
+related thread adds one subscribeThread.
 
 Where each change goes, as T3 at f570bd2 sends it. An agent's task goes on its parent's
 subscription, as a subagent.updated. A run goes on its thread's own subscription, as run.created
