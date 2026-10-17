@@ -7,15 +7,19 @@
   add_commands       its own commands
   print_expect       how `t3v expect` prints what t3term should show
   status_fields      its part of `t3v status`
+
+and may provide:
+
+  print_threads      how `t3v threads` lists its threads, given the state and --all
 """
 
 from __future__ import annotations
 
-from . import links
+from . import lineage, links
 
-SCENARIOS = {links.NAME: links}
+SCENARIOS = {links.NAME: links, lineage.NAME: lineage}
 DEFAULT = links.NAME
-FIXTURES = {links.NAME: links.LinksFixture}
+FIXTURES = {links.NAME: links.LinksFixture, lineage.NAME: lineage.LineageFixture}
 
 
 def scenario_of(state: dict):

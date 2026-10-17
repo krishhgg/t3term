@@ -15,13 +15,13 @@ Read the file for a feature before you drive it, and fix the file when a drive s
 | Environment and connection: the feed dot, the thread watch, reconnects | [connection.md](connection.md) | `links` |
 | Thread details: opening, pane or dialog, tabs, the Thread tab's facts | [thread-details.md](thread-details.md) | `links` |
 | Linked pull requests: the details' Pull requests tab | [linked-pull-requests.md](linked-pull-requests.md) | `links` |
+| Lineage: related threads, forks and agents in the details | [lineage.md](lineage.md) | `lineage` |
 | CLI: commands, `--json` and exit codes against a fake server | [cli.md](cli.md) | `links` |
 
 ## Not mapped yet
 
 These exist on master but have no file yet, because no scenario serves what they need or nobody has driven them. Each line names the missing precondition.
 
-- **Lineage** in the thread details: needs a world with forks, agents and context transfers. The `links` threads have none, so the section shows no rows.
 - **Sending a message, approvals, questions, interrupting and mode changes:** the fake server refuses every orchestration command (`message.dispatch`, `runtime-request.respond`, `run.interrupt`, `thread.runtime-mode.set`, `thread.interaction-mode.set`), so only t3term's refusal path is reachable.
 - **The tasks drawer:** needs a `todo_list` plan on the open thread's current run.
 - **The worktree setup card:** the fake server answers `subscribeWorktreeSetup` with null only.
