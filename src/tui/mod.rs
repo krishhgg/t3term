@@ -36,8 +36,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEventKind,
 };
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
@@ -61,7 +62,7 @@ use details::Details;
 use environment::{Feed, Identity};
 use markdown::Styles;
 use picker::{Item, Kind, Pick};
-use pull_requests::Part;
+use pull_requests::{Ask, Part};
 use scroll::{Pin, Scroll};
 use sidebar::{Badges, Capabilities, Shelf, ShelfChoices, Sidebar, View};
 use theme::{
@@ -99,9 +100,21 @@ const KEPT_TITLE: usize = 16;
 /// Opens T3's worktree setup subscription for a thread: `Client::watch_worktree_setup`, or a
 /// test's stand-in.
 type WatchSetup = Box<dyn Fn(&str) -> mpsc::UnboundedReceiver<WatchEvent>>;
-/// Reads a pull request from its host in the background, and sends the answer as an action
-/// with the ticket it was given.
-type ReadPull = Box<dyn Fn(Reference, u64)>;
+/// Reads a pull request from its host in the background as `Ask` says, and sends the answer
+/// as an action with the ask's ticket.
+type ReadPull = Box<dyn Fn(Reference, Ask)>;
+/// Opens T3's `pullRequests.subscribeRefreshes`: `Client::watch_pull_request_refreshes`, or a
+/// test's stand-in.
+type WatchRefreshes = Box<dyn Fn() -> mpsc::UnboundedReceiver<WatchEvent>>;
+
+/// T3's refresh numbers while a read of a link's pull request is held, and the last one heard.
+struct Refreshes {
+    events: mpsc::UnboundedReceiver<WatchEvent>,
+    /// The last number heard. The first sets where the numbers stand, and each that differs
+    /// from the last says T3's reads may have changed. A reconnect keeps it, so a number that
+    /// moved while the connection was down counts.
+    heard: Option<u64>,
+}
 
 /// Starts check `asked` of the saved environments for the Environments dialog, which sends
 /// what it found as `ActionResult::Environments`, and returns the handle that stops it. A test
@@ -591,6 +604,15 @@ struct App {
     watch_setup: WatchSetup,
     /// Reads the pull request whose details opened.
     read_pull: ReadPull,
+    /// Opens T3's refresh numbers for pull requests.
+    watch_refreshes: WatchRefreshes,
+    /// T3's refresh numbers, open while the details hold a read of a link's pull request.
+    refreshes: Option<Refreshes>,
+    /// Set once T3 refuses or ends the refresh subscription, which no read asks for again.
+    refreshes_refused: bool,
+    /// When the last key, click, wheel or paste came, which says whether you still use
+    /// t3term, so the open details keep their pull request current.
+    input_at: i64,
     /// Set once T3 refuses the worktree setup subscription. T3 refuses it for the session or
     /// the server, never for one thread, so no thread asks again.
     setup_refused: bool,
@@ -599,7 +621,13 @@ struct App {
 
 pub async fn run(client: Arc<Client>) -> Result<()> {
     let mut screen = Screen(Some(init()));
-    crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+    // Focus reports say when the terminal gains focus, which reads the open details again.
+    crossterm::execute!(
+        std::io::stdout(),
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        EnableFocusChange
+    )?;
     let Some(terminal) = screen.0.as_mut() else {
         return Ok(());
     };
@@ -637,7 +665,8 @@ impl Drop for Screen {
         let _ = crossterm::execute!(
             std::io::stdout(),
             DisableMouseCapture,
-            DisableBracketedPaste
+            DisableBracketedPaste,
+            DisableFocusChange
         );
         // Once the terminal has closed, ratatui's own Drop for Terminal and `ratatui::restore`
         // print their errors with `eprintln!`, which panics. A panic here aborts the process
@@ -651,24 +680,45 @@ impl Drop for Screen {
     }
 }
 
+/// Whether a read that keeps the details current reads the conversation after `detail`:
+/// only when the detail came and its `updatedAt` isn't `updated`, the one the details show.
+fn changed_since(
+    detail: &Result<Box<pull_request::Detail>, String>,
+    updated: Option<&str>,
+) -> bool {
+    detail
+        .as_ref()
+        .is_ok_and(|detail| Some(detail.updated_at.as_str()) != updated)
+}
+
 /// Reads the pull request `reference` names from its host through T3: its detail and its
 /// conversation at once, as the desktop's panel asks for them. Gives `send` each answer as it
 /// comes, or why it failed, and then `Part::Done`. A sentence of T3's own, such as a host the
 /// server has no credentials for, reads as T3 wrote it. Any other failure of the detail says
-/// that the read failed, and the Comments section says that of the conversation.
-async fn read_pull_request(client: &Client, reference: &Reference, send: impl Fn(Part)) {
+/// that the read failed, and the Comments section says that of the conversation. With
+/// `ask.invalidate`, it first sends `pullRequests.invalidate`, so T3 asks the host again rather
+/// than answer from its cache. When that fails, the reads still go and at worst answer from
+/// the cache, as the desktop's Refresh does (PullRequestDetailPanel.tsx:857-875). With
+/// `ask.updated`, it reads the detail alone, and the conversation after it only when the detail's
+/// `updatedAt` differs, as the desktop's live refresh does (PullRequestDetailPanel.tsx:836-856).
+async fn read_pull_request(client: &Client, reference: &Reference, ask: &Ask, send: impl Fn(Part)) {
     fn failed(e: &dyn std::fmt::Display) -> String {
         format!("Couldn't read this pull request: {e}")
     }
     match client.rpc().await {
         Ok(rpc) => {
+            if ask.invalidate {
+                let _ = pull_request::invalidate(&rpc, reference).await;
+            }
             let detail = async {
                 let answer = match pull_request::detail(&rpc, reference).await {
                     Ok(detail) => Ok(Box::new(detail)),
                     Err(e @ PullRequestError::Rpc(_)) => Err(failed(&e)),
                     Err(e) => Err(e.to_string()),
                 };
+                let changed = changed_since(&answer, ask.updated.as_deref());
                 send(Part::Detail(answer));
+                changed
             };
             let activity = async {
                 let answer = pull_request::activity(&rpc, reference).await;
@@ -676,7 +726,11 @@ async fn read_pull_request(client: &Client, reference: &Reference, send: impl Fn
                     answer.map(Box::new).map_err(|e| e.to_string()),
                 ));
             };
-            tokio::join!(detail, activity);
+            if ask.updated.is_none() {
+                tokio::join!(detail, activity);
+            } else if detail.await {
+                activity.await;
+            }
         }
         Err(e) => send(Part::Detail(Err(failed(&e)))),
     }
@@ -728,6 +782,10 @@ async fn event_loop(terminal: &mut Term, client: Arc<Client>) -> Result<()> {
             + Duration::from_millis(wake.map_or(0, |at| {
                 ((at - now_ms()).max(0) + 50).min(i32::MAX as i64) as u64
             }));
+        // The open details' next read to keep their pull request current, while you use t3term.
+        let live = app.live_at();
+        let live_deadline = tokio::time::Instant::now()
+            + Duration::from_millis(live.map_or(0, |at| (at - now_ms()).max(0) as u64));
         // The open thread's watch and its worktree setup subscription, which are its own.
         let (thread_events, setup_events) = match app.open.as_mut() {
             Some(open) => (Some(&mut open.events), open.setup.events.as_mut()),
@@ -742,6 +800,13 @@ async fn event_loop(terminal: &mut Term, client: Arc<Client>) -> Result<()> {
         let setup_event = async move {
             match setup_events {
                 Some(events) => events.recv().await,
+                None => std::future::pending().await,
+            }
+        };
+        // T3's refresh numbers, while the details hold a read of a link's pull request.
+        let refresh_event = async {
+            match app.refreshes.as_mut() {
+                Some(refreshes) => refreshes.events.recv().await,
                 None => std::future::pending().await,
             }
         };
@@ -765,6 +830,7 @@ async fn event_loop(terminal: &mut Term, client: Arc<Client>) -> Result<()> {
             }
             // `None` once the subscription has ended, which closes it for good.
             event = setup_event => dirty |= app.on_setup_event(event),
+            event = refresh_event => dirty |= app.on_refresh_event(event),
             Some(result) = action_results.recv() => {
                 app.on_action_result(result);
                 dirty = true;
@@ -774,6 +840,11 @@ async fn event_loop(terminal: &mut Term, client: Arc<Client>) -> Result<()> {
             // Only armed while a clock or spinner moves, to advance it.
             _ = tokio::time::sleep_until(tick_deadline), if running => {
                 tick_at = Instant::now() + TICK;
+                dirty = true;
+            }
+            // Only armed while the open details keep their pull request current.
+            _ = tokio::time::sleep_until(live_deadline), if live.is_some() => {
+                app.read_opened_pull();
                 dirty = true;
             }
             // Only armed while a thread is snoozed, to move it back when the snooze ends.
@@ -925,6 +996,7 @@ impl App {
         actions: mpsc::UnboundedSender<ActionResult>,
     ) -> App {
         let watcher = client.clone();
+        let refresher = client.clone();
         let (reader, answers) = (client.clone(), actions.clone());
         let environment = Identity::new(client.runtime.label.as_deref(), &client.runtime.origin);
         let current = client.runtime.environment_id.clone();
@@ -1005,15 +1077,20 @@ impl App {
                 Some(task.abort_handle())
             }),
             watch_setup: Box::new(move |thread_id: &str| watcher.watch_worktree_setup(thread_id)),
-            read_pull: Box::new(move |reference, ticket| {
+            read_pull: Box::new(move |reference, ask: Ask| {
                 let (client, answers) = (reader.clone(), answers.clone());
                 tokio::spawn(async move {
+                    let ticket = ask.ticket;
                     let send = |part| {
                         let _ = answers.send(ActionResult::PullRequest { ticket, part });
                     };
-                    read_pull_request(&client, &reference, send).await;
+                    read_pull_request(&client, &reference, &ask, send).await;
                 });
             }),
+            watch_refreshes: Box::new(move || refresher.watch_pull_request_refreshes()),
+            refreshes: None,
+            refreshes_refused: false,
+            input_at: now_ms(),
             setup_refused: false,
             quit: false,
         }
@@ -1277,36 +1354,108 @@ impl App {
     /// open thread's project, as the desktop's panel reads a link
     /// (apps/web/src/components/pullRequest/ThreadPullRequestsPanel.tsx). Only an environment
     /// whose capabilities have `pullRequests` reads them. The details show the answer when it
-    /// comes, and a reference T3's schema would refuse fails at once.
-    fn read_opened_pull(&mut self) {
-        let project = match self.details_record() {
-            details::Record::Found(thread) => thread
-                .get("projectId")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            _ => None,
-        };
-        let enabled = project.is_some() && self.environment_can("pullRequests");
-        // A read that waits goes once its details don't show.
+    /// comes, and a reference T3's schema would refuse fails at once. While the details hold a
+    /// read, T3's refresh numbers say when to read it again. Says whether it asked for a read.
+    fn read_opened_pull(&mut self) -> bool {
+        let project = self.pulls_project();
+        let enabled = project.is_some();
+        // A read that waits goes once its details don't show, and nothing is asked for until
+        // they do. The refresh numbers go on while a read is held.
         let shown = self.details.shows_pulls();
         self.details.pulls.shown(shown);
-        if !shown {
-            return;
-        }
         // The last frame's time can be long past, and a test can move it on.
         let now = now_ms().max(self.now);
-        let Some(ask) = self.details.pulls.take_ask(enabled, now) else {
-            return;
+        if shown && enabled {
+            self.details.pulls.live(now, self.input_at);
+        }
+        let ask = shown
+            .then(|| self.details.pulls.take_ask(enabled, now))
+            .flatten();
+        self.follow_refreshes(enabled);
+        let Some(ask) = ask else {
+            return false;
         };
         let project = project.unwrap_or_default();
         match Reference::new(&project, Some(&ask.host), &ask.repository, ask.number) {
-            Ok(reference) => (self.read_pull)(reference, ask.ticket),
+            Ok(reference) => (self.read_pull)(reference, ask),
             Err(failure) => {
                 let failure = Part::Detail(Err(failure.to_string()));
                 self.details.answer_pull(ask.ticket, failure, now);
                 self.details.answer_pull(ask.ticket, Part::Done, now);
             }
         }
+        true
+    }
+
+    /// The project of the thread whose details show, which a read of its links names, while
+    /// the environment reads pull requests.
+    fn pulls_project(&self) -> Option<String> {
+        let project = match self.details_record() {
+            details::Record::Found(thread) => thread.get("projectId").and_then(Value::as_str),
+            _ => None,
+        };
+        let project = project.map(str::to_string)?;
+        self.environment_can("pullRequests").then_some(project)
+    }
+
+    /// When the open details read their pull request's detail again to keep it current, as
+    /// `PullRequests::live` says. None once you left t3term alone for `IDLE` by then, or by now
+    /// when that time passed while the Mac slept, so an unattended TUI asks no host, and the
+    /// next key, click or wheel reads it. None too where nothing would read, so the event loop
+    /// never waits on a time that has passed.
+    fn live_at(&self) -> Option<i64> {
+        let due = self.details.pulls.live_at()?;
+        let now = now_ms().max(self.now);
+        let used = due.max(now).saturating_sub(self.input_at) < pull_requests::IDLE;
+        (used && self.pulls_project().is_some()).then_some(due)
+    }
+
+    /// Opens T3's refresh numbers once the details hold a read of a link's pull request on an
+    /// environment that reads them, and closes them once they don't, as the desktop follows
+    /// `pullRequests.subscribeRefreshes` while it shows a pull request
+    /// (packages/client-runtime/src/state/pullRequests.ts). A subscription T3 refused or ended
+    /// isn't opened again.
+    fn follow_refreshes(&mut self, enabled: bool) {
+        let wanted = enabled && !self.refreshes_refused && self.details.pulls.holds_read();
+        match (wanted, self.refreshes.is_some()) {
+            (true, false) => {
+                self.refreshes = Some(Refreshes {
+                    events: (self.watch_refreshes)(),
+                    heard: None,
+                });
+            }
+            (false, true) => self.refreshes = None,
+            _ => {}
+        }
+    }
+
+    /// Takes an event of T3's refresh numbers, or `None` once the subscription ended. A number
+    /// that differs from the last one heard reads the held pull request again, as
+    /// `PullRequests::refresh` says. Says whether the details changed.
+    fn on_refresh_event(&mut self, event: Option<WatchEvent>) -> bool {
+        let Some(refreshes) = self.refreshes.as_mut() else {
+            return false;
+        };
+        let number = match event {
+            Some(WatchEvent::Item(item)) => pull_request::refresh_revision(&item),
+            Some(WatchEvent::Reconnecting { .. }) => None,
+            Some(WatchEvent::Failed(_)) | None => {
+                self.refreshes = None;
+                self.refreshes_refused = true;
+                return false;
+            }
+        };
+        let Some(number) = number else {
+            return false;
+        };
+        let changed = refreshes.heard.is_some_and(|heard| heard != number);
+        refreshes.heard = Some(number);
+        if !changed {
+            return false;
+        }
+        let showing = self.details.pulls.refresh();
+        self.read_opened_pull();
+        showing
     }
 
     /// Hides or shows the sidebar and remembers it, as Ctrl+B and the desktop's Mod+B do. Focus
@@ -1612,7 +1761,8 @@ impl App {
 
     /// A key for the details while they have the keyboard. Esc closes a dialog. On a pane it
     /// gives the keyboard back and leaves the pane open. → or `l` shows the thread's pull
-    /// requests, and ← or `h` goes back: from a pull request's details to the list, and from
+    /// requests, or a pull request's Timeline in place of its Summary, and ← or `h` goes back:
+    /// from the Timeline to the Summary, from a pull request's details to the list, and from
     /// the list to the thread's tab. On the thread's tab the up and down arrows, `j` and `k`
     /// choose among Lineage's rows, and scroll the text past them or without them, and Enter
     /// acts on the chosen row. On the pull requests' tab they move along the pull requests, or
@@ -1629,8 +1779,8 @@ impl App {
             KeyCode::Esc => self.close_details(),
             KeyCode::Left => self.details.back(),
             KeyCode::Char('h') if plain => self.details.back(),
-            KeyCode::Right => self.details.show(details::Tab::PullRequests),
-            KeyCode::Char('l') if plain => self.details.show(details::Tab::PullRequests),
+            KeyCode::Right => self.details.forward(),
+            KeyCode::Char('l') if plain => self.details.forward(),
             KeyCode::Enter => {
                 if let Some(target) = self.details.enter() {
                     self.act_on_lineage(target);
@@ -1646,6 +1796,10 @@ impl App {
             KeyCode::Char('g') if plain => self.details.scroll_home(),
             KeyCode::End => self.details.scroll_end(),
             KeyCode::Char('G') if plain => self.details.scroll_end(),
+            KeyCode::Char('r') if plain => {
+                // The caller asks for the read once the key is done.
+                self.details.reload(now_ms().max(self.now));
+            }
             _ => {}
         }
     }
@@ -1753,11 +1907,30 @@ impl App {
     // ---- input ----
 
     /// Acts on a key, a paste or the mouse. When that opened a link's details, asks its host
-    /// for the pull request.
+    /// for the pull request. Says whether what shows changed.
     fn on_terminal_event(&mut self, event: Event) -> bool {
+        let now = now_ms().max(self.now);
+        let input = matches!(event, Event::Key(_) | Event::Mouse(_) | Event::Paste(_));
+        let idle = now - self.input_at >= pull_requests::IDLE;
+        // You arrive at the open details with your first input after an idle spell, or when
+        // the terminal gains focus while you use t3term, as the desktop's window does. Focus
+        // after an idle spell waits for that input, as the desktop's does.
+        let arrived = match event {
+            Event::FocusGained => !idle,
+            _ => input && idle,
+        };
+        if input {
+            self.input_at = now;
+        }
         let changed = self.on_input(event);
-        self.read_opened_pull();
-        changed
+        // A read asked for changes what the details show, though the input itself may not,
+        // as a mouse move or focus doesn't.
+        let mut asked = self.read_opened_pull();
+        // The read follows what the input showed.
+        if arrived && self.pulls_project().is_some() && self.details.pulls.arrive(now) {
+            asked |= self.read_opened_pull();
+        }
+        changed || asked
     }
 
     fn on_input(&mut self, event: Event) -> bool {
@@ -13546,7 +13719,12 @@ mod tests {
     /// A pull request's detail as T3 sends it for #31: behind its base by three commits, with
     /// a reviewer, a label, a check that passed and one that runs, and a description.
     fn host_detail() -> pull_request::Detail {
-        let detail = json!({
+        pull_request::Detail::read(&host_detail_sent()).unwrap()
+    }
+
+    /// `host_detail` as T3 sends it.
+    fn host_detail_sent() -> Value {
+        json!({
             "provider": "github",
             "capabilities": {"diff": true, "comment": true, "actions": [], "mergeMethods": [],
                 "search": true, "review": {"inlineComment": false, "reply": false,
@@ -13572,14 +13750,18 @@ mod tests {
             ],
             "mergeCapabilities": {"merge": true, "squash": true, "rebase": true},
             "baseComparison": "behind", "behindBy": 3
-        });
-        pull_request::Detail::read(&detail).unwrap()
+        })
     }
 
     /// The conversation on `host_detail`'s pull request: a remark, then octocat's approval
     /// under another casing of their login.
     fn host_activity() -> pull_request::Activity {
-        let activity = json!({
+        pull_request::Activity::read(&host_activity_sent()).unwrap()
+    }
+
+    /// `host_activity` as T3 sends it.
+    fn host_activity_sent() -> Value {
+        json!({
             "reviewers": [{"login": "octocat", "name": null, "isBot": false}],
             "comments": [
                 {"id": "c1", "kind": "issue-comment", "author": {"login": "mona",
@@ -13591,8 +13773,42 @@ mod tests {
                     "path": null, "reviewState": "APPROVED"}
             ],
             "commentCount": 2, "commentsTruncated": false, "reviewThreads": [], "commits": []
-        });
-        pull_request::Activity::read(&activity).unwrap()
+        })
+    }
+
+    /// The time `ms` after the Unix epoch as T3 writes it, in UTC to the second.
+    fn iso_at(ms: i64) -> String {
+        let (days, second) = (ms.div_euclid(86_400_000), ms.rem_euclid(86_400_000) / 1000);
+        // The inverse of `parse_iso_ms`'s days from a civil date.
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = yoe + era * 400 + i64::from(month <= 2);
+        let (hour, minute) = (second / 3600, second / 60 % 60);
+        format!(
+            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{:02}Z",
+            second % 60
+        )
+    }
+
+    #[test]
+    fn iso_at_writes_the_time_parse_iso_ms_reads() {
+        for ms in [
+            0,
+            951_782_400_000,
+            1_709_164_800_000,
+            1_791_882_000_000,
+            4_107_542_399_000,
+            now_ms() / 1000 * 1000,
+        ] {
+            assert_eq!(parse_iso_ms(&iso_at(ms)), Some(ms), "{ms}");
+        }
+        assert_eq!(iso_at(1_791_882_000_000), "2026-10-13T09:00:00Z");
     }
 
     /// Gives `app` the parts of read `ticket`'s answer, in order.
@@ -13603,23 +13819,43 @@ mod tests {
     }
 
     /// What a read of a pull request named: the project, the host, the repository, the number
-    /// and the ticket.
-    type Noted = (String, String, String, u64, u64);
+    /// and the ticket, whether it sent `pullRequests.invalidate` first and the `updatedAt` a
+    /// read that keeps the details current compares.
+    type Noted = (String, String, String, u64, u64, bool, Option<String>);
 
-    /// Replaces how `app` reads a pull request, so a read only notes what it named.
+    /// Replaces how `app` reads a pull request, so a read only notes what it named, and how it
+    /// opens T3's refresh numbers, so they never come.
     fn note_reads(app: &mut App) -> std::rc::Rc<std::cell::RefCell<Vec<Noted>>> {
         let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let noted = asked.clone();
-        app.read_pull = Box::new(move |reference: Reference, ticket| {
+        app.read_pull = Box::new(move |reference: Reference, ask: Ask| {
             noted.borrow_mut().push((
                 reference.project_id().to_string(),
                 reference.host().unwrap_or_default().to_string(),
                 reference.repository().to_string(),
                 reference.number(),
-                ticket,
+                ask.ticket,
+                ask.invalidate,
+                ask.updated,
             ));
         });
+        note_refreshes(app);
         asked
+    }
+
+    /// Replaces how `app` opens T3's refresh numbers, so each subscription only notes its
+    /// sender, which a test sends numbers on.
+    fn note_refreshes(
+        app: &mut App,
+    ) -> std::rc::Rc<std::cell::RefCell<Vec<mpsc::UnboundedSender<WatchEvent>>>> {
+        let opened = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let noted = opened.clone();
+        app.watch_refreshes = Box::new(move || {
+            let (sender, events) = mpsc::unbounded_channel();
+            noted.borrow_mut().push(sender);
+            events
+        });
+        opened
     }
 
     /// `pulls_tui` on an environment that also reads pull requests from their hosts, with
@@ -13701,6 +13937,98 @@ mod tests {
     }
 
     #[test]
+    fn the_arrows_and_a_click_show_a_links_timeline_and_the_keys_say_so() {
+        use pull_requests::Tab;
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        let _asked = note_reads(&mut app);
+        press(&mut app, KeyCode::Enter);
+        let status = |app: &mut App| {
+            let buffer = cells(app, 200, 50);
+            text_in(&buffer, Rect::new(0, 49, 200, 1))
+        };
+        // Until the host's detail came, the details have no tabs, and → leaves them be. `r`
+        // waits for the read under way.
+        press(&mut app, KeyCode::Right);
+        assert!(app.details.pulls.viewing());
+        assert_eq!(app.details.pulls.tabs(), None);
+        let shown = status(&mut app);
+        assert!(
+            shown.contains("↑↓/PgUp scroll · ← list · Esc leave"),
+            "{shown}"
+        );
+        // The frames read the real clock, so the remark and the review came 26 and 25 hours
+        // before it, and the remark's age reads the same on any day.
+        let mut activity = host_activity_sent();
+        for (at, hours) in [(0, 26), (1, 25)] {
+            let came = iso_at(now_ms() - hours * 3_600_000);
+            activity["comments"][at]["createdAt"] = json!(came);
+        }
+        let activity = pull_request::Activity::read(&activity).unwrap();
+        let parts = vec![
+            Part::Detail(Ok(Box::new(host_detail()))),
+            Part::Activity(Ok(Box::new(activity))),
+            Part::Done,
+        ];
+        hear(&mut app, 1, parts);
+        let shown = status(&mut app);
+        let hint = "↑↓/PgUp scroll · → timeline · ← list · r refresh · Esc leave";
+        assert!(shown.contains(hint), "{shown}");
+        let rows = body_after(&mut app, 200, 50);
+        // The pane is too narrow for where the link is in the list as well.
+        assert_eq!(rows[0], "← List  Summary  Timeline");
+
+        // → or `l` shows the Timeline, and ← or `h` the Summary, then the list.
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.details.pulls.tabs(), Some(Tab::Timeline));
+        let shown = status(&mut app);
+        assert!(
+            shown.contains("↑↓/PgUp scroll · ← summary · r refresh · Esc leave"),
+            "{shown}"
+        );
+        let rows = body_after(&mut app, 200, 50);
+        let text: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
+        for shown in [
+            "✓ Octocat approved",
+            "› 1 comment",
+            "1 author · 1d ago",
+            "● Pull request opened",
+        ] {
+            assert!(text.contains(&shown), "{shown:?} in {text:#?}");
+        }
+        let header = text.iter().position(|row| *row == "2 comments · 0 commits");
+        let header = header.expect("the header");
+        assert_eq!(text[header + 1..header + 3], ["1 approval", "Newest first"]);
+        assert!(!text.contains(&"Checks"), "{text:#?}");
+        for (code, tab, viewing) in [
+            (KeyCode::Char('l'), Some(Tab::Timeline), true),
+            (KeyCode::Left, Some(Tab::Summary), true),
+            (KeyCode::Char('l'), Some(Tab::Timeline), true),
+            (KeyCode::Char('h'), Some(Tab::Summary), true),
+            (KeyCode::Left, None, false),
+            (KeyCode::Enter, Some(Tab::Summary), true),
+        ] {
+            press(&mut app, code);
+            assert_eq!(app.details.pulls.tabs(), tab, "{code:?}");
+            assert_eq!(app.details.pulls.viewing(), viewing, "{code:?}");
+            assert_eq!(app.details.tab(), details::Tab::PullRequests, "{code:?}");
+        }
+
+        // A click on a tab's name shows it, and one on `← List` shows the list.
+        cells(&mut app, 200, 50);
+        let body = app.details.drawn.expect("the pane").body;
+        assert!(mouse(&mut app, CLICK, body.x + 18, body.y));
+        assert_eq!(app.details.pulls.tabs(), Some(Tab::Timeline));
+        cells(&mut app, 200, 50);
+        assert!(mouse(&mut app, CLICK, body.x + 9, body.y));
+        assert_eq!(app.details.pulls.tabs(), Some(Tab::Summary));
+        cells(&mut app, 200, 50);
+        assert!(mouse(&mut app, CLICK, body.x + 18, body.y));
+        cells(&mut app, 200, 50);
+        assert!(mouse(&mut app, CLICK, body.x + 1, body.y));
+        assert!(!app.details.pulls.viewing());
+    }
+
+    #[test]
     fn opening_a_links_details_reads_its_pull_request_from_its_host() {
         let links = vec![linked(31, "Bound titles"), linked(32, "Lineage")];
         let mut app = readable_pulls_tui(links);
@@ -13712,7 +14040,15 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         let ask = |ticket| {
             let ask = ("p", "github.com", "krishhgg/t3term", 31, ticket);
-            (ask.0.into(), ask.1.into(), ask.2.into(), ask.3, ask.4)
+            (
+                ask.0.into(),
+                ask.1.into(),
+                ask.2.into(),
+                ask.3,
+                ask.4,
+                false,
+                None,
+            )
         };
         assert_eq!(*asked.borrow(), [ask(1)]);
         let text = details_after(&mut app, 200, 50);
@@ -13786,33 +14122,34 @@ mod tests {
             "{again}"
         );
 
-        // A minute on, opening them reads again, and the first read's late answer is dropped.
+        // A minute on, opening them reads again while they show the last answers, and the
+        // first read's late answer is dropped.
         app.now += 61_000;
         press(&mut app, KeyCode::Left);
         press(&mut app, KeyCode::Enter);
         assert_eq!(asked.borrow().last(), Some(&ask(2)));
         hear(&mut app, 1, vec![Part::Detail(Ok(Box::new(host_detail())))]);
         let text = details_after(&mut app, 200, 50);
-        assert!(text.contains("Reading from github.com…"), "{text}");
+        assert!(
+            text.contains("Refreshing from github.com…") && text.contains("octocat"),
+            "{text}"
+        );
 
-        // A failed read says why, and opening the details again asks at once.
+        // A read again that fails leaves the last answers, and opening the details again asks
+        // at once.
         let failure = "Couldn't read this pull request: \u{1b}]52;c;bad\u{7}lost";
         hear(
             &mut app,
             2,
             vec![Part::Detail(Err(failure.into())), Part::Done],
         );
-        let rows = body_after(&mut app, 200, 120);
-        let text = rows
-            .iter()
-            .map(|row| row.trim())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let text = details_after(&mut app, 200, 50);
         assert!(
-            text.contains("Couldn't read this pull request: ]52;c;badlost"),
+            text.contains("Read from github.com")
+                && text.contains("octocat")
+                && !text.contains("lost"),
             "{text}"
         );
-        assert!(!text.contains("octocat"), "{text}");
         press(&mut app, KeyCode::Left);
         press(&mut app, KeyCode::Enter);
         assert_eq!(asked.borrow().last(), Some(&ask(3)));
@@ -13834,6 +14171,19 @@ mod tests {
         let text = details_after(&mut app, 200, 50);
         assert!(
             text.contains("Reading from github.com…") && !text.contains("octocat"),
+            "{text}"
+        );
+
+        // A first read that fails says why.
+        hear(&mut app, 4, vec![Part::Detail(Err(failure.into()))]);
+        let rows = body_after(&mut app, 200, 120);
+        let text = rows
+            .iter()
+            .map(|row| row.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("Couldn't read this pull request: ]52;c;badlost"),
             "{text}"
         );
 
@@ -13886,6 +14236,490 @@ mod tests {
         cells(&mut app, 200, 50);
         assert!(mouse(&mut app, CLICK, tabs[1].x, tabs[1].y));
         assert_eq!(numbers(&asked).last(), Some(&(31, 7)));
+    }
+
+    /// T3's refresh subscriptions a test opened, as `note_refreshes` notes them.
+    type Opened = std::rc::Rc<std::cell::RefCell<Vec<mpsc::UnboundedSender<WatchEvent>>>>;
+
+    /// Sends `event` on the last refresh subscription `app` opened and has `app` take it.
+    /// Says whether the details changed.
+    fn refresh_with(app: &mut App, opened: &Opened, event: WatchEvent) -> bool {
+        let sent = opened.borrow().last().map(|sender| sender.send(event));
+        assert!(matches!(sent, Some(Ok(()))), "an open subscription");
+        let event = app
+            .refreshes
+            .as_mut()
+            .and_then(|r| r.events.try_recv().ok());
+        app.on_refresh_event(event)
+    }
+
+    #[test]
+    fn t3s_refresh_numbers_read_the_open_details_again() {
+        let links = vec![linked(31, "Bound titles"), linked(32, "Lineage")];
+        let mut app = readable_pulls_tui(links);
+        let asked = note_reads(&mut app);
+        let opened = note_refreshes(&mut app);
+        let number = |number: u64| WatchEvent::Item(json!(number));
+        let reconnecting = || WatchEvent::Reconnecting {
+            reason: "closed".into(),
+            retry_in: Duration::from_secs(1),
+        };
+        let answered = |app: &mut App, ticket| {
+            let detail = Part::Detail(Ok(Box::new(host_detail())));
+            let activity = Part::Activity(Ok(Box::new(host_activity())));
+            hear(app, ticket, vec![detail, activity, Part::Done]);
+        };
+        let tickets = |asked: &std::cell::RefCell<Vec<Noted>>| {
+            asked.borrow().iter().map(|ask| ask.4).collect::<Vec<_>>()
+        };
+
+        // Nothing follows them until the details hold a read.
+        assert!(opened.borrow().is_empty());
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(opened.borrow().len(), 1);
+        answered(&mut app, 1);
+
+        // The first number is where T3 stands, and the same number again changes nothing,
+        // across a reconnection too.
+        assert!(!refresh_with(&mut app, &opened, number(5)));
+        assert!(!refresh_with(&mut app, &opened, number(5)));
+        assert!(!refresh_with(&mut app, &opened, reconnecting()));
+        assert!(!refresh_with(&mut app, &opened, number(5)));
+        assert!(!refresh_with(
+            &mut app,
+            &opened,
+            WatchEvent::Item(json!(-1))
+        ));
+        assert_eq!(tickets(&asked), [1]);
+
+        // Another number reads the details again, and they show the last answers until the
+        // new ones came.
+        assert!(refresh_with(&mut app, &opened, number(6)));
+        assert_eq!(tickets(&asked), [1, 2]);
+        let text = details_after(&mut app, 200, 50);
+        assert!(
+            text.contains("Refreshing from github.com…") && text.contains("octocat"),
+            "{text}"
+        );
+        answered(&mut app, 2);
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Read from github.com just now"), "{text}");
+
+        // A number that changed while T3 was out of reach reads them again.
+        assert!(!refresh_with(&mut app, &opened, reconnecting()));
+        assert!(refresh_with(&mut app, &opened, number(9)));
+        assert_eq!(tickets(&asked), [1, 2, 3]);
+        answered(&mut app, 3);
+
+        // With the list showing, a number marks the read, which opening the details again
+        // reads again at once.
+        press(&mut app, KeyCode::Left);
+        assert!(!refresh_with(&mut app, &opened, number(10)));
+        assert_eq!(tickets(&asked), [1, 2, 3]);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(tickets(&asked), [1, 2, 3, 4]);
+        answered(&mut app, 4);
+        assert_eq!(opened.borrow().len(), 1);
+
+        // With the pane closed, a number marks the read too, and the subscription stays.
+        // Opening the pane on the details again reads again.
+        alt(&mut app, 'b');
+        assert!(!app.details.open);
+        assert!(!refresh_with(&mut app, &opened, number(11)));
+        assert_eq!(tickets(&asked), [1, 2, 3, 4]);
+        assert!(app.refreshes.is_some());
+        alt(&mut app, 'b');
+        assert_eq!(tickets(&asked), [1, 2, 3, 4, 5]);
+        answered(&mut app, 5);
+        assert_eq!(opened.borrow().len(), 1);
+
+        // Another thread drops the read, and with it the subscription, with the pane closed too.
+        alt(&mut app, 'b');
+        assert!(!app.details.open);
+        app.open_thread(open_bound(bound("u", "q", Value::Null, Value::Null)));
+        app.read_opened_pull();
+        assert!(app.refreshes.is_none());
+        assert!(opened.borrow()[0].is_closed());
+    }
+
+    #[test]
+    fn r_reads_the_open_details_from_the_host_again() {
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        let asked = note_reads(&mut app);
+        let opened = note_refreshes(&mut app);
+        let number = |number: u64| WatchEvent::Item(json!(number));
+        let reads = |asked: &std::cell::RefCell<Vec<Noted>>| {
+            let asked = asked.borrow();
+            asked.iter().map(|ask| (ask.4, ask.5)).collect::<Vec<_>>()
+        };
+        let answered = |app: &mut App, ticket| {
+            let detail = Part::Detail(Ok(Box::new(host_detail())));
+            let activity = Part::Activity(Ok(Box::new(host_activity())));
+            hear(app, ticket, vec![detail, activity, Part::Done]);
+        };
+
+        // On the list, and while the first read is under way, `r` asks for nothing.
+        press(&mut app, KeyCode::Char('r'));
+        assert!(asked.borrow().is_empty());
+        press(&mut app, KeyCode::Enter);
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(reads(&asked), [(1, false)]);
+        assert!(!refresh_with(&mut app, &opened, number(5)));
+        answered(&mut app, 1);
+
+        // Once it is done, `r` reads from the host again, and the number that moves doesn't
+        // read once more.
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(reads(&asked), [(1, false), (2, true)]);
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Refreshing from github.com…"), "{text}");
+        assert!(!refresh_with(&mut app, &opened, number(6)));
+        answered(&mut app, 2);
+        assert_eq!(reads(&asked).len(), 2);
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Read from github.com just now"), "{text}");
+
+        // From the Timeline too. Ctrl+R is not `r`.
+        press(&mut app, KeyCode::Right);
+        let ctrl_r = KeyEvent::new(KeyCode::Char('r'), KeyModifiers::CONTROL);
+        app.on_terminal_event(Event::Key(ctrl_r));
+        assert_eq!(reads(&asked).len(), 2);
+        press(&mut app, KeyCode::Char('r'));
+        assert_eq!(reads(&asked), [(1, false), (2, true), (3, true)]);
+    }
+
+    #[test]
+    fn a_read_that_keeps_details_current_reads_the_conversation_once_the_detail_changed() {
+        let detail = Ok(Box::new(host_detail()));
+        assert!(!changed_since(&detail, Some("2026-10-13T11:00:00Z")));
+        assert!(changed_since(&detail, Some("2026-10-13T10:00:00Z")));
+        assert!(changed_since(&detail, None));
+        assert!(!changed_since(
+            &Err("timed out".into()),
+            Some("2026-10-13T10:00:00Z")
+        ));
+    }
+
+    /// The reader against a fake T3 on 127.0.0.1. A read that keeps the details current asks
+    /// for the conversation only once a detail came whose `updatedAt` differs from the one
+    /// shown, and none after a detail that stayed the same or failed. A person's refresh sends
+    /// `pullRequests.invalidate`, then asks for both at once. Each read ends with
+    /// `Part::Done`.
+    #[tokio::test]
+    async fn a_read_asks_t3_for_the_conversation_as_its_ask_says() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        type Socket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+        /// The next request t3term sent, past its pings, or None once `wait` passed.
+        async fn request(socket: &mut Socket, wait: Duration) -> Option<Value> {
+            let next = async {
+                loop {
+                    let frame = socket.next().await.expect("an open socket").unwrap();
+                    if let Message::Text(text) = frame {
+                        let frame: Value = serde_json::from_str(&text).unwrap();
+                        if frame["_tag"] == "Request" {
+                            return frame;
+                        }
+                    }
+                }
+            };
+            tokio::time::timeout(wait, next).await.ok()
+        }
+
+        async fn reply(socket: &mut Socket, request: &Value, exit: Value) {
+            let reply = json!({"_tag": "Exit", "requestId": request["id"], "exit": exit});
+            let reply = Message::Text(reply.to_string().into());
+            socket.send(reply).await.unwrap();
+        }
+
+        /// Runs a read beside the fake T3's side of it, for five seconds at most.
+        async fn beside<A, B>(
+            read: impl Future<Output = A>,
+            server: impl Future<Output = B>,
+        ) -> (A, B) {
+            let both = futures_util::future::join(read, server);
+            let limit = Duration::from_secs(5);
+            tokio::time::timeout(limit, both)
+                .await
+                .expect("a read within five seconds")
+        }
+
+        /// What a read gave its caller, in order.
+        async fn parts(client: &Client, reference: &Reference, ask: Ask) -> Vec<&'static str> {
+            let parts = std::cell::RefCell::new(Vec::new());
+            read_pull_request(client, reference, &ask, |part| {
+                parts.borrow_mut().push(match part {
+                    Part::Detail(Ok(_)) => "detail",
+                    Part::Detail(Err(_)) => "no detail",
+                    Part::Activity(Ok(_)) => "activity",
+                    Part::Activity(Err(_)) => "no activity",
+                    Part::Done => "done",
+                });
+            })
+            .await;
+            parts.into_inner()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let accepting = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        };
+        let (rpc, mut socket) = tokio::join!(crate::rpc::RpcClient::connect_url(&url), accepting);
+        let client = Client::over(rpc.unwrap());
+        let reference = Reference::new("p", Some("github.com"), "krishhgg/t3term", 31).unwrap();
+        let ask = |invalidate: bool, updated: Option<&str>| Ask {
+            ticket: 1,
+            host: "github.com".into(),
+            repository: "krishhgg/t3term".into(),
+            number: 31,
+            invalidate,
+            updated: updated.map(str::to_string),
+        };
+        let success = |value: Value| json!({"_tag": "Success", "value": value});
+        let soon = Duration::from_secs(5);
+        let shown = Some("2026-10-13T11:00:00Z");
+
+        // A detail that stayed the same: the detail alone. A request for the conversation
+        // would come before the next read's.
+        let server = async {
+            let asked = request(&mut socket, soon).await.expect("the detail");
+            assert_eq!(asked["tag"], "pullRequests.detail");
+            reply(&mut socket, &asked, success(host_detail_sent())).await;
+        };
+        let (read, ()) = beside(parts(&client, &reference, ask(false, shown)), server).await;
+        assert_eq!(read, ["detail", "done"]);
+
+        // A detail that changed: the conversation, asked for once the detail came.
+        let server = async {
+            let asked = request(&mut socket, soon).await.expect("the detail");
+            assert_eq!(asked["tag"], "pullRequests.detail");
+            let early = request(&mut socket, Duration::from_millis(200)).await;
+            assert_eq!(early, None);
+            reply(&mut socket, &asked, success(host_detail_sent())).await;
+            let asked = request(&mut socket, soon).await.expect("the conversation");
+            assert_eq!(asked["tag"], "pullRequests.activity");
+            reply(&mut socket, &asked, success(host_activity_sent())).await;
+        };
+        let older = Some("2026-10-13T10:00:00Z");
+        let (read, ()) = beside(parts(&client, &reference, ask(false, older)), server).await;
+        assert_eq!(read, ["detail", "activity", "done"]);
+
+        // A detail that failed: nothing more.
+        let not_found = json!({"_tag": "Failure", "cause": [{"_tag": "Fail", "error": {
+            "_tag": "PullRequestOperationError", "operation": "detail",
+            "detail": "Pull request #31 was not found.", "reason": "not-found"}}]});
+        let server = async {
+            let asked = request(&mut socket, soon).await.expect("the detail");
+            assert_eq!(asked["tag"], "pullRequests.detail");
+            reply(&mut socket, &asked, not_found).await;
+        };
+        let (read, ()) = beside(parts(&client, &reference, ask(false, shown)), server).await;
+        assert_eq!(read, ["no detail", "done"]);
+
+        // A person's refresh: the invalidate, then both at once.
+        let server = async {
+            let asked = request(&mut socket, soon).await.expect("the invalidate");
+            assert_eq!(asked["tag"], "pullRequests.invalidate");
+            reply(&mut socket, &asked, success(Value::Null)).await;
+            let first = request(&mut socket, soon).await.expect("a read");
+            let second = request(&mut socket, soon).await.expect("the other read");
+            let mut tags = [first["tag"].as_str(), second["tag"].as_str()];
+            tags.sort();
+            assert_eq!(
+                tags,
+                [Some("pullRequests.activity"), Some("pullRequests.detail")]
+            );
+            for asked in [first, second] {
+                let answer = match asked["tag"].as_str() {
+                    Some("pullRequests.detail") => host_detail_sent(),
+                    _ => host_activity_sent(),
+                };
+                reply(&mut socket, &asked, success(answer)).await;
+            }
+        };
+        let (mut read, ()) = beside(parts(&client, &reference, ask(true, None)), server).await;
+        assert_eq!(read.pop(), Some("done"));
+        read.sort();
+        assert_eq!(read, ["activity", "detail"]);
+        assert_eq!(request(&mut socket, Duration::from_millis(200)).await, None);
+    }
+
+    #[test]
+    fn the_open_details_read_their_detail_again_while_you_use_t3term() {
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        let asked = note_reads(&mut app);
+        let reads = |asked: &std::cell::RefCell<Vec<Noted>>| {
+            let asked = asked.borrow();
+            asked
+                .iter()
+                .map(|ask| (ask.4, ask.6.clone()))
+                .collect::<Vec<_>>()
+        };
+        let shown = Some("2026-10-13T11:00:00Z".to_string());
+        // The key and the read it asks for each read the clock, which can tick between them.
+        // A time ahead of the clock stops it for both.
+        app.now = now_ms() + 60 * 60_000;
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.live_at(), None);
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        let activity = Part::Activity(Ok(Box::new(host_activity())));
+        hear(&mut app, 1, vec![detail, activity, Part::Done]);
+
+        // Five minutes after the read was asked for, while keys came, the detail is read again
+        // with the `updatedAt` the details show.
+        let due = app
+            .live_at()
+            .expect("a read that keeps the details current");
+        assert_eq!(due - app.input_at, 5 * 60_000);
+        app.now = due - 1;
+        app.read_opened_pull();
+        assert_eq!(reads(&asked).len(), 1);
+        app.now = due;
+        app.read_opened_pull();
+        assert_eq!(reads(&asked), [(1, None), (2, shown.clone())]);
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        hear(&mut app, 2, vec![detail, Part::Done]);
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Read from github.com just now"), "{text}");
+
+        // With no key since the Enter, ten minutes before the next one, the details wait for
+        // a key.
+        let due = app.details.pulls.live_at().expect("the next read");
+        assert!(due - app.input_at >= pull_requests::IDLE);
+        assert_eq!(app.live_at(), None);
+        app.now = due + 60_000;
+        app.read_opened_pull();
+        assert_eq!(reads(&asked).len(), 2);
+        press(&mut app, KeyCode::Down);
+        let three = [(1, None), (2, shown.clone()), (3, shown.clone())];
+        assert_eq!(reads(&asked), three);
+        assert_eq!(app.live_at(), None);
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        hear(&mut app, 3, vec![detail, Part::Done]);
+        assert!(app.live_at().is_some());
+
+        // A key after six minutes without one reads at once, though five minutes haven't
+        // passed since the last read, as after a refresh number that read while you were away.
+        // A resize isn't you coming back.
+        app.input_at = app.now - pull_requests::IDLE;
+        assert_eq!(app.live_at(), None);
+        app.now += 30_000;
+        app.on_terminal_event(Event::Resize(200, 50));
+        assert_eq!(reads(&asked).len(), 3);
+        assert_eq!(app.live_at(), None);
+        // A mouse move counts, and draws the read it asked for.
+        assert!(mouse(&mut app, MouseEventKind::Moved, 1, 1));
+        assert_eq!(reads(&asked).len(), 4);
+        assert_eq!(reads(&asked)[3], (4, shown));
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        hear(&mut app, 4, vec![detail, Part::Done]);
+        assert!(app.live_at().is_some());
+        // Later keys while you use t3term wait for the five minutes.
+        app.now += 30_000;
+        press(&mut app, KeyCode::Up);
+        assert_eq!(reads(&asked).len(), 4);
+
+        // A Mac that slept through the five minutes and woke twenty minutes later reads nothing
+        // until a key, as the time since the last one counts from now.
+        let due = app.live_at().expect("the next read");
+        app.now = due + 20 * 60_000;
+        assert_eq!(app.live_at(), None);
+        app.read_opened_pull();
+        assert_eq!(reads(&asked).len(), 4);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(reads(&asked).len(), 5);
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        hear(&mut app, 5, vec![detail, Part::Done]);
+
+        // Nothing is due once the environment no longer reads pull requests, so the event loop
+        // doesn't wait on a time that passed.
+        let capabilities = json!({"threadPullRequests": true});
+        app.config = Some(json!({"environment": {"capabilities": capabilities}}));
+        assert!(app.details.pulls.live_at().is_some());
+        assert_eq!(app.live_at(), None);
+    }
+
+    #[test]
+    fn the_terminal_gaining_focus_reads_the_open_details_again_while_you_use_t3term() {
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        let asked = note_reads(&mut app);
+        let reads = |asked: &std::cell::RefCell<Vec<Noted>>| {
+            let asked = asked.borrow();
+            asked
+                .iter()
+                .map(|ask| (ask.4, ask.6.clone()))
+                .collect::<Vec<_>>()
+        };
+        let shown = Some("2026-10-13T11:00:00Z".to_string());
+        press(&mut app, KeyCode::Enter);
+        let came = now_ms().max(app.now);
+        app.now = came;
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        let activity = Part::Activity(Ok(Box::new(host_activity())));
+        hear(&mut app, 1, vec![detail, activity, Part::Done]);
+
+        // Within ten seconds of the detail, focus reads nothing, and losing it never does.
+        app.now = came + 9_000;
+        assert!(!app.on_terminal_event(Event::FocusGained));
+        app.now = came + 20_000;
+        assert!(!app.on_terminal_event(Event::FocusLost));
+        assert_eq!(reads(&asked).len(), 1);
+
+        // Later, focus reads the detail again, and draws that it does.
+        assert!(app.on_terminal_event(Event::FocusGained));
+        assert_eq!(reads(&asked), [(1, None), (2, shown)]);
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Refreshing from github.com…"), "{text}");
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        hear(&mut app, 2, vec![detail, Part::Done]);
+
+        // Focus after six minutes without input waits for the next input, as it isn't input.
+        app.now = came + 40_000;
+        let input = app.now - pull_requests::IDLE;
+        app.input_at = input;
+        assert!(!app.on_terminal_event(Event::FocusGained));
+        assert_eq!(app.input_at, input);
+        assert_eq!(reads(&asked).len(), 2);
+        assert!(mouse(&mut app, MouseEventKind::Moved, 1, 1));
+        assert_eq!(reads(&asked).len(), 3);
+    }
+
+    #[test]
+    fn t3_ending_the_refresh_numbers_leaves_reads_as_they_were() {
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        let asked = note_reads(&mut app);
+        let opened = note_refreshes(&mut app);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(opened.borrow().len(), 1);
+        assert!(!refresh_with(&mut app, &opened, WatchEvent::Item(json!(3))));
+
+        // A refusal ends the subscription for the session, and reads go on without it.
+        let refused = WatchEvent::Failed("Not allowed".into());
+        assert!(!refresh_with(&mut app, &opened, refused));
+        assert!(app.refreshes.is_none());
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        let activity = Part::Activity(Ok(Box::new(host_activity())));
+        hear(&mut app, 1, vec![detail, activity, Part::Done]);
+        app.now += 61_000;
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(asked.borrow().len(), 2);
+        assert_eq!(opened.borrow().len(), 1);
+
+        // So does a subscription that ended.
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        note_reads(&mut app);
+        let opened = note_refreshes(&mut app);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.refreshes.is_some());
+        assert!(!app.on_refresh_event(None));
+        assert!(app.refreshes.is_none() && app.refreshes_refused);
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(opened.borrow().len(), 1);
     }
 
     #[test]
@@ -14846,19 +15680,43 @@ mod tests {
             press(&mut app, KeyCode::Enter);
             app
         };
-        // And one whose host answered, with its description and a remark laid out.
+        // And one whose host answered, with its description and a remark laid out, the remark
+        // with your reaction in the primary color and another's in the muted one.
         let pull_answered = || {
             let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
             note_reads(&mut app);
             press(&mut app, KeyCode::Enter);
+            let mut sent = host_activity_sent();
+            sent["comments"][0]["reactions"] = json!([
+                {"content": "heart", "count": 2, "actors": [], "viewerHasReacted": true},
+                {"content": "laugh", "count": 1, "actors": [], "viewerHasReacted": false}
+            ]);
             let parts = vec![
                 Part::Detail(Ok(Box::new(host_detail()))),
-                Part::Activity(Ok(Box::new(host_activity()))),
+                Part::Activity(Ok(Box::new(pull_request::Activity::read(&sent).unwrap()))),
                 Part::Done,
             ];
             hear(&mut app, 1, parts);
             let shown = text_in(&cells(&mut app, 200, 50), Rect::new(0, 0, 200, 50));
             assert!(shown.contains("Second paragraph.") && shown.contains("Looks close."));
+            assert!(shown.contains("❤ 2"), "{shown}");
+            app
+        };
+        // And its Timeline, with the verdict on a row of its own and the run with the remark open.
+        let pull_timeline = || {
+            let mut app = pull_answered();
+            press(&mut app, KeyCode::Right);
+            cells(&mut app, 200, 50);
+            // The run that holds the remark opens: Newest first, then the run.
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            let shown = text_in(&cells(&mut app, 200, 50), Rect::new(0, 0, 200, 50));
+            assert!(
+                shown.contains("Newest first") && shown.contains("Looks close."),
+                "{shown}"
+            );
+            assert!(shown.contains("❤ 2"), "{shown}");
             app
         };
         let scenes = [
@@ -14866,6 +15724,7 @@ mod tests {
             ("crowded with details", crowded_details(), 200, 50),
             ("a pull request's details", pull_details(), 120, 40),
             ("a pull request's host answer", pull_answered(), 200, 50),
+            ("a pull request's Timeline", pull_timeline(), 200, 50),
         ];
         for (scene, mut app, width, height) in scenes {
             let composer = app.composer.text();
@@ -14900,8 +15759,8 @@ mod tests {
                 AppearanceMode::Dark
             );
         }
-        // Only the turn to System read anything.
-        assert_eq!(reads(&runtime), 4);
+        // Only the turn to System read anything, once a scene.
+        assert_eq!(reads(&runtime), 5);
     }
 
     #[test]

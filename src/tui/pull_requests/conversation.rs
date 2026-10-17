@@ -14,6 +14,9 @@
 //! the bots' remarks, the finished ones and each finished one. A finished remark shows on one
 //! row until it opens. `Shown` keeps what the reader opened until the details open again.
 //!
+//! The same remarks, with the commits and the pull request's opening, merge or close, make up
+//! the Timeline, which `timeline` lays out.
+//!
 //! What shows is cleaned and bounded once, when the answer arrives. Each remark's Markdown is
 //! laid out once for each width, and only while it shows.
 
@@ -28,9 +31,16 @@ use super::super::markdown::{self, Styles};
 use super::super::setup::bounded;
 use super::super::theme::{Theme, age, parse_iso_ms};
 use super::super::{clip, row};
-use super::{Answer, NAME, grouped, whole};
-use crate::pull_request::{self, Actor, Comment, Commit, ReviewThread};
+use super::{Answer, NAME, flowed, grouped, whole};
+use crate::pull_request::{
+    self, Actor, Comment, CommentKind, Commit, Reaction, ReactionContent, ReviewThread,
+};
 use crate::transcript::without_controls;
+
+mod timeline;
+
+use timeline::Timeline;
+pub(super) use timeline::{Lifecycle, section as timeline_section};
 
 /// How many active remarks show, as the desktop's first page of the conversation holds
 /// (`COMMENT_PAGE`).
@@ -47,7 +57,8 @@ const PREVIEW: usize = 1024;
 
 /// What the reader opened of a pull request's conversation, which the desktop keeps for one
 /// pull request at a time: the order, how many active and bots' remarks show, and which
-/// groups and finished remarks are open.
+/// groups and finished remarks are open. Then the Timeline's own order and which of its runs
+/// of remarks are open.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Shown {
     oldest_first: bool,
@@ -59,6 +70,9 @@ pub(super) struct Shown {
     finished_open: bool,
     /// The finished remarks open, by id.
     opened: HashSet<String>,
+    timeline_oldest_first: bool,
+    /// The Timeline's runs of remarks that are open, by `Timeline::key`.
+    runs_open: HashSet<String>,
 }
 
 impl Default for Shown {
@@ -70,6 +84,8 @@ impl Default for Shown {
             bots: COMMENT_PAGE,
             finished_open: false,
             opened: HashSet::new(),
+            timeline_oldest_first: false,
+            runs_open: HashSet::new(),
         }
     }
 }
@@ -92,6 +108,30 @@ impl Shown {
                     self.opened.insert(remark.id.clone());
                 }
             }
+            Control::TimelineOrder => self.timeline_oldest_first = !self.timeline_oldest_first,
+            Control::Run(at) => {
+                let timeline = conversation.timeline.as_ref();
+                if let Some(key) = timeline.and_then(|timeline| timeline.key(at))
+                    && !self.runs_open.remove(key)
+                {
+                    self.runs_open.insert(key.to_string());
+                }
+            }
+        }
+    }
+
+    /// Forgets the finished remarks and the Timeline's runs that were open and that
+    /// `conversation` no longer has, so what is kept stays within its size however often the
+    /// details read it again.
+    pub(super) fn prune(&mut self, conversation: &Conversation) {
+        let finished: HashSet<&str> = conversation
+            .finished
+            .iter()
+            .map(|remark| remark.id.as_str())
+            .collect();
+        self.opened.retain(|id| finished.contains(id.as_str()));
+        if let Some(timeline) = conversation.timeline.as_ref() {
+            self.runs_open.retain(|key| timeline.has_key(key));
         }
     }
 }
@@ -120,6 +160,11 @@ pub(super) enum Control {
     Finished,
     /// Opens or closes one finished remark, by its place among them as T3 sent them.
     Remark(usize),
+    /// The Timeline's switch between newest and oldest first.
+    TimelineOrder,
+    /// Opens or closes a run of remarks on the Timeline, by its place among the runs newest
+    /// first.
+    Run(usize),
 }
 
 impl Control {
@@ -238,6 +283,8 @@ enum Said {
 /// One remark, cleaned and bounded.
 struct Remark {
     id: String,
+    /// Whether it is a submitted review rather than a comment.
+    review: bool,
     /// The author's login, or `ghost` for a deleted account.
     author: String,
     /// When it was written, in milliseconds. None where the host's time doesn't parse.
@@ -257,8 +304,46 @@ struct Remark {
     resolved: bool,
     /// A finished remark's text on one row, as the desktop shows it until the remark opens.
     preview: String,
+    /// Its reactions, in the order T3 sent them.
+    reactions: Vec<Pill>,
     /// The text laid out at one width.
     laid_out: Option<(usize, Vec<Line<'static>>)>,
+}
+
+/// A reaction on a remark as the desktop's `PullRequestReactionBar` shows it: its emoji and how
+/// many people reacted with it.
+struct Pill {
+    text: String,
+    /// The reader reacted with it, which the desktop marks out.
+    mine: bool,
+}
+
+impl Pill {
+    fn of(reaction: &Reaction) -> Pill {
+        Pill {
+            text: format!("{} {}", emoji(reaction.content), reaction.count),
+            mine: reaction.viewer_reacted,
+        }
+    }
+}
+
+/// A reaction's emoji, as the desktop's `REACTION_EMOJI` gives them
+/// (pullRequestReactions.logic.ts), but for the heart. The desktop's ❤️ is ❤ and U+FE0F, which
+/// some terminals draw a column wide and others two, and ratatui 0.30 writes the cell after it
+/// without moving the cursor. Where the terminal draws it two wide, the rest of the row then
+/// lands a column to the right. Without the selector, each one's width is its East Asian Width,
+/// as unicode-width counts it: one for the heart and two for the other seven.
+fn emoji(content: ReactionContent) -> &'static str {
+    match content {
+        ReactionContent::ThumbsUp => "👍",
+        ReactionContent::ThumbsDown => "👎",
+        ReactionContent::Laugh => "😄",
+        ReactionContent::Hooray => "🎉",
+        ReactionContent::Confused => "😕",
+        ReactionContent::Heart => "❤",
+        ReactionContent::Rocket => "🚀",
+        ReactionContent::Eyes => "👀",
+    }
 }
 
 /// What a group of remarks says of them while it is closed, as the desktop's `CommentGroup`
@@ -331,6 +416,26 @@ pub(super) struct Conversation {
     verdicts: Vec<Verdict>,
     /// T3 sent more remarks, review threads, commits or reviewers than t3term keeps.
     cut: bool,
+    /// Among them remarks or commits, so a reviewer's last verdict, or a commit after it, may
+    /// be missing.
+    verdicts_cut: bool,
+    /// Where each remark went among the groups above, in the order T3 sent them.
+    places: Vec<Place>,
+    /// The commits, in the order T3 sent them.
+    commits: Vec<timeline::Commit>,
+    /// The author's login, where the host gave it with the conversation. It takes the place of
+    /// the detail's.
+    author: Option<String>,
+    /// The Timeline, once the pull request's detail came too.
+    timeline: Option<Timeline>,
+}
+
+/// Where a remark is among a conversation's groups.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Place {
+    Active(usize),
+    Bot(usize),
+    Finished(usize),
 }
 
 impl Conversation {
@@ -343,15 +448,19 @@ impl Conversation {
             .flat_map(|thread| thread.comments.iter().map(move |c| (c.id.as_str(), thread)))
             .collect();
         let (mut active, mut bots, mut finished) = (Vec::new(), Vec::new(), Vec::new());
+        let mut places = Vec::with_capacity(activity.comments.len());
         for comment in &activity.comments {
             let thread = threads.get(comment.id.as_str()).copied();
             let outcome = comment.review_state.as_deref().and_then(Outcome::of);
             let author = comment.author.as_ref();
             if thread.is_some_and(|thread| thread.resolved) || outcome == Some(Outcome::Dismissed) {
+                places.push(Place::Finished(finished.len()));
                 finished.push((comment, thread));
             } else if author.is_some_and(|actor| actor.is_bot || actor.login.ends_with("[bot]")) {
+                places.push(Place::Bot(bots.len()));
                 bots.push((comment, thread));
             } else {
+                places.push(Place::Active(active.len()));
                 active.push((comment, thread));
             }
         }
@@ -377,7 +486,64 @@ impl Conversation {
             reviewers,
             verdicts: verdicts(&activity.comments, &activity.commits),
             cut: activity.cut,
+            verdicts_cut: activity.verdicts_cut,
+            places,
+            commits: activity.commits.iter().map(timeline::Commit::of).collect(),
+            author: activity
+                .author
+                .as_ref()
+                .map(|actor| bounded(&actor.login, NAME)),
+            timeline: None,
         }
+    }
+
+    /// Lays the Timeline out from the pull request's `lifecycle`, from its detail, unless it
+    /// already is. A read again that brings a new detail and keeps this conversation, as when
+    /// the conversation's read failed, lays it out again with the new opening and ending.
+    pub(super) fn follow(&mut self, lifecycle: &Lifecycle) {
+        let follows = self.timeline.as_ref();
+        if !follows.is_some_and(|timeline| timeline.follows(lifecycle)) {
+            self.timeline = Some(Timeline::of(lifecycle, self));
+        }
+    }
+
+    fn remark(&self, place: Place) -> &Remark {
+        match place {
+            Place::Active(at) => &self.active[at],
+            Place::Bot(at) => &self.bots[at],
+            Place::Finished(at) => &self.finished[at],
+        }
+    }
+
+    fn remark_mut(&mut self, place: Place) -> &mut Remark {
+        match place {
+            Place::Active(at) => &mut self.active[at],
+            Place::Bot(at) => &mut self.bots[at],
+            Place::Finished(at) => &mut self.finished[at],
+        }
+    }
+
+    /// Lays the text of each remark the Timeline shows out at `width`, unless it already is.
+    pub(super) fn lay_out_timeline(&mut self, width: usize, theme: &Theme, shown: &Shown) {
+        let Some(timeline) = self.timeline.as_ref() else {
+            return;
+        };
+        for place in timeline.places_shown(shown) {
+            self.remark_mut(place).lay_out(width, theme);
+        }
+    }
+
+    /// How many reviewers' last verdicts approve changes the branch still has, as the
+    /// desktop's header counts them. None are counted from a conversation T3 read only the
+    /// recent end of, since an approval older than that would be missing. Nor are any when
+    /// t3term cut the remarks or commits short, since a later verdict or commit could take an
+    /// approval it kept back.
+    fn approvals(&self) -> usize {
+        if self.truncated || self.verdicts_cut {
+            return 0;
+        }
+        let approves = |verdict: &&Verdict| verdict.outcome == Outcome::Approved && !verdict.stale;
+        self.verdicts.iter().filter(approves).count()
     }
 
     /// Lays the text of each remark that shows out at `width`, unless it already is.
@@ -423,6 +589,8 @@ impl Conversation {
             }
             Control::Finished => !self.finished.is_empty(),
             Control::Remark(at) => shown.finished_open && at < self.finished.len(),
+            Control::TimelineOrder => self.timeline.is_some(),
+            Control::Run(at) => self.timeline.as_ref().is_some_and(|t| at < t.runs()),
         }
     }
 
@@ -450,6 +618,12 @@ impl Conversation {
                     .get(at)
                     .is_some_and(|remark| shown.opened.contains(&remark.id));
                 toggle(open, "comment")
+            }
+            Control::TimelineOrder if shown.timeline_oldest_first => "newest first".to_string(),
+            Control::TimelineOrder => "oldest first".to_string(),
+            Control::Run(at) => {
+                let open = self.timeline.as_ref().is_some_and(|t| t.open(at, shown));
+                toggle(open, "comments")
             }
         }
     }
@@ -486,6 +660,7 @@ impl Remark {
         };
         Remark {
             id: comment.id.clone(),
+            review: comment.kind == CommentKind::Review,
             author: comment
                 .author
                 .as_ref()
@@ -498,6 +673,7 @@ impl Remark {
             body_cut: comment.body.cut,
             resolved: thread.is_some_and(|thread| thread.resolved),
             preview,
+            reactions: comment.reactions.iter().flatten().map(Pill::of).collect(),
             laid_out: None,
         }
     }
@@ -517,7 +693,7 @@ impl Remark {
         self.laid_out = Some((width, lines));
     }
 
-    /// Its rows: its header, the file and line it is on, and its text.
+    /// Its rows: its header, its reactions, the file and line it is on, and its text.
     fn lines(&self, width: usize, now: i64, theme: &Theme) -> Vec<Line<'static>> {
         let muted = Style::new().fg(theme.muted);
         let said = match &self.said {
@@ -529,15 +705,16 @@ impl Remark {
             None => None,
         };
         let mut lines = self.header(said, width, now, theme);
+        lines.extend(self.reacted(width, theme));
         lines.extend(self.place(width, theme));
         lines.extend(self.text(width, theme));
         lines
     }
 
     /// A finished remark's rows, as the desktop's `CollapsedComment` shows it: its header with
-    /// why it is finished, the file and line it is on, then its text on one row while it is
-    /// closed and its whole text once it opens. The second number is how many of the rows
-    /// open and close it: all of them while it is closed, and its header once it opens.
+    /// why it is finished, its reactions, the file and line it is on, then its text on one row
+    /// while it is closed and its whole text once it opens. The second number is how many of the
+    /// rows open and close it: all of them while it is closed, and its header once it opens.
     fn finished_lines(
         &self,
         open: bool,
@@ -554,6 +731,7 @@ impl Remark {
         let chevron = if open { "⌄" } else { "›" };
         let mut lines = self.header(Some((format!("{chevron} {why}"), muted)), width, now, theme);
         let header = lines.len();
+        lines.extend(self.reacted(width, theme));
         lines.extend(self.place(width, theme));
         if open {
             lines.extend(self.text(width, theme));
@@ -582,16 +760,41 @@ impl Remark {
         fitted(left, at, width)
     }
 
+    /// Its reactions two columns apart, on as many rows as they take, with the reader's own in
+    /// the primary color, as the desktop's reaction bar marks them out. No row where it has
+    /// none, as the desktop hides an empty bar where the reader can't react, and t3term reacts
+    /// to nothing.
+    fn reacted(&self, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+        let pills = self
+            .reactions
+            .iter()
+            .map(|pill| {
+                let color = if pill.mine {
+                    theme.primary
+                } else {
+                    theme.muted
+                };
+                Span::styled(pill.text.clone(), Style::new().fg(color))
+            })
+            .collect();
+        flowed(pills, "  ", width, theme)
+    }
+
     /// The file and line it is on, and whether that line is still in the diff.
     fn place(&self, width: usize, theme: &Theme) -> Vec<Line<'static>> {
-        let Some(location) = &self.location else {
-            return Vec::new();
-        };
-        let text = match self.outdated {
+        match self.location() {
+            Some(text) => whole(&text, width, Style::new().fg(theme.muted)),
+            None => Vec::new(),
+        }
+    }
+
+    /// `src/tui/mod.rs:42 · Outdated`, or None where it is on no file.
+    fn location(&self) -> Option<String> {
+        let location = self.location.as_ref()?;
+        Some(match self.outdated {
             true => format!("{location} · Outdated"),
             false => location.clone(),
-        };
-        whole(&text, width, Style::new().fg(theme.muted))
+        })
     }
 
     /// Its text as laid out at `width`, and a note where T3 cut it short.

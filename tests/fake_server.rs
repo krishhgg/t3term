@@ -16,7 +16,10 @@ use tokio_tungstenite::tungstenite::Message;
 use tokio_tungstenite::tungstenite::protocol::frame::Frame;
 use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
 
-use t3term::client::{WatchEvent, spawn_config_watch, spawn_watch, spawn_worktree_setup_watch};
+use t3term::client::{
+    WatchEvent, spawn_config_watch, spawn_pull_request_refresh_watch, spawn_watch,
+    spawn_worktree_setup_watch,
+};
 use t3term::projection::{Applied, ThreadState, apply_config};
 use t3term::pull_request::{self, PullRequestError, Reference, State, Unavailable};
 use t3term::rpc::{BoundedChunk, BoundedStream, RpcClient, RpcError, StreamLimits};
@@ -2383,4 +2386,145 @@ async fn a_binary_frame_that_is_not_utf8_ends_every_call_and_stream_with_a_proto
         let reason = "t3term couldn't read a binary frame as UTF-8 (";
         ends_every_request_with_a_protocol_error(&frame, binary, reason).await;
     }
+}
+
+/// Reads a refresh subscription's request and returns its id. The payload is always empty, as
+/// `pullRequests.subscribeRefreshes` takes nothing, and a reconnection asks the same.
+async fn refresh_request(socket: &mut Socket) -> Value {
+    let request = recv(socket).await;
+    let id = request["id"].clone();
+    assert!(id.is_string(), "{request}");
+    let expected = json!({"_tag": "Request", "id": id, "tag": "pullRequests.subscribeRefreshes",
+        "payload": {}, "headers": []});
+    assert_eq!(request, expected);
+    id
+}
+
+#[tokio::test]
+async fn refresh_watch_passes_on_t3s_numbers_and_asks_the_same_again() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+
+    let server = tokio::spawn(async move {
+        // The number T3 stands at, then two more in one chunk, before the socket drops.
+        let mut socket = accept(&listener).await;
+        let id = refresh_request(&mut socket).await;
+        for values in [json!([3]), json!([4, 5])] {
+            send(&mut socket, chunk(&id, values)).await;
+            assert_eq!(recv(&mut socket).await, ack(&id));
+        }
+        drop(socket);
+        // Something other than a number, and the socket drops again.
+        let mut socket = accept(&listener).await;
+        let id = refresh_request(&mut socket).await;
+        send(&mut socket, chunk(&id, json!(["5"]))).await;
+        assert_eq!(recv(&mut socket).await, ack(&id));
+        drop(socket);
+        // The number T3 stands at after the restart, until the receiver goes.
+        let mut socket = accept(&listener).await;
+        let id = refresh_request(&mut socket).await;
+        send(&mut socket, chunk(&id, json!([7]))).await;
+        assert_eq!(recv(&mut socket).await, ack(&id));
+        assert_eq!(recv(&mut socket).await, interrupt(&id));
+    });
+
+    let mut events = spawn_pull_request_refresh_watch(dial(url));
+    let mut heard = Vec::new();
+    let mut waits = Vec::new();
+    loop {
+        match next_event(&mut events).await {
+            Some(WatchEvent::Reconnecting { retry_in, .. }) => waits.push(retry_in.as_millis()),
+            Some(WatchEvent::Item(item)) => {
+                let last = item == json!(7);
+                heard.push(item);
+                if last {
+                    break;
+                }
+            }
+            other => panic!("unexpected {other:?}"),
+        }
+    }
+    // Each item comes as T3 sent it. A number brings the wait back to the shortest, and a
+    // subscription that sends anything else doubles it.
+    assert_eq!(heard, [json!(3), json!(4), json!(5), json!("5"), json!(7)]);
+    assert_eq!(waits, [250, 500]);
+    assert_eq!(pull_request::refresh_revision(&json!(5)), Some(5));
+    assert_eq!(pull_request::refresh_revision(&json!("5")), None);
+    assert_eq!(pull_request::refresh_revision(&json!(-1)), None);
+    assert_eq!(pull_request::refresh_revision(&json!(1.5)), None);
+    assert_eq!(
+        pull_request::refresh_revision(&json!(9_007_199_254_740_992u64)),
+        None
+    );
+    drop(events);
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the server saw the interrupt")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_refresh_subscription_t3_ends_ends_the_watch_without_a_retry() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+
+    let server = tokio::spawn(async move {
+        let mut socket = accept(&listener).await;
+        let id = refresh_request(&mut socket).await;
+        send(&mut socket, chunk(&id, json!([3]))).await;
+        assert_eq!(recv(&mut socket).await, ack(&id));
+        let end = json!({"_tag": "Exit", "requestId": id, "exit": success(Value::Null)});
+        send(&mut socket, end).await;
+        // A retry would connect within the shortest wait, 250 ms.
+        let again = tokio::time::timeout(Duration::from_secs(1), listener.accept()).await;
+        assert!(again.is_err(), "it subscribed again");
+    });
+
+    let mut events = spawn_pull_request_refresh_watch(dial(url));
+    match next_event(&mut events).await {
+        Some(WatchEvent::Item(item)) => assert_eq!(item, json!(3)),
+        other => panic!("expected the number, got {other:?}"),
+    }
+    assert!(next_event(&mut events).await.is_none(), "it retried");
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the server waited for a retry")
+        .unwrap();
+}
+
+#[tokio::test]
+async fn a_refused_refresh_subscription_ends_the_watch_without_a_retry() {
+    let listener = TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("ws://{}", listener.local_addr().unwrap());
+    // Effect's answer on a server without the method, and T3's for a session without
+    // `orchestration:read`, which apps/server/src/auth/RpcAuthorization.ts asks for.
+    let missing = "Unknown request tag: pullRequests.subscribeRefreshes";
+    let unknown = json!({"_tag": "Die", "defect": missing});
+    let scope = json!({"_tag": "Fail", "error": {"_tag": "EnvironmentAuthorizationError",
+        "message": MISSING_SCOPE, "requiredScope": "orchestration:read"}});
+    let refusals = [(unknown, missing), (scope, MISSING_SCOPE)];
+
+    let answers = refusals.clone();
+    let server = tokio::spawn(async move {
+        for (reason, _) in answers {
+            let mut socket = accept(&listener).await;
+            let id = refresh_request(&mut socket).await;
+            send(&mut socket, refusal(&id, reason)).await;
+            // t3term interrupts the stream it dropped, and asks for nothing more.
+            assert_eq!(recv(&mut socket).await, interrupt(&id));
+        }
+    });
+
+    for (_, message) in refusals {
+        let mut events = spawn_pull_request_refresh_watch(dial(url.clone()));
+        match next_event(&mut events).await {
+            Some(WatchEvent::Failed(refused)) => assert_eq!(refused, message),
+            other => panic!("expected the refusal, got {other:?}"),
+        }
+        assert!(next_event(&mut events).await.is_none(), "it retried");
+    }
+    tokio::time::timeout(Duration::from_secs(5), server)
+        .await
+        .expect("the server saw both interrupts")
+        .unwrap();
 }

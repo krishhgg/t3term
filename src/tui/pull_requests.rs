@@ -2,8 +2,9 @@
 //! number, title and state, and the checks, review and line counts the host reported, with
 //! the repository and its branches under them. Enter or a second click shows a link's details
 //! in the list's place, its whole URL among them as plain text, and they scroll. ←, Enter or
-//! a click on the row above them goes back to the list. t3term opens no browser and changes
-//! nothing: the list only reads.
+//! a click on the row above them goes back to the list. Once the host's detail of the pull
+//! request came, that row names two tabs, the Summary and the Timeline, which →, ← and clicks
+//! switch between. t3term opens no browser and changes nothing: the list only reads.
 //!
 //! The links come from the thread's record that the details already hold, as the desktop's
 //! `ThreadPullRequestsPanel` (apps/web/src/components/pullRequest/ThreadPullRequestsPanel.tsx
@@ -43,7 +44,7 @@ use crate::transcript::without_controls;
 
 mod conversation;
 
-use conversation::{Control, Conversation, Reviewer, Shown, Targets};
+use conversation::{Control, Conversation, Lifecycle, Reviewer, Shown, Targets};
 
 /// The most links read from a thread's record. The rest are counted and left unread.
 const MOST_LINKS: usize = 1000;
@@ -71,6 +72,17 @@ const WATCHING: &str =
 /// `pullRequests.detail` for 60 seconds (packages/client-runtime/src/state/pullRequests.ts).
 /// Opening the link's details again within it shows that read rather than asking again.
 const FRESH: i64 = 60_000;
+/// How long after a read of a link was asked its details read the detail again while they
+/// show and you use t3term, in milliseconds, as the desktop's `LIVE_REFRESH_INTERVAL_MS`
+/// (apps/web/src/hooks/useLiveRefresh.ts:22).
+const LIVE: i64 = 5 * 60_000;
+/// How long after the last key, click or wheel t3term stops reading the details again, in
+/// milliseconds, as the desktop's `LIVE_REFRESH_IDLE_AFTER_MS` (useLiveRefresh.ts:31). The
+/// next one reads them again at once when they are due.
+pub(super) const IDLE: i64 = 6 * 60_000;
+/// How soon after a read of a link was asked coming back to t3term reads it again, in
+/// milliseconds, as the desktop's `LIVE_REFRESH_MIN_INTERVAL_MS` (useLiveRefresh.ts:19).
+const SOONEST: i64 = 10_000;
 /// The most characters kept of why a read failed.
 const FAILURE: usize = 1024;
 
@@ -748,6 +760,28 @@ struct Shape {
     /// keyboard.
     pick: Option<Control>,
     focused: bool,
+    /// The tab of the details that shows, while they have tabs.
+    tabs: Option<Tab>,
+}
+
+/// A tab of a link's details, as the desktop's pull request panel has them once the host's
+/// detail of the pull request came. The desktop's third, Code, has no counterpart here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum Tab {
+    #[default]
+    Summary,
+    Timeline,
+}
+
+impl Tab {
+    const ALL: [Tab; 2] = [Tab::Summary, Tab::Timeline];
+
+    fn name(self) -> &'static str {
+        match self {
+            Tab::Summary => "Summary",
+            Tab::Timeline => "Timeline",
+        }
+    }
 }
 
 /// What a click on a row of a page reaches.
@@ -757,7 +791,7 @@ enum Spot {
     Link(usize),
     /// The row above a link's details, which leads back to the list.
     Back,
-    /// A row of a control in the details' Comments section.
+    /// A row of a control in the details' Comments section or Timeline.
     Control(Control),
 }
 
@@ -774,6 +808,9 @@ pub(super) struct Page {
     /// The links a page of the list holds, or the rows of details it shows, which PageUp and
     /// PageDown move by.
     per_page: usize,
+    /// The columns of each tab's name on the row above a link's details, with the gap before
+    /// it. A click on the rest of that row leads back to the list.
+    tabs: Vec<(Range<usize>, Tab)>,
 }
 
 /// The selected link's details at one width and minute.
@@ -802,13 +839,18 @@ impl Default for Offset {
 }
 
 /// What reading a link's pull request from its host names: the link's host, repository and
-/// number as T3 sent them, and the ticket its answer comes back with.
+/// number as T3 sent them, and the ticket its answer comes back with. `invalidate` says a
+/// person asked to read it from the host, so the read sends `pullRequests.invalidate` first.
+/// `updated` is the `updatedAt` of the detail the details show, for a read that only keeps
+/// them current: it reads the conversation only when the new detail's differs.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Ask {
     pub ticket: u64,
     pub host: String,
     pub repository: String,
     pub number: u64,
+    pub invalidate: bool,
+    pub updated: Option<String>,
 }
 
 /// Part of what a host said of a pull request. A read sends its detail and its conversation as
@@ -832,12 +874,43 @@ struct Read {
     /// The read's ticket, once it was asked for. A read waits without one while another is
     /// under way.
     ticket: Option<u64>,
-    /// The time its detail came, which `FRESH` and the age the details show count from, as
-    /// the desktop's `Atom.swr` counts from its result's timestamp. Until then, the time it
-    /// was asked for, or wanted while it waits.
+    /// The time the detail shown came, which `FRESH` and the age the details show count from,
+    /// as the desktop's `Atom.swr` counts from its result's timestamp. Until one came, the time
+    /// it was asked for, or wanted while it waits.
     at: i64,
     answer: Answer<Summary>,
     conversation: Answer<Conversation>,
+    /// Set when the answers may be out of date: T3 said its reads may have changed since they
+    /// were asked for, or the details opened again after `FRESH`. They are read again while
+    /// the details show them, and show until the new answers come.
+    again: bool,
+    /// The read under way to replace the answers.
+    next: Option<Next>,
+    /// Set when the last read to replace the answers missed either one, so opening the details
+    /// again reads again, as a failure is never reused.
+    missed: bool,
+    /// Set when a person asked to read the pull request from its host, so the next read sends
+    /// `pullRequests.invalidate` first.
+    invalidate: bool,
+    /// Set while a read that sent `pullRequests.invalidate` is under way, until T3's refresh
+    /// number moves. The invalidate moves it, so that number doesn't read again.
+    echo: bool,
+    /// When its last read was asked for, which `LIVE` counts from.
+    asked: i64,
+    /// Set when the read again that `again` wants only keeps the details current, so it reads
+    /// the detail, and the conversation only once the detail changed. It reads both when
+    /// either answer failed or the last read missed one.
+    live: bool,
+}
+
+/// A read under way to replace a read's answers. It holds each answer until both came, so the
+/// details change once.
+struct Next {
+    ticket: u64,
+    /// The time its detail came, or the time it was asked for until then.
+    at: i64,
+    answer: Option<Result<Box<Summary>, String>>,
+    conversation: Option<Result<Box<Conversation>, String>>,
 }
 
 enum Answer<T> {
@@ -848,13 +921,74 @@ enum Answer<T> {
 }
 
 impl Read {
+    /// A read of `entry`'s pull request, wanted at `now`.
+    fn of(entry: &Entry, now: i64) -> Read {
+        Read {
+            key: entry.key.clone(),
+            host: entry.ask_host.clone(),
+            repository: entry.ask_repository.clone(),
+            number: entry.number,
+            ticket: None,
+            at: now,
+            answer: Answer::Reading,
+            conversation: Answer::Reading,
+            again: false,
+            next: None,
+            missed: false,
+            invalidate: false,
+            echo: false,
+            asked: now,
+            live: false,
+        }
+    }
+
     /// Whether opening the link's details again should leave it be: it is under way, or both
-    /// its answers came within `FRESH` of `now`. A failure of either is never reused.
+    /// its answers came within `FRESH` of `now` and T3 hasn't said its reads changed since. A
+    /// failure of either is never reused, nor are answers a read to replace them missed.
     fn stands(&self, now: i64) -> bool {
+        if self.next.is_some() {
+            return true;
+        }
+        if self.again || self.missed {
+            return false;
+        }
         match (&self.answer, &self.conversation) {
             (Answer::Failed(_), _) | (_, Answer::Failed(_)) => false,
             (Answer::Reading, _) | (_, Answer::Reading) => true,
             (Answer::Read(_), Answer::Read(_)) => now.saturating_sub(self.at) < FRESH,
+        }
+    }
+
+    /// Whether either answer came, so the details have something to show while they read
+    /// again.
+    fn answered(&self) -> bool {
+        matches!(self.answer, Answer::Read(_)) || matches!(self.conversation, Answer::Read(_))
+    }
+
+    /// Takes the answers of the read that replaces these. Each answer that came replaces its
+    /// own, and a failure replaces only a failure, as the desktop keeps showing the last
+    /// detail and conversation it read (PullRequestDetailPanel.tsx:2728).
+    fn settle(&mut self, next: Next) {
+        // A read that keeps the details current reads no conversation while the detail stays
+        // the same, which misses nothing.
+        self.missed =
+            !matches!(next.answer, Some(Ok(_))) || matches!(next.conversation, Some(Err(_)));
+        match next.answer {
+            Some(Ok(summary)) => {
+                self.answer = Answer::Read(summary);
+                self.at = next.at;
+            }
+            Some(Err(failure)) if !matches!(self.answer, Answer::Read(_)) => {
+                self.answer = Answer::Failed(failure);
+            }
+            _ => {}
+        }
+        match next.conversation {
+            Some(Ok(conversation)) => self.conversation = Answer::Read(conversation),
+            Some(Err(failure)) if !matches!(self.conversation, Answer::Read(_)) => {
+                self.conversation = Answer::Failed(failure);
+            }
+            _ => {}
         }
     }
 
@@ -892,6 +1026,10 @@ struct Summary {
     cut: bool,
     /// The description laid out at one width, so a new minute doesn't lay it out again.
     laid_out: Option<(usize, Vec<Line<'static>>)>,
+    /// When the pull request opened and ended, for the Timeline.
+    lifecycle: Lifecycle,
+    /// The detail's `updatedAt`, which a read that keeps the details current compares.
+    updated: String,
 }
 
 /// One check on the pull request's head.
@@ -934,6 +1072,8 @@ impl Summary {
             body_cut: detail.body.cut,
             cut: detail.cut,
             laid_out: None,
+            lifecycle: Lifecycle::of(detail),
+            updated: detail.updated_at.clone(),
         }
     }
 
@@ -1009,6 +1149,9 @@ pub(super) struct PullRequests {
     read: Option<Read>,
     /// Set when a link's details open, so the caller asks the host for its pull request.
     asking: bool,
+    /// Set while the details don't show the pull requests' tab, as when the pane closes or
+    /// the Thread tab shows, so a read again waits until they show.
+    hidden: bool,
     /// The ticket of the last read asked for.
     tickets: u64,
     /// The ticket of the read under way, until its answer comes. One read at a time is under
@@ -1018,8 +1161,14 @@ pub(super) struct PullRequests {
     /// What the reader opened of the conversation, which starts over each time a link's
     /// details open.
     shown: Shown,
-    /// The control in the Comments section that ↑ and ↓ chose, which Enter acts on.
+    /// The control in the Comments section or the Timeline that ↑ and ↓ chose, which Enter
+    /// acts on.
     pick: Option<Control>,
+    /// The tab of a link's details that shows while they have tabs, which starts over at the
+    /// Summary each time they open.
+    tab: Tab,
+    /// The other tab's scroll, which it shows at again when the reader goes back to it.
+    other: Offset,
     /// How many times the links were worked out and a page laid out, so the tests can tell
     /// what a frame or an event did.
     #[cfg(test)]
@@ -1048,6 +1197,8 @@ impl PullRequests {
         self.asking = false;
         self.shown = Shown::default();
         self.pick = None;
+        self.tab = Tab::Summary;
+        self.other = Offset::Top(0);
     }
 
     /// Drops the page, the details and the host's answer laid out in the old colors, after the
@@ -1109,6 +1260,39 @@ impl PullRequests {
     /// Whether the selected link's details show in the list's place.
     pub fn viewing(&self) -> bool {
         self.viewing
+    }
+
+    /// The tab of the selected link's details that shows, while they show and have tabs: once
+    /// the host's detail of the pull request came, as the desktop shows its tabs only then.
+    /// Until it does, and after it failed, the details show as the Summary does.
+    pub fn tabs(&self) -> Option<Tab> {
+        let read = self
+            .read
+            .as_ref()
+            .filter(|read| self.reads_selected(read))?;
+        let read = matches!(read.answer, Answer::Read(_));
+        (self.viewing && read).then_some(self.tab)
+    }
+
+    /// → in a link's details: shows the Timeline in the Summary's place. Says whether it did.
+    pub fn forward(&mut self) -> bool {
+        if self.tabs() != Some(Tab::Summary) {
+            return false;
+        }
+        self.switch(Tab::Timeline);
+        true
+    }
+
+    /// Shows `tab` of the details, at the scroll it had when the reader left it, with no
+    /// control chosen. Each tab keeps its own scroll while the other shows.
+    fn switch(&mut self, tab: Tab) {
+        if self.tab == tab {
+            return;
+        }
+        self.tab = tab;
+        std::mem::swap(&mut self.scroll, &mut self.other);
+        self.pick = None;
+        self.relay();
     }
 
     /// Moves the selection `delta` links, down for a positive one, and stops at the ends.
@@ -1323,14 +1507,16 @@ impl PullRequests {
         }
     }
 
-    /// Shows the selected link's details in the list's place, from their top, or the list
-    /// again.
+    /// Shows the selected link's details in the list's place, from the top of their Summary,
+    /// or the list again.
     pub fn toggle(&mut self) {
         if self.viewing {
-            self.back();
+            self.show_list();
         } else if !entries_of(self.list.as_ref()).is_empty() {
             self.viewing = true;
             self.scroll = Offset::Top(0);
+            self.tab = Tab::Summary;
+            self.other = Offset::Top(0);
             self.current = false;
             self.asking = true;
             // What was opened starts over, so the rows laid out for it go too, even where the
@@ -1346,7 +1532,9 @@ impl PullRequests {
     /// requests or the thread names no project, or a read of the link is under way or one from
     /// the last minute stands. The details show that the read is under way until `answer`
     /// takes its answer. A read wanted while another is under way waits, and the caller calls
-    /// again once that one's answer comes. None while nothing waits.
+    /// again once that one's answer comes. A read whose answers may be out of date is read
+    /// again while its details show, and they show its answers until the new ones come. None
+    /// while nothing waits.
     pub fn take_ask(&mut self, enabled: bool, now: i64) -> Option<Ask> {
         if std::mem::take(&mut self.asking) && enabled && self.viewing {
             self.want(now);
@@ -1358,46 +1546,214 @@ impl PullRequests {
         if self.running.is_some() {
             return None;
         }
-        let read = self.read.as_mut().filter(|read| read.ticket.is_none())?;
-        self.tickets += 1;
-        read.ticket = Some(self.tickets);
-        read.at = now;
-        self.running = read.ticket;
+        let showing = self.showing_read();
+        let read = self.read.as_mut()?;
+        let ticket = self.tickets + 1;
+        let mut updated = None;
+        if read.ticket.is_none() {
+            read.ticket = Some(ticket);
+            read.at = now;
+        } else if read.again && showing {
+            read.again = false;
+            // Only answers that both came and that the last read missed nothing of are kept,
+            // as a failure is never reused.
+            let live = std::mem::take(&mut read.live) && !read.missed;
+            if live
+                && let (Answer::Read(summary), Answer::Read(_)) = (&read.answer, &read.conversation)
+            {
+                updated = Some(summary.updated.clone());
+            }
+            read.next = Some(Next {
+                ticket,
+                at: now,
+                answer: None,
+                conversation: None,
+            });
+        } else {
+            return None;
+        }
+        self.tickets = ticket;
+        self.running = Some(ticket);
+        read.asked = now;
+        let invalidate = std::mem::take(&mut read.invalidate);
+        read.echo = invalidate;
         Some(Ask {
-            ticket: self.tickets,
+            ticket,
             host: read.host.clone(),
             repository: read.repository.clone(),
             number: read.number,
+            invalidate,
+            updated,
         })
     }
 
     /// Wants a read of the selected link's pull request, unless one under way or from the last
-    /// minute stands.
+    /// minute stands. A read of the link that has an answer is read again and shows it until
+    /// the new answers come, as the desktop's queries show what they hold while they read
+    /// again (`Atom.swr` in packages/client-runtime/src/state/runtime.ts).
     fn want(&mut self, now: i64) {
         let Some(entry) = entries_of(self.list.as_ref()).get(self.selected) else {
             return;
         };
-        let read = self.read.as_ref().filter(|read| read.key == entry.key);
-        if read.is_some_and(|read| read.stands(now)) {
-            return;
+        if let Some(read) = self.read.as_mut().filter(|read| read.key == entry.key) {
+            if read.stands(now) {
+                // Its answers show, and the detail is read again unless it just came.
+                self.arrive(now);
+                return;
+            }
+            if read.answered() {
+                read.again = true;
+                read.live = false;
+                self.relay();
+                return;
+            }
         }
-        self.read = Some(Read {
-            key: entry.key.clone(),
-            host: entry.ask_host.clone(),
-            repository: entry.ask_repository.clone(),
-            number: entry.number,
-            ticket: None,
-            at: now,
-            answer: Answer::Reading,
-            conversation: Answer::Reading,
-        });
+        self.read = Some(Read::of(entry, now));
         self.relay();
+    }
+
+    /// Whether the details show the link whose read is held.
+    fn showing_read(&self) -> bool {
+        let shown = entries_of(self.list.as_ref()).get(self.selected);
+        !self.hidden
+            && self.viewing
+            && self
+                .read
+                .as_ref()
+                .zip(shown)
+                .is_some_and(|(read, entry)| read.key == entry.key)
+    }
+
+    /// Whether a read of a link's pull request is held, which T3's refresh numbers can make
+    /// out of date.
+    pub fn holds_read(&self) -> bool {
+        self.read.is_some()
+    }
+
+    /// Notes that T3 said its pull request reads may have changed, as a new number on
+    /// `pullRequests.subscribeRefreshes` says. A read asked for before is read again: at once
+    /// while its details show, once a read under way is done, and when they show again
+    /// otherwise, as the desktop reads a query again on the signal while something shows it
+    /// and only marks it stale when nothing does (`refreshOnSignalWhileRead` in
+    /// packages/client-runtime/src/state/runtime.ts). Says whether the details show it.
+    pub fn refresh(&mut self) -> bool {
+        let showing = self.showing_read();
+        let Some(read) = self.read.as_mut().filter(|read| read.ticket.is_some()) else {
+            return false;
+        };
+        // The first number after a person's refresh is that refresh's own, and the read it
+        // started reads what moved it.
+        if std::mem::take(&mut read.echo) {
+            return false;
+        }
+        read.again = true;
+        read.live = false;
+        if showing {
+            self.relay();
+        }
+        showing
+    }
+
+    /// `r` in a link's details: reads its pull request from its host again, as the desktop's
+    /// Refresh does (PullRequestDetailPanel.tsx:857-875). The read sends
+    /// `pullRequests.invalidate` first, so T3 asks the host rather than answer from its cache,
+    /// and the details show the last answers until the new ones come. Only a link whose details
+    /// hold a read does this, and not while a read of it waits or is under way, as the
+    /// desktop's Refresh waits for the one that runs. Says whether it wants a read.
+    pub fn reload(&mut self, now: i64) -> bool {
+        if !self.reloads() {
+            return false;
+        }
+        let read = self.read.as_mut().expect("a read of the shown link");
+        if read.answered() {
+            read.again = true;
+            read.live = false;
+            read.invalidate = true;
+        } else {
+            // Nothing came to show meanwhile, so it reads as the details' first read does.
+            let entry = &entries_of(self.list.as_ref())[self.selected];
+            let mut read = Read::of(entry, now);
+            read.invalidate = true;
+            self.read = Some(read);
+        }
+        self.relay();
+        true
+    }
+
+    /// Whether `r` would read the shown link's pull request from its host again: its details
+    /// show and hold a read of it, and no read of it waits or is under way.
+    pub fn reloads(&self) -> bool {
+        self.viewing
+            && self.read.as_ref().is_some_and(|read| {
+                let done = read.ticket.is_some() && read.ticket != self.running;
+                self.reads_selected(read) && done && read.next.is_none()
+            })
+    }
+
+    /// When the details read the detail they show again to keep it current, as the desktop's
+    /// `useLiveRefresh` does while its panel shows a pull request: `LIVE` after its last read
+    /// was asked for. None unless they show a read that is done, with no read again wanted.
+    pub fn live_at(&self) -> Option<i64> {
+        let read = self.read.as_ref().filter(|_| self.showing_read())?;
+        let done = read.ticket.is_some() && read.ticket != self.running && read.next.is_none();
+        (done && !read.again).then_some(read.asked + LIVE)
+    }
+
+    /// Reads the detail the details show again once `live_at` is past at `now`, unless the
+    /// last key, click or wheel at `input` came `IDLE` or more before `now`, as the desktop
+    /// stops its interval for a reader who left and checks it against the time it runs. A Mac
+    /// that slept past `live_at` so reads nothing on waking, and the next key reads it at
+    /// once. The read reads the conversation again only when the detail's `updatedAt`
+    /// changed, as the desktop does (PullRequestDetailPanel.tsx:836-856). Says whether it
+    /// wants a read.
+    pub fn live(&mut self, now: i64, input: i64) -> bool {
+        let Some(due) = self.live_at() else {
+            return false;
+        };
+        if now < due || now.saturating_sub(input) >= IDLE {
+            return false;
+        }
+        self.read_live(now)
+    }
+
+    /// Reads the detail the details show again at `now`, when you arrive at them: their link's
+    /// details open again, you come back to t3term after `IDLE` or more without a key, click
+    /// or wheel, or its terminal gains focus. The desktop's `useLiveRefresh` reads on each of
+    /// these (`onArrival`), and on arriving at a pull request only once it read it before
+    /// (`shouldRefreshOnArrival`). Not while the detail they show came, or their last read
+    /// was asked for, under `SOONEST` ago, so a read again that failed isn't asked again at
+    /// once. Says whether it wants a read.
+    pub fn arrive(&mut self, now: i64) -> bool {
+        let came = self.read.as_ref().filter(|_| self.live_at().is_some());
+        match came.map(|read| read.at.max(read.asked)) {
+            Some(at) if now - at >= SOONEST => self.read_live(now),
+            _ => false,
+        }
+    }
+
+    /// Wants the shown read again to keep it current, as `live` and `arrive` say: the detail,
+    /// and the conversation only once it changed. A read that failed reads both, as a first
+    /// read does, as the desktop's live refresh reads a detail it couldn't read.
+    fn read_live(&mut self, now: i64) -> bool {
+        let read = self.read.as_mut().expect("the shown read");
+        if read.answered() {
+            read.again = true;
+            read.live = true;
+        } else {
+            // Nothing came to show, so it reads as the details' first read does.
+            let entry = &entries_of(self.list.as_ref())[self.selected];
+            self.read = Some(Read::of(entry, now));
+        }
+        self.relay();
+        true
     }
 
     /// Notes whether the details show the pull requests' tab. Once they don't, as when the
     /// pane closes or the Thread tab shows, a read that waits to be asked for is dropped, so no
-    /// host is asked for a link nobody looks at, and showing them again wants it again.
+    /// host is asked for a link nobody looks at, and showing them again wants it again. A read
+    /// again waits until they show.
     pub fn shown(&mut self, shown: bool) {
+        self.hidden = !shown;
         if !shown && self.unqueue() {
             self.asking = true;
         }
@@ -1415,36 +1771,72 @@ impl PullRequests {
     }
 
     /// Takes part of the answer to read `ticket`, which came at `now`: the pull request's
-    /// detail or conversation, or why reading it failed. Says whether it is the read the
-    /// details wait for. An answer to an earlier read, or to a read of another thread's link,
-    /// is dropped. Once the read is done, another can be asked for.
+    /// detail or conversation, or why reading it failed. Says whether what the details show
+    /// changed. An answer to an earlier read, or to a read of another thread's link, is
+    /// dropped. The answers of a read that replaces others are held until it is done, then
+    /// replace them as `Read::settle` says. Once the read is done, another can be asked for.
     pub fn answer(&mut self, ticket: u64, part: Part, now: i64) -> bool {
-        if let Part::Done = part {
-            if self.running == Some(ticket) {
-                self.running = None;
-            }
-            return false;
+        let done = matches!(part, Part::Done);
+        if done && self.running == Some(ticket) {
+            self.running = None;
         }
-        let Some(read) = self
-            .read
-            .as_mut()
-            .filter(|read| read.ticket == Some(ticket))
-        else {
+        let Some(read) = self.read.as_mut() else {
             return false;
         };
-        match part {
-            Part::Detail(Ok(detail)) => {
-                read.at = now;
-                read.answer = Answer::Read(Box::new(Summary::of(&detail)));
+        let ours = read.ticket == Some(ticket)
+            || read.next.as_ref().is_some_and(|next| next.ticket == ticket);
+        if done && ours {
+            // A refresh number that comes after the read is done is another change.
+            read.echo = false;
+        }
+        if let Some(next) = read.next.as_mut().filter(|next| next.ticket == ticket) {
+            // A read that replaces the answers shows nothing until both came.
+            match part {
+                Part::Detail(answer) => {
+                    if answer.is_ok() {
+                        next.at = now;
+                    }
+                    let answer = answer.map(|detail| Box::new(Summary::of(&detail)));
+                    next.answer = Some(answer.map_err(|failure| bounded(&failure, FAILURE)));
+                    return false;
+                }
+                Part::Activity(answer) => {
+                    let answer = answer.map(|activity| Box::new(Conversation::of(&activity)));
+                    next.conversation = Some(answer.map_err(|failure| bounded(&failure, FAILURE)));
+                    return false;
+                }
+                Part::Done => {
+                    let next = read.next.take().expect("the read under way");
+                    read.settle(next);
+                }
             }
-            Part::Detail(Err(failure)) => read.answer = Answer::Failed(bounded(&failure, FAILURE)),
-            Part::Activity(Ok(activity)) => {
-                read.conversation = Answer::Read(Box::new(Conversation::of(&activity)));
+        } else if read.ticket != Some(ticket) || done {
+            return false;
+        } else {
+            match part {
+                Part::Detail(Ok(detail)) => {
+                    read.at = now;
+                    read.answer = Answer::Read(Box::new(Summary::of(&detail)));
+                }
+                Part::Detail(Err(failure)) => {
+                    read.answer = Answer::Failed(bounded(&failure, FAILURE));
+                }
+                Part::Activity(Ok(activity)) => {
+                    read.conversation = Answer::Read(Box::new(Conversation::of(&activity)));
+                }
+                Part::Activity(Err(failure)) => {
+                    read.conversation = Answer::Failed(bounded(&failure, FAILURE));
+                }
+                Part::Done => {}
             }
-            Part::Activity(Err(failure)) => {
-                read.conversation = Answer::Failed(bounded(&failure, FAILURE));
-            }
-            Part::Done => {}
+        }
+        // The Timeline takes the pull request's opening and end from its detail, so it is made
+        // once both answers came, in either order.
+        if let (Answer::Read(summary), Answer::Read(conversation)) =
+            (&read.answer, &mut read.conversation)
+        {
+            conversation.follow(&summary.lifecycle);
+            self.shown.prune(conversation);
         }
         // The rows move, so no control stays chosen.
         self.pick = None;
@@ -1460,9 +1852,19 @@ impl PullRequests {
         self.current = false;
     }
 
+    /// ← in a link's details: shows the Summary in the Timeline's place, or else the list
+    /// again. Says whether the details showed.
+    pub fn back(&mut self) -> bool {
+        if self.tabs() == Some(Tab::Timeline) {
+            self.switch(Tab::Summary);
+            return true;
+        }
+        self.show_list()
+    }
+
     /// Shows the list again in place of a link's details, with that link still selected. Says
     /// whether the details showed.
-    pub fn back(&mut self) -> bool {
+    fn show_list(&mut self) -> bool {
         if !self.viewing {
             return false;
         }
@@ -1474,21 +1876,29 @@ impl PullRequests {
         true
     }
 
-    /// A click on row `offset` of the page the last frame drew. On a link's rows it selects
-    /// the link, or shows its details when it is selected already, and on the row above the
-    /// details it shows the list again. Says whether it landed on one of those. Once the
-    /// selection or the scroll moved, a click lands on nothing until a frame draws the page.
-    pub fn click(&mut self, offset: usize) -> bool {
-        let hit = self
-            .page
-            .as_ref()
-            .filter(|_| self.current)
-            .and_then(|page| page.rows.get(offset).copied().flatten());
-        match hit {
+    /// A click at `column` of row `offset` of the page the last frame drew. On a link's rows
+    /// it selects the link, or shows its details when it is selected already. On the row above
+    /// the details it shows the tab whose name it is on, or else the list again. Says whether
+    /// it landed on one of those and changed what shows. Once the selection or the scroll
+    /// moved, a click lands on nothing until a frame draws the page.
+    pub fn click(&mut self, column: usize, offset: usize) -> bool {
+        let Some(page) = self.page.as_ref().filter(|_| self.current) else {
+            return false;
+        };
+        let tab = page
+            .tabs
+            .iter()
+            .find(|(columns, _)| offset == 0 && columns.contains(&column));
+        if let Some(&(_, tab)) = tab {
+            let changed = self.tab != tab;
+            self.switch(tab);
+            return changed;
+        }
+        match page.rows.get(offset).copied().flatten() {
             Some(Spot::Link(index)) if index == self.selected => self.toggle(),
             Some(Spot::Link(index)) => self.select(index),
             Some(Spot::Back) => {
-                self.back();
+                self.show_list();
             }
             Some(Spot::Control(control)) => self.act(control),
             None => return false,
@@ -1509,25 +1919,31 @@ impl PullRequests {
         count * ENTRY_ROWS + 1
     }
 
-    /// The rows of the selected link's details at `width`, worked out again only for another
-    /// link, width or minute.
+    /// The rows of the selected link's details at `width`, as the tab that shows has them,
+    /// worked out again only for another link, width or minute, or once what they show changed.
     fn prepare_detail(&mut self, width: usize, now: i64, theme: &Theme) -> usize {
         let (index, at) = (self.selected, (width, now.div_euclid(60_000)));
         let cached = self.detail.as_ref().map(|detail| (detail.index, detail.at));
         if cached != Some((index, at)) {
+            let tab = self.tabs().unwrap_or(Tab::Summary);
             let lines = match entries_of(self.list.as_ref()).get(index) {
                 Some(entry) => {
                     let read = self.read.as_mut().filter(|read| read.key == entry.key);
                     if let Some(read) = read {
-                        if let Answer::Read(summary) = &mut read.answer {
+                        if let (Tab::Summary, Answer::Read(summary)) = (tab, &mut read.answer) {
                             summary.lay_out(width, theme);
                         }
                         if let Answer::Read(conversation) = &mut read.conversation {
-                            conversation.lay_out(width, theme, &self.shown);
+                            match tab {
+                                Tab::Summary => conversation.lay_out(width, theme, &self.shown),
+                                Tab::Timeline => {
+                                    conversation.lay_out_timeline(width, theme, &self.shown);
+                                }
+                            }
                         }
                     }
                     let read = self.read.as_ref().filter(|read| read.key == entry.key);
-                    detail_lines(entry, read, &self.shown, width, now, theme)
+                    detail_lines(entry, read, &self.shown, tab, width, now, theme)
                 }
                 None => (Vec::new(), Vec::new()),
             };
@@ -1575,6 +1991,7 @@ impl PullRequests {
             minute: now.div_euclid(60_000),
             pick: self.pick.filter(|_| self.viewing),
             focused,
+            tabs: self.tabs(),
         };
         if self.page.as_ref().map(|page| page.shape) != Some(shape) {
             #[cfg(test)]
@@ -1605,6 +2022,7 @@ fn lay_out(list: Option<&List>, mut shape: Shape, now: i64, theme: &Theme) -> Pa
         above: false,
         below: false,
         per_page: 1,
+        tabs: Vec::new(),
     };
     let (width, height) = (shape.width, shape.height);
     if width == 0 || height == 0 {
@@ -1657,8 +2075,10 @@ fn lay_out(list: Option<&List>, mut shape: Shape, now: i64, theme: &Theme) -> Pa
     page
 }
 
-/// The page of the selected link's details for `shape`: the row back to the list, with where
-/// the link is in it, then as many rows of the details as fit from row `shape.scroll`.
+/// The page of the selected link's details for `shape`: the row back to the list, with the
+/// names of the tabs while they have them and where the link is in the list, then as many rows
+/// of the details as fit from row `shape.scroll`. Where the row is too narrow, where the link
+/// is goes first, and then the names are cut.
 fn view(list: Option<&List>, detail: Option<&Detail>, shape: Shape, theme: &Theme) -> Page {
     let mut page = Page {
         shape,
@@ -1667,6 +2087,7 @@ fn view(list: Option<&List>, detail: Option<&Detail>, shape: Shape, theme: &Them
         above: false,
         below: false,
         per_page: 1,
+        tabs: Vec::new(),
     };
     let (width, height) = (shape.width, shape.height);
     if width == 0 || height == 0 {
@@ -1677,10 +2098,30 @@ fn view(list: Option<&List>, detail: Option<&Detail>, shape: Shape, theme: &Them
         _ => &[],
     };
     let back = Style::new().fg(theme.focus).add_modifier(Modifier::BOLD);
-    let back = fitted(vec![Span::styled("← List", back)], width);
+    let mut left = vec![Span::styled("← List", back)];
+    if let Some(shown) = shape.tabs {
+        let active = back.add_modifier(Modifier::UNDERLINED);
+        let muted = Style::new().fg(theme.muted);
+        for tab in Tab::ALL {
+            let start = spans_width(&left);
+            let style = if tab == shown { active } else { muted };
+            left.push(Span::raw("  "));
+            left.push(Span::styled(tab.name(), style));
+            let end = spans_width(&left).min(width);
+            // A name of which no column shows can't be clicked.
+            if start + 2 < end {
+                page.tabs.push((start..end, tab));
+            }
+        }
+    }
+    let back = fitted(left, width);
     let count = entries_of(list).len();
     let place = format!("{} of {count}", shape.selected + 1);
-    let place = vec![Span::styled(place, Style::new().fg(theme.muted))];
+    // Where the link is shows only a gap of two columns away from the rest.
+    let place = match spans_width(&back) + 2 + place.width() <= width {
+        true => vec![Span::styled(place, Style::new().fg(theme.muted))],
+        false => Vec::new(),
+    };
     page.lines.push(row(back, place, width));
     page.rows.push(Some(Spot::Back));
     let room = height - 1;
@@ -2079,15 +2520,17 @@ fn branches(repository: &str, head: &str, base: &str, room: usize) -> String {
 }
 
 /// A link's details, which show in the list's place: its number and whole title, its status
-/// and the lines it changes, then what its host said of it when the details read it, then each
-/// under its label its URL, whole as plain text to copy, its repository, its branches, its
-/// author, and who linked it and when it last changed and synced, then what watching it does
-/// and the stack it heads. Each value wraps to every row it takes, so the reader can scroll to
-/// all of it, and each was bounded when it was read.
+/// and the lines it changes. On the Summary, what its host said of it when the details read
+/// it follows, then each under its label its URL, whole as plain text to copy, its repository,
+/// its branches, its author, and who linked it and when it last changed and synced, then what
+/// watching it does and the stack it heads. On the Timeline, the Timeline follows. Each value
+/// wraps to every row it takes, so the reader can scroll to all of it, and each was bounded
+/// when it was read.
 fn detail_lines(
     entry: &Entry,
     read: Option<&Read>,
     shown: &Shown,
+    tab: Tab,
     width: usize,
     now: i64,
     theme: &Theme,
@@ -2104,6 +2547,20 @@ fn detail_lines(
     lines.extend(flowed(status_parts(entry, theme), " · ", width, theme));
     lines.extend(flowed(diff_parts(snapshot, theme), " ", width, theme));
     let mut targets = Vec::new();
+    if let (Tab::Timeline, Some(read)) = (tab, read) {
+        lines.push(Line::default());
+        let at = lines.len();
+        let timeline = conversation::timeline_section(&read.conversation, shown, width, now, theme);
+        lines.extend(timeline.lines);
+        let moved = |rows: Range<usize>| rows.start + at..rows.end + at;
+        targets.extend(
+            timeline
+                .targets
+                .into_iter()
+                .map(|(rows, c)| (moved(rows), c)),
+        );
+        return (lines, targets);
+    }
     if let Some(read) = read {
         let at = lines.len();
         let (host, controls) = host_lines(entry, read, shown, width, now, theme);
@@ -2190,13 +2647,15 @@ fn host_lines(
     let warning = Style::new().fg(theme.warning_fg);
     let mut lines = vec![Line::default()];
     let summary = match &read.answer {
-        Answer::Reading => {
-            let reading = format!("Reading from {}…", entry.host);
-            lines.extend(whole(&reading, width, muted));
+        // A failure shows until a read again is under way, which has no summary to show over,
+        // so it reads as a first read does.
+        Answer::Failed(failure) if read.next.is_none() => {
+            lines.extend(whole(failure, width, warning));
             return (lines, Vec::new());
         }
-        Answer::Failed(failure) => {
-            lines.extend(whole(failure, width, warning));
+        Answer::Reading | Answer::Failed(_) => {
+            let reading = format!("Reading from {}…", entry.host);
+            lines.extend(whole(&reading, width, muted));
             return (lines, Vec::new());
         }
         Answer::Read(summary) => summary,
@@ -2205,11 +2664,11 @@ fn host_lines(
         "now" => "just now".to_string(),
         ago => format!("{ago} ago"),
     };
-    lines.extend(whole(
-        &format!("Read from {} {at}", entry.host),
-        width,
-        muted,
-    ));
+    let when = match read.next.is_some() {
+        true => format!("Refreshing from {}…", entry.host),
+        false => format!("Read from {} {at}", entry.host),
+    };
+    lines.extend(whole(&when, width, muted));
     if let Some(behind) = summary.behind {
         let by = match behind {
             Some(1) => " by 1 commit".to_string(),
@@ -3291,28 +3750,28 @@ mod tests {
         let links = vec![link("o/r", 1, "a", "m"), link("o/r", 2, "b", "m")];
         pulls.set(list_of(&thread(links)));
         // Before a frame lays the list out, a click lands on nothing.
-        assert!(!pulls.click(0));
+        assert!(!pulls.click(0, 0));
         pulls.page(40, 20, now(), true, &theme);
         // The second link's rows are the page's fourth to sixth.
-        assert!(pulls.click(4));
+        assert!(pulls.click(0, 4));
         assert_eq!((pulls.selected, pulls.viewing), (1, false));
         pulls.page(40, 20, now(), true, &theme);
         // The blank rows and the footer take no click.
         for offset in [6, 7, 18, 19, 20, 200] {
-            assert!(!pulls.click(offset), "{offset}");
+            assert!(!pulls.click(0, offset), "{offset}");
         }
         // A second click on the link shows its details.
-        assert!(pulls.click(3));
+        assert!(pulls.click(0, 3));
         assert!(pulls.viewing);
         let rows = rows_of(&pulls.page(40, 20, now(), true, &theme).lines);
         assert_eq!(rows[1], "#2 Change 2");
         // Only the row above them takes a click, and it leads back to the list with the link
         // still selected.
         for offset in 1..30 {
-            assert!(!pulls.click(offset), "{offset}");
+            assert!(!pulls.click(0, offset), "{offset}");
         }
         assert!(pulls.viewing);
-        assert!(pulls.click(0));
+        assert!(pulls.click(0, 0));
         assert_eq!((pulls.selected, pulls.viewing), (1, false));
     }
 
@@ -3332,31 +3791,31 @@ mod tests {
         pulls.page_by(true);
         assert_eq!(pulls.selected, 8);
         for offset in 0..10 {
-            assert!(!pulls.click(offset), "{offset}");
+            assert!(!pulls.click(0, offset), "{offset}");
         }
         assert_eq!((pulls.selected, pulls.viewing), (8, false));
         // After the frame, the click lands on the link that row shows now.
         let page = pulls.page(40, 10, now(), true, &theme);
         assert_eq!(page.rows[0], Some(Spot::Link(6)));
-        assert!(pulls.click(0));
+        assert!(pulls.click(0, 0));
         assert_eq!(pulls.selected, 6);
         // So with the details: until a frame draws them, no click shows the list again, and
         // after their scroll moves, none does until the next.
         pulls.page(40, 10, now(), true, &theme);
-        assert!(pulls.click(0));
+        assert!(pulls.click(0, 0));
         assert!(pulls.viewing);
-        assert!(!pulls.click(0));
+        assert!(!pulls.click(0, 0));
         pulls.page(40, 10, now(), true, &theme);
         pulls.move_by(3);
-        assert!(!pulls.click(0));
+        assert!(!pulls.click(0, 0));
         assert!(pulls.viewing);
         pulls.page(40, 10, now(), true, &theme);
-        assert!(pulls.click(0));
+        assert!(pulls.click(0, 0));
         assert!(!pulls.viewing);
         // A move that changes nothing keeps the page the reader sees.
         pulls.page(40, 10, now(), true, &theme);
         pulls.move_by(0);
-        assert!(pulls.click(3));
+        assert!(pulls.click(0, 3));
         assert_eq!(pulls.selected, 7);
     }
 
@@ -3524,13 +3983,503 @@ mod tests {
             .expect("the section");
         assert_eq!(rows[at..at + 3], failed);
         assert_eq!(reopen(&mut pulls, now()), Some(2));
-        // Both answers stand for a minute.
-        assert!(pulls.answer(2, Part::Detail(Ok(read_detail(&bare_detail()))), now()));
+        // The detail that came shows while the read goes again, and the new answers show once
+        // both came.
+        pulls.page(44, 60, now(), true, &theme());
+        let rows = detail_rows(&pulls);
+        assert!(rows.contains(&"Refreshing from github.com…".to_string()));
+        assert!(rows.contains(&"timed out".to_string()));
+        let detail = Part::Detail(Ok(read_detail(&bare_detail())));
+        assert!(!pulls.answer(2, detail, now()));
         let activity = pull_request::Activity::read(&bare_activity()).unwrap();
-        assert!(pulls.answer(2, Part::Activity(Ok(Box::new(activity))), now()));
-        assert!(!pulls.answer(2, Part::Done, now()));
-        assert_eq!(reopen(&mut pulls, now() + FRESH - 1), None);
+        assert!(!pulls.answer(2, Part::Activity(Ok(Box::new(activity))), now()));
+        assert!(pulls.answer(2, Part::Done, now()));
+        pulls.page(44, 60, now(), true, &theme());
+        let rows = detail_rows(&pulls);
+        assert!(rows.contains(&"Read from github.com just now".to_string()));
+        assert!(!rows.contains(&"timed out".to_string()));
+        // Both answers stand for a minute, and then show while the read goes again.
+        assert_eq!(reopen(&mut pulls, now() + SOONEST - 1), None);
         assert_eq!(reopen(&mut pulls, now() + FRESH), Some(3));
+        pulls.page(44, 60, now() + FRESH, true, &theme());
+        let rows = detail_rows(&pulls);
+        assert!(rows.contains(&"Refreshing from github.com…".to_string()));
+        assert!(
+            !rows.iter().any(|row| row.starts_with("Reading")),
+            "{rows:#?}"
+        );
+    }
+
+    #[test]
+    fn a_refresh_reads_again_while_the_details_show_the_read() {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![link(
+            "krishhgg/t3term",
+            31,
+            "a",
+            "b",
+        )])));
+        let activity = || {
+            let activity = pull_request::Activity::read(&bare_activity()).unwrap();
+            Part::Activity(Ok(Box::new(activity)))
+        };
+        let ticket = |pulls: &mut PullRequests| pulls.take_ask(true, now()).map(|a| a.ticket);
+        let rows = |pulls: &mut PullRequests| {
+            pulls.page(44, 60, now(), true, &theme());
+            detail_rows(pulls)
+        };
+        // Nothing is read yet, so there is nothing to refresh.
+        assert!(!pulls.refresh());
+        pulls.toggle();
+        assert!(!pulls.refresh());
+
+        // A refresh during the first read reads again once it is done.
+        assert_eq!(ticket(&mut pulls), Some(1));
+        assert!(pulls.refresh());
+        assert_eq!(ticket(&mut pulls), None);
+        assert!(pulls.answer(1, Part::Detail(Ok(read_detail(&bare_detail()))), now()));
+        assert!(pulls.answer(1, activity(), now()));
+        assert!(!pulls.answer(1, Part::Done, now()));
+        assert_eq!(ticket(&mut pulls), Some(2));
+        assert!(rows(&mut pulls).contains(&"Refreshing from github.com…".to_string()));
+
+        // A refresh that misses an answer keeps the last answers, and the details show when
+        // they were read. Opening them again reads again at once.
+        assert!(!pulls.answer(2, Part::Detail(Err("timed out".into())), now()));
+        assert!(!pulls.answer(2, activity(), now()));
+        assert!(pulls.answer(2, Part::Done, now()));
+        let shown = rows(&mut pulls);
+        assert!(shown.contains(&"Read from github.com just now".to_string()));
+        assert!(!shown.contains(&"timed out".to_string()), "{shown:#?}");
+        assert_eq!(ticket(&mut pulls), None);
+        pulls.back();
+        pulls.toggle();
+        assert_eq!(ticket(&mut pulls), Some(3));
+        assert!(!pulls.answer(3, Part::Detail(Ok(read_detail(&bare_detail()))), now()));
+        assert!(!pulls.answer(3, activity(), now()));
+        assert!(pulls.answer(3, Part::Done, now()));
+        pulls.back();
+        pulls.toggle();
+        assert_eq!(ticket(&mut pulls), None);
+
+        // While the list shows, a refresh only marks the read, and opening the details again
+        // reads again within the minute.
+        pulls.back();
+        assert!(!pulls.refresh());
+        assert_eq!(ticket(&mut pulls), None);
+        pulls.toggle();
+        assert_eq!(ticket(&mut pulls), Some(4));
+        assert!(rows(&mut pulls).contains(&"Refreshing from github.com…".to_string()));
+        assert!(!pulls.answer(4, Part::Detail(Ok(read_detail(&bare_detail()))), now()));
+        assert!(!pulls.answer(4, activity(), now()));
+        assert!(pulls.answer(4, Part::Done, now()));
+
+        // So does one while the tab doesn't show, as when the pane closes, and showing it
+        // reads again.
+        pulls.shown(false);
+        assert!(!pulls.refresh());
+        assert_eq!(ticket(&mut pulls), None);
+        pulls.shown(true);
+        let ask = pulls.take_ask(true, now() - 45_000).map(|ask| ask.ticket);
+        assert_eq!(ask, Some(5));
+
+        // The new answers stand for a minute from when the pull request came, though the host
+        // took 45 seconds, so opening the details again reads only the detail.
+        assert!(!pulls.answer(5, Part::Detail(Ok(read_detail(&bare_detail()))), now()));
+        assert!(!pulls.answer(5, activity(), now()));
+        assert!(pulls.answer(5, Part::Done, now()));
+        pulls.back();
+        pulls.toggle();
+        let ask = pulls.take_ask(true, now() + 20_000);
+        assert_eq!(
+            ask.map(|ask| (ask.ticket, ask.updated.is_some())),
+            Some((6, true))
+        );
+    }
+
+    #[test]
+    fn r_reads_a_link_from_its_host_again_once_and_only_when_none_is_under_way() {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![
+            link("krishhgg/t3term", 31, "a", "b"),
+            link("krishhgg/t3term", 32, "c", "d"),
+        ])));
+        let detail = || Part::Detail(Ok(read_detail(&bare_detail())));
+        let activity = || {
+            let activity = pull_request::Activity::read(&bare_activity()).unwrap();
+            Part::Activity(Ok(Box::new(activity)))
+        };
+        let answered = |pulls: &mut PullRequests, ticket| {
+            pulls.answer(ticket, detail(), now());
+            pulls.answer(ticket, activity(), now());
+            pulls.answer(ticket, Part::Done, now());
+        };
+        let asked = |pulls: &mut PullRequests| {
+            let ask = pulls.take_ask(true, now());
+            ask.map(|ask| (ask.number, ask.ticket, ask.invalidate))
+        };
+        let rows = |pulls: &mut PullRequests| {
+            pulls.page(44, 60, now(), true, &theme());
+            detail_rows(pulls)
+        };
+
+        // The list has nothing to read again, and neither does a read under way.
+        assert!(!pulls.reloads() && !pulls.reload(now()));
+        pulls.toggle();
+        assert_eq!(asked(&mut pulls), Some((31, 1, false)));
+        assert!(!pulls.reloads() && !pulls.reload(now()));
+        answered(&mut pulls, 1);
+
+        // Once it is done, `r` reads again from the host, and the details show the last
+        // answers until the new ones come.
+        assert!(pulls.reloads() && pulls.reload(now()));
+        assert_eq!(asked(&mut pulls), Some((31, 2, true)));
+        assert!(!pulls.reloads() && !pulls.reload(now()));
+        let shown = rows(&mut pulls);
+        assert!(shown.contains(&"Refreshing from github.com…".to_string()));
+        assert!(shown.contains(&"Reviewers".to_string()), "{shown:#?}");
+
+        // The number its invalidate moved doesn't read again, and the next one does, once
+        // the read is done.
+        assert!(!pulls.refresh());
+        assert!(pulls.refresh());
+        answered(&mut pulls, 2);
+        assert_eq!(asked(&mut pulls), Some((31, 3, false)));
+        answered(&mut pulls, 3);
+
+        // A read from the host that heard no number forgets it once done, so the next number
+        // reads again.
+        assert!(pulls.reload(now()));
+        assert_eq!(asked(&mut pulls), Some((31, 4, true)));
+        answered(&mut pulls, 4);
+        assert!(pulls.refresh());
+        assert_eq!(asked(&mut pulls), Some((31, 5, false)));
+        answered(&mut pulls, 5);
+
+        // With nothing to show meanwhile, as after a failure, it reads as a first read does.
+        pulls.back();
+        pulls.move_by(1);
+        pulls.toggle();
+        assert_eq!(asked(&mut pulls), Some((32, 6, false)));
+        pulls.answer(
+            6,
+            Part::Detail(Err("Pull request #32 was not found.".into())),
+            now(),
+        );
+        pulls.answer(6, Part::Activity(Err("Not found".into())), now());
+        pulls.answer(6, Part::Done, now());
+        assert!(pulls.reload(now()));
+        assert!(rows(&mut pulls).contains(&"Reading from github.com…".to_string()));
+        assert_eq!(asked(&mut pulls), Some((32, 7, true)));
+
+        // Nor does a link whose read waits for another's.
+        pulls.back();
+        pulls.move_by(-1);
+        pulls.toggle();
+        assert_eq!(asked(&mut pulls), None);
+        assert!(!pulls.reloads() && !pulls.reload(now()));
+        pulls.answer(7, Part::Done, now());
+        assert_eq!(asked(&mut pulls), Some((31, 8, false)));
+    }
+
+    #[test]
+    fn the_details_read_their_detail_again_after_five_minutes_while_in_use() {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![link(
+            "krishhgg/t3term",
+            31,
+            "a",
+            "b",
+        )])));
+        let detail = |updated: &str| {
+            let mut detail = bare_detail();
+            detail["updatedAt"] = json!(updated);
+            Part::Detail(Ok(read_detail(&detail)))
+        };
+        let remark = |body: &str| {
+            let mut activity = bare_activity();
+            activity["comments"] = json!([{"id": body, "kind": "issue-comment",
+                "author": {"login": "mona", "name": null}, "body": body,
+                "createdAt": "2026-10-13T09:00:00Z", "url": null, "path": null,
+                "reviewState": null}]);
+            activity["commentCount"] = json!(1);
+            let activity = pull_request::Activity::read(&activity).unwrap();
+            Part::Activity(Ok(Box::new(activity)))
+        };
+        let asked = |pulls: &mut PullRequests, at: i64| {
+            let ask = pulls.take_ask(true, at);
+            ask.map(|ask| (ask.ticket, ask.updated))
+        };
+        let rows = |pulls: &mut PullRequests, at: i64| {
+            pulls.page(44, 60, at, true, &theme());
+            detail_rows(pulls)
+        };
+        let t0 = now();
+
+        // Nothing is due until a read is done.
+        assert_eq!(pulls.live_at(), None);
+        pulls.toggle();
+        assert_eq!(asked(&mut pulls, t0), Some((1, None)));
+        assert_eq!(pulls.live_at(), None);
+        pulls.answer(1, detail("2026-10-13T11:00:00Z"), t0);
+        pulls.answer(1, remark("First."), t0);
+        pulls.answer(1, Part::Done, t0);
+        assert_eq!(pulls.live_at(), Some(t0 + LIVE));
+
+        // Five minutes after it was asked for, with a key a minute ago, the detail is read
+        // again with the `updatedAt` it showed. Waking from a sleep twenty minutes past that
+        // key reads nothing.
+        assert!(!pulls.live(t0 + LIVE - 1, t0 + LIVE - 60_000));
+        assert!(!pulls.live(t0 + LIVE + 19 * 60_000, t0 + LIVE - 60_000));
+        assert!(pulls.live(t0 + LIVE, t0 + LIVE - 60_000));
+        let t1 = t0 + LIVE;
+        let updated = Some("2026-10-13T11:00:00Z".to_string());
+        assert_eq!(asked(&mut pulls, t1), Some((2, updated)));
+        assert_eq!(pulls.live_at(), None);
+        assert!(rows(&mut pulls, t1).contains(&"Refreshing from github.com…".to_string()));
+
+        // A detail that stayed the same keeps the conversation, and the read stands.
+        assert!(!pulls.answer(2, detail("2026-10-13T11:00:00Z"), t1));
+        assert!(pulls.answer(2, Part::Done, t1));
+        let shown = rows(&mut pulls, t1);
+        assert!(shown.contains(&"Read from github.com just now".to_string()));
+        assert!(shown.iter().any(|row| row.trim() == "First."), "{shown:#?}");
+        pulls.back();
+        pulls.toggle();
+        assert_eq!(asked(&mut pulls, t1 + 1), None);
+
+        // Left alone for six minutes by then, the details wait, and the next key reads them.
+        let t2 = t1 + LIVE;
+        assert_eq!(pulls.live_at(), Some(t2));
+        assert!(!pulls.live(t2, t2 - IDLE));
+        assert!(!pulls.live(t2 + 60_000, t2 - IDLE));
+        assert!(pulls.live(t2 + 60_000, t2 + 60_000));
+        assert_eq!(asked(&mut pulls, t2).map(|ask| ask.0), Some(3));
+
+        // A detail that changed comes with the conversation the read asked for after it.
+        assert!(!pulls.answer(3, detail("2026-10-13T12:00:00Z"), t2));
+        assert!(!pulls.answer(3, remark("Second."), t2));
+        assert!(pulls.answer(3, Part::Done, t2));
+        let shown = rows(&mut pulls, t2);
+        assert!(
+            shown.iter().any(|row| row.trim() == "Second."),
+            "{shown:#?}"
+        );
+
+        // A failed read waits five minutes more rather than ask again at once.
+        let t3 = t2 + LIVE;
+        assert!(pulls.live(t3, t3));
+        assert_eq!(asked(&mut pulls, t3).map(|ask| ask.0), Some(4));
+        assert!(!pulls.answer(4, Part::Detail(Err("timed out".into())), t3));
+        assert!(pulls.answer(4, Part::Done, t3));
+        assert!(!rows(&mut pulls, t3).contains(&"timed out".to_string()));
+        assert_eq!(pulls.live_at(), Some(t3 + LIVE));
+        assert!(!pulls.live(t3 + 1, t3 + 1));
+
+        // A refresh number reads the conversation too, though a live read was due.
+        let t4 = t3 + LIVE;
+        assert!(pulls.live(t4, t4));
+        assert!(pulls.refresh());
+        assert_eq!(asked(&mut pulls, t4), Some((5, None)));
+        pulls.answer(5, Part::Done, t4);
+
+        // Nothing is due while the list shows or the tab doesn't.
+        pulls.back();
+        assert_eq!(pulls.live_at(), None);
+        pulls.toggle();
+        pulls.shown(false);
+        assert_eq!(pulls.live_at(), None);
+        pulls.shown(true);
+        assert_eq!(pulls.live_at(), Some(t4 + LIVE));
+    }
+
+    #[test]
+    fn a_read_that_keeps_details_current_reads_a_conversation_that_failed_again() {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![link(
+            "krishhgg/t3term",
+            31,
+            "a",
+            "b",
+        )])));
+        let detail = |updated: &str| {
+            let mut detail = bare_detail();
+            detail["updatedAt"] = json!(updated);
+            Part::Detail(Ok(read_detail(&detail)))
+        };
+        let remark = |body: &str| {
+            let mut activity = bare_activity();
+            activity["comments"] = json!([{"id": body, "kind": "issue-comment",
+                "author": {"login": "mona", "name": null}, "body": body,
+                "createdAt": "2026-10-13T09:00:00Z", "url": null, "path": null,
+                "reviewState": null}]);
+            activity["commentCount"] = json!(1);
+            let activity = pull_request::Activity::read(&activity).unwrap();
+            Part::Activity(Ok(Box::new(activity)))
+        };
+        let timed_out = || Part::Activity(Err("timed out".into()));
+        let live = |pulls: &mut PullRequests, at: i64| {
+            assert!(pulls.live(at, at));
+            let ask = pulls.take_ask(true, at).expect("a read again");
+            (ask.ticket, ask.updated)
+        };
+        let t0 = now();
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(true, t0).map(|ask| ask.ticket), Some(1));
+        pulls.answer(1, detail("2026-10-13T11:00:00Z"), t0);
+        pulls.answer(1, timed_out(), t0);
+        pulls.answer(1, Part::Done, t0);
+
+        // A first read whose conversation failed reads it again with the detail.
+        let t1 = t0 + LIVE;
+        assert_eq!(live(&mut pulls, t1), (2, None));
+        pulls.answer(2, detail("2026-10-13T11:00:00Z"), t1);
+        pulls.answer(2, remark("First."), t1);
+        pulls.answer(2, Part::Done, t1);
+
+        // A detail that changed and a conversation that then failed keep the last conversation
+        // beside the new detail.
+        let t2 = t1 + LIVE;
+        let shown = Some("2026-10-13T11:00:00Z".to_string());
+        assert_eq!(live(&mut pulls, t2), (3, shown));
+        pulls.answer(3, detail("2026-10-13T12:00:00Z"), t2);
+        pulls.answer(3, timed_out(), t2);
+        pulls.answer(3, Part::Done, t2);
+        pulls.page(44, 60, t2, true, &theme());
+        let rows = detail_rows(&pulls);
+        assert!(rows.iter().any(|row| row.trim() == "First."), "{rows:#?}");
+
+        // The next read reads both, though the detail shown is the newest, and once both came
+        // the one after reads the detail alone again.
+        let t3 = t2 + LIVE;
+        assert_eq!(live(&mut pulls, t3), (4, None));
+        pulls.answer(4, detail("2026-10-13T12:00:00Z"), t3);
+        pulls.answer(4, remark("Second."), t3);
+        pulls.answer(4, Part::Done, t3);
+        let t4 = t3 + LIVE;
+        let shown = Some("2026-10-13T12:00:00Z".to_string());
+        assert_eq!(live(&mut pulls, t4), (5, shown));
+    }
+
+    #[test]
+    fn coming_back_to_t3term_reads_the_details_again_unless_read_ten_seconds_ago() {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![link(
+            "krishhgg/t3term",
+            31,
+            "a",
+            "b",
+        )])));
+        let t0 = now();
+        assert!(!pulls.arrive(t0));
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(true, t0).map(|ask| ask.ticket), Some(1));
+        assert!(!pulls.arrive(t0 + LIVE));
+        let mut detail = bare_detail();
+        detail["updatedAt"] = json!("2026-10-13T11:00:00Z");
+        pulls.answer(1, Part::Detail(Ok(read_detail(&detail))), t0);
+        let activity = pull_request::Activity::read(&bare_activity()).unwrap();
+        pulls.answer(1, Part::Activity(Ok(Box::new(activity))), t0);
+        pulls.answer(1, Part::Done, t0);
+
+        // Well before the five minutes, coming back reads the detail again, though not within
+        // ten seconds of the last read.
+        assert!(!pulls.arrive(t0 + SOONEST - 1));
+        assert!(pulls.arrive(t0 + SOONEST));
+        let ask = pulls.take_ask(true, t0 + SOONEST).expect("a read again");
+        let updated = Some("2026-10-13T11:00:00Z".to_string());
+        assert_eq!((ask.ticket, ask.updated), (2, updated));
+        assert!(!pulls.arrive(t0 + LIVE));
+        pulls.answer(2, Part::Detail(Err("timed out".into())), t0 + SOONEST);
+        pulls.answer(2, Part::Done, t0 + SOONEST);
+        assert_eq!(pulls.live_at(), Some(t0 + SOONEST + LIVE));
+
+        // A read again that failed counts from when it was asked for, so arriving within ten
+        // seconds of it asks nothing more, though the detail shown came before.
+        assert!(!pulls.arrive(t0 + 2 * SOONEST - 1));
+        assert!(pulls.arrive(t0 + 2 * SOONEST));
+
+        // Not on the list.
+        pulls.back();
+        assert!(!pulls.arrive(t0 + LIVE));
+    }
+
+    #[test]
+    fn details_whose_read_failed_read_it_again_after_five_minutes_while_in_use() {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![link(
+            "krishhgg/t3term",
+            31,
+            "a",
+            "b",
+        )])));
+        let t0 = now();
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(true, t0).map(|ask| ask.ticket), Some(1));
+        pulls.answer(1, Part::Detail(Err("timed out".into())), t0);
+        pulls.answer(1, Part::Activity(Err("timed out".into())), t0);
+        pulls.answer(1, Part::Done, t0);
+        assert_eq!(pulls.live_at(), Some(t0 + LIVE));
+
+        // It reads both again as a first read does, since there is no detail to compare.
+        let t1 = t0 + LIVE;
+        assert!(pulls.live(t1, t1));
+        let ask = pulls.take_ask(true, t1).expect("a read again");
+        assert_eq!((ask.ticket, ask.invalidate, ask.updated), (2, false, None));
+        pulls.page(44, 60, t1, true, &theme());
+        assert!(detail_rows(&pulls).contains(&"Reading from github.com…".to_string()));
+    }
+
+    #[test]
+    fn a_read_again_with_no_detail_to_show_says_it_reads() {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![link(
+            "krishhgg/t3term",
+            31,
+            "a",
+            "b",
+        )])));
+        let activity = || {
+            let activity = pull_request::Activity::read(&bare_activity()).unwrap();
+            Part::Activity(Ok(Box::new(activity)))
+        };
+        let ticket = |pulls: &mut PullRequests| pulls.take_ask(true, now()).map(|a| a.ticket);
+        let rows = |pulls: &mut PullRequests| {
+            pulls.page(44, 60, now(), true, &theme());
+            detail_rows(pulls)
+        };
+        let failure = "no credential".to_string();
+        let reading = "Reading from github.com…".to_string();
+        // The detail fails and the conversation comes, so the details say why.
+        pulls.toggle();
+        assert_eq!(ticket(&mut pulls), Some(1));
+        assert!(pulls.answer(1, Part::Detail(Err(failure.clone())), now()));
+        assert!(pulls.answer(1, activity(), now()));
+        assert!(!pulls.answer(1, Part::Done, now()));
+        assert!(rows(&mut pulls).contains(&failure));
+
+        // Opening them again reads again, and with no detail to show over, they say so in
+        // place of the old failure until both answers came.
+        pulls.back();
+        pulls.toggle();
+        assert_eq!(ticket(&mut pulls), Some(2));
+        let shown = rows(&mut pulls);
+        assert!(shown.contains(&reading), "{shown:#?}");
+        assert!(!shown.contains(&failure), "{shown:#?}");
+        assert!(!pulls.answer(2, Part::Detail(Err(failure.clone())), now()));
+        assert!(rows(&mut pulls).contains(&reading));
+        assert!(!pulls.answer(2, activity(), now()));
+        assert!(pulls.answer(2, Part::Done, now()));
+        let shown = rows(&mut pulls);
+        assert!(shown.contains(&failure), "{shown:#?}");
+        assert!(!shown.contains(&reading), "{shown:#?}");
+
+        // So does a refresh while the details show them.
+        assert!(pulls.refresh());
+        assert_eq!(ticket(&mut pulls), Some(3));
+        let shown = rows(&mut pulls);
+        assert!(shown.contains(&reading), "{shown:#?}");
+        assert!(!shown.contains(&failure), "{shown:#?}");
     }
 
     #[test]
@@ -3615,33 +4564,42 @@ mod tests {
 
     #[test]
     fn an_answer_stands_for_a_minute_from_when_it_came() {
-        let mut pulls = PullRequests::default();
-        pulls.set(list_of(&thread(vec![link(
-            "krishhgg/t3term",
-            31,
-            "a",
-            "b",
-        )])));
-        let reopen = |pulls: &mut PullRequests, at: i64| {
+        // The host took 45 seconds, and the details say when the answer came.
+        let answered = || {
+            let mut pulls = PullRequests::default();
+            pulls.set(list_of(&thread(vec![link(
+                "krishhgg/t3term",
+                31,
+                "a",
+                "b",
+            )])));
+            pulls.toggle();
+            let asked = now() - 45_000;
+            assert_eq!(pulls.take_ask(true, asked).map(|ask| ask.ticket), Some(1));
+            assert!(pulls.answer(1, Part::Detail(Ok(read_detail(&bare_detail()))), now()));
+            let activity = pull_request::Activity::read(&bare_activity()).unwrap();
+            assert!(pulls.answer(1, Part::Activity(Ok(Box::new(activity))), now()));
+            assert!(!pulls.answer(1, Part::Done, now()));
+            pulls.page(44, 30, now(), true, &theme());
+            let rows = detail_rows(&pulls);
+            assert!(rows.contains(&"Read from github.com just now".to_string()));
+            pulls
+        };
+        // Which read opening the details again at `at` asks for, and whether it reads only the
+        // detail.
+        let reopen = |at: i64| {
+            let mut pulls = answered();
             pulls.back();
             pulls.toggle();
-            pulls.take_ask(true, at).map(|ask| ask.ticket)
+            let ask = pulls.take_ask(true, at);
+            ask.map(|ask| (ask.ticket, ask.updated.is_some()))
         };
-        pulls.toggle();
-        let asked = now() - 45_000;
-        assert_eq!(pulls.take_ask(true, asked).map(|ask| ask.ticket), Some(1));
-        // The host took 45 seconds, and the details say when the answer came.
-        assert!(pulls.answer(1, Part::Detail(Ok(read_detail(&bare_detail()))), now()));
-        let activity = pull_request::Activity::read(&bare_activity()).unwrap();
-        assert!(pulls.answer(1, Part::Activity(Ok(Box::new(activity))), now()));
-        assert!(!pulls.answer(1, Part::Done, now()));
-        pulls.page(44, 30, now(), true, &theme());
-        let rows = detail_rows(&pulls);
-        assert!(rows.contains(&"Read from github.com just now".to_string()));
-        // Twenty seconds on, the answer stands.
-        assert_eq!(reopen(&mut pulls, now() + 20_000), None);
-        assert_eq!(reopen(&mut pulls, now() + FRESH - 1), None);
-        assert_eq!(reopen(&mut pulls, now() + FRESH), Some(2));
+        // Within ten seconds of the answer, nothing is read. Within the minute the answers
+        // stand, and only the detail is read again. After it, both are.
+        assert_eq!(reopen(now() + SOONEST - 1), None);
+        assert_eq!(reopen(now() + SOONEST), Some((2, true)));
+        assert_eq!(reopen(now() + FRESH - 1), Some((2, true)));
+        assert_eq!(reopen(now() + FRESH), Some((2, false)));
     }
 
     #[test]
@@ -4005,18 +4963,18 @@ mod tests {
         pulls.end();
         let (bots, _) = control_rows(&mut pulls, 24, true, Control::Bots);
         // Either of the group's rows opens it, and it is chosen.
-        assert!(pulls.click(bots[1]));
+        assert!(pulls.click(0, bots[1]));
         assert_eq!(pulls.pick, Some(Control::Bots));
         assert_eq!(pulls.action().as_deref(), Some("hide bot comments"));
         // The rows moved, so until a frame draws them a click lands on nothing.
-        assert!(!pulls.click(bots[0]));
+        assert!(!pulls.click(0, bots[0]));
         let (open, _) = control_rows(&mut pulls, 24, true, Control::Bots);
         assert_eq!(open, bots);
-        assert!(pulls.click(bots[0]));
+        assert!(pulls.click(0, bots[0]));
         assert_eq!(pulls.action().as_deref(), Some("show bot comments"));
         // A row between two controls takes no click.
         pulls.page(40, 24, now(), true, &theme);
-        assert!(!pulls.click(bots[0] - 1));
+        assert!(!pulls.click(0, bots[0] - 1));
         assert_eq!(pulls.action().as_deref(), Some("show bot comments"));
     }
 
@@ -4076,5 +5034,192 @@ mod tests {
         pulls.step(true);
         assert_eq!(pulls.pick, None);
         assert_ne!(pulls.scroll, scroll);
+    }
+
+    #[test]
+    fn a_links_details_have_a_summary_and_a_timeline_each_at_its_own_scroll() {
+        let theme = theme();
+        let head = |pulls: &mut PullRequests, width| {
+            let page = pulls.page(width, 6, now(), true, &theme);
+            (rows_of(&page.lines[..1]).remove(0), page.tabs.clone())
+        };
+        // Until the host's detail came, the details have no tabs and → does nothing.
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![link(
+            "krishhgg/t3term",
+            31,
+            "a",
+            "b",
+        )])));
+        pulls.toggle();
+        let ask = pulls.take_ask(true, now()).expect("a read");
+        assert_eq!(pulls.tabs(), None);
+        assert!(!pulls.forward());
+        let (row, tabs) = head(&mut pulls, 40);
+        assert_eq!(row, format!("← List{}1 of 1", " ".repeat(28)));
+        assert!(tabs.is_empty());
+        let detail = Part::Detail(Ok(read_detail(&bare_detail())));
+        assert!(pulls.answer(ask.ticket, detail, now()));
+        assert_eq!(pulls.tabs(), Some(Tab::Summary));
+        let (row, tabs) = head(&mut pulls, 40);
+        assert_eq!(
+            row,
+            format!("← List  Summary  Timeline{}1 of 1", " ".repeat(9))
+        );
+        assert_eq!(tabs, [(6..15, Tab::Summary), (15..25, Tab::Timeline)]);
+        let page = pulls.page(40, 6, now(), true, &theme);
+        let underlined = |name: &str| {
+            let span = page.lines[0].spans.iter().find(|span| span.content == name);
+            span.unwrap()
+                .style
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        };
+        assert!(underlined("Summary") && !underlined("Timeline"));
+        // The Timeline waits for the conversation.
+        assert!(pulls.forward());
+        assert_eq!(pulls.tabs(), Some(Tab::Timeline));
+        head(&mut pulls, 40);
+        let rows = detail_rows(&pulls);
+        assert_eq!(rows[rows.len() - 2..], ["", "Reading the conversation…"]);
+        let activity = pull_request::Activity::read(&remarks(3)).unwrap();
+        let activity = Part::Activity(Ok(Box::new(activity)));
+        assert!(pulls.answer(ask.ticket, activity, now()));
+        head(&mut pulls, 40);
+        let rows = detail_rows(&pulls);
+        // The fixture's remarks came before it opened.
+        let timeline = [
+            "",
+            "4 comments · 0 commits      Newest first",
+            "",
+            "● Pull request opened",
+            "  4h ago",
+            "",
+            "› 4 comments",
+            "  2 authors · 11h ago",
+        ];
+        assert_eq!(rows[rows.len() - 8..], timeline);
+
+        // Each tab keeps its own scroll, and a switch chooses no control.
+        assert!(pulls.back());
+        head(&mut pulls, 40);
+        pulls.move_by(3);
+        assert!(pulls.forward());
+        assert_eq!(pulls.scroll, Offset::Top(0));
+        head(&mut pulls, 40);
+        pulls.move_by(2);
+        head(&mut pulls, 40);
+        assert!(pulls.back());
+        assert_eq!(pulls.scroll, Offset::Top(3));
+        head(&mut pulls, 40);
+        assert!(pulls.forward());
+        assert_eq!(pulls.scroll, Offset::Top(2));
+        assert!(!pulls.forward());
+
+        // A click on a tab's name shows it, and one on the rest of the row leads straight back
+        // to the list.
+        head(&mut pulls, 40);
+        assert!(!pulls.click(20, 0), "the tab that shows");
+        assert!(pulls.click(8, 0));
+        assert_eq!(pulls.tabs(), Some(Tab::Summary));
+        assert!(!pulls.click(20, 0), "before a frame drew the tab");
+        head(&mut pulls, 40);
+        assert!(pulls.click(20, 0));
+        assert_eq!(pulls.tabs(), Some(Tab::Timeline));
+        head(&mut pulls, 40);
+        assert!(pulls.click(36, 0));
+        assert!(!pulls.viewing());
+
+        // They open again on the Summary, from the top of each tab.
+        pulls.toggle();
+        assert_eq!(pulls.tabs(), Some(Tab::Summary));
+        assert_eq!(
+            (pulls.scroll, pulls.other),
+            (Offset::Top(0), Offset::Top(0))
+        );
+        assert!(pulls.forward());
+        assert_eq!(pulls.scroll, Offset::Top(0));
+
+        // ↓ chooses the Timeline's controls, and Enter does what they do.
+        pulls.page(40, 24, now(), true, &theme);
+        pulls.step(true);
+        assert_eq!(pulls.action().as_deref(), Some("oldest first"));
+        pulls.enter();
+        assert_eq!(pulls.action().as_deref(), Some("newest first"));
+        pulls.page(40, 24, now(), true, &theme);
+        pulls.step(true);
+        assert_eq!(pulls.action().as_deref(), Some("show comments"));
+        pulls.enter();
+        pulls.page(40, 24, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(rows.contains(&"⌄ 4 comments".to_string()), "{rows:?}");
+        assert!(
+            rows.contains(&"  ci[bot] commented".to_string()),
+            "{rows:?}"
+        );
+        // ← shows the Summary, with no control chosen, then the list.
+        assert!(pulls.back());
+        assert_eq!((pulls.tabs(), pulls.pick), (Some(Tab::Summary), None));
+        assert!(pulls.back());
+        assert!(!pulls.viewing());
+        assert!(!pulls.back());
+    }
+
+    #[test]
+    fn a_read_again_forgets_the_open_runs_it_no_longer_has() {
+        let mut pulls = conversing(remarks(3));
+        let theme = theme();
+        assert!(!pulls.answer(1, Part::Done, now()));
+        // The Timeline's one run opens.
+        assert!(pulls.forward());
+        pulls.page(40, 24, now(), true, &theme);
+        pulls.step(true);
+        assert_eq!(pulls.action().as_deref(), Some("oldest first"));
+        pulls.page(40, 24, now(), true, &theme);
+        pulls.step(true);
+        assert_eq!(pulls.action().as_deref(), Some("show comments"));
+        pulls.enter();
+        assert_ne!(pulls.shown, Shown::default());
+
+        // A newer remark joins it, so it is another run, and the key of the one that went is
+        // forgotten.
+        assert!(pulls.refresh());
+        assert_eq!(pulls.take_ask(true, now()).map(|ask| ask.ticket), Some(2));
+        let mut activity = remarks(3);
+        let newer = json!({"id": "d", "kind": "issue-comment",
+            "author": {"login": "mona", "name": null}, "body": "Later",
+            "createdAt": "2026-10-13T01:00:00Z", "url": null, "path": null,
+            "reviewState": null});
+        activity["comments"].as_array_mut().unwrap().push(newer);
+        activity["commentCount"] = json!(5);
+        let activity = pull_request::Activity::read(&activity).unwrap();
+        let detail = Part::Detail(Ok(read_detail(&bare_detail())));
+        assert!(!pulls.answer(2, detail, now()));
+        assert!(!pulls.answer(2, Part::Activity(Ok(Box::new(activity))), now()));
+        assert!(pulls.answer(2, Part::Done, now()));
+        assert_eq!(pulls.shown, Shown::default());
+    }
+
+    #[test]
+    fn the_row_above_a_links_details_drops_where_it_is_then_cuts_the_tab_names() {
+        let mut pulls = conversing(remarks(1));
+        let theme = theme();
+        let both = vec![(6..15, Tab::Summary), (15..25, Tab::Timeline)];
+        let cases = [
+            (33, "← List  Summary  Timeline  1 of 1", both.clone()),
+            (32, "← List  Summary  Timeline", both),
+            (
+                20,
+                "← List  Summary  Ti…",
+                vec![(6..15, Tab::Summary), (15..20, Tab::Timeline)],
+            ),
+            (9, "← List  …", vec![(6..9, Tab::Summary)]),
+            (8, "← List", vec![]),
+        ];
+        for (width, row, tabs) in cases {
+            let page = pulls.page(width, 6, now(), true, &theme);
+            assert_eq!(rows_of(&page.lines[..1]), [row], "{width}");
+            assert_eq!(page.tabs, tabs, "{width}");
+        }
     }
 }
