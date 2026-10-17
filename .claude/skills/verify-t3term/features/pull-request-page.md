@@ -65,7 +65,8 @@ $T3V keys Enter && $T3V wait --text "Summary. Four files change," --text "Enter 
 $T3V capture bots-older
 $T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 1 and .rpcRequestsByTag["pullRequests.activity"] == 1'
 
-# The same link again within the minute: its answers show while the detail alone is read again, since it is over 10 seconds old, and the groups start folded.
+# The same link again within the minute: its answers show while the detail alone is read again, once it is over 10 seconds old, and the groups start folded.
+$T3V wait --idle 10000 --timeout 15
 $T3V keys Left && $T3V wait --gone "← List"
 $T3V keys Enter && $T3V wait --text "← List  Summary  Timeline" --text "#41 Stack base" --text "Refreshing from github.com…" --text "Comments (28)" --gone "Reading"
 $T3V wait --text "Read from github.com just now" --text "Comments (28)" --gone "Refreshing from"
@@ -223,7 +224,7 @@ $T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.invalidate"] == 2 an
 - `Read from github.com just now` turns into `1m ago` at the first frame a minute after the answer, and nothing draws a frame while t3term idles. Wait on `Read from github.com`, and wait out a minute with `t3v wait --idle 61000`.
 - The pane is 32 columns inside, so long rows wrap: the credential sentence breaks after `No GitHub credential on the`, and a check's name wraps under its mark. Wait on text that fits one row.
 - Opening another link drops the last answers, so going back to a link read a moment ago reads it again. Count the reads after each open.
-- The recipe opens #41 again 15 to 30 s after its answers came. It reads the detail alone then. Steps added before that open can push it past the minute, and then #41's conversation is read again too.
+- The recipe waits 10 s before it opens #41 again, so its detail is over 10 seconds old and is read again, within the minute, so its conversation isn't. Steps added before that open can push it past the minute, and then #41's conversation is read again too.
 - A read under way holds back the next link's until both its answers came. Keys sent faster than 3 s apart can leave a link waiting with `Reading from…` until the first read is over.
 - The conversation arriving adds rows above the reader's place, and the details don't keep it, so what shows moves down. Wait for `Comments (` before you scroll.
 - ↑ and ↓ scroll only while no button or group has a row in view. PgDn and the other scrolling keys work as before, and a chosen control they scroll out of view counts as none chosen, so the next ↓ chooses the first one in view. An answer from T3 clears the choice too. Wait on the status line's `Enter …` after each arrow.
