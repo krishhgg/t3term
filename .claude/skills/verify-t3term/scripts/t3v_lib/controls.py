@@ -153,6 +153,11 @@ def cmd_reconnect(args) -> int:
     return 0
 
 
+def cmd_frame(args) -> int:
+    send(args, '/__fixture/frame', {'frame': args.frame, 'client': args.client})
+    return 0
+
+
 def add_commands(commands, run_option):
     """The world's commands. `run_option` adds --run to a parser."""
     added = [commands.add_parser('expect', help='what t3term should show now, from what the server sent'),
@@ -222,5 +227,14 @@ def add_commands(commands, run_option):
     reconnect.add_argument('--hold', type=float, default=3.0, help='seconds /ws answers 503 (default 3, at most 30)')
     reconnect.set_defaults(func=cmd_reconnect)
     added.append(reconnect)
+
+    frame = commands.add_parser('frame', help="send one frame t3term can't parse on each open socket of the TUI "
+                                              "or the CLI: text that isn't JSON (json) or binary that isn't UTF-8 "
+                                              '(binary); refused when no such socket is open')
+    frame.add_argument('frame', choices=('json', 'binary'))
+    frame.add_argument('--client', choices=('tui', 'cli'), default='tui',
+                       help="whose sockets get it, by the client t3term's session was issued to (default tui)")
+    frame.set_defaults(func=cmd_frame)
+    added.append(frame)
     for parser in added:
         run_option(parser)
