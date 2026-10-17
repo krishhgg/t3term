@@ -45,6 +45,22 @@ fn output(command: &mut Command) -> Output {
     spawn(command).wait_with_output().expect("run t3term")
 }
 
+/// Every process these tests start holds `SPAWNING`, through `spawn` and `output`, or in the
+/// one test that holds `spawning()` itself until stdout's reader is gone. A test that calls
+/// `Command::output` or `Command::spawn` straight, as a merge from master can bring in, fails
+/// here rather than now and then on macOS.
+#[test]
+fn every_process_starts_holding_the_spawn_lock() {
+    let calls = ["output", "spawn", "status"].map(|name| format!(".{name}()"));
+    let starts: Vec<&str> = include_str!("cli.rs")
+        .lines()
+        .map(str::trim)
+        .filter(|line| calls.iter().any(|call| line.contains(call.as_str())))
+        .collect();
+    // `spawn`'s own call, and `launch_into_closed_stdout`'s under `spawning()`.
+    assert_eq!(starts.len(), 2, "{starts:#?}");
+}
+
 struct Home(TempDir);
 
 impl Home {
@@ -3380,7 +3396,7 @@ fn environment_status_probes_each_saved_environment_by_its_descriptor_alone() {
     let near_a = |args: &[&str]| {
         let mut command = home.command(args, &t3);
         command.env("T3TERM_ORIGIN", &a.origin);
-        command.output().expect("run t3term")
+        output(&mut command)
     };
     let expected = [
         ("a", "ready", None, 0),
@@ -3763,7 +3779,7 @@ fn a_descriptor_over_256_kib_blocks_its_environment_alone_and_gets_no_login() {
     home.record_server(&a.origin);
     let mut discover = home.command(&["--json", "threads"], &t3);
     discover.env("T3TERM_ORIGIN", &servers[2].0);
-    assert_eq!(listed_ids(&discover.output().unwrap()), [THREAD_A]);
+    assert_eq!(listed_ids(&output(&mut discover)), [THREAD_A]);
     let ambient = home.0.path().join(".t3");
     logins += &session_log(ambient.to_str().unwrap(), READ_SCOPE);
     assert_eq!(home.t3_log(), logins);
