@@ -144,6 +144,11 @@ impl Shown {
             | Control::Folds
             | Control::Layout
             | Control::Wrap
+            | Control::Tree
+            | Control::Folders
+            | Control::Folder(..)
+            | Control::TreeFile(_)
+            | Control::MoreFiles
             | Control::Stretch(..)
             | Control::Retry
             | Control::More(_)
@@ -237,6 +242,21 @@ pub(super) enum Control {
     Layout,
     /// Lets the lines of the Code tab run on past the end of their rows, or wraps them again.
     Wrap,
+    /// Shows the Code tab's file tree, or hides it again.
+    Tree,
+    /// Opens every folder of the Code tab's file tree, or closes them all once every one is
+    /// open.
+    Folders,
+    /// Opens or closes a folder's row of the Code tab's file tree, by the place of its first
+    /// file among the files shown and the number of parts in the path of the last folder the
+    /// row joins.
+    Folder(usize, usize),
+    /// Unfolds a file from its row of the Code tab's file tree and shows it at the top of the
+    /// details, by the place among the files shown of the first with its path.
+    TreeFile(usize),
+    /// Reads the Code tab's next slice from the end of its file tree, or reads again the slice
+    /// whose read failed.
+    MoreFiles,
     /// Reads again the slice of the diff whose read failed, at the end of the Code tab.
     Retry,
     /// Opens or closes a review thread on the Code tab, by its place among the threads as T3
@@ -267,8 +287,9 @@ pub(super) enum Control {
 
 impl Control {
     /// Whether the Code tab's own state, rather than the conversation's, says what it does:
-    /// a file, the toggles for the whitespace and the wrapping, the button that folds or
-    /// unfolds every file, a run of unchanged lines, Retry and the list of commits.
+    /// a file, the toggles for the whitespace, the layout, the wrapping and the file tree, the
+    /// button that folds or unfolds every file, the tree's rows, a run of unchanged lines,
+    /// Retry and the list of commits.
     pub(super) fn on_code(self) -> bool {
         matches!(
             self,
@@ -277,6 +298,11 @@ impl Control {
                 | Control::Folds
                 | Control::Layout
                 | Control::Wrap
+                | Control::Tree
+                | Control::Folders
+                | Control::Folder(..)
+                | Control::TreeFile(_)
+                | Control::MoreFiles
                 | Control::Stretch(..)
                 | Control::Retry
         ) || self.on_commits()
@@ -856,6 +882,11 @@ impl Conversation {
             | Control::Folds
             | Control::Layout
             | Control::Wrap
+            | Control::Tree
+            | Control::Folders
+            | Control::Folder(..)
+            | Control::TreeFile(_)
+            | Control::MoreFiles
             | Control::Stretch(..)
             | Control::Retry
             | Control::Thread(_)
@@ -917,6 +948,11 @@ impl Conversation {
             | Control::Folds
             | Control::Layout
             | Control::Wrap
+            | Control::Tree
+            | Control::Folders
+            | Control::Folder(..)
+            | Control::TreeFile(_)
+            | Control::MoreFiles
             | Control::Stretch(..)
             | Control::Retry
             | Control::Commits
