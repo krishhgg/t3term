@@ -59,6 +59,22 @@ LEAK_MARKERS = {
 SCREEN_MARKERS = tuple(LEAK_MARKERS)
 
 
+# ---- emoji that end in U+FE0F: src/tui/wide_emoji.rs ----
+
+# thr-none's last reply, for features/transcript.md. Every emoji but the party popper ends in U+FE0F
+# (VS16), which tmux draws two columns wide. Each list row with emoji sits over a row of text, so a
+# scroll of one row puts letters under the column each of those emoji hides. Written with escapes,
+# so the U+FE0F shows here.
+VS16_REPLY = '\n'.join((
+    'Emoji check: each row of the list keeps its columns.',
+    '',
+    '- \u26a0\ufe0f one \u2764\ufe0f two \u2714\ufe0f three',
+    '- warnings, hearts and checks',
+    '- \u2764\ufe0f 2  \U0001f389 3  \u26a0\ufe0f 1  reactions',
+    '- every row of this list has text',
+))
+
+
 # ---- the links T3 sends: packages/contracts/src/threadPullRequest.ts ----
 
 
@@ -902,5 +918,8 @@ def build_world(t0: int) -> dict:
     legacy.reply(2, FENCE_REPLY, legacy.latest_run()['completedAt'])
     for thread in threads.values():
         thread.settle_record()
+    # Emoji that end in U+FE0F: a reply after the last turn's on thr-none.
+    none = threads['thr-none']
+    none.reply(2, VS16_REPLY, none.latest_run()['completedAt'])
     return {'projects': [desk], 'threads': threads, 'order': order}
 
