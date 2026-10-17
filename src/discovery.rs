@@ -19,6 +19,12 @@ pub const PROTOCOL_QUERY_PARAM: &str = "orchestrationProtocol";
 /// 200 bytes to each.
 const MAX_RECORD_BYTES: u64 = 16 * 1024;
 
+/// The longest descriptor body t3term reads. T3 f570bd21 sends about 1.3 KB from a desktop
+/// Mac: an id, a label, the platform, the version and some 40 capability flags
+/// (apps/server/src/environment/ServerEnvironment.ts:208-275). A long label or install path
+/// adds a few KB at most.
+const MAX_DESCRIPTOR_BYTES: usize = 256 * 1024;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Runtime {
@@ -309,7 +315,8 @@ fn refused(error: &reqwest::Error) -> bool {
 }
 
 /// What the server at `origin` reports at `/.well-known/t3/environment`. `http` is a
-/// `direct_client`, so the answer comes from `origin` and no other server.
+/// `direct_client`, so the answer comes from `origin` and no other server. The 2.5 seconds
+/// cover the whole answer, body included.
 async fn fetch_descriptor(
     http: &reqwest::Client,
     origin: &str,
@@ -318,7 +325,7 @@ async fn fetch_descriptor(
         "{}/.well-known/t3/environment",
         origin.trim_end_matches('/')
     );
-    let response = http
+    let mut response = http
         .get(url)
         .timeout(Duration::from_millis(2500))
         .send()
@@ -337,15 +344,50 @@ async fn fetch_descriptor(
     if !status.is_success() {
         return Err(NoDescriptor::Invalid(format!("HTTP {status}")));
     }
-    let body = response.bytes().await.map_err(|error| {
-        if error.is_timeout() {
-            NoDescriptor::Unanswered
-        } else {
-            NoDescriptor::Invalid("the answer stopped partway".into())
-        }
-    })?;
+    let body = descriptor_body(&mut response).await?;
     serde_json::from_slice(&body)
         .map_err(|_| NoDescriptor::Invalid("the body doesn't parse as one".into()))
+}
+
+/// The body of a descriptor answer, read a chunk at a time, up to `MAX_DESCRIPTOR_BYTES`. A
+/// body that declares a longer length is refused before t3term reads any of it. One with no
+/// length, sent in chunks or until the server closes the connection, is refused as soon as
+/// what t3term has read passes the cap. Either way the body t3term keeps stays within the cap.
+async fn descriptor_body(response: &mut reqwest::Response) -> Result<Vec<u8>, NoDescriptor> {
+    let too_long = || {
+        let cap = MAX_DESCRIPTOR_BYTES / 1024;
+        NoDescriptor::Invalid(format!("the body is longer than {cap} KiB"))
+    };
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_DESCRIPTOR_BYTES as u64)
+    {
+        return Err(too_long());
+    }
+    let mut body = Vec::new();
+    loop {
+        let chunk = response.chunk().await.map_err(|error| {
+            if error.is_timeout() {
+                NoDescriptor::Unanswered
+            } else {
+                NoDescriptor::Invalid("the answer stopped partway".into())
+            }
+        })?;
+        let Some(chunk) = chunk else {
+            return Ok(body);
+        };
+        if chunk.len() > MAX_DESCRIPTOR_BYTES - body.len() {
+            return Err(too_long());
+        }
+        // Double the buffer when the chunk doesn't fit, so a body read in small chunks is
+        // copied a few times at most, but never ask for more room than the cap.
+        let needed = body.len() + chunk.len();
+        if needed > body.capacity() {
+            let room = needed.max(2 * body.capacity()).min(MAX_DESCRIPTOR_BYTES);
+            body.reserve_exact(room - body.len());
+        }
+        body.extend_from_slice(&chunk);
+    }
 }
 
 struct Candidate {
@@ -376,11 +418,43 @@ fn recorded_servers(home: &Path) -> Vec<(PathBuf, RuntimeState)> {
     servers
 }
 
+/// The origin `T3TERM_ORIGIN` names, when it is set, and the T3 home whose records
+/// `discover_any` reads.
+fn discover_from() -> (Option<String>, PathBuf) {
+    #[cfg(test)]
+    {
+        if let Some(given) = fake::DISCOVER_FROM.with_borrow(Clone::clone) {
+            return given;
+        }
+    }
+    (std::env::var("T3TERM_ORIGIN").ok(), t3_home())
+}
+
+/// What a unit test gives `Target::Discover` in place of `T3TERM_ORIGIN` and the T3 home. A
+/// test can't set those without changing them for the tests on other threads. Each thread has
+/// its own, and a thread that sets none reads the process environment.
+#[cfg(test)]
+pub(crate) mod fake {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        pub(super) static DISCOVER_FROM: RefCell<Option<(Option<String>, PathBuf)>> =
+            const { RefCell::new(None) };
+    }
+
+    /// Makes `Target::Discover` on this thread try `origin` first, then the servers `home`
+    /// records.
+    pub(crate) fn discover_from(origin: Option<&str>, home: &Path) {
+        DISCOVER_FROM.set(Some((origin.map(str::to_string), home.to_path_buf())));
+    }
+}
+
 /// Tries `T3TERM_ORIGIN` first, then the servers recorded under `~/.t3/userdata` and `~/.t3/dev`.
 async fn discover_any() -> Result<Runtime> {
-    let home = t3_home();
+    let (named, home) = discover_from();
     let mut candidates = Vec::new();
-    if let Ok(origin) = std::env::var("T3TERM_ORIGIN") {
+    if let Some(origin) = named {
         candidates.push(Candidate {
             origin,
             state_dir: None,
@@ -578,6 +652,91 @@ async fn find_local(local: &LocalTarget, stopped: &mut Option<String>) -> Result
     ))
 }
 
+/// The server `runtime` describes, checked again at `runtime.origin` before t3term sends it a
+/// new credential, which can be hours after `discover` found it. It asks that origin alone,
+/// even when the T3 home now records another one, and fails unless the server there still
+/// reports `runtime`'s environment id on orchestration protocol 2. A named environment's server
+/// must also report the id its T3 home holds now, as `discover_local` checks.
+///
+/// The pid comes from the record again, and only when the record names this origin, so a
+/// restarted server's `t3` is the one that runs.
+pub async fn rediscover(target: &Target, runtime: &Runtime) -> Result<Runtime> {
+    let now = match target {
+        Target::Local(local) => {
+            let pinned = LocalTarget {
+                origin: Some(runtime.origin.clone()),
+                ..local.clone()
+            };
+            discover_local(&pinned)
+                .await
+                .map_err(|unreached| unreached.error)?
+        }
+        Target::Discover => describe_again(runtime).await?,
+    };
+    if now.environment_id != runtime.environment_id {
+        return Err(err_exit(
+            "T3_ENVIRONMENT_CHANGED",
+            exit::REJECTED,
+            format!(
+                "The server at {} is environment {} now, not {} as when t3term connected. t3term stopped before sending it a credential. Start t3term again to use it.",
+                runtime.origin, now.environment_id, runtime.environment_id
+            ),
+        ));
+    }
+    now.require_supported_protocol()?;
+    Ok(now)
+}
+
+/// `rediscover` for a server that `discover_any` found.
+async fn describe_again(runtime: &Runtime) -> Result<Runtime> {
+    let origin = runtime.origin.as_str();
+    let descriptor = fetch_descriptor(&direct_client(), origin)
+        .await
+        .map_err(|problem| match problem {
+            NoDescriptor::Refused | NoDescriptor::Unanswered => err_exit(
+                "T3_SERVER_UNAVAILABLE",
+                exit::UNAVAILABLE,
+                format!("The T3 server at {origin} did not answer. t3term does not try another server."),
+            ),
+            NoDescriptor::Redirected => err_exit(
+                "T3_REDIRECTED",
+                exit::REJECTED,
+                format!(
+                    "The T3 server at {origin} answered with a redirect. t3term doesn't follow one, since the answer would come from another server."
+                ),
+            ),
+            NoDescriptor::Invalid(answer) => err_exit(
+                "T3_DESCRIPTOR_INVALID",
+                exit::REJECTED,
+                format!(
+                    "The T3 server at {origin} answered /.well-known/t3/environment, but not with a T3 environment descriptor: {answer}."
+                ),
+            ),
+        })?;
+    let pid = match runtime.state_dir.clone() {
+        Some(state_dir) => {
+            let record =
+                off_runtime(move || read_record(&state_dir.join("server-runtime.json"))).await?;
+            match record {
+                // `discover_any` takes a record's origin as written, and `described` drops a
+                // trailing slash.
+                Record::Server(state) if state.origin.trim_end_matches('/') == origin => {
+                    Some(state.pid)
+                }
+                _ => None,
+            }
+        }
+        None => None,
+    };
+    Ok(described(
+        origin,
+        runtime.t3_home.clone(),
+        runtime.state_dir.clone(),
+        pid,
+        descriptor,
+    ))
+}
+
 /// The origin a home's record names, as `loopback_origin` writes it, or why t3term won't use
 /// it.
 fn recorded_origin(name: &str, recorded: &str) -> Result<String> {
@@ -617,10 +776,13 @@ fn described(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
     use crate::auth::Scope;
     use crate::client::Client;
     use crate::error::T3Error;
+    use crate::http::fake;
 
     fn code(error: &anyhow::Error) -> Option<&'static str> {
         error.downcast_ref::<T3Error>().map(|e| e.code)
@@ -863,6 +1025,122 @@ mod tests {
         assert_eq!(unreached.stopped, None);
     }
 
+    /// What a server of `environment_id` on orchestration protocol `protocol` answers at
+    /// `/.well-known/t3/environment`.
+    fn descriptor_of(environment_id: &str, protocol: u64) -> String {
+        let descriptor = serde_json::json!({
+            "environmentId": environment_id,
+            "serverVersion": "0.0.0",
+            "orchestrationProtocolVersion": protocol,
+        });
+        fake::response("200 OK", &[], &descriptor.to_string())
+    }
+
+    /// The server of environment `env-a` that `discover_any` found at `origin`, recorded in
+    /// `state_dir`.
+    fn found_at(origin: &str, state_dir: &Path) -> Runtime {
+        Runtime {
+            origin: origin.to_string(),
+            t3_home: state_dir.parent().unwrap().to_path_buf(),
+            state_dir: Some(state_dir.to_path_buf()),
+            pid: Some(1),
+            environment_id: "env-a".into(),
+            label: None,
+            server_version: "0.0.0".into(),
+            protocol_version: Some(PROTOCOL_VERSION),
+            capabilities: serde_json::json!({}),
+        }
+    }
+
+    /// Checked again, a server `discover_any` found is asked at its own origin, and its pid
+    /// comes from a record of that origin alone.
+    #[tokio::test]
+    async fn rediscovery_asks_the_origin_it_found_and_reads_the_pid_again() {
+        let home = tempfile::tempdir().unwrap();
+        let state_dir = home.path().join("userdata");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let answer = descriptor_of("env-a", 2);
+        let a = fake::Server::start(move |_| answer.clone());
+        let runtime = found_at(&a.origin, &state_dir);
+        // The server started again at the same origin, with a new pid.
+        let record = serde_json::json!({"version": 1, "pid": 4242, "origin": a.origin});
+        std::fs::write(state_dir.join("server-runtime.json"), record.to_string()).unwrap();
+        let now = rediscover(&Target::Discover, &runtime).await.unwrap();
+        assert_eq!(now.origin, a.origin);
+        assert_eq!(now.environment_id, "env-a");
+        assert_eq!(now.pid, Some(4242));
+        // A record of another origin gives no pid, so t3term can't run another server's `t3`.
+        std::fs::write(state_dir.join("server-runtime.json"), record_of(STOPPED)).unwrap();
+        let now = rediscover(&Target::Discover, &runtime).await.unwrap();
+        assert_eq!(now.pid, None);
+        let asked = ["/.well-known/t3/environment", "/.well-known/t3/environment"];
+        assert_eq!(a.paths(), asked);
+    }
+
+    /// Any other answer at the origin stops t3term there, and it asks no other server.
+    #[tokio::test]
+    async fn rediscovery_stops_at_another_environment_or_a_bad_answer() {
+        let home = tempfile::tempdir().unwrap();
+        let state_dir = home.path().join("userdata");
+        let elsewhere = fake::Server::start(|_| descriptor_of("env-a", 2));
+        let location = format!("location: {}/.well-known/t3/environment", elsewhere.origin);
+        let answers = [
+            (descriptor_of("env-other", 2), "T3_ENVIRONMENT_CHANGED"),
+            (descriptor_of("env-a", 1), "T3_PROTOCOL_UNSUPPORTED"),
+            (
+                fake::response("302 Found", &[location.as_str()], ""),
+                "T3_REDIRECTED",
+            ),
+            (
+                fake::response("500 Internal Server Error", &[], "{}"),
+                "T3_DESCRIPTOR_INVALID",
+            ),
+            (String::new(), "T3_SERVER_UNAVAILABLE"),
+        ];
+        for (answer, expected) in answers {
+            let a = fake::Server::start(move |_| answer.clone());
+            let checked = rediscover(&Target::Discover, &found_at(&a.origin, &state_dir)).await;
+            assert_eq!(code(&checked.unwrap_err()), Some(expected));
+            assert_eq!(a.paths(), ["/.well-known/t3/environment"], "{expected}");
+        }
+        let checked = rediscover(&Target::Discover, &found_at(STOPPED, &state_dir)).await;
+        assert_eq!(code(&checked.unwrap_err()), Some("T3_SERVER_UNAVAILABLE"));
+        assert_eq!(elsewhere.paths(), Vec::<String>::new());
+    }
+
+    /// A named environment is checked at the origin the client uses, even when its T3 home
+    /// records another server since, and its server must report the id the home holds now.
+    #[tokio::test]
+    async fn rediscovering_a_named_environment_keeps_to_the_clients_origin() {
+        let elsewhere = fake::Server::start(|_| descriptor_of("env-b", 2));
+        let answer = Arc::new(Mutex::new(descriptor_of("env-b", 2)));
+        let served = answer.clone();
+        let b_server = fake::Server::start(move |_| served.lock().unwrap().clone());
+        let home = tempfile::tempdir().unwrap();
+        let recorded = record_of(&b_server.origin);
+        let b = environment_b(home.path(), None, Some(recorded.as_str()));
+        let runtime = discover_local(&b).await.unwrap();
+        assert_eq!(runtime.pid, Some(1));
+        let target = Target::Local(b);
+        let state_dir = home.path().join("userdata");
+        let record = state_dir.join("server-runtime.json");
+        std::fs::write(&record, record_of(&elsewhere.origin)).unwrap();
+        let now = rediscover(&target, &runtime).await.unwrap();
+        assert_eq!(now.origin, b_server.origin);
+        assert_eq!(now.pid, None);
+        // Another server took the port, and the home still holds env-b.
+        *answer.lock().unwrap() = descriptor_of("env-other", 2);
+        let checked = rediscover(&target, &runtime).await;
+        assert_eq!(code(&checked.unwrap_err()), Some("T3_ENVIRONMENT_MISMATCH"));
+        // The home was made again with a new id, and its server reports that id.
+        std::fs::write(state_dir.join("environment-id"), "env-new\n").unwrap();
+        *answer.lock().unwrap() = descriptor_of("env-new", 2);
+        let checked = rediscover(&target, &runtime).await;
+        assert_eq!(code(&checked.unwrap_err()), Some("T3_ENVIRONMENT_CHANGED"));
+        assert_eq!(b_server.paths().len(), 4);
+        assert_eq!(elsewhere.paths(), Vec::<String>::new());
+    }
+
     /// The read waits for a message that only another task on this single-threaded runtime
     /// sends. Run on the runtime's own thread, it would wait out its 10 seconds and fail.
     #[tokio::test]
@@ -875,5 +1153,192 @@ mod tests {
         };
         let (read, ()) = tokio::join!(read, other);
         assert!(read.unwrap(), "the read held up the runtime");
+    }
+
+    const PADDED_ID: &str = "6f1c2a8e-3b7d-4e9a-9c41-2d5f8b0a7e13";
+
+    /// The capabilities T3 f570bd21 reports from a desktop Mac, in the order it sends them.
+    const CAPABILITIES: &[&str] = &[
+        "repositoryIdentity",
+        "connectionProbe",
+        "attachmentUploads",
+        "questionAttachments",
+        "fileAttachments",
+        "pullRequests",
+        "pullRequestChecks",
+        "inlineMessageContext",
+        "requiredWorktreeBootstrap",
+        "threadSettlement",
+        "threadAutoSettlement",
+        "storageCleanup",
+        "projectWorktreeCleanup",
+        "worktreesDirectory",
+        "threadRestartContinuation",
+        "projectSettingsOverrides",
+        "threadSnooze",
+        "environmentThemes",
+        "usageLimitSources",
+        "usagePriceOverrides",
+        "usageModelAliases",
+        "threadPinning",
+        "threadPinReorder",
+        "threadActiveReorder",
+        "threadAutoSettleOptOut",
+        "threadTitleRegeneration",
+        "threadVisitedTracking",
+        "threadPullRequests",
+        "threadPullRequestWatch",
+        "pullRequestStackActions",
+        "threadPullRequestLinking",
+        "serverResolvedCommandContext",
+        "environmentIcon",
+        "projectCloneTracking",
+        "serverSelfUpdate",
+        "serverSelfUpdateProgress",
+        "desktopAppUpdate",
+        "serverBrowser",
+        "agentActivityPublishing",
+    ];
+
+    /// A descriptor as T3 f570bd21 builds one on a desktop Mac
+    /// (apps/server/src/environment/ServerEnvironment.ts:208-275), with `padding`, a key t3term
+    /// ignores, long enough that the JSON is `size` bytes. The capabilities are built one at a
+    /// time because a single `json!` holding all of them passes the macro recursion limit.
+    fn padded_descriptor(size: usize) -> Vec<u8> {
+        let capabilities: serde_json::Map<String, Value> = CAPABILITIES
+            .iter()
+            .map(|&name| {
+                let value = match name {
+                    "fileAttachments" => serde_json::json!({"maxUploadBytes": 52428800}),
+                    "serverSelfUpdate" => Value::from("desktop-managed"),
+                    "agentActivityPublishing" => Value::Bool(false),
+                    _ => Value::Bool(true),
+                };
+                (name.to_owned(), value)
+            })
+            .collect();
+        let mut descriptor = serde_json::json!({
+            "environmentId": PADDED_ID,
+            "label": "Studio Mac",
+            "platform": {"os": "darwin", "arch": "arm64", "machine": "mac-studio"},
+            "serverVersion": "0.0.46-nightly.20261007.2787",
+            "orchestrationProtocolVersion": 2,
+            "capabilities": capabilities,
+            "padding": ""
+        });
+        let unpadded = descriptor.to_string().len();
+        descriptor["padding"] = Value::String("x".repeat(size - unpadded));
+        let text = descriptor.to_string().into_bytes();
+        assert_eq!(text.len(), size);
+        text
+    }
+
+    /// A 200 answer with `headers`, each ending in CRLF, and then `body` as it is.
+    fn answer(headers: &str, body: &[u8]) -> Vec<u8> {
+        let head = format!("HTTP/1.1 200 OK\r\nConnection: close\r\n{headers}\r\n");
+        [head.as_bytes(), body].concat()
+    }
+
+    /// A 200 answer that declares the length of `body`.
+    fn declared(body: &[u8]) -> Vec<u8> {
+        answer(&format!("Content-Length: {}\r\n", body.len()), body)
+    }
+
+    /// A 200 answer that sends `body` in chunks of 4 KiB and declares no length, ended by the
+    /// last, empty chunk when `ended`.
+    fn chunked(body: &[u8], ended: bool) -> Vec<u8> {
+        let mut sent = Vec::new();
+        for chunk in body.chunks(4096) {
+            sent.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            sent.extend_from_slice(chunk);
+            sent.extend_from_slice(b"\r\n");
+        }
+        if ended {
+            sent.extend_from_slice(b"0\r\n\r\n");
+        }
+        answer("Transfer-Encoding: chunked\r\n", &sent)
+    }
+
+    /// Starts a server on 127.0.0.1 that answers one request with `sent`, as it is written, and
+    /// returns its origin. It then holds the connection open until t3term closes it, or for 10
+    /// seconds at most, so an answer that hasn't ended never does.
+    fn answer_once(sent: Vec<u8>) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|read| read > 2) {
+                line.clear();
+            }
+            let _ = stream.write_all(&sent);
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+            let _ = stream.read_to_end(&mut Vec::new());
+        });
+        origin
+    }
+
+    /// What `fetch_descriptor` found at `origin`, in words a test can compare.
+    async fn fetched(origin: &str) -> String {
+        match fetch_descriptor(&direct_client(), origin).await {
+            Ok(descriptor) => format!("descriptor {}", descriptor.environment_id),
+            Err(NoDescriptor::Refused) => "refused".into(),
+            Err(NoDescriptor::Unanswered) => "unanswered".into(),
+            Err(NoDescriptor::Redirected) => "redirected".into(),
+            Err(NoDescriptor::Invalid(why)) => format!("invalid: {why}"),
+        }
+    }
+
+    const TOO_LONG: &str = "invalid: the body is longer than 256 KiB";
+
+    /// A descriptor of 256 KiB is read whole, whether the server declares its length or sends
+    /// it in chunks. One byte more is refused either way, though it would parse.
+    #[tokio::test]
+    async fn a_descriptor_is_read_up_to_256_kib() {
+        let fits = padded_descriptor(MAX_DESCRIPTOR_BYTES);
+        let over = padded_descriptor(MAX_DESCRIPTOR_BYTES + 1);
+        let read = format!("descriptor {PADDED_ID}");
+        let cases = [
+            ("fits, declared", declared(&fits), read.as_str()),
+            ("fits, chunked", chunked(&fits, true), read.as_str()),
+            ("over, declared", declared(&over), TOO_LONG),
+            ("over, chunked", chunked(&over, true), TOO_LONG),
+        ];
+        for (case, sent, found) in cases {
+            assert_eq!(fetched(&answer_once(sent)).await, found, "{case}");
+        }
+    }
+
+    /// None of these servers ends its answer. Reading one to its end would wait out the 2.5
+    /// seconds and find the server unanswered, so an answer refused as too long shows t3term
+    /// stopped at the cap.
+    #[tokio::test]
+    async fn a_body_past_256_kib_is_refused_before_it_ends() {
+        let over = padded_descriptor(MAX_DESCRIPTOR_BYTES + 1);
+        let cases = [
+            // A length of 1 GiB, and none of the body.
+            (
+                "declared, unsent",
+                answer("Content-Length: 1073741824\r\n", b""),
+                TOO_LONG,
+            ),
+            // Chunks one byte past the cap, and no last chunk.
+            ("chunked, unended", chunked(&over, false), TOO_LONG),
+            // No length, so the body would end only when the server closed the connection.
+            ("until closed", answer("", &over), TOO_LONG),
+            // A body under the cap that stops partway still waits out the 2.5 seconds.
+            (
+                "short, unfinished",
+                answer("Content-Length: 4096\r\n", &over[..100]),
+                "unanswered",
+            ),
+        ];
+        for (case, sent, found) in cases {
+            assert_eq!(fetched(&answer_once(sent)).await, found, "{case}");
+        }
     }
 }
