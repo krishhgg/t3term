@@ -86,9 +86,15 @@ def cmd_expect(args) -> int:
 def cmd_threads(args) -> int:
     root, state = locate(args.run)
     answer = live_state(root)
-    print_threads(answer.get('threads', []))
+    scenario = scenario_for(state)
+    # A scenario whose threads carry more prints them itself.
+    listing = getattr(scenario, 'print_threads', None)
+    if listing is not None:
+        listing(answer, args.all)
+    else:
+        print_threads(answer.get('threads', []))
     print()
-    scenario_for(state).print_expect(answer)
+    scenario.print_expect(answer)
     return 0
 
 
@@ -153,6 +159,9 @@ def add_commands(commands, run_option):
              commands.add_parser('threads', help='the threads, their copies and streams, then expect')]
     added[0].set_defaults(func=cmd_expect)
     added[1].set_defaults(func=cmd_threads)
+    added[1].add_argument('--all', action='store_true',
+                          help="list the threads a scenario folds away too, such as lineage's agent threads "
+                               'of thr-many')
 
     label = commands.add_parser('label', help="serve another label; t3term shows it after restart")
     label.add_argument('preset', choices=LABEL_PRESETS)
@@ -183,7 +192,8 @@ def add_commands(commands, run_option):
     pulse.set_defaults(func=cmd_pulse)
     added.append(pulse)
 
-    run = commands.add_parser('run', help="set the thread's latest run status")
+    run = commands.add_parser('run', help="set the thread's latest run status; lineage starts a first run "
+                                          'where the thread has none')
     run.add_argument('thread')
     run.add_argument('status', choices=RUN_STATUSES)
     run.set_defaults(func=cmd_run)
@@ -195,7 +205,8 @@ def add_commands(commands, run_option):
     added.append(close)
 
     for name, what in (('gone', 'a thread.removed on the shell'),
-                       ('back', 'a thread.updated on the shell that lists the thread again')):
+                       ('back', 'a thread.updated on the shell that lists the thread again; lineage '
+                                'unarchives an archived thread first')):
         action = commands.add_parser(name, help=what)
         action.add_argument('thread')
         action.set_defaults(func=cmd_thread_action)
