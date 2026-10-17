@@ -1981,6 +1981,28 @@ async fn pull_request_reads_send_t3s_reference_and_read_its_answers() {
     );
     assert_eq!(activity.unwrap().comment_count, 0);
 
+    // A pull request in no stack, or on a host T3 reads no stacks from, answers null.
+    let (stack, ()) = tokio::join!(
+        pull_request::stack(&rpc, &reference),
+        answer_request(
+            &mut socket,
+            "pullRequests.stack",
+            &payload,
+            success(Value::Null)
+        ),
+    );
+    assert_eq!(stack.unwrap(), None);
+    let some = json!({"id": "S_1", "number": 7, "url": "https://github.com/krishhgg/t3term/stacks/7",
+        "base": "master", "layers": [{"number": 40, "headBranch": "a", "state": "merged"},
+        {"number": 41, "headBranch": "feature", "state": "open"}]});
+    let (stack, ()) = tokio::join!(
+        pull_request::stack(&rpc, &reference),
+        answer_request(&mut socket, "pullRequests.stack", &payload, success(some)),
+    );
+    let stack = stack.unwrap().unwrap();
+    let layers: Vec<_> = stack.layers.iter().map(|layer| layer.number).collect();
+    assert_eq!((stack.number, layers), (7, vec![40, 41]));
+
     // Invalidating names the one pull request, so T3 keeps its listings.
     let named = json!({"reference": payload});
     let (invalidated, ()) = tokio::join!(
@@ -2035,6 +2057,38 @@ async fn a_pull_request_read_names_what_failed() {
     let error = error.unwrap_err();
     assert!(matches!(error, PullRequestError::NotFound(_)));
     assert_eq!(error.to_string(), "Pull request #41 was not found.");
+
+    // The other reads leave the host out too, where the reference has none.
+    let (checks, ()) = tokio::join!(
+        pull_request::checks(&rpc, &reference),
+        answer_request(
+            &mut socket,
+            "pullRequests.checks",
+            &payload,
+            success(Value::Null)
+        ),
+    );
+    assert_eq!(checks.unwrap(), None);
+    let gone = fail(
+        json!({"_tag": "PullRequestOperationError", "operation": "stack",
+        "detail": "Pull request #41 was not found.", "reason": "not-found"}),
+    );
+    let (stack, ()) = tokio::join!(
+        pull_request::stack(&rpc, &reference),
+        answer_request(&mut socket, "pullRequests.stack", &payload, gone),
+    );
+    assert!(matches!(stack.unwrap_err(), PullRequestError::NotFound(_)));
+    let named = json!({"reference": payload});
+    let (invalidated, ()) = tokio::join!(
+        pull_request::invalidate(&rpc, &reference),
+        answer_request(
+            &mut socket,
+            "pullRequests.invalidate",
+            &named,
+            success(Value::Null)
+        ),
+    );
+    invalidated.unwrap();
 
     // An answer that breaks T3's schema is named, not guessed at.
     let mut broken = least_detail();

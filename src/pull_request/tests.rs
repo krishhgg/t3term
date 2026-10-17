@@ -228,6 +228,7 @@ fn a_detail_reads_every_field_t3_sends() {
             edit_change_request: true,
             edit_comment: true,
             labels: true,
+            stacks: true,
         }
     );
     assert_eq!(
@@ -373,6 +374,7 @@ fn optional_fields_t3_leaves_out_read_as_the_schema_says() {
         "viewedFiles",
         "edit",
         "labels",
+        "stacks",
     ] {
         capabilities.remove(key);
     }
@@ -403,6 +405,7 @@ fn optional_fields_t3_leaves_out_read_as_the_schema_says() {
     assert_eq!(capabilities.viewed_files, None);
     assert!(!capabilities.edit_change_request && !capabilities.edit_comment);
     assert!(!capabilities.labels);
+    assert!(!capabilities.stacks);
     // A permission the host reports nothing about is granted, except updating the branch,
     // which absent says the viewer may not.
     assert!(detail.permissions.update_methods.is_empty());
@@ -833,6 +836,144 @@ fn checks_read_their_state_and_list() {
         }
     );
     assert!(Checks::read(&json!({"checks": []})).is_err());
+}
+
+/// A stack as T3's GitHub provider sends it: three layers, bottom to top, the middle one
+/// without its optional fields.
+fn stack_value() -> Value {
+    json!({
+        "id": "S_kwDOAbc", "number": 7, "url": "https://github.com/krishhgg/t3term/stacks/7",
+        "base": "master",
+        "layers": [
+            {"number": 49, "title": "Read a pull request over RPC", "isDraft": false,
+                "headSha": "2bb3739", "headBranch": "t3term/pull-request-detail",
+                "state": "merged"},
+            {"number": 50, "headBranch": "t3term/pull-request-page", "state": "open"},
+            {"number": 52, "title": "", "isDraft": true, "headSha": "abc1234",
+                "headBranch": "t3term/pull-request-comments", "state": "closed"}
+        ]
+    })
+}
+
+#[test]
+fn a_stack_reads_its_layers_bottom_to_top() {
+    let stack = Stack::read(&stack_value()).unwrap();
+    let layer =
+        |number, title: Option<&str>, is_draft, head_sha: Option<&str>, branch, state| Layer {
+            number,
+            title: title.map(str::to_string),
+            is_draft,
+            head_sha: head_sha.map(str::to_string),
+            head_branch: branch,
+            state,
+        };
+    assert_eq!(
+        stack,
+        Stack {
+            id: "S_kwDOAbc".to_string(),
+            number: 7,
+            url: "https://github.com/krishhgg/t3term/stacks/7".to_string(),
+            base: "master".to_string(),
+            layers: vec![
+                layer(
+                    49,
+                    Some("Read a pull request over RPC"),
+                    Some(false),
+                    Some("2bb3739"),
+                    "t3term/pull-request-detail".to_string(),
+                    State::Merged,
+                ),
+                layer(
+                    50,
+                    None,
+                    None,
+                    None,
+                    "t3term/pull-request-page".to_string(),
+                    State::Open,
+                ),
+                // An empty title is T3's to send, and the caller's to fall back from.
+                layer(
+                    52,
+                    Some(""),
+                    Some(true),
+                    Some("abc1234"),
+                    "t3term/pull-request-comments".to_string(),
+                    State::Closed,
+                ),
+            ],
+            cut: false,
+        }
+    );
+
+    let mut empty = stack_value();
+    empty["layers"] = json!([]);
+    assert!(Stack::read(&empty).unwrap().layers.is_empty());
+
+    let mut many = stack_value();
+    let layer = many["layers"][1].clone();
+    let mut layers = vec![layer; MOST_LAYERS];
+    // Past the bound, so never read.
+    layers.push(json!({"number": 0, "state": "draft"}));
+    many["layers"] = json!(layers);
+    let stack = Stack::read(&many).unwrap();
+    assert_eq!(stack.layers.len(), MOST_LAYERS);
+    assert!(stack.cut);
+}
+
+#[test]
+fn a_stack_without_a_field_t3_requires_is_malformed() {
+    // `pointer` is a JSON pointer into the stack, such as /layers/1/state.
+    let broken = |pointer: &str, value: Value| {
+        let mut stack = stack_value();
+        *stack.pointer_mut(pointer).unwrap() = value;
+        Stack::read(&stack).unwrap_err().to_string()
+    };
+    let says = |what: &str| format!("T3 sent a pull request answer t3term can't read: {what}");
+    assert_eq!(broken("/id", json!("  ")), says("a stack has no valid id"));
+    assert_eq!(
+        broken("/number", json!(0)),
+        says("a stack has no valid number")
+    );
+    assert_eq!(
+        broken("/url", Value::Null),
+        says("a stack has no valid url")
+    );
+    assert_eq!(broken("/base", json!(3)), says("a stack has no valid base"));
+    assert_eq!(
+        broken("/layers", json!({})),
+        says("a stack has no valid layers")
+    );
+    let layer = |key: &str, value| broken(&format!("/layers/2/{key}"), value);
+    assert_eq!(
+        layer("number", json!(-1)),
+        says("a layer has no valid number")
+    );
+    assert_eq!(
+        layer("headBranch", json!("")),
+        says("a layer has no valid headBranch")
+    );
+    // A state this version doesn't know breaks the answer, as it does a detail's.
+    assert_eq!(
+        layer("state", json!("draft")),
+        says("a layer has no valid state")
+    );
+    assert_eq!(
+        layer("isDraft", json!("yes")),
+        says("a layer has no valid isDraft")
+    );
+    assert_eq!(
+        layer("headSha", json!(" ")),
+        says("a layer has no valid headSha")
+    );
+    assert_eq!(layer("title", json!(5)), says("a layer has no valid title"));
+    assert_eq!(
+        broken("/layers/1", json!("t3term/pull-request-page")),
+        says("a layer isn't an object")
+    );
+    assert_eq!(
+        Stack::read(&json!([])).unwrap_err().to_string(),
+        says("a stack isn't an object")
+    );
 }
 
 #[test]
