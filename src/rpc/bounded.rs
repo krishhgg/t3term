@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc};
 
-use super::RpcError;
+use super::{Owner, RpcError};
 
 /// The most a bounded stream may hold that its caller has not accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -98,8 +98,13 @@ impl fmt::Debug for BoundedChunk {
 
 /// A stream from `RpcClient::bounded_stream`. Dropping it interrupts the stream on the
 /// server if it is still open, and discards the chunks still queued in it.
+///
+/// The connection stays open while the stream lives, even after every client has dropped.
 pub struct BoundedStream {
     pub(super) shared: Arc<Shared>,
+    /// Kept here and not in `Shared`, which the connection's map of requests holds too. It
+    /// drops after `drop` has queued the `Interrupt`.
+    pub(super) _owner: Arc<Owner>,
 }
 
 impl BoundedStream {
@@ -148,7 +153,9 @@ impl Drop for BoundedStream {
     }
 }
 
-/// What a bounded stream shares with its chunks and with the connection's reader.
+/// What a bounded stream shares with its chunks and with the connection's reader. It holds no
+/// share in the connection, so neither the reader's map nor a chunk the caller keeps after
+/// dropping the stream holds the connection open.
 pub(super) struct Shared {
     request_id: String,
     limits: StreamLimits,
