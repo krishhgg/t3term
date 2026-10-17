@@ -3,6 +3,8 @@
 //! `pullRequests.activity`. `pullRequests.invalidate` makes T3's next read of it ask the host
 //! again. Each is one RPC call, which T3 answers through the host's CLI or API or from a cache
 //! of its own. Nothing here writes to the host, and nothing keeps what it read.
+//! `pullRequests.subscribeRefreshes` is a stream of numbers that says when T3's reads may have
+//! changed, which `client::spawn_pull_request_refresh_watch` follows.
 //!
 //! A `Reference` addresses a pull request: the project T3 reads through, the host, the
 //! repository and the number. T3 routes a pull request from another repository on the same
@@ -31,6 +33,7 @@ pub const DETAIL: &str = "pullRequests.detail";
 pub const CHECKS: &str = "pullRequests.checks";
 pub const ACTIVITY: &str = "pullRequests.activity";
 pub const INVALIDATE: &str = "pullRequests.invalidate";
+pub const SUBSCRIBE_REFRESHES: &str = "pullRequests.subscribeRefreshes";
 
 /// How long a call waits for T3's answer. T3 asks the host, and GitHub can take several
 /// seconds to answer for a long conversation.
@@ -322,6 +325,15 @@ pub async fn invalidate(rpc: &RpcClient, reference: &Reference) -> Result<(), Pu
     let payload = json!({"reference": reference.payload()});
     rpc.call(INVALIDATE, payload, CALL_TIMEOUT).await?;
     Ok(())
+}
+
+/// The number an item of `pullRequests.subscribeRefreshes` carries, which T3 moves on each time
+/// its reads may have changed: after an agent's turn in any project, after a change made
+/// through T3 and after any client's `pullRequests.invalidate`
+/// (apps/server/src/pullRequest/PullRequestService.ts). Each subscription opens with the
+/// number as it stands, unless it is still 0. None for an item that isn't a `NonNegativeInt`.
+pub fn refresh_revision(item: &Value) -> Option<u64> {
+    item.as_u64().filter(|number| *number <= MAX_SAFE_INTEGER)
 }
 
 /// The host a pull request is on, as `SourceControlProviderKind` names it.

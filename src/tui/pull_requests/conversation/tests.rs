@@ -916,13 +916,18 @@ fn timeline_rows(
 
 /// A merged pull request with two commits, three verdicts and four other remarks.
 fn merged() -> Answer<Conversation> {
+    merged_with(vec![], vec![])
+}
+
+/// `merged()`, read again once `comments` and `commits` came as well.
+fn merged_with(more_comments: Vec<Value>, more_commits: Vec<Value>) -> Answer<Conversation> {
     let review =
         |id, who, minutes, state, body| remark(id, actor(who), &ago_at(minutes), Some(state), body);
     let comment = |id, who, minutes, body| remark(id, actor(who), &ago_at(minutes), None, body);
     let mut nit = comment("k2", "Lee", 250, "Nit.");
     nit["kind"] = json!("review-comment");
     nit["path"] = json!("src/a.rs");
-    let comments = vec![
+    let mut comments = vec![
         review(
             "r1",
             "octocat",
@@ -936,7 +941,8 @@ fn merged() -> Answer<Conversation> {
         review("a1", "octocat", 60, "APPROVED", ""),
         comment("k4", "hubot", 30, "Ship it."),
     ];
-    let commits = vec![
+    comments.extend(more_comments);
+    let mut commits = vec![
         commit(
             "a1b2c3d4e5f6",
             "Add the parser",
@@ -946,6 +952,7 @@ fn merged() -> Answer<Conversation> {
         ),
         commit("0f0f0f0f0f0f", "", &ago_at(120), Some((0, 0)), None),
     ];
+    commits.extend(more_commits);
     let mut conversation = conversation_of(&activity(comments, vec![], commits));
     let ended = json!(ago_at(5));
     conversation.follow(&lifecycle(&ago_at(600), Some("mona"), ended.clone(), ended));
@@ -1070,6 +1077,85 @@ fn the_timeline_reads_as_the_desktops_does() {
 }
 
 #[test]
+fn an_open_run_stays_open_when_the_timeline_is_read_again_until_it_grows() {
+    let mut shown = Shown::default();
+    let answer = merged();
+    let Answer::Read(conversation) = &answer else {
+        unreachable!()
+    };
+    shown.act(Control::Run(0), conversation);
+    shown.act(Control::Run(1), conversation);
+    let open = |answer: &Answer<Conversation>, shown: &Shown| {
+        let Answer::Read(conversation) = answer else {
+            unreachable!()
+        };
+        let runs = conversation.timeline.as_ref().map_or(0, |t| t.runs());
+        (0..runs)
+            .map(|run| conversation.action(Control::Run(run), shown))
+            .collect::<Vec<_>>()
+    };
+    assert_eq!(open(&answer, &shown), ["hide comments", "hide comments"]);
+
+    // Read again with a commit and a remark since, the runs move down one and stay open, and
+    // the new one is closed, as the desktop keys each run by its first remark newest first.
+    let comment = remark("k5", actor("hubot"), &ago_at(10), None, "Merged.");
+    let since = commit("1e1e1e1e1e1e", "Bump", &ago_at(20), None, None);
+    let mut again = merged_with(vec![comment.clone()], vec![since]);
+    assert_eq!(
+        open(&again, &shown),
+        ["show comments", "hide comments", "hide comments"]
+    );
+    let (rows, _) = timeline_rows(&mut again, &shown, 60);
+    assert!(rows.contains(&"  Ship it.".to_string()), "{rows:#?}");
+
+    // A remark that joins the newest run makes it another run, which is closed.
+    let again = merged_with(vec![comment], vec![]);
+    assert_eq!(open(&again, &shown), ["show comments", "hide comments"]);
+
+    // The key of the run that is gone is forgotten once the new conversation is in, so reads
+    // again never pile keys up, and the run still open stays open.
+    let Answer::Read(conversation) = &again else {
+        unreachable!()
+    };
+    assert_eq!(shown.runs_open.len(), 2);
+    shown.prune(conversation);
+    assert_eq!(shown.runs_open.len(), 1);
+    assert_eq!(open(&again, &shown), ["show comments", "hide comments"]);
+}
+
+#[test]
+fn the_timeline_takes_a_new_ending_and_keeps_its_remarks_and_open_runs() {
+    let mut answer = merged();
+    let mut shown = Shown::default();
+    let Answer::Read(conversation) = &mut answer else {
+        unreachable!()
+    };
+    shown.act(Control::Run(1), conversation);
+    // Read while it was open, then again once it merged, as a read again whose conversation
+    // failed keeps the conversation it had.
+    conversation.follow(&lifecycle(
+        &ago_at(600),
+        Some("mona"),
+        Value::Null,
+        Value::Null,
+    ));
+    let (rows, _) = timeline_rows(&mut answer, &shown, 60);
+    assert!(!rows.contains(&"● Pull request merged".to_string()));
+    assert!(rows.contains(&"  One more.".to_string()), "{rows:#?}");
+    let Answer::Read(conversation) = &mut answer else {
+        unreachable!()
+    };
+    let ended = json!(ago_at(5));
+    conversation.follow(&lifecycle(&ago_at(600), Some("mona"), ended.clone(), ended));
+    let (rows, _) = timeline_rows(&mut answer, &shown, 60);
+    assert!(
+        rows.contains(&"● Pull request merged".to_string()),
+        "{rows:#?}"
+    );
+    assert!(rows.contains(&"  One more.".to_string()), "{rows:#?}");
+}
+
+#[test]
 fn the_timeline_fits_every_width() {
     let mut answer = merged();
     let (rows, targets) = timeline_rows(&mut answer, &Shown::default(), 30);
@@ -1098,7 +1184,10 @@ fn the_timeline_fits_every_width() {
     assert_eq!(rows[verdict..verdict + 7], expected);
 
     let mut shown = Shown::default();
-    shown.runs_open.extend([0, 1]);
+    if let Answer::Read(conversation) = &answer {
+        shown.act(Control::Run(0), conversation);
+        shown.act(Control::Run(1), conversation);
+    }
     for width in 0..=70 {
         let (rows, targets) = timeline_rows(&mut answer, &shown, width);
         for row in &rows {
