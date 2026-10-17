@@ -16782,7 +16782,7 @@ mod tests {
             app.on_action_result(ActionResult::PullRequestDiff { ticket, answer });
             cells(&mut app, 200, 50);
             // Down past the toolbar's rows to the file's own.
-            for _ in 0..4 {
+            for _ in 0..10 {
                 press(&mut app, KeyCode::Down);
                 let shown = text_in(&cells(&mut app, 200, 50), Rect::new(0, 0, 200, 50));
                 if shown.contains("Enter expand file") {
