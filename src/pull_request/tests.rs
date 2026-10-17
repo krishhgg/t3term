@@ -613,9 +613,25 @@ fn lists_past_their_bound_are_cut_and_the_rest_left_unread() {
     let activity = Activity::read(&value).unwrap();
     assert_eq!(activity.comments.len(), MOST_COMMENTS);
     assert!(activity.cut);
+    assert!(activity.verdicts_cut);
     assert_eq!(activity.threads[0].comments.len(), MOST_THREAD_COMMENTS);
     assert!(activity.threads[0].cut);
     assert!(!activity.threads[1].cut);
+
+    // Review threads and reviewers past their bounds leave every verdict and commit in.
+    let mut value = activity_value();
+    let thread = value["reviewThreads"][1].clone();
+    value["reviewThreads"] = json!(vec![thread; MOST_THREADS + 1]);
+    let reviewer = value["reviewers"][0].clone();
+    value["reviewers"] = json!(vec![reviewer; MOST_PEOPLE + 1]);
+    let activity = Activity::read(&value).unwrap();
+    assert!(activity.cut);
+    assert!(!activity.verdicts_cut);
+    let commit = value["commits"][0].clone();
+    value["commits"] = json!(vec![commit; MOST_COMMITS + 1]);
+    let activity = Activity::read(&value).unwrap();
+    assert_eq!(activity.commits.len(), MOST_COMMITS);
+    assert!(activity.verdicts_cut);
 }
 
 #[test]
