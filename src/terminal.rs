@@ -272,6 +272,14 @@ impl Terminal {
         &self.id
     }
 
+    /// Whether this terminal's connection takes no more requests, as
+    /// [`RpcClient::is_closed`] says. A call that fails with [`RpcError::Disconnected`] while
+    /// the connection is still open got no answer in time, and the connection and its streams
+    /// go on.
+    pub fn is_closed(&self) -> bool {
+        self.rpc.is_closed()
+    }
+
     /// Attaches to the terminal with `terminal.attach`, which needs the session's
     /// `terminal:operate` scope.
     ///

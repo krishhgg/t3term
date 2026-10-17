@@ -1,5 +1,7 @@
 //! The operations the CLI and TUI share. Neither talks to the server any other way.
 
+mod terminal_access;
+
 use std::future::Future;
 use std::pin::Pin;
 use std::sync::Arc;
@@ -16,6 +18,7 @@ use crate::http::Api;
 use crate::models::Plan;
 use crate::projection::{ShellState, ThreadState};
 use crate::rpc::{RpcClient, RpcError};
+use terminal_access::TerminalAccess;
 
 const DISPATCH_TIMEOUT: Duration = Duration::from_secs(60);
 const MAX_BACKOFF: Duration = Duration::from_secs(10);
@@ -26,6 +29,8 @@ pub struct Client {
     // Held for its Drop, which revokes a temporary credential.
     session: Session,
     rpc: Mutex<Option<RpcClient>>,
+    /// The terminal's own session and connection, made on the first `terminal_rpc` call.
+    terminal: Arc<TerminalAccess>,
 }
 
 /// What to do when a message arrives while the thread is already working.
@@ -52,6 +57,7 @@ impl Client {
         let session = Session::login(&runtime, scopes, ttl).await?;
         let api = Api::new(&runtime, session.token());
         Ok(Client {
+            terminal: Arc::new(TerminalAccess::new(target.clone(), runtime.clone())),
             runtime,
             api,
             session,
@@ -76,6 +82,7 @@ impl Client {
         };
         Client {
             api: Api::new(&runtime, ""),
+            terminal: Arc::new(TerminalAccess::new(Target::Discover, runtime.clone())),
             runtime,
             session: Session::offline(),
             rpc: Mutex::new(None),
@@ -100,6 +107,20 @@ impl Client {
         let rpc = RpcClient::connect(&self.api).await?;
         *slot = Some(rpc.clone());
         Ok(rpc)
+    }
+
+    /// The terminal's connection, a WebSocket of its own whose session carries `terminal:read`
+    /// and `terminal:operate` alone. The first call issues that session and opens the
+    /// connection, later calls share both, and a call after the connection drops opens it
+    /// again. A client runs one connect at a time, and calls that come while it runs all get
+    /// what it ends with, the connection or the same error. Neither `connect` nor `rpc` issues
+    /// the session, and this opens no terminal and sends nothing on the connection. Once the
+    /// client drops and no connect is still running, the connection closes for every clone a
+    /// caller holds, and then the session's revoke starts. The socket drops soon after, once
+    /// the WebSocket Close frame goes out or a second passes. A connect gets 30 seconds for its
+    /// ticket and WebSocket handshake.
+    pub async fn terminal_rpc(&self) -> Result<RpcClient> {
+        self.terminal.rpc().await
     }
 
     pub async fn shell(&self) -> Result<ShellState> {

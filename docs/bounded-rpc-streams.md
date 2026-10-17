@@ -1,6 +1,6 @@
 # Bounded RPC streams
 
-`RpcClient::bounded_stream` opens an Effect RPC stream whose caller acks each chunk, within limits the caller sets. An embedded terminal needs it to read terminal output without an unbounded queue. src/terminal.rs opens them for a terminal's streams and for terminal metadata ([terminal-events.md](terminal-events.md)), but nothing in the TUI does yet. The embedded terminal is still missing ([parity.md, group 15](parity.md#15-embedded-terminal)), and the TUI's watches are unchanged: they use `RpcClient::stream`, which acks each chunk as it arrives and queues its values without a bound.
+`RpcClient::bounded_stream` opens an Effect RPC stream whose caller acks each chunk, within limits the caller sets. An embedded terminal needs it to read terminal output without an unbounded queue. src/terminal.rs opens them for a terminal's streams and for terminal metadata ([terminal-events.md](terminal-events.md)), and the TUI's terminal drawer reads its attach stream through one ([terminal-pane.md](terminal-pane.md)). The TUI's other watches are unchanged. They use `RpcClient::stream`, which acks each chunk as it arrives and queues its values without a bound.
 
 ```rust
 let limits = StreamLimits::new(16, 256 * 1024).expect("limits above zero");
@@ -79,4 +79,4 @@ tungstenite's default caps a frame at 16 MiB. Under that default, any message fr
 
 ## Out of scope
 
-This adds no terminal pane, PTY command, CLI flag or connection. The terminal methods need the `terminal:read` and `terminal:operate` scopes, and asking T3 for them is left to a later change.
+This adds no terminal pane, PTY command, CLI flag or connection. The terminal methods need the `terminal:read` and `terminal:operate` scopes. [Terminal sessions](terminal-auth.md) asks T3 for them, and [the terminal drawer](terminal-pane.md) is the pane.
