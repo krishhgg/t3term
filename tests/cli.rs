@@ -35,9 +35,18 @@ fn spawning() -> MutexGuard<'static, ()> {
 
 /// Starts `command` while no other test starts a process, so it inherits no other test's pipe,
 /// and gives back the lock with it. A test that closes its end of a pipe keeps the lock until
-/// that end is closed. This is the one place in this file that starts a process.
+/// that end is closed.
 fn spawn_alone(command: &mut Command) -> (Child, MutexGuard<'static, ()>) {
-    let alone = spawning();
+    spawn_holding(spawning(), command)
+}
+
+/// Starts `command` while `alone` holds `SPAWNING`, and gives the lock back with the child. A
+/// test that makes a pipe for t3term takes the lock before it makes the pipe and passes it here.
+/// This is the one place in this file that starts a process.
+fn spawn_holding(
+    alone: MutexGuard<'static, ()>,
+    command: &mut Command,
+) -> (Child, MutexGuard<'static, ()>) {
     let child = command.spawn().expect("run t3term");
     (child, alone)
 }
@@ -53,11 +62,12 @@ fn output(command: &mut Command) -> Output {
     spawn(command).wait_with_output().expect("run t3term")
 }
 
-/// Every process these tests start goes through `spawn_alone`: no other function in this file
-/// calls `Command::output`, `Command::spawn` or `Command::status`. A test that calls one of them
-/// straight, as a merge from master can bring in, fails here rather than now and then on macOS.
+/// Every process these tests start goes through `spawn_holding`, which takes the held lock: no
+/// other function in this file calls `Command::output`, `Command::spawn` or `Command::status`. A
+/// test that calls one of them straight, as a merge from master can bring in, fails here rather
+/// than now and then on macOS.
 #[test]
-fn every_process_starts_through_spawn_alone() {
+fn every_process_starts_through_spawn_holding() {
     let calls = ["output", "spawn", "status"].map(|name| format!(".{name}()"));
     let lines: Vec<&str> = include_str!("cli.rs").lines().map(str::trim).collect();
     let mut within = "";
@@ -67,7 +77,7 @@ fn every_process_starts_through_spawn_alone() {
             within = name.split('(').next().unwrap_or(name);
         }
         let starts = calls.iter().any(|call| line.contains(call.as_str()));
-        if starts && within != "spawn_alone" {
+        if starts && within != "spawn_holding" {
             elsewhere.push((within, *line));
         }
     }
