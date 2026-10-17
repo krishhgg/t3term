@@ -2168,8 +2168,9 @@ impl PullRequests {
     /// The read of a slice of the diff that the Code tab wants, as `Code::ask` says: the first
     /// slice once the tab shows for the first time since the details opened, or again where
     /// it is stale, and the next once the end of the files comes near. None unless `enabled`
-    /// and the tab shows. While a read that sends `pullRequests.invalidate` is under way, the
-    /// diff waits for it, so T3 forgets its cached diff before the read asks for it.
+    /// and the tab shows. After a read that sends `pullRequests.invalidate`, the diff waits
+    /// until T3's refresh number moves or that read is done, so T3 has forgotten its cached
+    /// diff before the read asks for it.
     pub fn take_diff_ask(&mut self, enabled: bool, now: i64) -> Option<DiffAsk> {
         if !enabled || !self.showing_read() || self.tabs() != Some(Tab::Code) {
             return None;
@@ -6389,6 +6390,21 @@ mod tests {
         pulls.answer(ask.ticket, Part::Done, now());
         assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(6, None)));
         assert!(pulls.answer_diff(6, Ok(added(0, 2, None)), now()));
+        assert!(unfolded(&mut pulls));
+        // Or once T3's refresh number moves, which the invalidate moves after T3 forgot the
+        // diff, while the read that sent it is still under way.
+        assert!(pulls.reload(now()));
+        let ask = pulls.take_ask(true, now()).expect("the read again");
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        assert!(!pulls.refresh());
+        let ticket = ask.ticket + 1;
+        assert_eq!(
+            pulls.take_diff_ask(true, now()),
+            Some(diff_ask(ticket, None))
+        );
+        assert!(pulls.answer_diff(ticket, Ok(added(0, 2, None)), now()));
+        answer(&mut pulls, ask.ticket, &bare_detail(), true);
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
         assert!(unfolded(&mut pulls));
 
         // A read that keeps the details current reads it again where `updatedAt` moved.
