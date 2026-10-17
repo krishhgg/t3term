@@ -422,6 +422,9 @@ pub(super) struct Conversation {
     verdicts: Vec<Verdict>,
     /// T3 sent more remarks, review threads, commits or reviewers than t3term keeps.
     cut: bool,
+    /// Among them remarks or commits, so a reviewer's last verdict, or a commit after it, may
+    /// be missing.
+    verdicts_cut: bool,
     /// Where each remark went among the groups above, in the order T3 sent them.
     places: Vec<Place>,
     /// The commits, in the order T3 sent them.
@@ -489,6 +492,7 @@ impl Conversation {
             reviewers,
             verdicts: verdicts(&activity.comments, &activity.commits),
             cut: activity.cut,
+            verdicts_cut: activity.verdicts_cut,
             places,
             commits: activity.commits.iter().map(timeline::Commit::of).collect(),
             author: activity
@@ -537,9 +541,11 @@ impl Conversation {
 
     /// How many reviewers' last verdicts approve changes the branch still has, as the
     /// desktop's header counts them. None are counted from a conversation T3 read only the
-    /// recent end of, since an approval older than that would be missing.
+    /// recent end of, since an approval older than that would be missing. Nor are any when
+    /// t3term cut the remarks or commits short, since a later verdict or commit could take an
+    /// approval it kept back.
     fn approvals(&self) -> usize {
-        if self.truncated {
+        if self.truncated || self.verdicts_cut {
             return 0;
         }
         let approves = |verdict: &&Verdict| verdict.outcome == Outcome::Approved && !verdict.stale;
@@ -564,6 +570,14 @@ impl Conversation {
                     remark.lay_out(width, theme);
                 }
             }
+        }
+    }
+
+    /// Drops each remark's text laid out in the old colors, after the theme changed.
+    pub(super) fn restyle(&mut self) {
+        let remarks = self.active.iter_mut().chain(&mut self.bots);
+        for remark in remarks.chain(&mut self.finished) {
+            remark.laid_out = None;
         }
     }
 
