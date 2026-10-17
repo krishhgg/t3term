@@ -163,6 +163,16 @@ impl Client {
         }
     }
 
+    /// A client for tests of the TUI whose calls go over `rpc`, a socket to a fake T3. It
+    /// reaches nothing else, as `offline` doesn't.
+    #[cfg(test)]
+    pub(crate) fn over(rpc: RpcClient) -> Client {
+        Client {
+            rpc: Mutex::new(Some(rpc)),
+            ..Client::offline()
+        }
+    }
+
     pub fn login_source(&self) -> LoginSource {
         self.session.source
     }

@@ -60,7 +60,7 @@ use details::Details;
 use environment::{Feed, Identity};
 use markdown::Styles;
 use picker::{Item, Kind, Pick};
-use pull_requests::Part;
+use pull_requests::{Ask, Part};
 use scroll::{Pin, Scroll};
 use sidebar::{Badges, Capabilities, Shelf, ShelfChoices, Sidebar, View};
 use theme::{
@@ -98,9 +98,9 @@ const KEPT_TITLE: usize = 16;
 /// Opens T3's worktree setup subscription for a thread: `Client::watch_worktree_setup`, or a
 /// test's stand-in.
 type WatchSetup = Box<dyn Fn(&str) -> mpsc::UnboundedReceiver<WatchEvent>>;
-/// Reads a pull request from its host in the background, and sends the answer as an action
-/// with the ticket it was given. With `true`, it sends `pullRequests.invalidate` first.
-type ReadPull = Box<dyn Fn(Reference, u64, bool)>;
+/// Reads a pull request from its host in the background as `Ask` says, and sends the answer
+/// as an action with the ask's ticket.
+type ReadPull = Box<dyn Fn(Reference, Ask)>;
 /// Opens T3's `pullRequests.subscribeRefreshes`: `Client::watch_pull_request_refreshes`, or a
 /// test's stand-in.
 type WatchRefreshes = Box<dyn Fn() -> mpsc::UnboundedReceiver<WatchEvent>>;
@@ -582,6 +582,9 @@ struct App {
     refreshes: Option<Refreshes>,
     /// Set once T3 refuses or ends the refresh subscription, which no read asks for again.
     refreshes_refused: bool,
+    /// When the last key, click, wheel or paste came, which says whether you still use
+    /// t3term, so the open details keep their pull request current.
+    input_at: i64,
     /// Set once T3 refuses the worktree setup subscription. T3 refuses it for the session or
     /// the server, never for one thread, so no thread asks again.
     setup_refused: bool,
@@ -642,26 +645,34 @@ impl Drop for Screen {
     }
 }
 
+/// Whether a read that keeps the details current reads the conversation after `detail`:
+/// only when the detail came and its `updatedAt` isn't `updated`, the one the details show.
+fn changed_since(
+    detail: &Result<Box<pull_request::Detail>, String>,
+    updated: Option<&str>,
+) -> bool {
+    detail
+        .as_ref()
+        .is_ok_and(|detail| Some(detail.updated_at.as_str()) != updated)
+}
+
 /// Reads the pull request `reference` names from its host through T3: its detail and its
 /// conversation at once, as the desktop's panel asks for them. Gives `send` each answer as it
 /// comes, or why it failed, and then `Part::Done`. A sentence of T3's own, such as a host the
 /// server has no credentials for, reads as T3 wrote it. Any other failure of the detail says
 /// that the read failed, and the Comments section says that of the conversation. With
-/// `invalidate`, it first sends `pullRequests.invalidate`, so T3 asks the host again rather
+/// `ask.invalidate`, it first sends `pullRequests.invalidate`, so T3 asks the host again rather
 /// than answer from its cache. When that fails, the reads still go and at worst answer from
-/// the cache, as the desktop's Refresh does (PullRequestDetailPanel.tsx:857-875).
-async fn read_pull_request(
-    client: &Client,
-    reference: &Reference,
-    invalidate: bool,
-    send: impl Fn(Part),
-) {
+/// the cache, as the desktop's Refresh does (PullRequestDetailPanel.tsx:857-875). With
+/// `ask.updated`, it reads the detail alone, and the conversation after it only when the detail's
+/// `updatedAt` differs, as the desktop's live refresh does (PullRequestDetailPanel.tsx:836-856).
+async fn read_pull_request(client: &Client, reference: &Reference, ask: &Ask, send: impl Fn(Part)) {
     fn failed(e: &dyn std::fmt::Display) -> String {
         format!("Couldn't read this pull request: {e}")
     }
     match client.rpc().await {
         Ok(rpc) => {
-            if invalidate {
+            if ask.invalidate {
                 let _ = pull_request::invalidate(&rpc, reference).await;
             }
             let detail = async {
@@ -670,7 +681,9 @@ async fn read_pull_request(
                     Err(e @ PullRequestError::Rpc(_)) => Err(failed(&e)),
                     Err(e) => Err(e.to_string()),
                 };
+                let changed = changed_since(&answer, ask.updated.as_deref());
                 send(Part::Detail(answer));
+                changed
             };
             let activity = async {
                 let answer = pull_request::activity(&rpc, reference).await;
@@ -678,7 +691,11 @@ async fn read_pull_request(
                     answer.map(Box::new).map_err(|e| e.to_string()),
                 ));
             };
-            tokio::join!(detail, activity);
+            if ask.updated.is_none() {
+                tokio::join!(detail, activity);
+            } else if detail.await {
+                activity.await;
+            }
         }
         Err(e) => send(Part::Detail(Err(failed(&e)))),
     }
@@ -730,6 +747,10 @@ async fn event_loop(terminal: &mut Term, client: Arc<Client>) -> Result<()> {
             + Duration::from_millis(wake.map_or(0, |at| {
                 ((at - now_ms()).max(0) + 50).min(i32::MAX as i64) as u64
             }));
+        // The open details' next read to keep their pull request current, while you use t3term.
+        let live = app.live_at();
+        let live_deadline = tokio::time::Instant::now()
+            + Duration::from_millis(live.map_or(0, |at| (at - now_ms()).max(0) as u64));
         // The open thread's watch and its worktree setup subscription, which are its own.
         let (thread_events, setup_events) = match app.open.as_mut() {
             Some(open) => (Some(&mut open.events), open.setup.events.as_mut()),
@@ -784,6 +805,11 @@ async fn event_loop(terminal: &mut Term, client: Arc<Client>) -> Result<()> {
             // Only armed while a clock or spinner moves, to advance it.
             _ = tokio::time::sleep_until(tick_deadline), if running => {
                 tick_at = Instant::now() + TICK;
+                dirty = true;
+            }
+            // Only armed while the open details keep their pull request current.
+            _ = tokio::time::sleep_until(live_deadline), if live.is_some() => {
+                app.read_opened_pull();
                 dirty = true;
             }
             // Only armed while a thread is snoozed, to move it back when the snooze ends.
@@ -977,18 +1003,20 @@ impl App {
             details: Details::default(),
             screen: Rect::default(),
             watch_setup: Box::new(move |thread_id: &str| watcher.watch_worktree_setup(thread_id)),
-            read_pull: Box::new(move |reference, ticket, invalidate| {
+            read_pull: Box::new(move |reference, ask: Ask| {
                 let (client, answers) = (reader.clone(), answers.clone());
                 tokio::spawn(async move {
+                    let ticket = ask.ticket;
                     let send = |part| {
                         let _ = answers.send(ActionResult::PullRequest { ticket, part });
                     };
-                    read_pull_request(&client, &reference, invalidate, send).await;
+                    read_pull_request(&client, &reference, &ask, send).await;
                 });
             }),
             watch_refreshes: Box::new(move || refresher.watch_pull_request_refreshes()),
             refreshes: None,
             refreshes_refused: false,
+            input_at: now_ms(),
             setup_refused: false,
             quit: false,
         }
@@ -1253,38 +1281,59 @@ impl App {
     /// (apps/web/src/components/pullRequest/ThreadPullRequestsPanel.tsx). Only an environment
     /// whose capabilities have `pullRequests` reads them. The details show the answer when it
     /// comes, and a reference T3's schema would refuse fails at once. While the details hold a
-    /// read, T3's refresh numbers say when to read it again.
-    fn read_opened_pull(&mut self) {
-        let project = match self.details_record() {
-            details::Record::Found(thread) => thread
-                .get("projectId")
-                .and_then(Value::as_str)
-                .map(str::to_string),
-            _ => None,
-        };
-        let enabled = project.is_some() && self.environment_can("pullRequests");
+    /// read, T3's refresh numbers say when to read it again. Says whether it asked for a read.
+    fn read_opened_pull(&mut self) -> bool {
+        let project = self.pulls_project();
+        let enabled = project.is_some();
         // A read that waits goes once its details don't show, and nothing is asked for until
         // they do. The refresh numbers go on while a read is held.
         let shown = self.details.shows_pulls();
         self.details.pulls.shown(shown);
         // The last frame's time can be long past, and a test can move it on.
         let now = now_ms().max(self.now);
+        if shown && enabled {
+            self.details.pulls.live(now, self.input_at);
+        }
         let ask = shown
             .then(|| self.details.pulls.take_ask(enabled, now))
             .flatten();
         self.follow_refreshes(enabled);
         let Some(ask) = ask else {
-            return;
+            return false;
         };
         let project = project.unwrap_or_default();
         match Reference::new(&project, Some(&ask.host), &ask.repository, ask.number) {
-            Ok(reference) => (self.read_pull)(reference, ask.ticket, ask.invalidate),
+            Ok(reference) => (self.read_pull)(reference, ask),
             Err(failure) => {
                 let failure = Part::Detail(Err(failure.to_string()));
                 self.details.answer_pull(ask.ticket, failure, now);
                 self.details.answer_pull(ask.ticket, Part::Done, now);
             }
         }
+        true
+    }
+
+    /// The project of the thread whose details show, which a read of its links names, while
+    /// the environment reads pull requests.
+    fn pulls_project(&self) -> Option<String> {
+        let project = match self.details_record() {
+            details::Record::Found(thread) => thread.get("projectId").and_then(Value::as_str),
+            _ => None,
+        };
+        let project = project.map(str::to_string)?;
+        self.environment_can("pullRequests").then_some(project)
+    }
+
+    /// When the open details read their pull request's detail again to keep it current, as
+    /// `PullRequests::live` says. None once you left t3term alone for `IDLE` by then, or by now
+    /// when that time passed while the Mac slept, so an unattended TUI asks no host, and the
+    /// next key, click or wheel reads it. None too where nothing would read, so the event loop
+    /// never waits on a time that has passed.
+    fn live_at(&self) -> Option<i64> {
+        let due = self.details.pulls.live_at()?;
+        let now = now_ms().max(self.now);
+        let used = due.max(now).saturating_sub(self.input_at) < pull_requests::IDLE;
+        (used && self.pulls_project().is_some()).then_some(due)
     }
 
     /// Opens T3's refresh numbers once the details hold a read of a link's pull request on an
@@ -1742,11 +1791,24 @@ impl App {
     // ---- input ----
 
     /// Acts on a key, a paste or the mouse. When that opened a link's details, asks its host
-    /// for the pull request.
+    /// for the pull request. Says whether what shows changed.
     fn on_terminal_event(&mut self, event: Event) -> bool {
+        let now = now_ms().max(self.now);
+        let input = matches!(event, Event::Key(_) | Event::Mouse(_) | Event::Paste(_));
+        let returned = input && now - self.input_at >= pull_requests::IDLE;
+        if input {
+            self.input_at = now;
+        }
         let changed = self.on_input(event);
-        self.read_opened_pull();
-        changed
+        // A read asked for changes what the details show, though the input itself may not,
+        // as a mouse move doesn't.
+        let mut asked = self.read_opened_pull();
+        // Coming back after an idle spell reads what the details then show, once this input
+        // has done what it does.
+        if returned && self.pulls_project().is_some() && self.details.pulls.returned(now) {
+            asked |= self.read_opened_pull();
+        }
+        changed || asked
     }
 
     fn on_input(&mut self, event: Event) -> bool {
@@ -13404,7 +13466,12 @@ mod tests {
     /// A pull request's detail as T3 sends it for #31: behind its base by three commits, with
     /// a reviewer, a label, a check that passed and one that runs, and a description.
     fn host_detail() -> pull_request::Detail {
-        let detail = json!({
+        pull_request::Detail::read(&host_detail_sent()).unwrap()
+    }
+
+    /// `host_detail` as T3 sends it.
+    fn host_detail_sent() -> Value {
+        json!({
             "provider": "github",
             "capabilities": {"diff": true, "comment": true, "actions": [], "mergeMethods": [],
                 "search": true, "review": {"inlineComment": false, "reply": false,
@@ -13430,8 +13497,7 @@ mod tests {
             ],
             "mergeCapabilities": {"merge": true, "squash": true, "rebase": true},
             "baseComparison": "behind", "behindBy": 3
-        });
-        pull_request::Detail::read(&detail).unwrap()
+        })
     }
 
     /// The conversation on `host_detail`'s pull request: a remark, then octocat's approval
@@ -13500,22 +13566,24 @@ mod tests {
     }
 
     /// What a read of a pull request named: the project, the host, the repository, the number
-    /// and the ticket, and whether it sent `pullRequests.invalidate` first.
-    type Noted = (String, String, String, u64, u64, bool);
+    /// and the ticket, whether it sent `pullRequests.invalidate` first and the `updatedAt` a
+    /// read that keeps the details current compares.
+    type Noted = (String, String, String, u64, u64, bool, Option<String>);
 
     /// Replaces how `app` reads a pull request, so a read only notes what it named, and how it
     /// opens T3's refresh numbers, so they never come.
     fn note_reads(app: &mut App) -> std::rc::Rc<std::cell::RefCell<Vec<Noted>>> {
         let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let noted = asked.clone();
-        app.read_pull = Box::new(move |reference: Reference, ticket, invalidate| {
+        app.read_pull = Box::new(move |reference: Reference, ask: Ask| {
             noted.borrow_mut().push((
                 reference.project_id().to_string(),
                 reference.host().unwrap_or_default().to_string(),
                 reference.repository().to_string(),
                 reference.number(),
-                ticket,
-                invalidate,
+                ask.ticket,
+                ask.invalidate,
+                ask.updated,
             ));
         });
         note_refreshes(app);
@@ -13726,6 +13794,7 @@ mod tests {
                 ask.3,
                 ask.4,
                 false,
+                None,
             )
         };
         assert_eq!(*asked.borrow(), [ask(1)]);
@@ -14064,6 +14133,260 @@ mod tests {
         assert_eq!(reads(&asked).len(), 2);
         press(&mut app, KeyCode::Char('r'));
         assert_eq!(reads(&asked), [(1, false), (2, true), (3, true)]);
+    }
+
+    #[test]
+    fn a_read_that_keeps_details_current_reads_the_conversation_once_the_detail_changed() {
+        let detail = Ok(Box::new(host_detail()));
+        assert!(!changed_since(&detail, Some("2026-10-13T11:00:00Z")));
+        assert!(changed_since(&detail, Some("2026-10-13T10:00:00Z")));
+        assert!(changed_since(&detail, None));
+        assert!(!changed_since(
+            &Err("timed out".into()),
+            Some("2026-10-13T10:00:00Z")
+        ));
+    }
+
+    /// The reader against a fake T3 on 127.0.0.1. A read that keeps the details current asks
+    /// for the conversation only once a detail came whose `updatedAt` differs from the one
+    /// shown, and none after a detail that stayed the same or failed. A person's refresh sends
+    /// `pullRequests.invalidate`, then asks for both at once. Each read ends with
+    /// `Part::Done`.
+    #[tokio::test]
+    async fn a_read_asks_t3_for_the_conversation_as_its_ask_says() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+        type Socket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
+
+        /// The next request t3term sent, past its pings, or None once `wait` passed.
+        async fn request(socket: &mut Socket, wait: Duration) -> Option<Value> {
+            let next = async {
+                loop {
+                    let frame = socket.next().await.expect("an open socket").unwrap();
+                    if let Message::Text(text) = frame {
+                        let frame: Value = serde_json::from_str(&text).unwrap();
+                        if frame["_tag"] == "Request" {
+                            return frame;
+                        }
+                    }
+                }
+            };
+            tokio::time::timeout(wait, next).await.ok()
+        }
+
+        async fn reply(socket: &mut Socket, request: &Value, exit: Value) {
+            let reply = json!({"_tag": "Exit", "requestId": request["id"], "exit": exit});
+            let reply = Message::Text(reply.to_string().into());
+            socket.send(reply).await.unwrap();
+        }
+
+        /// Runs a read beside the fake T3's side of it, for five seconds at most.
+        async fn beside<A, B>(
+            read: impl Future<Output = A>,
+            server: impl Future<Output = B>,
+        ) -> (A, B) {
+            let both = futures_util::future::join(read, server);
+            let limit = Duration::from_secs(5);
+            tokio::time::timeout(limit, both)
+                .await
+                .expect("a read within five seconds")
+        }
+
+        /// What a read gave its caller, in order.
+        async fn parts(client: &Client, reference: &Reference, ask: Ask) -> Vec<&'static str> {
+            let parts = std::cell::RefCell::new(Vec::new());
+            read_pull_request(client, reference, &ask, |part| {
+                parts.borrow_mut().push(match part {
+                    Part::Detail(Ok(_)) => "detail",
+                    Part::Detail(Err(_)) => "no detail",
+                    Part::Activity(Ok(_)) => "activity",
+                    Part::Activity(Err(_)) => "no activity",
+                    Part::Done => "done",
+                });
+            })
+            .await;
+            parts.into_inner()
+        }
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let accepting = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        };
+        let (rpc, mut socket) = tokio::join!(crate::rpc::RpcClient::connect_url(&url), accepting);
+        let client = Client::over(rpc.unwrap());
+        let reference = Reference::new("p", Some("github.com"), "krishhgg/t3term", 31).unwrap();
+        let ask = |invalidate: bool, updated: Option<&str>| Ask {
+            ticket: 1,
+            host: "github.com".into(),
+            repository: "krishhgg/t3term".into(),
+            number: 31,
+            invalidate,
+            updated: updated.map(str::to_string),
+        };
+        let success = |value: Value| json!({"_tag": "Success", "value": value});
+        let soon = Duration::from_secs(5);
+        let shown = Some("2026-10-13T11:00:00Z");
+
+        // A detail that stayed the same: the detail alone. A request for the conversation
+        // would come before the next read's.
+        let server = async {
+            let asked = request(&mut socket, soon).await.expect("the detail");
+            assert_eq!(asked["tag"], "pullRequests.detail");
+            reply(&mut socket, &asked, success(host_detail_sent())).await;
+        };
+        let (read, ()) = beside(parts(&client, &reference, ask(false, shown)), server).await;
+        assert_eq!(read, ["detail", "done"]);
+
+        // A detail that changed: the conversation, asked for once the detail came.
+        let server = async {
+            let asked = request(&mut socket, soon).await.expect("the detail");
+            assert_eq!(asked["tag"], "pullRequests.detail");
+            let early = request(&mut socket, Duration::from_millis(200)).await;
+            assert_eq!(early, None);
+            reply(&mut socket, &asked, success(host_detail_sent())).await;
+            let asked = request(&mut socket, soon).await.expect("the conversation");
+            assert_eq!(asked["tag"], "pullRequests.activity");
+            reply(&mut socket, &asked, success(host_activity_sent())).await;
+        };
+        let older = Some("2026-10-13T10:00:00Z");
+        let (read, ()) = beside(parts(&client, &reference, ask(false, older)), server).await;
+        assert_eq!(read, ["detail", "activity", "done"]);
+
+        // A detail that failed: nothing more.
+        let not_found = json!({"_tag": "Failure", "cause": [{"_tag": "Fail", "error": {
+            "_tag": "PullRequestOperationError", "operation": "detail",
+            "detail": "Pull request #31 was not found.", "reason": "not-found"}}]});
+        let server = async {
+            let asked = request(&mut socket, soon).await.expect("the detail");
+            assert_eq!(asked["tag"], "pullRequests.detail");
+            reply(&mut socket, &asked, not_found).await;
+        };
+        let (read, ()) = beside(parts(&client, &reference, ask(false, shown)), server).await;
+        assert_eq!(read, ["no detail", "done"]);
+
+        // A person's refresh: the invalidate, then both at once.
+        let server = async {
+            let asked = request(&mut socket, soon).await.expect("the invalidate");
+            assert_eq!(asked["tag"], "pullRequests.invalidate");
+            reply(&mut socket, &asked, success(Value::Null)).await;
+            let first = request(&mut socket, soon).await.expect("a read");
+            let second = request(&mut socket, soon).await.expect("the other read");
+            let mut tags = [first["tag"].as_str(), second["tag"].as_str()];
+            tags.sort();
+            assert_eq!(
+                tags,
+                [Some("pullRequests.activity"), Some("pullRequests.detail")]
+            );
+            for asked in [first, second] {
+                let answer = match asked["tag"].as_str() {
+                    Some("pullRequests.detail") => host_detail_sent(),
+                    _ => host_activity_sent(),
+                };
+                reply(&mut socket, &asked, success(answer)).await;
+            }
+        };
+        let (mut read, ()) = beside(parts(&client, &reference, ask(true, None)), server).await;
+        assert_eq!(read.pop(), Some("done"));
+        read.sort();
+        assert_eq!(read, ["activity", "detail"]);
+        assert_eq!(request(&mut socket, Duration::from_millis(200)).await, None);
+    }
+
+    #[test]
+    fn the_open_details_read_their_detail_again_while_you_use_t3term() {
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        let asked = note_reads(&mut app);
+        let reads = |asked: &std::cell::RefCell<Vec<Noted>>| {
+            let asked = asked.borrow();
+            asked
+                .iter()
+                .map(|ask| (ask.4, ask.6.clone()))
+                .collect::<Vec<_>>()
+        };
+        let shown = Some("2026-10-13T11:00:00Z".to_string());
+        // The key and the read it asks for each read the clock, which can tick between them.
+        // A time ahead of the clock stops it for both.
+        app.now = now_ms() + 60 * 60_000;
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.live_at(), None);
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        let activity = Part::Activity(Ok(Box::new(host_activity())));
+        hear(&mut app, 1, vec![detail, activity, Part::Done]);
+
+        // Five minutes after the read was asked for, while keys came, the detail is read again
+        // with the `updatedAt` the details show.
+        let due = app
+            .live_at()
+            .expect("a read that keeps the details current");
+        assert_eq!(due - app.input_at, 5 * 60_000);
+        app.now = due - 1;
+        app.read_opened_pull();
+        assert_eq!(reads(&asked).len(), 1);
+        app.now = due;
+        app.read_opened_pull();
+        assert_eq!(reads(&asked), [(1, None), (2, shown.clone())]);
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        hear(&mut app, 2, vec![detail, Part::Done]);
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Read from github.com just now"), "{text}");
+
+        // With no key since the Enter, ten minutes before the next one, the details wait for
+        // a key.
+        let due = app.details.pulls.live_at().expect("the next read");
+        assert!(due - app.input_at >= pull_requests::IDLE);
+        assert_eq!(app.live_at(), None);
+        app.now = due + 60_000;
+        app.read_opened_pull();
+        assert_eq!(reads(&asked).len(), 2);
+        press(&mut app, KeyCode::Down);
+        let three = [(1, None), (2, shown.clone()), (3, shown.clone())];
+        assert_eq!(reads(&asked), three);
+        assert_eq!(app.live_at(), None);
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        hear(&mut app, 3, vec![detail, Part::Done]);
+        assert!(app.live_at().is_some());
+
+        // A key after six minutes without one reads at once, though five minutes haven't
+        // passed since the last read, as after a refresh number that read while you were away.
+        // A resize isn't you coming back.
+        app.input_at = app.now - pull_requests::IDLE;
+        assert_eq!(app.live_at(), None);
+        app.now += 30_000;
+        app.on_terminal_event(Event::Resize(200, 50));
+        assert_eq!(reads(&asked).len(), 3);
+        assert_eq!(app.live_at(), None);
+        // A mouse move counts, and draws the read it asked for.
+        assert!(mouse(&mut app, MouseEventKind::Moved, 1, 1));
+        assert_eq!(reads(&asked).len(), 4);
+        assert_eq!(reads(&asked)[3], (4, shown));
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        hear(&mut app, 4, vec![detail, Part::Done]);
+        assert!(app.live_at().is_some());
+        // Later keys while you use t3term wait for the five minutes.
+        app.now += 30_000;
+        press(&mut app, KeyCode::Up);
+        assert_eq!(reads(&asked).len(), 4);
+
+        // A Mac that slept through the five minutes and woke twenty minutes later reads nothing
+        // until a key, as the time since the last one counts from now.
+        let due = app.live_at().expect("the next read");
+        app.now = due + 20 * 60_000;
+        assert_eq!(app.live_at(), None);
+        app.read_opened_pull();
+        assert_eq!(reads(&asked).len(), 4);
+        press(&mut app, KeyCode::Down);
+        assert_eq!(reads(&asked).len(), 5);
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        hear(&mut app, 5, vec![detail, Part::Done]);
+
+        // Nothing is due once the environment no longer reads pull requests, so the event loop
+        // doesn't wait on a time that passed.
+        let capabilities = json!({"threadPullRequests": true});
+        app.config = Some(json!({"environment": {"capabilities": capabilities}}));
+        assert!(app.details.pulls.live_at().is_some());
+        assert_eq!(app.live_at(), None);
     }
 
     #[test]
