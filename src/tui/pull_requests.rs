@@ -828,13 +828,15 @@ impl Default for Offset {
 }
 
 /// What reading a link's pull request from its host names: the link's host, repository and
-/// number as T3 sent them, and the ticket its answer comes back with.
+/// number as T3 sent them, and the ticket its answer comes back with. `invalidate` says a
+/// person asked to read it from the host, so the read sends `pullRequests.invalidate` first.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) struct Ask {
     pub ticket: u64,
     pub host: String,
     pub repository: String,
     pub number: u64,
+    pub invalidate: bool,
 }
 
 /// Part of what a host said of a pull request. A read sends its detail and its conversation as
@@ -873,6 +875,12 @@ struct Read {
     /// Set when the last read to replace the answers missed either one, so opening the details
     /// again reads again, as a failure is never reused.
     missed: bool,
+    /// Set when a person asked to read the pull request from its host, so the next read sends
+    /// `pullRequests.invalidate` first.
+    invalidate: bool,
+    /// Set while a read that sent `pullRequests.invalidate` is under way, until T3's refresh
+    /// number moves. The invalidate moves it, so that number doesn't read again.
+    echo: bool,
 }
 
 /// A read under way to replace a read's answers. It holds each answer until both came, so the
@@ -907,6 +915,8 @@ impl Read {
             again: false,
             next: None,
             missed: false,
+            invalidate: false,
+            echo: false,
         }
     }
 
@@ -1530,11 +1540,14 @@ impl PullRequests {
         }
         self.tickets = ticket;
         self.running = Some(ticket);
+        let invalidate = std::mem::take(&mut read.invalidate);
+        read.echo = invalidate;
         Some(Ask {
             ticket,
             host: read.host.clone(),
             repository: read.repository.clone(),
             number: read.number,
+            invalidate,
         })
     }
 
@@ -1589,11 +1602,51 @@ impl PullRequests {
         let Some(read) = self.read.as_mut().filter(|read| read.ticket.is_some()) else {
             return false;
         };
+        // The first number after a person's refresh is that refresh's own, and the read it
+        // started reads what moved it.
+        if std::mem::take(&mut read.echo) {
+            return false;
+        }
         read.again = true;
         if showing {
             self.relay();
         }
         showing
+    }
+
+    /// `r` in a link's details: reads its pull request from its host again, as the desktop's
+    /// Refresh does (PullRequestDetailPanel.tsx:857-875). The read sends
+    /// `pullRequests.invalidate` first, so T3 asks the host rather than answer from its cache,
+    /// and the details show the last answers until the new ones come. Only a link whose details
+    /// hold a read does this, and not while a read of it waits or is under way, as the
+    /// desktop's Refresh waits for the one that runs. Says whether it wants a read.
+    pub fn reload(&mut self, now: i64) -> bool {
+        if !self.reloads() {
+            return false;
+        }
+        let read = self.read.as_mut().expect("a read of the shown link");
+        if read.answered() {
+            read.again = true;
+            read.invalidate = true;
+        } else {
+            // Nothing came to show meanwhile, so it reads as the details' first read does.
+            let entry = &entries_of(self.list.as_ref())[self.selected];
+            let mut read = Read::of(entry, now);
+            read.invalidate = true;
+            self.read = Some(read);
+        }
+        self.relay();
+        true
+    }
+
+    /// Whether `r` would read the shown link's pull request from its host again: its details
+    /// show and hold a read of it, and no read of it waits or is under way.
+    pub fn reloads(&self) -> bool {
+        self.viewing
+            && self.read.as_ref().is_some_and(|read| {
+                let done = read.ticket.is_some() && read.ticket != self.running;
+                self.reads_selected(read) && done && read.next.is_none()
+            })
     }
 
     /// Notes whether the details show the pull requests' tab. Once they don't, as when the
@@ -1631,6 +1684,12 @@ impl PullRequests {
         let Some(read) = self.read.as_mut() else {
             return false;
         };
+        let ours = read.ticket == Some(ticket)
+            || read.next.as_ref().is_some_and(|next| next.ticket == ticket);
+        if done && ours {
+            // A refresh number that comes after the read is done is another change.
+            read.echo = false;
+        }
         if let Some(next) = read.next.as_mut().filter(|next| next.ticket == ticket) {
             // A read that replaces the answers shows nothing until both came.
             match part {
@@ -3933,6 +3992,91 @@ mod tests {
         pulls.back();
         pulls.toggle();
         assert_eq!(pulls.take_ask(true, now() + 20_000), None);
+    }
+
+    #[test]
+    fn r_reads_a_link_from_its_host_again_once_and_only_when_none_is_under_way() {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![
+            link("krishhgg/t3term", 31, "a", "b"),
+            link("krishhgg/t3term", 32, "c", "d"),
+        ])));
+        let detail = || Part::Detail(Ok(read_detail(&bare_detail())));
+        let activity = || {
+            let activity = pull_request::Activity::read(&bare_activity()).unwrap();
+            Part::Activity(Ok(Box::new(activity)))
+        };
+        let answered = |pulls: &mut PullRequests, ticket| {
+            pulls.answer(ticket, detail(), now());
+            pulls.answer(ticket, activity(), now());
+            pulls.answer(ticket, Part::Done, now());
+        };
+        let asked = |pulls: &mut PullRequests| {
+            let ask = pulls.take_ask(true, now());
+            ask.map(|ask| (ask.number, ask.ticket, ask.invalidate))
+        };
+        let rows = |pulls: &mut PullRequests| {
+            pulls.page(44, 60, now(), true, &theme());
+            detail_rows(pulls)
+        };
+
+        // The list has nothing to read again, and neither does a read under way.
+        assert!(!pulls.reloads() && !pulls.reload(now()));
+        pulls.toggle();
+        assert_eq!(asked(&mut pulls), Some((31, 1, false)));
+        assert!(!pulls.reloads() && !pulls.reload(now()));
+        answered(&mut pulls, 1);
+
+        // Once it is done, `r` reads again from the host, and the details show the last
+        // answers until the new ones come.
+        assert!(pulls.reloads() && pulls.reload(now()));
+        assert_eq!(asked(&mut pulls), Some((31, 2, true)));
+        assert!(!pulls.reloads() && !pulls.reload(now()));
+        let shown = rows(&mut pulls);
+        assert!(shown.contains(&"Refreshing from github.com…".to_string()));
+        assert!(shown.contains(&"Reviewers".to_string()), "{shown:#?}");
+
+        // The number its invalidate moved doesn't read again, and the next one does, once
+        // the read is done.
+        assert!(!pulls.refresh());
+        assert!(pulls.refresh());
+        answered(&mut pulls, 2);
+        assert_eq!(asked(&mut pulls), Some((31, 3, false)));
+        answered(&mut pulls, 3);
+
+        // A read from the host that heard no number forgets it once done, so the next number
+        // reads again.
+        assert!(pulls.reload(now()));
+        assert_eq!(asked(&mut pulls), Some((31, 4, true)));
+        answered(&mut pulls, 4);
+        assert!(pulls.refresh());
+        assert_eq!(asked(&mut pulls), Some((31, 5, false)));
+        answered(&mut pulls, 5);
+
+        // With nothing to show meanwhile, as after a failure, it reads as a first read does.
+        pulls.back();
+        pulls.move_by(1);
+        pulls.toggle();
+        assert_eq!(asked(&mut pulls), Some((32, 6, false)));
+        pulls.answer(
+            6,
+            Part::Detail(Err("Pull request #32 was not found.".into())),
+            now(),
+        );
+        pulls.answer(6, Part::Activity(Err("Not found".into())), now());
+        pulls.answer(6, Part::Done, now());
+        assert!(pulls.reload(now()));
+        assert!(rows(&mut pulls).contains(&"Reading from github.com…".to_string()));
+        assert_eq!(asked(&mut pulls), Some((32, 7, true)));
+
+        // Nor does a link whose read waits for another's.
+        pulls.back();
+        pulls.move_by(-1);
+        pulls.toggle();
+        assert_eq!(asked(&mut pulls), None);
+        assert!(!pulls.reloads() && !pulls.reload(now()));
+        pulls.answer(7, Part::Done, now());
+        assert_eq!(asked(&mut pulls), Some((31, 8, false)));
     }
 
     #[test]
