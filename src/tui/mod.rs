@@ -6,6 +6,7 @@
 //! advance, and a one-shot timer for the moment the soonest snooze ends, which no server event
 //! marks. An idle TUI uses no CPU.
 
+mod appearance;
 mod banner;
 mod composer;
 mod details;
@@ -13,6 +14,7 @@ mod environment;
 mod label;
 mod lineage;
 mod markdown;
+mod palettes;
 mod picker;
 mod plan;
 mod provider;
@@ -22,9 +24,12 @@ mod setup;
 mod sidebar;
 mod tasks;
 mod theme;
+mod theme_list;
 mod unsent;
+mod wide_emoji;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Stdout;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -35,11 +40,12 @@ use crossterm::event::{
     KeyModifiers, MouseButton, MouseEventKind,
 };
 use futures_util::StreamExt;
-use ratatui::Frame;
+use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::{Frame, Terminal};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
@@ -48,7 +54,7 @@ use crate::client::{Client, IfBusy, WatchEvent};
 use crate::models::Choice;
 use crate::projection::{Applied, ShellState, ThreadState, apply_config, is_active_status, status};
 use crate::pull_request::{self, PullRequestError, Reference};
-use crate::settings::Settings;
+use crate::settings::{AppearanceMode, Settings, ThemeName};
 use crate::transcript::{self, BlockKind, ChangeLine};
 use composer::Composer;
 use details::Details;
@@ -58,7 +64,11 @@ use picker::{Item, Kind, Pick};
 use pull_requests::{Ask, Part};
 use scroll::{Pin, Scroll};
 use sidebar::{Badges, Capabilities, Shelf, ShelfChoices, Sidebar, View};
-use theme::{Theme, duration_label, model_display_name, now_ms, parse_iso_ms, runtime_mode_label};
+use theme::{
+    Appearance, Depth, Theme, duration_label, model_display_name, now_ms, parse_iso_ms,
+    runtime_mode_label,
+};
+use theme_list::ThemeList;
 use unsent::{Failed, Unsent};
 
 const FRAME: Duration = Duration::from_millis(33);
@@ -348,6 +358,12 @@ enum ActionResult {
         /// One-message draft options this send took, such as ultrathink, to put back.
         reserved: Vec<(String, String)>,
     },
+    /// The system's appearance, read when the color scheme turned to System, from the read
+    /// numbered `read`.
+    SystemAppearance {
+        appearance: Appearance,
+        read: u64,
+    },
 }
 
 /// An open model, effort or mode menu.
@@ -451,6 +467,17 @@ impl OpenThread {
 struct App {
     client: Arc<Client>,
     theme: Theme,
+    /// The color scheme, which says which half of the theme draws. Saved between runs.
+    appearance_mode: AppearanceMode,
+    /// The system's appearance as last read, for the System scheme. `None` before a read has
+    /// answered.
+    system_appearance: Option<Appearance>,
+    /// How many reads of the system's appearance have started since the one at start, which
+    /// numbers each.
+    system_reads: u64,
+    /// The number of the read `system_appearance` came from. Reads can answer out of order,
+    /// and an answer from an older read is dropped.
+    system_read_kept: u64,
     /// T3's configuration, with its providers and models. The config subscription keeps it
     /// current, and it stays as it was while the subscription reconnects.
     config: Option<Value>,
@@ -465,6 +492,8 @@ struct App {
     /// Messages that failed to send, until they go out or reach T3 late.
     unsent: Unsent,
     picker: Option<Picker>,
+    /// The Change theme list, while it is open.
+    theme_list: Option<ThemeList>,
     shell: Option<ShellState>,
     /// The badge of each project in `shell`, which the sidebar's cards and the breadcrumb show.
     badges: Badges,
@@ -564,7 +593,7 @@ struct App {
 }
 
 pub async fn run(client: Arc<Client>) -> Result<()> {
-    let mut screen = Screen(Some(ratatui::init()));
+    let mut screen = Screen(Some(init()));
     // Focus reports say when the terminal gains focus, which reads the open details again.
     crossterm::execute!(
         std::io::stdout(),
@@ -578,9 +607,31 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
     event_loop(terminal, client).await
 }
 
+/// The terminal the TUI draws on: ratatui's crossterm backend on stdout, through
+/// [`WideEmoji`](wide_emoji::WideEmoji).
+type Term = Terminal<wide_emoji::WideEmoji<CrosstermBackend<Stdout>>>;
+
+/// `ratatui::init` with the backend `Term` names: a panic hook that puts the terminal back,
+/// raw mode and the alternate screen. Like it, it panics when the terminal can't be set up.
+fn init() -> Term {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        ratatui::restore();
+        hook(info);
+    }));
+    let set_up = || -> std::io::Result<Term> {
+        crossterm::terminal::enable_raw_mode()?;
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+        Terminal::new(wide_emoji::WideEmoji(CrosstermBackend::new(
+            std::io::stdout(),
+        )))
+    };
+    set_up().expect("failed to initialize terminal")
+}
+
 /// Owns the terminal while the TUI runs and puts it back when dropped, including when main
 /// drops the TUI after a signal.
-struct Screen(Option<ratatui::DefaultTerminal>);
+struct Screen(Option<Term>);
 
 impl Drop for Screen {
     fn drop(&mut self) {
@@ -659,13 +710,25 @@ async fn read_pull_request(client: &Client, reference: &Reference, ask: &Ask, se
     send(Part::Done);
 }
 
-async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>) -> Result<()> {
+async fn event_loop(terminal: &mut Term, client: Arc<Client>) -> Result<()> {
     let (actions, mut action_results) = mpsc::unbounded_channel();
     let mut shell_events = client.watch_shell(None);
     // Dropped when the loop ends, which ends the subscription.
     let mut config_events = client.watch_config();
     let settings = Settings::load().await;
-    let mut app = App::new(client, Theme::detect(), &settings, actions);
+    // Read before the first frame, so System on a light Mac draws no dark frame first.
+    let system = match settings.appearance_mode {
+        AppearanceMode::System => appearance::system().await,
+        _ => None,
+    };
+    let shown = appearance::resolve(settings.appearance_mode, system, Appearance::Dark);
+    let mut app = App::new(
+        client,
+        Theme::of(settings.theme, shown, Depth::detect()),
+        &settings,
+        actions,
+    );
+    app.system_appearance = system;
     let mut input = EventStream::new();
     let mut dirty = true;
     let mut last_draw = Instant::now() - FRAME;
@@ -887,12 +950,17 @@ impl App {
         App {
             client,
             theme,
+            appearance_mode: settings.appearance_mode,
+            system_appearance: None,
+            system_reads: 0,
+            system_read_kept: 0,
             config: None,
             config_subscribed: true,
             config_revision: 0,
             drafts: HashMap::new(),
             unsent: Unsent::default(),
             picker: None,
+            theme_list: None,
             shell: None,
             badges: Badges::default(),
             feed: Feed::Connecting,
@@ -1764,8 +1832,11 @@ impl App {
                 true
             }
             Event::Paste(text) => {
-                // An open menu covers the composer, so a paste goes to the model search or
-                // nowhere.
+                // The theme list and an open menu cover the composer, so a paste goes to the
+                // model search or nowhere.
+                if self.theme_list.is_some() {
+                    return true;
+                }
                 match self.picker.as_ref().map(|p| p.kind) {
                     Some(Kind::Model) => {
                         let line = text.split_whitespace().collect::<Vec<_>>().join(" ");
@@ -1807,6 +1878,29 @@ impl App {
                         // The wheel and the other buttons wait for the drag to end.
                         _ => return false,
                     }
+                }
+                // The theme list takes the mouse, over the details too. A click on a theme
+                // chooses it, and a click on its × or outside it closes it. The wheel over it
+                // moves the highlight. Nothing reaches what it covers. Until a frame draws it,
+                // it takes events and does nothing with them.
+                if let Some(list) = self.theme_list.as_mut() {
+                    let Some(drawn) = list.drawn else {
+                        return false;
+                    };
+                    match mouse.kind {
+                        _ if click && inside(drawn.close) => self.theme_list = None,
+                        _ if click && inside(drawn.area) => {
+                            let Some(name) = list.at(mouse.column, mouse.row) else {
+                                return false;
+                            };
+                            self.choose_theme(name);
+                        }
+                        _ if click => self.theme_list = None,
+                        MouseEventKind::ScrollUp if inside(drawn.area) => list.select_by(-1),
+                        MouseEventKind::ScrollDown if inside(drawn.area) => list.select_by(1),
+                        _ => return false,
+                    }
+                    return true;
                 }
                 // A dialog of the thread's details takes the mouse. A click on its × closes it,
                 // as does a click outside it, on the button too. A click on a tab, a pull
@@ -2014,8 +2108,11 @@ impl App {
                 self.end_drag(false);
                 self.sidebar.border = Rect::default();
                 // The details' button and the details may have moved too, so they take no
-                // click until then.
+                // click until then, and so does the theme list.
                 self.details.resized();
+                if let Some(list) = self.theme_list.as_mut() {
+                    list.drawn = None;
+                }
                 true
             }
             _ => false,
@@ -2038,6 +2135,28 @@ impl App {
         match key.code {
             KeyCode::Char('c') | KeyCode::Char('q') if ctrl => {
                 self.quit = true;
+                return;
+            }
+            // The color scheme, from any pane, an open menu, dialog or theme list included. The
+            // desktop's Cmd+Option+Shift+A. Terminals send Esc then `A` for it, which Alt+A
+            // below for an approval doesn't take.
+            KeyCode::Char('A') if alt => {
+                self.cycle_appearance();
+                return;
+            }
+            // The desktop's Change theme list, Cmd+Option+A, from any pane, over a menu or a
+            // dialog too. Terminals send Esc then Ctrl+A for Ctrl+Alt+A, which comes ahead of
+            // Alt+A for an approval and Ctrl+A in the composer. The same keys close it, as they
+            // close a menu.
+            KeyCode::Char('a') if ctrl && alt => {
+                self.toggle_theme_list();
+                return;
+            }
+            // The open list takes every other key but quitting, so nothing reaches what it
+            // covers: Ctrl+X doesn't stop a run under it, and the sidebar and the details stay
+            // as they are.
+            _ if self.theme_list.is_some() => {
+                self.on_theme_list_key(key);
                 return;
             }
             KeyCode::Char('x') if ctrl => {
@@ -2262,6 +2381,98 @@ impl App {
         }
     }
 
+    /// Turns the color scheme to the next of System, Light and Dark, as the desktop's
+    /// Cmd+Option+Shift+A does, saves it and says which it is, as the desktop's toast does. Turning
+    /// to System reads the system's appearance again, since it may have changed. Until the read
+    /// answers, the screen keeps the appearance it has.
+    fn cycle_appearance(&mut self) {
+        let mode = self.appearance_mode.next();
+        self.appearance_mode = mode;
+        Settings::update(move |settings| settings.appearance_mode = mode);
+        if mode == AppearanceMode::System {
+            self.read_system_appearance();
+        }
+        self.follow_appearance();
+        self.message = Some((format!("Appearance: {}", mode.label()), false));
+    }
+
+    /// Reads the system's appearance in the background. The answer arrives as an action with
+    /// the read's number, and a read that can't tell sends nothing.
+    fn read_system_appearance(&mut self) {
+        self.system_reads += 1;
+        let read = self.system_reads;
+        let results = self.actions.clone();
+        tokio::spawn(async move {
+            if let Some(appearance) = appearance::system().await {
+                let _ = results.send(ActionResult::SystemAppearance { appearance, read });
+            }
+        });
+    }
+
+    /// Opens the Change theme list on its first row, closing an open menu, or closes the list.
+    fn toggle_theme_list(&mut self) {
+        self.theme_list = match self.theme_list {
+            Some(_) => None,
+            None => {
+                self.picker = None;
+                Some(ThemeList::default())
+            }
+        };
+    }
+
+    fn on_theme_list_key(&mut self, key: KeyEvent) {
+        let ctrl = key.modifiers.contains(KeyModifiers::CONTROL);
+        let Some(list) = self.theme_list.as_mut() else {
+            return;
+        };
+        match key.code {
+            KeyCode::Esc => self.theme_list = None,
+            KeyCode::Enter => {
+                let name = list.selected();
+                self.choose_theme(name);
+            }
+            KeyCode::Up | KeyCode::Char('k') => list.select_by(-1),
+            KeyCode::Down | KeyCode::Char('j') => list.select_by(1),
+            KeyCode::Char('p') if ctrl => list.select_by(-1),
+            KeyCode::Char('n') if ctrl => list.select_by(1),
+            KeyCode::Home | KeyCode::PageUp => list.select_by(-isize::MAX),
+            KeyCode::End | KeyCode::PageDown => list.select_by(isize::MAX),
+            _ => {}
+        }
+    }
+
+    /// Closes the theme list, draws `name` in the half that shows and saves it, as the
+    /// desktop's `setTheme` saves a choice even when it is the theme already drawing.
+    fn choose_theme(&mut self, name: ThemeName) {
+        self.theme_list = None;
+        if name != self.theme.name {
+            self.theme = Theme::of(name, self.theme.appearance, self.theme.depth);
+            self.restyle();
+        }
+        Settings::update(move |settings| settings.theme = name);
+    }
+
+    /// Draws the half of the theme the color scheme calls for, when it isn't the one drawing.
+    fn follow_appearance(&mut self) {
+        let current = self.theme.appearance;
+        let wanted = appearance::resolve(self.appearance_mode, self.system_appearance, current);
+        if wanted != current {
+            self.theme = Theme::of(self.theme.name, wanted, self.theme.depth);
+            self.restyle();
+        }
+    }
+
+    /// Drops every row laid out in the old colors, so the next frame draws all of it in the
+    /// new ones, at once.
+    fn restyle(&mut self) {
+        self.cache.clear();
+        self.details.restyle();
+        if let Some(open) = self.open.as_mut() {
+            open.setup.restyle();
+        }
+        self.layout_changed = true;
+    }
+
     /// Turns verbose mode on or off and remembers it, the way the GUI keeps a view setting.
     /// It opens every run of calls at once, instead of one click at a time.
     fn toggle_verbose(&mut self) {
@@ -2330,6 +2541,13 @@ impl App {
         match result {
             ActionResult::Info(text) => self.message = Some((text, false)),
             ActionResult::Error(text) => self.message = Some((text, true)),
+            // An older read than the one kept says less about the system now.
+            ActionResult::SystemAppearance { appearance, read } if read > self.system_read_kept => {
+                self.system_read_kept = read;
+                self.system_appearance = Some(appearance);
+                self.follow_appearance();
+            }
+            ActionResult::SystemAppearance { .. } => {}
             ActionResult::Config { config, revision } => {
                 // A change from the subscription since the read was asked for is newer than
                 // the answer.
@@ -3041,7 +3259,7 @@ impl App {
         };
         let button_style = if self.details.open {
             Style::new()
-                .fg(self.theme.primary)
+                .fg(self.theme.focus)
                 .bg(self.theme.chip_bg)
                 .add_modifier(Modifier::BOLD)
         } else {
@@ -3129,6 +3347,14 @@ impl App {
                     .draw_dialog(frame, below, now, &self.environment, &self.theme)
             }
             None => self.details.forget_drawn(),
+        }
+        // Over everything but the status line, which says its keys.
+        if let Some(list) = self.theme_list.as_mut() {
+            let above = Rect {
+                height: area.height.saturating_sub(1),
+                ..area
+            };
+            list.draw(frame, above, &self.theme);
         }
     }
 
@@ -3503,7 +3729,7 @@ impl App {
             frame.render_widget(
                 Paragraph::new(Line::styled(
                     label.clone(),
-                    Style::new().fg(t.fg).bg(t.primary),
+                    Style::new().fg(t.on_primary).bg(t.primary),
                 )),
                 Rect::new(x, area.y + area.height - 1, label.width() as u16, 1),
             );
@@ -3629,7 +3855,7 @@ impl App {
         let button = |label: &str, primary: bool| {
             let style = if primary {
                 Style::new()
-                    .fg(t.fg)
+                    .fg(t.on_primary)
                     .bg(t.primary)
                     .add_modifier(Modifier::BOLD)
             } else {
@@ -3843,7 +4069,7 @@ impl App {
             Style::new().fg(t.muted).bg(t.chip_bg)
         } else {
             Style::new()
-                .fg(t.fg)
+                .fg(t.on_primary)
                 .bg(t.primary)
                 .add_modifier(Modifier::BOLD)
         };
@@ -3997,7 +4223,7 @@ impl App {
                     Item::Entry { label, current, .. } => {
                         let check = if *current { " ✓ " } else { "   " };
                         let left = vec![
-                            Span::styled(check, Style::new().fg(t.primary)),
+                            Span::styled(check, Style::new().fg(t.focus)),
                             Span::styled(
                                 fit(label, row_width.saturating_sub(4)),
                                 Style::new().fg(t.fg),
@@ -4030,7 +4256,8 @@ impl App {
             .as_ref()
             .is_some_and(|o| self.unsent.has_saved(&o.id));
         // Only Ctrl+B and the toggle bring a hidden sidebar back, so the keys lead with it.
-        let restore = if self.sidebar_hidden && self.picker.is_none() {
+        let covered = self.picker.is_some() || self.theme_list.is_some();
+        let restore = if self.sidebar_hidden && !covered {
             "Ctrl+B sidebar · "
         } else {
             ""
@@ -4041,13 +4268,14 @@ impl App {
             Span::styled("● ", Style::new().fg(color)),
             Span::styled(head, Style::new().fg(t.muted)),
         ];
-        if unsent && self.picker.is_none() && room > 0 {
+        if unsent && !covered && room > 0 {
             let note = fit("Unsent message: Ctrl+R  ·  ", room);
             room -= note.width();
             spans.push(Span::styled(note, Style::new().fg(t.warning_fg)));
         }
         let hint;
         let keys = match (self.focus, self.picker.as_ref().map(|p| p.kind)) {
+            _ if self.theme_list.is_some() => "↑↓ choose · Enter select · Esc close",
             (_, Some(Kind::Model)) => "Type to search · ↑↓ choose · Enter select · Esc close",
             (_, Some(_)) => "↑↓ choose · Enter select · Esc close",
             (Focus::Sidebar, None) => {
@@ -4760,7 +4988,7 @@ fn render_block(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use theme::Depth;
+    use crate::settings::ThemeName;
 
     fn block(kind: BlockKind, item_type: &str, header: &str, body: &str) -> transcript::Block {
         transcript::Block {
@@ -14891,5 +15119,709 @@ mod tests {
         assert_eq!(app.composer.text(), "half a reply");
         // None of it asked T3 for anything.
         assert_eq!(reads(&runtime), 0);
+    }
+
+    // ---- appearance ----
+
+    fn alt_shift_a(app: &mut App) {
+        let key = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::ALT | KeyModifiers::SHIFT);
+        app.on_terminal_event(Event::Key(key));
+    }
+
+    /// Each color `buffer` draws that `theme` doesn't have, with the first cell that draws it.
+    fn foreign_colors(buffer: &ratatui::buffer::Buffer, theme: &Theme) -> Vec<(Color, u16, u16)> {
+        let palette: HashSet<Color> = theme.colors().into_iter().chain([Color::Reset]).collect();
+        let mut seen = HashSet::new();
+        let mut foreign = Vec::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let cell = &buffer[(x, y)];
+                for color in [cell.fg, cell.bg] {
+                    if !palette.contains(&color) && seen.insert(color) {
+                        foreign.push((color, x, y));
+                    }
+                }
+            }
+        }
+        foreign
+    }
+
+    #[test]
+    fn alt_shift_a_redraws_everything_in_the_other_half_at_once() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        // The crowded thread, then with its details beside it, and a linked pull request's
+        // details: every part of the screen that keeps its rows from one frame to the next.
+        let crowded_details = || {
+            let mut app = crowded();
+            alt(&mut app, 'b');
+            app
+        };
+        let pull_details = || {
+            let mut app = pulls_tui(vec![long_linked(32), long_linked(31)], false);
+            app.focus = Focus::Transcript;
+            cells(&mut app, 120, 40);
+            alt(&mut app, 'b');
+            press(&mut app, KeyCode::Right);
+            cells(&mut app, 120, 40);
+            press(&mut app, KeyCode::Enter);
+            app
+        };
+        // And one whose host answered, with its description and a remark laid out.
+        let pull_answered = || {
+            let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+            note_reads(&mut app);
+            press(&mut app, KeyCode::Enter);
+            let parts = vec![
+                Part::Detail(Ok(Box::new(host_detail()))),
+                Part::Activity(Ok(Box::new(host_activity()))),
+                Part::Done,
+            ];
+            hear(&mut app, 1, parts);
+            let shown = text_in(&cells(&mut app, 200, 50), Rect::new(0, 0, 200, 50));
+            assert!(shown.contains("Second paragraph.") && shown.contains("Looks close."));
+            app
+        };
+        // And its Timeline, with the verdict on a row of its own and the run with the remark open.
+        let pull_timeline = || {
+            let mut app = pull_answered();
+            press(&mut app, KeyCode::Right);
+            cells(&mut app, 200, 50);
+            // The run that holds the remark opens: Newest first, then the run.
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            let shown = text_in(&cells(&mut app, 200, 50), Rect::new(0, 0, 200, 50));
+            assert!(
+                shown.contains("Newest first") && shown.contains("Looks close."),
+                "{shown}"
+            );
+            app
+        };
+        let scenes = [
+            ("crowded", crowded(), 80, 24),
+            ("crowded with details", crowded_details(), 200, 50),
+            ("a pull request's details", pull_details(), 120, 40),
+            ("a pull request's host answer", pull_answered(), 200, 50),
+            ("a pull request's Timeline", pull_timeline(), 200, 50),
+        ];
+        for (scene, mut app, width, height) in scenes {
+            let composer = app.composer.text();
+            let dark = cells(&mut app, width, height);
+            assert_eq!(app.theme.appearance, Appearance::Dark, "{scene}");
+            assert_eq!(foreign_colors(&dark, &app.theme), [], "{scene}");
+
+            // Dark goes to System, which keeps what draws until the system's appearance is
+            // read, and the read never answers here. Then Light.
+            alt_shift_a(&mut app);
+            assert_eq!(app.appearance_mode, AppearanceMode::System, "{scene}");
+            assert_eq!(app.theme.appearance, Appearance::Dark, "{scene}");
+            alt_shift_a(&mut app);
+            assert_eq!(app.appearance_mode, AppearanceMode::Light, "{scene}");
+            assert_eq!(app.theme.appearance, Appearance::Light, "{scene}");
+            // The next frame draws at once, in the new colors only.
+            assert!(app.layout_changed, "{scene}");
+            let light = cells(&mut app, width, height);
+            assert_eq!(foreign_colors(&light, &app.theme), [], "{scene}");
+            let canvas = light.content.iter().filter(|cell| cell.bg == app.theme.bg);
+            assert!(canvas.count() > 0, "{scene}");
+
+            // And back to Dark.
+            alt_shift_a(&mut app);
+            assert_eq!(app.theme.appearance, Appearance::Dark, "{scene}");
+            let dark = cells(&mut app, width, height);
+            assert_eq!(foreign_colors(&dark, &app.theme), [], "{scene}");
+            // No key reached the composer, and each choice was saved.
+            assert_eq!(app.composer.text(), composer, "{scene}");
+            assert_eq!(
+                crate::settings::saved_in_test().appearance_mode,
+                AppearanceMode::Dark
+            );
+        }
+        // Only the turn to System read anything, once a scene.
+        assert_eq!(reads(&runtime), 5);
+    }
+
+    #[test]
+    fn system_draws_the_systems_appearance_read_each_time_it_is_chosen() {
+        use appearance::fake::{READS, SYSTEM};
+        use theme::Appearance::{Dark, Light};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut app = tui(&Settings::default());
+            let (sender, mut results) = mpsc::unbounded_channel();
+            app.actions = sender;
+            READS.set(0);
+            let message = |app: &App| app.message.as_ref().map(|(text, _)| text.clone());
+
+            // Dark to System keeps dark until the read says the system is light.
+            SYSTEM.set(Some(Light));
+            alt_shift_a(&mut app);
+            assert_eq!(message(&app).as_deref(), Some("Appearance: System"));
+            assert_eq!(app.theme.appearance, Dark);
+            app.on_action_result(results.recv().await.unwrap());
+            assert_eq!((app.theme.appearance, READS.get()), (Light, 1));
+            assert_eq!(
+                crate::settings::saved_in_test().appearance_mode,
+                AppearanceMode::System
+            );
+
+            // Light and Dark read nothing.
+            alt_shift_a(&mut app);
+            assert_eq!(message(&app).as_deref(), Some("Appearance: Light"));
+            assert_eq!(app.theme.appearance, Light);
+            alt_shift_a(&mut app);
+            assert_eq!(message(&app).as_deref(), Some("Appearance: Dark"));
+            assert_eq!(app.theme.appearance, Dark);
+            tokio::task::yield_now().await;
+            assert_eq!(READS.get(), 1);
+
+            // Back on System, the last read draws at once, and the system is read again.
+            SYSTEM.set(Some(Dark));
+            alt_shift_a(&mut app);
+            assert_eq!(app.theme.appearance, Light);
+            app.on_action_result(results.recv().await.unwrap());
+            assert_eq!((app.theme.appearance, READS.get()), (Dark, 2));
+
+            // A read that can't tell sends nothing, and what draws stays.
+            SYSTEM.set(None);
+            for _ in 0..3 {
+                alt_shift_a(&mut app);
+            }
+            assert_eq!(app.appearance_mode, AppearanceMode::System);
+            tokio::task::yield_now().await;
+            assert_eq!(READS.get(), 3);
+            assert!(results.try_recv().is_err());
+            assert_eq!(app.theme.appearance, Dark);
+
+            // A read that answers after the reader moved on is kept for the next turn to
+            // System and draws nothing now.
+            SYSTEM.set(Some(Light));
+            for _ in 0..3 {
+                alt_shift_a(&mut app);
+            }
+            alt_shift_a(&mut app);
+            assert_eq!(app.appearance_mode, AppearanceMode::Light);
+            app.on_action_result(results.recv().await.unwrap());
+            assert_eq!(app.system_appearance, Some(Light));
+            alt_shift_a(&mut app);
+            alt_shift_a(&mut app);
+            assert_eq!(app.appearance_mode, AppearanceMode::System);
+            assert_eq!(app.theme.appearance, Light);
+            app.on_action_result(results.recv().await.unwrap());
+            assert!(results.try_recv().is_err());
+
+            // Two reads that answer out of order: the newer one's answer draws, and the
+            // older one's, arriving after it, is dropped.
+            for system in [Light, Dark] {
+                SYSTEM.set(Some(system));
+                for _ in 0..3 {
+                    alt_shift_a(&mut app);
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(app.appearance_mode, AppearanceMode::System);
+            let older = results.recv().await.unwrap();
+            let newer = results.recv().await.unwrap();
+            app.on_action_result(newer);
+            assert_eq!(app.theme.appearance, Dark);
+            app.on_action_result(older);
+            assert_eq!(app.system_appearance, Some(Dark));
+            assert_eq!(app.theme.appearance, Dark);
+        });
+    }
+
+    /// Ctrl+Alt+A, as terminals report Esc then a quick Ctrl+A.
+    fn ctrl_alt_a(app: &mut App) {
+        let both = KeyModifiers::CONTROL | KeyModifiers::ALT;
+        app.on_terminal_event(Event::Key(KeyEvent::new(KeyCode::Char('a'), both)));
+    }
+
+    /// Where the last frame drew the theme list.
+    fn theme_list_drawn(app: &App) -> theme_list::Drawn {
+        let list = app.theme_list.as_ref().expect("the theme list is open");
+        list.drawn.expect("a frame drew the theme list")
+    }
+
+    #[test]
+    fn ctrl_alt_a_lists_the_themes_and_enter_draws_and_saves_one() {
+        use theme::Appearance::{Dark, Light};
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = crowded();
+        app.composer.insert('x');
+        let draft = app.composer.text();
+        ctrl_alt_a(&mut app);
+        let buffer = cells(&mut app, 120, 40);
+        let drawn = theme_list_drawn(&app);
+        // Centered, a third of the way down the rows above the status line.
+        assert_eq!(drawn.area, Rect::new(40, 10, 40, 9));
+        let text = text_in(&buffer, drawn.area);
+        let rows: Vec<&str> = text.lines().map(str::trim_end).collect();
+        assert_eq!(rows[1], "│ Change theme                       × │");
+        let names: Vec<_> = rows[2..8]
+            .iter()
+            .map(|row| {
+                row.trim_start_matches(['│', ' '])
+                    .split("  ")
+                    .next()
+                    .unwrap()
+            })
+            .collect();
+        assert_eq!(
+            names,
+            ["T3 Code", "T3 Chat", "Grove", "Ocean", "Ember", "Iris"]
+        );
+        assert!(rows[2].contains("Current   ●   ● "), "{}", rows[2]);
+        assert_eq!(text.matches("Current").count(), 1);
+        // Each dot is a half's focus color on its canvas, light then dark.
+        for (index, name) in ThemeName::ALL.into_iter().enumerate() {
+            let y = drawn.area.y + 2 + index as u16;
+            let dots: Vec<_> = (drawn.area.x..drawn.area.right())
+                .map(|x| &buffer[(x, y)])
+                .filter(|cell| cell.symbol() == "●")
+                .map(|cell| (cell.fg, cell.bg))
+                .collect();
+            let half = |appearance| {
+                let half = Theme::of(name, appearance, Depth::TrueColor);
+                (half.focus, half.bg)
+            };
+            assert_eq!(dots, [half(Light), half(Dark)], "{name:?}");
+        }
+        // The first row is highlighted, and the status line says the list's keys.
+        let first = drawn.area.y + 2;
+        assert_eq!(buffer[(drawn.area.x + 2, first)].bg, app.theme.highlight);
+        assert_eq!(buffer[(drawn.area.x + 2, first + 1)].bg, app.theme.popover);
+        let status = text_in(&buffer, Rect::new(0, 39, 120, 1));
+        assert!(
+            status.contains("↑↓ choose · Enter select · Esc close"),
+            "{status}"
+        );
+
+        // ↓ twice and Enter draw Grove in the half that shows, save it and close the list.
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.theme_list.is_none());
+        assert_eq!(
+            (app.theme.name, app.theme.appearance),
+            (ThemeName::Grove, Dark)
+        );
+        assert_eq!(crate::settings::saved_in_test().theme, ThemeName::Grove);
+        let buffer = cells(&mut app, 120, 40);
+        assert_eq!(foreign_colors(&buffer, &app.theme), []);
+        assert_eq!(app.composer.text(), draft);
+
+        // It opens on its first row again, with Grove's row marked, in Grove's colors.
+        ctrl_alt_a(&mut app);
+        let buffer = cells(&mut app, 120, 40);
+        let drawn = theme_list_drawn(&app);
+        let text = text_in(&buffer, drawn.area);
+        let current = text.lines().find(|row| row.contains("Current")).unwrap();
+        assert!(current.starts_with("│ Grove "), "{current}");
+        assert_eq!(
+            buffer[(drawn.area.x + 2, drawn.area.y + 2)].bg,
+            app.theme.highlight
+        );
+        // Besides Grove's colors, only the dots' colors draw, and only in the list.
+        let dots: HashSet<Color> = ThemeName::ALL
+            .into_iter()
+            .flat_map(|name| [Light, Dark].map(|half| Theme::of(name, half, Depth::TrueColor)))
+            .flat_map(|half| [half.focus, half.bg])
+            .collect();
+        for (color, x, y) in foreign_colors(&buffer, &app.theme) {
+            assert!(dots.contains(&color), "{color:?} at {x}, {y}");
+            let at = ratatui::layout::Position::new(x, y);
+            assert!(drawn.area.contains(at), "{color:?} at {x}, {y}");
+        }
+
+        // Alt+Shift+A switches the half under the open list. End, then Enter, draws Iris in it.
+        alt_shift_a(&mut app);
+        alt_shift_a(&mut app);
+        assert_eq!(app.theme.appearance, Light);
+        assert!(app.theme_list.is_some());
+        press(&mut app, KeyCode::End);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(
+            (app.theme.name, app.theme.appearance),
+            (ThemeName::Iris, Light)
+        );
+        assert_eq!(crate::settings::saved_in_test().theme, ThemeName::Iris);
+
+        // Choosing the theme that draws saves it again and changes nothing else. Esc closes
+        // the list and saves nothing.
+        crate::settings::Settings::update(|settings| settings.theme = ThemeName::T3Code);
+        ctrl_alt_a(&mut app);
+        for _ in 0..5 {
+            press(&mut app, KeyCode::Char('j'));
+        }
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(app.theme.name, ThemeName::Iris);
+        assert_eq!(crate::settings::saved_in_test().theme, ThemeName::Iris);
+        crate::settings::Settings::update(|settings| settings.theme = ThemeName::T3Code);
+        ctrl_alt_a(&mut app);
+        press(&mut app, KeyCode::Down);
+        press(&mut app, KeyCode::Esc);
+        assert!(app.theme_list.is_none());
+        assert_eq!(app.theme.name, ThemeName::Iris);
+        assert_eq!(crate::settings::saved_in_test().theme, ThemeName::T3Code);
+    }
+
+    #[test]
+    fn the_theme_list_takes_every_key_and_click_over_what_it_covers() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = crowded();
+        let request = json!({"id": "q1", "kind": "command", "status": "pending"});
+        app.on_thread_event(live(2, "runtime-request.updated", request));
+        app.focus = Focus::Composer;
+        let draft = app.composer.text();
+        let tasks = runtime.metrics().num_alive_tasks();
+
+        // Ctrl+A alone stays the composer's.
+        let ctrl_a = KeyEvent::new(KeyCode::Char('a'), KeyModifiers::CONTROL);
+        app.on_terminal_event(Event::Key(ctrl_a));
+        assert!(app.theme_list.is_none());
+
+        // Ctrl+Alt+A comes ahead of Alt+A for the approval and Ctrl+A in the composer, and an
+        // open menu closes under the list.
+        app.picker = Some(mode_menu());
+        ctrl_alt_a(&mut app);
+        assert!(app.theme_list.is_some());
+        assert!(app.picker.is_none());
+        // Letters, Alt+A, a paste and Tab go nowhere. Nor do the keys that work from any pane:
+        // Ctrl+X doesn't stop the run under the list, and Ctrl+B and Alt+B leave the sidebar
+        // and the details as they are.
+        let open = app.open.as_ref().unwrap();
+        assert!(open.state.as_ref().unwrap().active_run().is_some());
+        let sidebar_hidden = app.sidebar_hidden;
+        press(&mut app, KeyCode::Char('x'));
+        alt(&mut app, 'a');
+        app.on_terminal_event(Event::Paste("pasted".into()));
+        press(&mut app, KeyCode::Tab);
+        for c in ['x', 'b'] {
+            let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+            app.on_terminal_event(Event::Key(key));
+        }
+        alt(&mut app, 'b');
+        assert!(app.theme_list.is_some());
+        assert_eq!(app.composer.text(), draft);
+        assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(app.sidebar_hidden, sidebar_hidden);
+        assert_eq!(
+            crate::settings::saved_in_test().sidebar_hidden,
+            Settings::default().sidebar_hidden
+        );
+        assert!(!app.details.open);
+        assert!(app.message.is_none());
+        assert_eq!(
+            runtime.metrics().num_alive_tasks(),
+            tasks,
+            "no answer went out"
+        );
+        // The same keys close it.
+        ctrl_alt_a(&mut app);
+        assert!(app.theme_list.is_none());
+
+        // Over the details' dialog, Esc closes the list and leaves the dialog open.
+        alt(&mut app, 'b');
+        cells(&mut app, 120, 40);
+        assert!(app.details_modal());
+        ctrl_alt_a(&mut app);
+        alt(&mut app, 'b');
+        assert!(app.details_modal());
+        press(&mut app, KeyCode::Esc);
+        assert!(app.theme_list.is_none());
+        assert!(app.details_modal());
+
+        // Until a frame draws it, a click does nothing.
+        ctrl_alt_a(&mut app);
+        let left = MouseEventKind::Down(MouseButton::Left);
+        assert!(!mouse(&mut app, left, 0, 0));
+        assert!(app.theme_list.is_some());
+        cells(&mut app, 120, 40);
+        let drawn = theme_list_drawn(&app);
+        // The wheel moves the highlight, and a click on the title row does nothing.
+        mouse(
+            &mut app,
+            MouseEventKind::ScrollDown,
+            drawn.area.x + 3,
+            drawn.area.y + 3,
+        );
+        assert_eq!(
+            app.theme_list.as_ref().unwrap().selected(),
+            ThemeName::T3Chat
+        );
+        assert!(!mouse(&mut app, left, drawn.area.x + 3, drawn.area.y + 1));
+        // A click on the border does nothing either.
+        assert!(!mouse(&mut app, left, drawn.area.x, drawn.area.y + 4));
+        assert!(app.theme_list.is_some());
+        // A click on Ocean's row chooses it, wherever on the row.
+        let ocean = drawn.area.y + 2 + 3;
+        assert!(mouse(&mut app, left, drawn.area.right() - 4, ocean));
+        assert!(app.theme_list.is_none());
+        assert_eq!(app.theme.name, ThemeName::Ocean);
+        assert!(app.details_modal(), "the click went no further");
+
+        // A click on × closes it, and so does one outside it, which the details don't get.
+        for close in [true, false] {
+            ctrl_alt_a(&mut app);
+            cells(&mut app, 120, 40);
+            let drawn = theme_list_drawn(&app);
+            let (x, y) = match close {
+                true => (drawn.close.x + 1, drawn.close.y),
+                false => (0, 0),
+            };
+            assert!(mouse(&mut app, left, x, y));
+            assert!(app.theme_list.is_none());
+            assert!(app.details_modal());
+            assert_eq!(app.theme.name, ThemeName::Ocean);
+        }
+
+        // A resize leaves the list open, and it takes no click until a frame draws it again.
+        ctrl_alt_a(&mut app);
+        cells(&mut app, 120, 40);
+        app.on_terminal_event(Event::Resize(100, 30));
+        let drawn_before = drawn;
+        assert!(!mouse(
+            &mut app,
+            left,
+            drawn_before.area.x + 3,
+            drawn_before.area.y + 3
+        ));
+        assert!(app.theme_list.is_some());
+        assert_eq!(
+            runtime.metrics().num_alive_tasks(),
+            tasks,
+            "no answer went out"
+        );
+
+        // Ctrl+C still quits.
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.on_terminal_event(Event::Key(ctrl_c));
+        assert!(app.quit);
+    }
+
+    #[test]
+    fn the_theme_list_moves_with_the_keys_a_menu_takes() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = tui(&Settings::default());
+        ctrl_alt_a(&mut app);
+        let ctrl = |c| KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+        let steps = [
+            (KeyEvent::from(KeyCode::Down), ThemeName::T3Chat),
+            (KeyCode::Char('j').into(), ThemeName::Grove),
+            (ctrl('n'), ThemeName::Ocean),
+            (KeyCode::Up.into(), ThemeName::Grove),
+            (KeyCode::Char('k').into(), ThemeName::T3Chat),
+            (ctrl('p'), ThemeName::T3Code),
+            (KeyCode::End.into(), ThemeName::Iris),
+            (KeyCode::Home.into(), ThemeName::T3Code),
+            (KeyCode::PageDown.into(), ThemeName::Iris),
+            (KeyCode::PageUp.into(), ThemeName::T3Code),
+        ];
+        for (key, highlighted) in steps {
+            app.on_terminal_event(Event::Key(key));
+            let list = app.theme_list.as_ref().expect("the list stays open");
+            assert_eq!(list.selected(), highlighted, "{key:?}");
+        }
+    }
+
+    #[test]
+    fn the_theme_list_fits_a_small_screen_and_keeps_its_highlight_in_view() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = tui(&Settings::default());
+        ctrl_alt_a(&mut app);
+        for (width, height) in [(80, 24), (40, 12), (30, 8), (19, 6), (12, 4)] {
+            let buffer = cells(&mut app, width, height);
+            let drawn = theme_list_drawn(&app);
+            assert!(Rect::new(0, 0, width, height - 1).contains(drawn.area.as_position()));
+            assert!(drawn.area.right() <= width && drawn.area.bottom() < height);
+            let text = text_in(&buffer, drawn.area);
+            assert!(text.contains("Change"), "{width}x{height}: {text}");
+        }
+        // On 4 rows the list shows two themes and follows the highlight.
+        press(&mut app, KeyCode::End);
+        let buffer = cells(&mut app, 30, 4);
+        let drawn = theme_list_drawn(&app);
+        let text = text_in(&buffer, drawn.area);
+        assert!(text.contains("Ember") && text.contains("Iris"), "{text}");
+        assert!(!text.contains("Grove"), "{text}");
+        let left = MouseEventKind::Down(MouseButton::Left);
+        let iris = (0..4)
+            .find(|&y| text_in(&buffer, Rect::new(0, y, 30, 1)).contains("Iris"))
+            .unwrap();
+        assert!(mouse(&mut app, left, 5, iris));
+        assert_eq!(app.theme.name, ThemeName::Iris);
+    }
+
+    #[test]
+    fn a_built_in_theme_draws_both_halves_in_its_own_colors() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        // The crowded thread with its details, a pending approval and a scrolled transcript.
+        let crowded_details = || {
+            let mut app = crowded();
+            let request = json!({"id": "q1", "kind": "command", "status": "pending"});
+            app.on_thread_event(live(2, "runtime-request.updated", request));
+            app.composer.insert('x');
+            alt(&mut app, 'b');
+            cells(&mut app, 200, 50);
+            press(&mut app, KeyCode::PageUp);
+            app
+        };
+        // A running step, a menu's check and the sidebar's bar, which mark what is current.
+        let marks = || {
+            let mut app = tui(&Settings::default());
+            let thread = bound("t", "p", json!("/work/repo-t"), json!("t3code/t"));
+            app.on_shell_event(details_shell(vec![thread.clone()]));
+            let steps = json!([{"id": "s1", "text": "Fix the bug", "status": "running"}]);
+            let list = json!({"id": "l1", "threadId": "t", "runId": null, "nodeId": "n",
+                "kind": "todo_list", "status": "active", "steps": steps});
+            let more = json!({"thread": thread, "plans": [list]});
+            app.open_thread(codex_thread("t", None, more));
+            app.on_config_event(config_snapshot(vec![codex("ready")], json!({})));
+            cells(&mut app, 120, 40);
+            alt(&mut app, 't');
+            app.picker = Some(mode_menu());
+            app.focus = Focus::Sidebar;
+            app
+        };
+        // A linked pull request's details, with the way back to the list.
+        let pull_details = || {
+            let mut app = pulls_tui(vec![long_linked(32), long_linked(31)], false);
+            app.focus = Focus::Transcript;
+            cells(&mut app, 120, 40);
+            alt(&mut app, 'b');
+            press(&mut app, KeyCode::Right);
+            cells(&mut app, 120, 40);
+            press(&mut app, KeyCode::Enter);
+            app
+        };
+        for name in ThemeName::ALL.into_iter().skip(1) {
+            // Each scene with its size and the text it draws only in the focus color.
+            let pull = "a pull request's details";
+            let scenes = [
+                ("crowded with details", crowded_details(), 200, 50, &[][..]),
+                ("marks", marks(), 120, 40, &["◉", "✓", "▎"][..]),
+                (pull, pull_details(), 120, 40, &["← List"][..]),
+            ];
+            for (scene, mut app, width, height, marks) in scenes {
+                let at = format!("{name:?}, {scene}");
+                // As the event loop builds it from a file that names the theme.
+                app.theme = Theme::of(name, Appearance::Dark, Depth::TrueColor);
+                app.restyle();
+                let dark = cells(&mut app, width, height);
+                drawn_in_its_own_colors(&dark, &app.theme, marks, &at);
+                // Alt+Shift+A changes the half and keeps the theme.
+                alt_shift_a(&mut app);
+                alt_shift_a(&mut app);
+                assert_eq!(app.theme.name, name, "{at}");
+                assert_eq!(app.theme.appearance, Appearance::Light, "{at}");
+                assert_ne!(app.theme.bg, Theme::light(Depth::TrueColor).bg, "{at}");
+                let light = cells(&mut app, width, height);
+                drawn_in_its_own_colors(&light, &app.theme, marks, &at);
+                alt_shift_a(&mut app);
+                assert_eq!(app.theme.name, name, "{at}");
+            }
+        }
+    }
+
+    /// Checks that `buffer` draws only `theme`'s colors, on its canvas, with its focus color
+    /// drawing each of `marks`, which mark what is current, and its action color filling
+    /// buttons and never drawing text.
+    fn drawn_in_its_own_colors(
+        buffer: &ratatui::buffer::Buffer,
+        theme: &Theme,
+        marks: &[&str],
+        at: &str,
+    ) {
+        assert_eq!(foreign_colors(buffer, theme), [], "{at}");
+        let cells = || buffer.content.iter();
+        assert!(cells().any(|cell| cell.bg == theme.bg), "{at}");
+        assert!(cells().any(|cell| cell.fg == theme.focus), "{at}");
+        // Where each mark starts, as a run of cells that each hold one of its characters.
+        let area = buffer.area;
+        let starts = |mark: &str| {
+            let glyphs: Vec<String> = mark.chars().map(String::from).collect();
+            let rows = area.top()..area.bottom();
+            let spots = rows.flat_map(|y| (area.left()..area.right()).map(move |x| (x, y)));
+            spots
+                .filter(|&(x, y)| {
+                    let fits = x as usize + glyphs.len() <= area.right() as usize;
+                    fits && glyphs
+                        .iter()
+                        .enumerate()
+                        .all(|(at, glyph)| buffer[(x + at as u16, y)].symbol() == glyph)
+                })
+                .collect::<Vec<_>>()
+        };
+        for mark in marks {
+            let spots = starts(mark);
+            assert!(!spots.is_empty(), "{at}: no {mark}");
+            for spot in spots {
+                assert_eq!(buffer[spot].fg, theme.focus, "{at}: {mark} at {spot:?}");
+            }
+        }
+        if theme.primary != theme.focus {
+            assert_eq!(
+                cells().filter(|cell| cell.fg == theme.primary).count(),
+                0,
+                "{at}"
+            );
+        }
+    }
+
+    #[test]
+    fn text_on_the_primary_color_takes_its_own_color() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = crowded();
+        let request = json!({"id": "q1", "kind": "command", "status": "pending"});
+        app.on_thread_event(live(2, "runtime-request.updated", request));
+        app.composer.insert('x');
+        cells(&mut app, 80, 24);
+        press(&mut app, KeyCode::PageUp);
+        for mode in [AppearanceMode::Light, AppearanceMode::Dark] {
+            while app.appearance_mode != mode {
+                alt_shift_a(&mut app);
+            }
+            let t = app.theme.clone();
+            let buffer = cells(&mut app, 80, 24);
+            // The send button, Approve and how far the transcript is scrolled, and nothing on
+            // the primary color in another.
+            let on_primary: String = buffer
+                .content
+                .iter()
+                .filter(|cell| cell.bg == t.primary)
+                .inspect(|cell| assert_eq!(cell.fg, t.on_primary, "{mode:?}"))
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(on_primary.contains("Approve"), "{mode:?}: {on_primary}");
+            assert!(on_primary.contains('↑'), "{mode:?}: {on_primary}");
+            assert!(on_primary.contains("more"), "{mode:?}: {on_primary}");
+        }
+    }
+
+    #[test]
+    fn alt_a_still_answers_an_approval_and_alt_shift_a_never_does() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = crowded();
+        let request = json!({"id": "q1", "kind": "command", "status": "pending"});
+        app.on_thread_event(live(2, "runtime-request.updated", request));
+        cells(&mut app, 80, 24);
+        alt_shift_a(&mut app);
+        assert_eq!(app.appearance_mode, AppearanceMode::System);
+        // The turn to System read the system, and nothing answered the request.
+        assert_eq!(reads(&runtime), 1);
+        alt(&mut app, 'a');
+        assert_eq!(app.appearance_mode, AppearanceMode::System);
+        // Alt+A sent the answer.
+        assert_eq!(reads(&runtime), 2);
     }
 }

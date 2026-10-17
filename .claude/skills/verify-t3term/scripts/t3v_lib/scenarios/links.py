@@ -43,6 +43,11 @@ The threads, in the shell's order. Each is in proj-links, with no worktree and t
   thr-hostile   Hostile: text and sizes  the `hostile` preset
   thr-malformed Malformed: not a list    an object where `pullRequests` goes
 
+thr-legacy's last reply, after its second turn's, is Markdown with code fences for
+features/transcript.md: a four-backtick fence that holds a three-backtick one, a tilde fence, a
+backtick run with text after it inside a fence, backticks that are inline code, and a run followed
+by U+00A0 inside a fence.
+
 The presets `t3v links THREAD PRESET` sets:
 
   mixed       what thr-mixed starts with
@@ -82,6 +87,10 @@ screen, from 26 to 34 columns. So with the sidebar shown, 200x50 gives a pane, a
 Under the details' title, the tabs row reads "Thread  Pull requests 11", or "Thread  PRs 11" on a
 card too narrow for that. A link's details show in the list's place under a row that reads
 "← List" at the left and "4 of 11" at the right.
+
+thr-none's last reply, after its second turn's, is a list for features/transcript.md whose rows
+alternate emoji that end in U+FE0F with text. At 200x30 the thread runs past the transcript's top,
+and a scroll of one row puts each emoji row where a row of text was.
 """
 
 from __future__ import annotations

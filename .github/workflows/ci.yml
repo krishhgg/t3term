@@ -64,6 +64,11 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-rust-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
           restore-keys: ${{ runner.os }}-${{ runner.arch }}-rust-${{ env.RUST_TOOLCHAIN }}-
 
+      # t3v's own tests, in this required job: they run a stand-in cargo in temporary directories.
+      - name: Test t3v
+        if: runner.os == 'macOS'
+        run: python3 -I -B -m unittest discover -v -s .claude/skills/verify-t3term/scripts/t3v_lib -t .claude/skills/verify-t3term/scripts
+
       - name: Format
         if: runner.os == 'macOS'
         run: cargo fmt --all -- --check

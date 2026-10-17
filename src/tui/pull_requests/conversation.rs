@@ -527,6 +527,14 @@ impl Conversation {
         }
     }
 
+    /// Drops each remark's text laid out in the old colors, after the theme changed.
+    pub(super) fn restyle(&mut self) {
+        let remarks = self.active.iter_mut().chain(&mut self.bots);
+        for remark in remarks.chain(&mut self.finished) {
+            remark.laid_out = None;
+        }
+    }
+
     /// Whether `control` shows while the reader opened what `shown` says.
     pub(super) fn has(&self, control: Control, shown: &Shown) -> bool {
         let some = self.sent > 0;
