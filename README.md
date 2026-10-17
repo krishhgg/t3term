@@ -419,7 +419,7 @@ The thread is invented and comes from a fake T3 server that sends what the pinne
 
 ### Light and dark
 
-Alt+Shift+A switches the colors to the next of System, Light and Dark, in the order the desktop's Cmd+Option+Shift+A uses, and the status line names the choice, such as `Appearance: Light`. Light draws T3 Code's light colors and Dark its dark ones. System draws whichever macOS shows. t3term reads that at start and again each time Alt+Shift+A comes back to System, so a change to macOS's appearance while t3term runs shows the next time you switch to System. On other systems, or when macOS's setting can't be read, System draws dark. The key works from any pane, over a menu or a dialog too, and never types into the composer. Like Alt+A, it needs Option to send Meta on a Mac.
+Alt+Shift+A switches the colors to the next of System, Light and Dark, in the order the desktop's Cmd+Option+Shift+A uses, and the status line names the choice, such as `Appearance: Light`. Light draws T3 Code's light colors and Dark its dark ones. System draws whichever macOS shows. t3term reads that at start and again each time Alt+Shift+A comes back to System, so a change to macOS's appearance while t3term runs shows the next time you switch to System. On other systems System draws dark. On macOS, when the setting can't be read, System keeps what the last read that worked found, and draws dark when none has. The key works from any pane, over a menu or a dialog too, and never types into the composer. Like Alt+A, it needs Option to send Meta on a Mac.
 
 | Dark, 120x48 | Light, 120x48 |
 |---|---|
