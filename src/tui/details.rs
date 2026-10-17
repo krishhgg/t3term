@@ -1452,7 +1452,7 @@ fn tabs_row(
         }
     };
     let active = Style::new()
-        .fg(theme.primary)
+        .fg(theme.focus)
         .add_modifier(Modifier::BOLD | Modifier::UNDERLINED);
     let muted = Style::new().fg(theme.muted);
     let names = [THREAD_TAB.to_string(), pulls];

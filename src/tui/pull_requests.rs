@@ -1676,7 +1676,7 @@ fn view(list: Option<&List>, detail: Option<&Detail>, shape: Shape, theme: &Them
         Some(detail) if detail.index == shape.selected => &detail.lines,
         _ => &[],
     };
-    let back = Style::new().fg(theme.primary).add_modifier(Modifier::BOLD);
+    let back = Style::new().fg(theme.focus).add_modifier(Modifier::BOLD);
     let back = fitted(vec![Span::styled("← List", back)], width);
     let count = entries_of(list).len();
     let place = format!("{} of {count}", shape.selected + 1);

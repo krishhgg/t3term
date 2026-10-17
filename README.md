@@ -399,7 +399,7 @@ Click the row to open it. Each call is then one row with its icon, what it did a
 
 T3 leaves tool output out of a thread's projection so a large result can't stall the socket, and marks the item instead. t3term asks for it with `orchestration.getTurnItem`, only for the rows on screen, and keeps the answer until the item changes. Each row shows twelve lines: the first twelve of a file or a search, the last twelve of a command, where its result is.
 
-Colors come from T3's dark theme. When `COLORTERM` reports truecolor the TUI uses the exact values. Otherwise, or when `T3TERM_COLOR=256` is set, it maps each one to the nearest entry in the 256-color palette.
+Colors come from T3 Code's theme, or from the built-in theme `settings.json` names, as [Light and dark](#light-and-dark) says. When `COLORTERM` reports truecolor the TUI uses the exact values. Otherwise, or when `T3TERM_COLOR=256` is set, it maps each one to the nearest entry in the 256-color palette.
 
 ### File changes
 
@@ -434,6 +434,16 @@ The threads and pull requests are invented and come from a fake T3 server. The i
 t3term saves the choice in `~/.config/t3term/settings.json` under `appearanceMode`, as `system`, `light` or `dark`. A file without the key, or with a value t3term doesn't know, draws dark, as t3term did before it had a choice. The desktop starts on System and keeps its choice in the browser's storage, so this key is t3term's.
 
 Light uses the desktop's light colors, with a few exceptions. Where the desktop tells two surfaces apart by a border, or by a shade too faint for a terminal, t3term uses a darker gray: code blocks, inline code, a menu's highlighted row and the sidebar's active and selected rows. Chips are filled, as in dark. In 256 colors the light grays round to three, so the composer, menus and the sidebar share the canvas's white, and a code block in your own message has the message's background.
+
+t3term also draws the desktop's built-in themes T3 Chat, Grove, Ocean, Ember and Iris, each in a light and a dark half that Alt+Shift+A switches between. Set one under `theme` in `settings.json`, as `t3-chat`, `grove`, `ocean`, `ember` or `iris`, and t3term reads it at start. `t3-code`, a file without the key or a name t3term doesn't know draws T3 Code's own colors. The desktop keeps its choice in the browser's storage, so this key is t3term's too. Nothing in the TUI changes the theme yet.
+
+A theme sets the colors the desktop lets it set: the canvas, text, borders, the sidebar, the composer, menus, message bubbles, code, warnings and errors. Its action color fills the send and Approve buttons, and its focus color marks what is current, such as the sidebar's bar, a menu's check, the open tab and a running task step. Open, Merged, passing checks, approvals and Watching keep T3 Code's green, violet and blue, and so do the provider marks and the project badges. Closed, conflicts and failing checks take the theme's error color, pending checks and requested changes its warning color, and Draft its muted color. The desktop takes the theme's error color only for conflicts and failing checks, and keeps fixed red, gray and amber for Closed, Draft and pending checks.
+
+| Grove dark, 120x48 | Grove light, 120x48 |
+|---|---|
+| ![The same thread's details in Grove's dark colors: a deep green canvas and sidebar, green message bubbles, a gray dialog with the Pull requests tab underlined in green, and the same pull request states as before](docs/screenshots/theme-grove-dark.png) | ![The same screen after Alt+Shift+A twice: Grove's light colors, a pale green canvas and sidebar, and the status line reads Appearance: Light](docs/screenshots/theme-grove-light.png) |
+
+These come from the same fake T3 server, with `"theme": "grove"` in the settings file.
 
 ## It's a CLI too
 
@@ -526,13 +536,13 @@ The tests draw frames on a test backend, so they don't show what the built binar
 - Provider setup. The provider banner names T3 Code's provider setup, but t3term can't install a provider, sign in to one or update it. The banner follows the provider the model chip names. The desktop also weighs the thread's running session and the project's default model, and falls back to another provider when the chosen one is off or unavailable. t3term has none of those fallbacks, so where they apply the banner can name a different provider from the desktop's, or none.
 - Acting on a proposed plan. The desktop's card menu copies a plan, downloads it as Markdown or saves it to the workspace, and its composer offers Implement and Implement in a new thread. t3term only shows the plan. Its collapsed card also ends at ten lines with text and `...`, where the desktop clips the preview to a fixed height and fades it out.
 - Pinning, snoozing, settling and reordering threads. The sidebar shows the shelves, but moving a thread between them still takes the desktop app. The Snoozed shelf also stays open, where the desktop starts it closed. Snoozed threads are full cards, where the desktop shows a one-line row with the wake time.
-- The rest of the desktop's appearance settings. t3term has the stock theme's light and dark colors, but not the built-in themes T3 Chat, Grove, Ocean, Ember and Iris, custom themes, contrast or the blue and orange diff colors. System picks up a change to macOS's appearance only when you switch to it again.
+- The rest of the desktop's appearance settings. t3term draws the stock theme and the built-in themes, but the TUI can't change the theme yet, and t3term has no custom themes, no mix of a different theme in each half, no contrast setting and not the blue and orange diff colors. System picks up a change to macOS's appearance only when you switch to it again.
 - Marking threads seen. The sidebar reads Done and Woke against the visit time the server keeps for each thread, but t3term doesn't report a visit when you open one, so only the desktop or another client clears those words. A server too old to keep visit times gets no Done from t3term at all, because the desktop's fallback is a visit time saved in the browser.
 
 ## Credit
 
 [T3 Code](https://github.com/pingdotgg/t3code) is by [T3 Tools Inc.](https://t3.codes) and is MIT licensed. t3term exists because they built something worth writing a second client for, and because they made the protocol readable.
 
-t3term is an unofficial, independent project. It is not made by, endorsed by or affiliated with T3 Tools Inc. It copies none of their code: it is Rust that speaks their WebSocket API. The dark palette is read from T3 Code's MIT-licensed theme so the two look like the same product, and the screenshot above shows their desktop app for comparison. "T3" and "T3 Code" are theirs.
+t3term is an unofficial, independent project. It is not made by, endorsed by or affiliated with T3 Tools Inc. It copies none of their code: it is Rust that speaks their WebSocket API. The stock colors and the built-in themes' colors are read from T3 Code's MIT-licensed theme files so the two look like the same product, and the screenshot above shows their desktop app for comparison. "T3" and "T3 Code" are theirs.
 
 MIT, see [LICENSE](LICENSE).

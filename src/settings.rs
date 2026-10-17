@@ -72,6 +72,78 @@ pub struct Settings {
     /// `t3code:theme-appearance-mode` in the browser's storage, so this key is t3term's. A file
     /// without it, or with a value this build doesn't know, draws dark.
     pub appearance_mode: AppearanceMode,
+    /// The theme: T3 Code's own colors or one of the desktop's built-in themes, each drawn in
+    /// the half the color scheme shows. The desktop keeps its choice under `t3code:theme` in the
+    /// browser's storage, so this key is t3term's. Read at start. A file without it, or with a
+    /// name this build doesn't know, draws T3 Code's.
+    pub theme: ThemeName,
+}
+
+/// T3 Code's own theme or one of the desktop's built-in themes, in the order the desktop lists
+/// them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+pub enum ThemeName {
+    /// The desktop's stock colors. The desktop has no id for them, and its mobile app calls
+    /// them `t3-code`.
+    #[default]
+    #[serde(rename = "t3-code")]
+    T3Code,
+    #[serde(rename = "t3-chat")]
+    T3Chat,
+    #[serde(rename = "grove")]
+    Grove,
+    #[serde(rename = "ocean")]
+    Ocean,
+    #[serde(rename = "ember")]
+    Ember,
+    #[serde(rename = "iris")]
+    Iris,
+}
+
+impl ThemeName {
+    pub const ALL: [ThemeName; 6] = [
+        ThemeName::T3Code,
+        ThemeName::T3Chat,
+        ThemeName::Grove,
+        ThemeName::Ocean,
+        ThemeName::Ember,
+        ThemeName::Iris,
+    ];
+
+    /// The id the desktop gives the theme, which the file saves.
+    pub fn id(self) -> &'static str {
+        match self {
+            ThemeName::T3Code => "t3-code",
+            ThemeName::T3Chat => "t3-chat",
+            ThemeName::Grove => "grove",
+            ThemeName::Ocean => "ocean",
+            ThemeName::Ember => "ember",
+            ThemeName::Iris => "iris",
+        }
+    }
+
+    /// Its name, as the desktop shows it.
+    pub fn label(self) -> &'static str {
+        match self {
+            ThemeName::T3Code => "T3 Code",
+            ThemeName::T3Chat => "T3 Chat",
+            ThemeName::Grove => "Grove",
+            ThemeName::Ocean => "Ocean",
+            ThemeName::Ember => "Ember",
+            ThemeName::Iris => "Iris",
+        }
+    }
+}
+
+/// Reads anything but the six ids as T3 Code's, as `AppearanceMode` reads an unknown mode.
+impl<'de> Deserialize<'de> for ThemeName {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let value = serde_json::Value::deserialize(deserializer)?;
+        Ok(ThemeName::ALL
+            .into_iter()
+            .find(|name| value.as_str() == Some(name.id()))
+            .unwrap_or_default())
+    }
 }
 
 /// Which appearance the TUI draws.
@@ -138,6 +210,7 @@ impl Default for Settings {
             sidebar_width: None,
             sidebar_shelves_version: SHELVES_VERSION,
             appearance_mode: AppearanceMode::default(),
+            theme: ThemeName::default(),
         }
     }
 }
@@ -409,6 +482,7 @@ mod tests {
                 "sidebarHidden": false,
                 "sidebarShelvesVersion": 1,
                 "appearanceMode": "dark",
+                "theme": "t3-code",
             })
         );
     }
@@ -451,6 +525,34 @@ mod tests {
                 serde_json::from_value::<AppearanceMode>(saved).unwrap(),
                 mode
             );
+        }
+    }
+
+    #[test]
+    fn the_theme_reads_leniently() {
+        let theme = |raw: &str| parse(raw.as_bytes()).unwrap().theme;
+        assert_eq!(theme("{}"), ThemeName::T3Code);
+        assert_eq!(theme(r#"{"theme": "grove"}"#), ThemeName::Grove);
+        assert_eq!(theme(r#"{"theme": "t3-chat"}"#), ThemeName::T3Chat);
+        // A name this build doesn't know draws T3 Code's and keeps the rest of the file. The
+        // desktop reads the ids its older builds saved, such as `t3-grove`, as their themes,
+        // but no t3term saved those.
+        for unknown in [r#""t3-grove""#, r#""Grove""#, r#""light""#, "null", "7"] {
+            let raw = format!(r#"{{"verbose": true, "theme": {unknown}}}"#);
+            let read = parse(raw.as_bytes()).unwrap();
+            assert_eq!(read.theme, ThemeName::T3Code, "{unknown}");
+            assert!(read.verbose, "{unknown}");
+        }
+        // Each saves as the id it reads back from, in the desktop's order.
+        let ids: Vec<_> = ThemeName::ALL.iter().map(|name| name.id()).collect();
+        assert_eq!(
+            ids,
+            ["t3-code", "t3-chat", "grove", "ocean", "ember", "iris"]
+        );
+        for name in ThemeName::ALL {
+            let saved = serde_json::to_value(name).unwrap();
+            assert_eq!(saved, name.id());
+            assert_eq!(serde_json::from_value::<ThemeName>(saved).unwrap(), name);
         }
     }
 
@@ -579,6 +681,7 @@ mod tests {
                 sidebar_width: None,
                 sidebar_shelves_version: 1,
                 appearance_mode: AppearanceMode::Dark,
+                theme: ThemeName::T3Code,
             }
         );
 
@@ -635,6 +738,7 @@ mod tests {
             sidebar_width: Some(42),
             sidebar_shelves_version: SHELVES_VERSION,
             appearance_mode: AppearanceMode::Light,
+            theme: ThemeName::Grove,
         };
         std::fs::write(&path, serde_json::to_string(&others).unwrap()).unwrap();
         update_at(&path, |settings| settings.sidebar_hidden = true).unwrap();
@@ -709,6 +813,7 @@ mod tests {
             sidebar_width: None,
             sidebar_shelves_version: SHELVES_VERSION,
             appearance_mode: AppearanceMode::System,
+            theme: ThemeName::Iris,
         };
         std::fs::write(&path, serde_json::to_string(&others).unwrap()).unwrap();
         update_at(&path, |settings| settings.sidebar_width = Some(42)).unwrap();

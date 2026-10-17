@@ -1,11 +1,15 @@
-//! T3 Code's stock theme as terminal colors, in its light and dark halves, plus the small
-//! formatting helpers the GUI uses for times, durations, model names and project badges.
+//! T3 Code's stock theme as terminal colors, in its light and dark halves, the built-in themes
+//! built on them, and the small formatting helpers the GUI uses for times, durations, model
+//! names and project badges.
 //!
 //! True color is used when `COLORTERM` says the terminal supports it. Otherwise every value
 //! degrades to the nearest xterm-256 color when the theme is built, so drawing never pays for
 //! the mapping.
 
 use ratatui::style::{Color, Style};
+
+use super::palettes::{Oklch, Palette, Roles};
+use crate::settings::ThemeName;
 
 /// Whether colors go out as 24-bit values or as xterm-256 indexes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -66,6 +70,16 @@ pub fn nearest_256(r: u8, g: u8, b: u8) -> u8 {
     }
 }
 
+/// `over` at `amount` over `base`, mixed in sRGB as the desktop's `mixThemeRgbColors` mixes.
+fn mix(base: u32, over: u32, amount: f64) -> u32 {
+    let channel = |shift: u32| {
+        let (base, over) = ((base >> shift) & 0xff, (over >> shift) & 0xff);
+        let mixed = base as f64 + (over as f64 - base as f64) * amount;
+        (mixed.round() as u32) << shift
+    };
+    channel(16) | channel(8) | channel(0)
+}
+
 fn hex(depth: Depth, value: u32) -> Color {
     let (r, g, b) = ((value >> 16) as u8, (value >> 8) as u8, value as u8);
     match depth {
@@ -87,6 +101,16 @@ const PROJECT_COLORS_LIGHT: [u32; 18] = [
     0x0092b8, 0x0084d1, 0x155dfc, 0x4f39f6, 0x7f22fe, 0x9810fa, 0xc800de, 0xe60076, 0xec003f,
 ];
 
+/// The light half's indigo, `text-indigo-600`, and the dark half's, which the question panel's
+/// tint in a built-in theme comes from.
+const INDIGO_LIGHT: u32 = 0x4f39f6;
+const INDIGO_DARK: u32 = 0xa3b3ff;
+
+/// How much of the warning color or indigo the outline and the fill of the approval and
+/// question panels mix into the canvas.
+const PANEL_OUTLINE: f64 = 0.28;
+const PANEL_FILL: f64 = 0.08;
+
 /// Which half of a theme draws: the desktop's resolved appearance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Appearance {
@@ -97,6 +121,8 @@ pub enum Appearance {
 /// Semantic colors, named after the CSS variables in T3's `index.css` where one exists.
 #[derive(Debug, Clone)]
 pub struct Theme {
+    /// The theme these colors are a half of.
+    pub name: ThemeName,
     /// The half these colors are.
     pub appearance: Appearance,
     /// The depth they were built for, which another half is built for too.
@@ -106,9 +132,13 @@ pub struct Theme {
     pub muted: Color,
     pub border: Color,
     pub border_strong: Color,
+    /// Filled buttons, such as the send button. A theme's action color.
     pub primary: Color,
     /// `--primary-foreground`, text on `primary`, as on the send button.
     pub on_primary: Color,
+    /// `--ring`, which marks a selection or focus, such as the sidebar's highlight bar and a
+    /// menu's check. The stock theme's is its primary blue, and a theme's is its focus color.
+    pub focus: Color,
     pub info: Color,
     pub info_fg: Color,
     pub success: Color,
@@ -147,11 +177,74 @@ pub struct Theme {
 }
 
 impl Theme {
-    /// The stock theme's `appearance` half.
-    pub fn of(appearance: Appearance, depth: Depth) -> Theme {
-        match appearance {
+    /// `name`'s `appearance` half: the stock theme's, or a built-in theme's built on it.
+    pub fn of(name: ThemeName, appearance: Appearance, depth: Depth) -> Theme {
+        let stock = match appearance {
             Appearance::Light => Theme::light(depth),
             Appearance::Dark => Theme::new(depth),
+        };
+        match Palette::of(name) {
+            Some(palette) => stock.with(name, palette.half(appearance)),
+            None => stock,
+        }
+    }
+
+    /// This stock half with a built-in theme's `roles` in place of the colors the desktop lets
+    /// a theme set. Its green, blue and violet, and its provider and project colors, stay, as
+    /// the desktop keeps them. Its warning, error and muted colors are the theme's.
+    fn with(self, name: ThemeName, roles: &Roles) -> Theme {
+        let depth = self.depth;
+        let c = |color: Oklch| hex(depth, color.rgb());
+        let canvas = roles.canvas.rgb();
+        let tint = |color: u32, amount: f64| hex(depth, mix(canvas, color, amount));
+        let indigo = match self.appearance {
+            Appearance::Light => INDIGO_LIGHT,
+            Appearance::Dark => INDIGO_DARK,
+        };
+        // The desktop shows a code block by its border too, which t3term doesn't draw, so a
+        // theme that draws code on its canvas color has it on its secondary fill. Of the
+        // built-in themes, only T3 Chat's dark half does.
+        let code = match roles.code_background.rgb() == canvas {
+            true => roles.secondary,
+            false => roles.code_background,
+        };
+        Theme {
+            name,
+            bg: c(roles.canvas),
+            fg: c(roles.text),
+            muted: c(roles.muted_foreground),
+            border: c(roles.border),
+            border_strong: c(roles.input),
+            // Under a theme the desktop's `--primary` is the theme's action color, and its
+            // `--ring` the theme's focus color.
+            primary: c(roles.message_action),
+            on_primary: c(roles.message_action_foreground),
+            focus: c(roles.focus),
+            warning: c(roles.warning),
+            warning_fg: c(roles.warning_foreground),
+            warning_border: tint(roles.warning.rgb(), PANEL_OUTLINE),
+            warning_surface: tint(roles.warning.rgb(), PANEL_FILL),
+            error: c(roles.error),
+            error_fg: c(roles.error_foreground),
+            bubble: c(roles.message_surface),
+            // The composer, which the desktop puts on `surfaceRaised` under a theme.
+            raised: c(roles.surface_raised),
+            code_bg: c(code),
+            // `--muted`, which the desktop gives inline code.
+            inline_code_bg: c(roles.muted),
+            // The desktop fills a chip only under the pointer, with `--accent`.
+            chip_bg: c(roles.accent_surface),
+            sidebar_bg: c(roles.sidebar),
+            sidebar_fg: c(roles.sidebar_foreground),
+            sidebar_muted: c(roles.sidebar_muted_foreground),
+            sidebar_border: c(roles.sidebar_border),
+            row_active: c(roles.sidebar_row_active),
+            row_selected: c(roles.sidebar_row_selected),
+            popover: c(roles.surface_overlay),
+            highlight: c(roles.accent_surface),
+            indigo_border: tint(indigo, PANEL_OUTLINE),
+            indigo_surface: tint(indigo, PANEL_FILL),
+            ..self
         }
     }
 
@@ -159,6 +252,7 @@ impl Theme {
     pub fn new(depth: Depth) -> Theme {
         let c = |v: u32| hex(depth, v);
         Theme {
+            name: ThemeName::T3Code,
             appearance: Appearance::Dark,
             depth,
             bg: c(0x0a0a0a),
@@ -169,6 +263,7 @@ impl Theme {
             primary: c(0x346bf1),
             // The desktop's is white. The dark half keeps the text color it drew before.
             on_primary: c(0xf5f5f5),
+            focus: c(0x346bf1),
             info: c(0x2b7fff),
             info_fg: c(0x51a2ff),
             success: c(0x00d492),
@@ -179,7 +274,7 @@ impl Theme {
             warning_surface: c(0x1d150a),
             error: c(0xfb414a),
             error_fg: c(0xff6467),
-            indigo: c(0xa3b3ff),
+            indigo: c(INDIGO_DARK),
             violet: c(0xc4b4ff),
             bubble: c(0x171717),
             raised: c(0x101010),
@@ -208,6 +303,7 @@ impl Theme {
     pub fn light(depth: Depth) -> Theme {
         let c = |v: u32| hex(depth, v);
         Theme {
+            name: ThemeName::T3Code,
             appearance: Appearance::Light,
             depth,
             // `--background`, zinc-25, and `--foreground`, zinc-800.
@@ -222,6 +318,7 @@ impl Theme {
             primary: c(0x1b4ed8),
             // `--primary-foreground`, white.
             on_primary: c(0xffffff),
+            focus: c(0x1b4ed8),
             // `--info`, blue-500, and `--info-foreground`, blue-700.
             info: c(0x2b7fff),
             info_fg: c(0x1447e6),
@@ -240,7 +337,7 @@ impl Theme {
             error_fg: c(0xc10007),
             // The light half of `text-indigo-600 dark:text-indigo-300/90` and of
             // `text-violet-600 dark:text-violet-300/90`.
-            indigo: c(0x4f39f6),
+            indigo: c(INDIGO_LIGHT),
             violet: c(0x7f22fe),
             // `--message-surface`, zinc-100.
             bubble: c(0xf4f4f5),
@@ -287,6 +384,7 @@ impl Theme {
     #[cfg(test)]
     pub fn colors(&self) -> Vec<Color> {
         let Theme {
+            name: _,
             appearance: _,
             depth: _,
             bg,
@@ -296,6 +394,7 @@ impl Theme {
             border_strong,
             primary,
             on_primary,
+            focus,
             info,
             info_fg,
             success,
@@ -335,6 +434,7 @@ impl Theme {
             *border_strong,
             *primary,
             *on_primary,
+            *focus,
             *info,
             *info_fg,
             *success,
@@ -583,6 +683,7 @@ pub fn duration_label(ms: i64) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::tui::palettes::{GROVE, T3_CHAT};
 
     /// WCAG 2's contrast ratio between two 24-bit colors.
     fn contrast(a: Color, b: Color) -> f64 {
@@ -624,8 +725,12 @@ mod tests {
 
     #[test]
     fn each_half_tells_apart_the_backgrounds_it_draws_on_one_another() {
-        for appearance in [Appearance::Light, Appearance::Dark] {
-            let t = Theme::of(appearance, Depth::TrueColor);
+        let halves = ThemeName::ALL
+            .into_iter()
+            .flat_map(|name| [(name, Appearance::Light), (name, Appearance::Dark)]);
+        for (name, appearance) in halves {
+            let t = Theme::of(name, appearance, Depth::TrueColor);
+            assert_eq!(t.name, name);
             assert_eq!(t.appearance, appearance);
             assert_eq!(t.depth, Depth::TrueColor);
             // Each pair is something drawn and what it is drawn on.
@@ -655,13 +760,19 @@ mod tests {
                 ("the question panel on the canvas", t.indigo_surface, t.bg),
             ];
             for (what, drawn, on) in pairs {
-                assert_ne!(drawn, on, "{appearance:?}: {what}");
+                // T3 Chat draws its active and selected rows alike, as the desktop does. The
+                // highlight's bar and the open thread's title tell them apart.
+                if name == ThemeName::T3Chat && what == "the active row beside the selected" {
+                    assert_eq!(drawn, on, "{name:?} {appearance:?}");
+                    continue;
+                }
+                assert_ne!(drawn, on, "{name:?} {appearance:?}: {what}");
             }
-            // The dark half's is 4.3 to 1. The light half's text color on its blue was 2.2.
+            // The stock dark half's is 4.3 to 1. The light half's text color on its blue was 2.2.
             let reads = contrast(t.on_primary, t.primary);
             assert!(
                 reads >= 4.0,
-                "{appearance:?}: text on primary at {reads:.1} to 1"
+                "{name:?} {appearance:?}: text on primary at {reads:.1} to 1"
             );
         }
         // The light half has the desktop's own canvas, text and blue.
@@ -675,6 +786,60 @@ mod tests {
             Theme::new(Depth::TrueColor).project_colors[1],
             Color::Rgb(0xff, 0x64, 0x67)
         );
+    }
+
+    #[test]
+    fn a_built_in_theme_takes_its_roles_and_keeps_the_stock_status_colors() {
+        for name in ThemeName::ALL.into_iter().skip(1) {
+            let palette = Palette::of(name).unwrap();
+            for appearance in [Appearance::Light, Appearance::Dark] {
+                let t = Theme::of(name, appearance, Depth::TrueColor);
+                let stock = Theme::of(ThemeName::T3Code, appearance, Depth::TrueColor);
+                let roles = palette.half(appearance);
+                let rgb = |color: Oklch| hex(Depth::TrueColor, color.rgb());
+                let at = format!("{name:?} {appearance:?}");
+                assert_eq!(t.bg, rgb(roles.canvas), "{at}");
+                assert_eq!(t.fg, rgb(roles.text), "{at}");
+                assert_eq!(t.primary, rgb(roles.message_action), "{at}");
+                assert_eq!(t.focus, rgb(roles.focus), "{at}");
+                assert_eq!(t.raised, rgb(roles.surface_raised), "{at}");
+                assert_eq!(t.sidebar_bg, rgb(roles.sidebar), "{at}");
+                // The colors the desktop keeps under a theme.
+                let kept = |t: &Theme| {
+                    let mut kept = vec![t.info, t.info_fg, t.success, t.emerald, t.indigo];
+                    kept.extend([t.violet, t.claude, t.openai]);
+                    kept.extend(t.project_colors);
+                    kept
+                };
+                assert_eq!(kept(&t), kept(&stock), "{at}");
+                // The panels mix the warning color and indigo into the theme's canvas.
+                let canvas = roles.canvas.rgb();
+                let warning = roles.warning.rgb();
+                let tint = |color, amount| hex(Depth::TrueColor, mix(canvas, color, amount));
+                assert_eq!(t.warning_border, tint(warning, 0.28), "{at}");
+                assert_eq!(t.warning_surface, tint(warning, 0.08), "{at}");
+                let indigo = [INDIGO_LIGHT, INDIGO_DARK][(appearance == Appearance::Dark) as usize];
+                assert_eq!(t.indigo_border, tint(indigo, 0.28), "{at}");
+                assert_eq!(t.indigo_surface, tint(indigo, 0.08), "{at}");
+            }
+        }
+        // As the stock light half's panels do.
+        let light = Theme::light(Depth::TrueColor);
+        let tint = |color, amount| hex(Depth::TrueColor, mix(0xfcfcfc, color, amount));
+        assert_eq!(light.warning_border, tint(0xfe9a00, 0.28));
+        assert_eq!(light.warning_surface, tint(0xfe9a00, 0.08));
+        assert_eq!(light.indigo_border, tint(INDIGO_LIGHT, 0.28));
+        assert_eq!(light.indigo_surface, tint(INDIGO_LIGHT, 0.08));
+        // T3 Chat's dark half draws code on its canvas color, so a block takes its secondary.
+        let chat = Theme::of(ThemeName::T3Chat, Appearance::Dark, Depth::TrueColor);
+        let roles = &T3_CHAT.dark;
+        assert_eq!(roles.code_background.rgb(), roles.canvas.rgb());
+        assert_eq!(chat.code_bg, hex(Depth::TrueColor, roles.secondary.rgb()));
+        // In 256 colors a built-in half maps each color as the stock halves do.
+        let indexed = Theme::of(ThemeName::Grove, Appearance::Light, Depth::Indexed);
+        assert_eq!(indexed.depth, Depth::Indexed);
+        assert_eq!(indexed.bg, hex(Depth::Indexed, GROVE.light.canvas.rgb()));
+        assert!(matches!(indexed.bg, Color::Indexed(_)));
     }
 
     #[test]
