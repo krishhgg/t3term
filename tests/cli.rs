@@ -3909,9 +3909,9 @@ fn run_into_closed(
     let mut command = home.command(args, &t3);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     // No other test starts a process until the reader is gone, so none holds it open.
-    let alone = spawning();
+    let (child, alone) = spawn_alone(&mut command);
     let mut running = Running {
-        child: command.spawn().expect("run t3term"),
+        child,
         release: home.0.path().join("release"),
     };
 
@@ -4150,11 +4150,11 @@ fn environment_status_into_a_closed_stdout_fails_without_a_panic() {
         };
         let mut command = home.command(args, "false");
         let child = {
-            let _alone = spawning();
+            let alone = spawning();
             let (reader, writer) = std::io::pipe().unwrap();
             drop(reader);
             command.stdout(writer).stderr(Stdio::piped());
-            command.spawn().expect("run t3term")
+            spawn_holding(alone, &mut command).0
         };
         let finished = child.wait_with_output().unwrap();
         assert_eq!(finished.status.code(), Some(1), "{args:?}");
