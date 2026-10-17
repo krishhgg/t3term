@@ -44,6 +44,7 @@ T3V_RUN=$BASE $T3V keys Enter
 | Scenario | World | Ready text | Feature files |
 |---|---|---|---|
 | `links` | Project "Linked Desk" with 8 threads, one for each state of a thread's linked pull requests: every state, one open link, an emptied list, the old single link, no field, 1,005 links, hostile text and an unreadable list | `Mixed: every state` | sidebar, connection, thread-details, linked-pull-requests, cli |
+| `lineage` | Project "Lineage Desk" with 10 threads that fork, start agents and transfer context: a parent, forks running and done, archived forks and parents, 134 agents of which 124 are done, and a thread with no relations | `Main: open me first` | lineage |
 
 `t3v expect` prints what t3term should show now, worked out from what the server sent. `t3v threads` lists the thread ids that the world controls take.
 
