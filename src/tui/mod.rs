@@ -135,6 +135,8 @@ struct Cached {
     lines: Vec<Line<'static>>,
     /// The header row and the button's row of a proposed plan long enough to collapse.
     toggle: Option<(usize, usize)>,
+    /// The clock row under a prompt, when it has one.
+    clock: Option<usize>,
 }
 
 /// What tools printed, for the rows verbose mode is showing. T3 leaves tool output out of a
@@ -391,6 +393,13 @@ struct OpenThread {
     error: banner::Derived,
     /// The thread's worktree setup, its subscription and its card.
     setup: setup::Watch,
+    /// Where the last frame drew the clock row of the run going on, and what a second can add
+    /// to it. With that row out of view, the transcript's whole area, so the run keeps the tick
+    /// unless something covers all of it.
+    clock: Rect,
+    /// Whether a banner, a menu or a dialog the last frame drew covered all of `clock`, so the
+    /// run's clock had nothing on screen to move.
+    clock_hidden: bool,
 }
 
 impl OpenThread {
@@ -405,6 +414,8 @@ impl OpenThread {
             prepared: Prepared::default(),
             error: banner::Derived::default(),
             setup: setup::Watch::default(),
+            clock: Rect::default(),
+            clock_hidden: false,
         }
     }
 
@@ -703,8 +714,8 @@ async fn event_loop(terminal: &mut Term, client: Arc<Client>) -> Result<()> {
             dirty = false;
         }
         let redraw_at = tokio::time::Instant::from_std(last_draw + FRAME);
-        // The sidebar's half reads the last frame drawn. A frame still waiting out the budget
-        // puts it at most one frame behind.
+        // Which clocks show comes from the last frame drawn and what it drew over them. A
+        // frame still waiting out the budget puts it at most one frame behind.
         let running = needs_tick(app.open.as_ref(), &app.sidebar);
         if !running {
             tick_at = Instant::now() + TICK;
@@ -779,15 +790,40 @@ async fn event_loop(terminal: &mut Term, client: Arc<Client>) -> Result<()> {
 /// the last frame drew its worktree setup card while its subscription says the setup runs, or
 /// the last frame drew a sidebar card that reads Working or Goal. Work the sidebar doesn't
 /// show, because it is behind a closed shelf, scrolled away or in a hidden sidebar, doesn't
-/// wake the TUI, and neither does a setup card out of view.
+/// wake the TUI, and neither does a setup card out of view. Nor does a clock that a banner, a
+/// menu or a dialog covers whole: the run's clock row, or with that row out of view the whole
+/// transcript, the setup card's rows or the Working card's row.
 fn needs_tick(open: Option<&OpenThread>, sidebar: &Sidebar) -> bool {
     // A closed watch never hears that its run finished, so its last state can't count.
     let open_run = open
-        .filter(|o| o.connection != "closed")
+        .filter(|o| o.connection != "closed" && !o.clock_hidden)
         .and_then(|o| o.state.as_ref())
         .is_some_and(|s| s.active_run().is_some());
     let setup = open.is_some_and(|o| o.setup.ticks());
     open_run || setup || sidebar.drew_working()
+}
+
+/// Whether the rects in `over` cover every cell of `area` between them. An empty `area` has
+/// nothing to cover, so it isn't covered.
+fn covered(area: Rect, over: &[Rect]) -> bool {
+    !area.is_empty()
+        && (area.top()..area.bottom()).all(|y| {
+            let mut x = area.left();
+            while x < area.right() {
+                // The furthest right a rect over this cell reaches.
+                let reach = over
+                    .iter()
+                    .filter(|r| (r.top()..r.bottom()).contains(&y))
+                    .filter(|r| (r.left()..r.right()).contains(&x))
+                    .map(|r| r.right())
+                    .max();
+                match reach {
+                    Some(right) => x = right,
+                    None => return false,
+                }
+            }
+            true
+        })
 }
 
 /// The sidebar's column, `sidebar_width` columns wide, and the main column, which takes the
@@ -3318,6 +3354,38 @@ impl App {
             };
             list.draw(frame, above, &self.theme);
         }
+        // A clock or spinner a banner, a menu or a dialog covers has nothing on screen to move,
+        // so it keeps no tick going.
+        let over = self.overlays();
+        self.sidebar.cover(&over);
+        if let Some(open) = self.open.as_mut() {
+            open.clock_hidden = covered(open.clock, &over);
+            open.setup.cover(&over);
+        }
+    }
+
+    /// Where the last frame drew over what lies under it: the banners over the transcript's top
+    /// rows, a menu, a dialog of the details, the Environments dialog and the theme list. Each
+    /// is empty when the frame didn't draw it. The details' pane sits beside the conversation
+    /// and covers nothing.
+    fn overlays(&self) -> [Rect; 6] {
+        [
+            self.provider_banner.area,
+            self.banner.area,
+            self.picker_area,
+            match self.details.drawn {
+                Some(drawn) if drawn.layout == details::Layout::Dialog => drawn.area,
+                _ => Rect::default(),
+            },
+            self.environments
+                .drawn
+                .as_ref()
+                .map_or(Rect::default(), |drawn| drawn.area),
+            self.theme_list
+                .as_ref()
+                .and_then(|list| list.drawn)
+                .map_or(Rect::default(), |drawn| drawn.area),
+        ]
     }
 
     /// The GUI's breadcrumb: project, a slash, the thread title, and the open thread's watch at
@@ -3529,6 +3597,7 @@ impl App {
                     key,
                     lines: card.lines,
                     toggle: card.toggle,
+                    clock: None,
                 };
                 self.cache.insert(block.item_id.clone(), cached);
             } else if fresh {
@@ -3556,10 +3625,13 @@ impl App {
                     }
                     None => render_block(block, width as usize, &context, &extra),
                 };
+                // The clock row comes before the hairline that ends the prompt.
+                let clock = matches!(extra, Extra::Fold(_)).then(|| lines.len() - 2);
                 let cached = Cached {
                     key,
                     lines,
                     toggle: None,
+                    clock,
                 };
                 self.cache.insert(block.item_id.clone(), cached);
             }
@@ -3622,6 +3694,7 @@ impl App {
             (from < to).then_some((card, at, from, to))
         });
         let mut drawn_setup = None;
+        let mut run_clock = None;
 
         // Copy only the rows in view.
         let mut lines = Vec::with_capacity(height);
@@ -3655,12 +3728,23 @@ impl App {
                 }
                 // A prompt with the setup card under it has the card's rows after its own.
                 let own = cached.lines.len();
+                // The running prompt's clock row in view, with the two columns a second can add
+                // to it, as from `59s` to `1m 0s`.
+                if let Some(at) = cached.clock
+                    && active_run.as_deref() == Some(block.run_id.as_str())
+                    && (from..to.min(own)).contains(&at)
+                {
+                    let y = area.y + (lines.len() + at - from) as u16;
+                    let width = (cached.lines[at].width() + 2).min(usize::from(area.width));
+                    let row = Rect::new(area.x, y, width as u16, 1);
+                    run_clock = Some(run_clock.map_or(row, |clock: Rect| clock.union(row)));
+                }
                 lines.extend(cached.lines[from.min(own)..to.min(own)].iter().cloned());
                 if host == Some(index)
                     && let Some((card, at, from, to)) = card_view
                 {
                     let top = at as isize - start as isize;
-                    drawn_setup = card.drawn(from, to, top, area.y, scroll);
+                    drawn_setup = card.drawn(from, to, top, area, scroll);
                     lines.extend(card.lines[from..to].iter().cloned());
                 }
                 anchor.get_or_insert_with(|| (block.item_id.clone(), from));
@@ -3678,7 +3762,7 @@ impl App {
             && let Some((card, at, from, to)) = card_view
         {
             let top = at as isize - start as isize;
-            drawn_setup = card.drawn(from, to, top, area.y, scroll);
+            drawn_setup = card.drawn(from, to, top, area, scroll);
             lines.extend(card.lines[from..to].iter().cloned());
         }
         self.bundle_rows = rows;
@@ -3700,6 +3784,9 @@ impl App {
         self.drawn_scroll = scroll;
         if let Some(open) = self.open.as_mut() {
             open.setup.drawn = drawn_setup;
+            // A clock row out of view keeps the tick going as before, unless something covers
+            // the whole transcript.
+            open.clock = run_clock.unwrap_or(area);
         }
         for (item_id, revision) in wanted {
             self.fetch_output(item_id, revision);
@@ -3937,7 +4024,10 @@ impl App {
                 .collect()
         };
         frame.render_widget(Paragraph::new(lines), text_area);
-        if focused {
+        // The Environments dialog and the theme list take the keys and may cover the composer,
+        // so no cursor shows through them.
+        let dialog = self.environments.is_open() || self.theme_list.is_some();
+        if focused && !dialog {
             frame.set_cursor_position((
                 text_area.x + cursor.1 as u16,
                 text_area.y + (cursor.0 - first) as u16,
@@ -5505,6 +5595,8 @@ mod tests {
             prepared: Prepared::default(),
             error: banner::Derived::default(),
             setup: setup::Watch::default(),
+            clock: Rect::default(),
+            clock_hidden: false,
         };
 
         // A working card on screen ticks by itself, even past a closed watch.
@@ -15453,5 +15545,234 @@ mod tests {
         assert!(rows.last().unwrap().contains(environments::KEYS));
         press(&mut app, KeyCode::Down);
         assert_eq!(app.environments.selected(), chosen + 1);
+    }
+
+    #[test]
+    fn rects_cover_an_area_only_when_they_leave_none_of_its_cells() {
+        let area = Rect::new(2, 3, 10, 2);
+        assert!(covered(area, &[Rect::new(0, 0, 20, 10)]));
+        // Rects that meet edge to edge, or overlap, cover it between them.
+        assert!(covered(
+            area,
+            &[Rect::new(2, 3, 5, 2), Rect::new(7, 3, 5, 2)]
+        ));
+        let rows = [
+            Rect::new(0, 3, 8, 1),
+            Rect::new(6, 3, 6, 1),
+            Rect::new(2, 4, 10, 1),
+        ];
+        assert!(covered(area, &rows));
+        // A column, a row or a gap between two rects left out.
+        assert!(!covered(area, &[Rect::new(2, 3, 9, 2)]));
+        assert!(!covered(area, &[Rect::new(2, 3, 10, 1)]));
+        assert!(!covered(
+            area,
+            &[Rect::new(2, 3, 4, 2), Rect::new(7, 3, 5, 2)]
+        ));
+        // An empty rect covers nothing, and an empty area isn't covered.
+        assert!(!covered(area, &[Rect::default()]));
+        assert!(!covered(Rect::new(2, 3, 0, 2), &[Rect::new(0, 0, 20, 10)]));
+    }
+
+    /// Forty saved environments, which make the Environments dialog as tall as the screen.
+    fn forty_environments() -> Vec<String> {
+        (0..40).map(|i| format!("env{i:02}")).collect()
+    }
+
+    /// Opens the Environments dialog as check `asked` and has it find `names`.
+    fn environments_found(app: &mut App, asked: u64, names: &[String]) {
+        alt(app, 'c');
+        assert!(app.environments.is_open());
+        let names: Vec<&str> = names.iter().map(String::as_str).collect();
+        found(app, asked, &names);
+    }
+
+    #[test]
+    fn a_working_card_under_the_environments_dialog_needs_no_tick() {
+        let (mut app, _) = tui_counting_checks();
+        app.on_shell_event(shell_snapshot(vec![listed("w", "Busy", "running")]));
+        let ticks = |app: &App| needs_tick(app.open.as_ref(), &app.sidebar);
+        screen(&mut app, 80, 24);
+        assert!(ticks(&app));
+        // As tall as the screen, the dialog covers the card.
+        environments_found(&mut app, 1, &forty_environments());
+        let rows = screen(&mut app, 80, 24);
+        assert!(!shows(&rows, "Busy"), "{rows:#?}");
+        assert!(!ticks(&app));
+        // With one environment it ends above the card.
+        press(&mut app, KeyCode::Esc);
+        environments_found(&mut app, 2, &["one".into()]);
+        let rows = screen(&mut app, 80, 24);
+        assert!(shows(&rows, "Busy"), "{rows:#?}");
+        assert!(ticks(&app));
+        // Closed, it covers nothing.
+        press(&mut app, KeyCode::Esc);
+        environments_found(&mut app, 3, &forty_environments());
+        screen(&mut app, 80, 24);
+        assert!(!ticks(&app));
+        press(&mut app, KeyCode::Esc);
+        screen(&mut app, 80, 24);
+        assert!(ticks(&app));
+    }
+
+    #[test]
+    fn the_running_prompts_clock_under_a_dialog_needs_no_tick() {
+        let (mut app, _subscriptions) = setup_tui();
+        app.check_environments = Box::new(|_, _| None);
+        // The sidebar, hidden for now, lists the thread as idle, so only the prompt's clock
+        // moves.
+        app.on_shell_event(shell_snapshot(vec![listed("t", "Fix it", "idle")]));
+        let runs = json!([setup_run("running", true)]);
+        open_setup_thread(
+            &mut app,
+            "t",
+            worktree_thread("t", false, runs, short_answer()),
+        );
+        let ticks = |app: &App| needs_tick(app.open.as_ref(), &app.sidebar);
+        let rows = screen(&mut app, 80, 24);
+        assert!(shows(&rows, "Working for"), "{rows:#?}");
+        assert!(ticks(&app));
+
+        // The Environments dialog covers it.
+        environments_found(&mut app, 1, &forty_environments());
+        let rows = screen(&mut app, 80, 24);
+        assert!(!shows(&rows, "Working for"), "{rows:#?}");
+        assert!(!ticks(&app));
+        press(&mut app, KeyCode::Esc);
+        screen(&mut app, 80, 24);
+        assert!(ticks(&app));
+
+        // A dialog of the details leaves the start of the row in view while the sidebar is
+        // hidden, so the tick goes on.
+        alt(&mut app, 'b');
+        let rows = screen(&mut app, 63, 24);
+        assert!(app.details_modal());
+        assert!(shows(&rows, " Wor│"), "{rows:#?}");
+        assert!(ticks(&app));
+        // Beside the sidebar, the dialog covers the row.
+        ctrl_b(&mut app);
+        let rows = screen(&mut app, 63, 24);
+        assert!(app.details_modal());
+        assert!(!shows(&rows, "Working for"), "{rows:#?}");
+        assert!(!ticks(&app));
+        press(&mut app, KeyCode::Esc);
+        screen(&mut app, 80, 24);
+        assert!(ticks(&app));
+
+        // So does the theme list, on a wider screen.
+        ctrl_alt_a(&mut app);
+        let rows = screen(&mut app, 80, 24);
+        assert!(!shows(&rows, "Working for"), "{rows:#?}");
+        assert!(!ticks(&app));
+        ctrl_alt_a(&mut app);
+        screen(&mut app, 80, 24);
+        assert!(ticks(&app));
+    }
+
+    #[test]
+    fn every_banner_menu_and_dialog_counts_as_drawn_over_the_screen() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = crowded();
+        app.check_environments = Box::new(|_, _| None);
+        let over = |app: &mut App, area: fn(&App) -> Rect| {
+            screen(app, 63, 40);
+            let drawn = area(app);
+            assert!(!drawn.is_empty());
+            app.overlays().contains(&drawn)
+        };
+        // Codex's notice and the thread's error, over the transcript.
+        assert!(over(&mut app, |app| app.provider_banner.area));
+        assert!(over(&mut app, |app| app.banner.area));
+        app.picker = Some(mode_menu());
+        assert!(over(&mut app, |app| app.picker_area));
+        app.picker = None;
+        alt(&mut app, 'b');
+        assert!(over(&mut app, |app| app.details.drawn.unwrap().area));
+        alt(&mut app, 'c');
+        assert!(over(&mut app, |app| app
+            .environments
+            .drawn
+            .as_ref()
+            .unwrap()
+            .area));
+        ctrl_alt_a(&mut app);
+        assert!(over(&mut app, |app| app
+            .theme_list
+            .as_ref()
+            .unwrap()
+            .drawn
+            .unwrap()
+            .area));
+        // The details' pane covers nothing.
+        ctrl_alt_a(&mut app);
+        alt(&mut app, 'c');
+        screen(&mut app, 200, 50);
+        let pane = app.details.drawn.unwrap();
+        assert_eq!(pane.layout, details::Layout::Pane);
+        assert!(!app.overlays().contains(&pane.area));
+        // Nor does anything closed.
+        alt(&mut app, 'b');
+        screen(&mut app, 200, 50);
+        let shown = app
+            .overlays()
+            .iter()
+            .filter(|area| !area.is_empty())
+            .count();
+        assert_eq!(shown, 2, "only the banners");
+    }
+
+    #[test]
+    fn a_setup_card_under_the_environments_dialog_needs_no_tick() {
+        let (mut app, subscriptions) = setup_tui();
+        app.check_environments = Box::new(|_, _| None);
+        let snapshot = worktree_thread("a", true, json!([]), short_answer());
+        open_setup_thread(&mut app, "a", snapshot);
+        let stages = setup_stages(["running", "pending", "pending", "pending", "pending"]);
+        let item = setup_item("a", "running", 1, stages);
+        assert!(deliver(&mut app, &subscriptions, WatchEvent::Item(item)));
+        let ticks = |app: &App| needs_tick(app.open.as_ref(), &app.sidebar);
+        assert!(shows(&screen(&mut app, 63, 24), "Setting up worktree…"));
+        assert!(ticks(&app));
+        environments_found(&mut app, 1, &forty_environments());
+        let rows = screen(&mut app, 63, 24);
+        assert!(!shows(&rows, "Setting up worktree…"), "{rows:#?}");
+        assert!(!ticks(&app));
+        // Wider than the dialog, the card's clock shows past its right edge.
+        screen(&mut app, 80, 24);
+        assert!(ticks(&app));
+    }
+
+    /// Where the cursor shows after one frame of `app`, or None when the frame hid it.
+    fn drawn_cursor(app: &mut App, width: u16, height: u16) -> Option<(u16, u16)> {
+        use ratatui::Terminal;
+        use ratatui::backend::TestBackend;
+
+        let mut terminal = Terminal::new(TestBackend::new(width, height)).unwrap();
+        terminal.draw(|frame| app.draw(frame)).unwrap();
+        // TestBackend keeps whether the cursor shows to itself, but its Debug says.
+        let backend = format!("{:?}", terminal.backend());
+        let (_, state) = backend.rsplit_once("cursor: ").unwrap();
+        let position = terminal.get_cursor_position().unwrap();
+        state
+            .starts_with("true")
+            .then_some((position.x, position.y))
+    }
+
+    #[test]
+    fn no_cursor_shows_through_the_environments_dialog_or_the_theme_list() {
+        let (mut app, _) = tui_counting_checks();
+        app.focus = Focus::Composer;
+        app.composer.insert_str("draft");
+        let shown = drawn_cursor(&mut app, 120, 40);
+        assert!(shown.is_some());
+        alt(&mut app, 'c');
+        assert_eq!(drawn_cursor(&mut app, 120, 40), None);
+        alt(&mut app, 'c');
+        assert_eq!(drawn_cursor(&mut app, 120, 40), shown);
+        ctrl_alt_a(&mut app);
+        assert_eq!(drawn_cursor(&mut app, 120, 40), None);
+        ctrl_alt_a(&mut app);
+        assert_eq!(drawn_cursor(&mut app, 120, 40), shown);
     }
 }
