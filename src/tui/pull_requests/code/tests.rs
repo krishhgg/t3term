@@ -4356,6 +4356,11 @@ fn a_folder_closed_before_a_read_again_joins_it_to_another_stays_closed() {
 +b
 "
     );
+    let again = |code: &mut Code, ticket: u64, patch: &str| {
+        code.again();
+        assert_eq!(code.ask(ticket), Some(None));
+        assert_eq!(code.take(ticket, Ok(slice(patch, None)), 0), Some(true));
+    };
     let mut code = read(slice(&both, None), 0);
     code.act(Control::Tree, &[]);
     assert_eq!(
@@ -4363,20 +4368,24 @@ fn a_folder_closed_before_a_read_again_joins_it_to_another_stays_closed() {
         ["⌄ a", "  ⌄ b", "    M g.rs", "  M f.rs"]
     );
     code.act(Control::Folder(0, 1), &[]);
-    // A read again whose `a` holds only `b` joins them on one row, which stays closed.
-    code.again();
-    assert_eq!(code.ask(2), Some(None));
-    assert_eq!(code.take(2, Ok(slice(inner, None)), 0), Some(true));
+    // A read again whose `a` holds only `b` joins them on one row, which stays closed, and the
+    // row for every folder opens them.
+    again(&mut code, 2, inner);
+    assert_eq!(tree_of(&code)[1..], [FOLDERS_FOLDED, "› a/b"]);
+    assert_eq!(code.action(Control::Folders, &[]), "expand all folders");
+    code.act(Control::Folders, &[]);
+    assert_eq!(tree_of(&code)[1..], [FOLDERS_OPEN, "⌄ a/b", "  M g.rs"]);
+    // The joined row itself opens both folders.
+    again(&mut code, 3, &both);
+    code.act(Control::Folder(0, 1), &[]);
+    again(&mut code, 4, inner);
     assert_eq!(tree_of(&code)[1..], [FOLDERS_FOLDED, "› a/b"]);
     assert_eq!(code.action(Control::Folder(0, 2), &[]), "expand folder");
-    // The row opens both folders.
     code.act(Control::Folder(0, 2), &[]);
     assert_eq!(tree_of(&code)[1..], [FOLDERS_OPEN, "⌄ a/b", "  M g.rs"]);
     // Closing it closes `b`, which stays closed once `a` has a file of its own again.
     code.act(Control::Folder(0, 2), &[]);
-    code.again();
-    assert_eq!(code.ask(3), Some(None));
-    assert_eq!(code.take(3, Ok(slice(&both, None)), 0), Some(true));
+    again(&mut code, 5, &both);
     assert_eq!(
         tree_of(&code)[1..],
         [FOLDERS_FOLDED, "⌄ a", "  › b", "  M f.rs"]

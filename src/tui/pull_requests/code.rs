@@ -833,13 +833,10 @@ impl Code {
             }
             // Every folder the other way, as the desktop's button sets each folder
             // (fileTreeExpansion.ts:44-56).
-            Control::Folders => {
-                let folders = self.tree().folders();
-                match folders.iter().all(|path| !self.folded.contains(path)) {
-                    true => self.folded.extend(folders),
-                    false => self.folded.clear(),
-                }
-            }
+            Control::Folders => match self.folders_open() {
+                true => self.folded.extend(self.tree().folders()),
+                false => self.folded.clear(),
+            },
             Control::Folder(first, parts) => {
                 let row = self.tree_rows().into_iter().find_map(|row| match row.kind {
                     tree::Kind::Folder {
