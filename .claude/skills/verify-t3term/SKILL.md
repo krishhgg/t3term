@@ -43,7 +43,7 @@ T3V_RUN=$BASE $T3V keys Enter
 
 | Scenario | World | Ready text | Feature files |
 |---|---|---|---|
-| `links` | Project "Linked Desk" with 8 threads, one for each state of a thread's linked pull requests: every state, one open link, an emptied list, the old single link, no field, 1,005 links, hostile text and an unreadable list | `Mixed: every state` | sidebar, connection, thread-details, linked-pull-requests, pull-request-page, cli, environments, transcript |
+| `links` | Project "Linked Desk" with 8 threads, one for each state of a thread's linked pull requests: every state, one open link, an emptied list, the old single link, no field, 1,005 links, hostile text and an unreadable list | `Mixed: every state` | sidebar, connection, thread-details, linked-pull-requests, pull-request-page, cli, environments, transcript, appearance |
 | `lineage` | Project "Lineage Desk" with 10 threads that fork, start agents and transfer context: a parent, forks running and done, archived forks and parents, 134 agents of which 124 are done, and a thread with no relations | `Main: open me first` | lineage |
 | `terminal` | Projects "Terminal Desk" and "Rootless Desk" with 8 threads, one for each state of the terminal drawer: running with history, no terminal yet, no worktree, exited, failed, busy, 8 MiB of history and no workspace root. The fake shell answers what the drawer types. Needs a build with the drawer (#41) | `Running: a shell` | none until the drawer merges |
 

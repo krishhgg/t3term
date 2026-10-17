@@ -6,6 +6,7 @@
 //! advance, and a one-shot timer for the moment the soonest snooze ends, which no server event
 //! marks. An idle TUI uses no CPU.
 
+mod appearance;
 mod banner;
 mod composer;
 mod details;
@@ -50,7 +51,7 @@ use crate::client::{Client, IfBusy, WatchEvent};
 use crate::models::Choice;
 use crate::projection::{Applied, ShellState, ThreadState, apply_config, is_active_status, status};
 use crate::pull_request::{self, PullRequestError, Reference};
-use crate::settings::Settings;
+use crate::settings::{AppearanceMode, Settings};
 use crate::transcript::{self, BlockKind, ChangeLine};
 use composer::Composer;
 use details::Details;
@@ -60,7 +61,10 @@ use picker::{Item, Kind, Pick};
 use pull_requests::Part;
 use scroll::{Pin, Scroll};
 use sidebar::{Badges, Capabilities, Shelf, ShelfChoices, Sidebar, View};
-use theme::{Theme, duration_label, model_display_name, now_ms, parse_iso_ms, runtime_mode_label};
+use theme::{
+    Appearance, Depth, Theme, duration_label, model_display_name, now_ms, parse_iso_ms,
+    runtime_mode_label,
+};
 use unsent::{Failed, Unsent};
 
 const FRAME: Duration = Duration::from_millis(33);
@@ -338,6 +342,12 @@ enum ActionResult {
         /// One-message draft options this send took, such as ultrathink, to put back.
         reserved: Vec<(String, String)>,
     },
+    /// The system's appearance, read when the color scheme turned to System, from the read
+    /// numbered `read`.
+    SystemAppearance {
+        appearance: Appearance,
+        read: u64,
+    },
 }
 
 /// An open model, effort or mode menu.
@@ -441,6 +451,17 @@ impl OpenThread {
 struct App {
     client: Arc<Client>,
     theme: Theme,
+    /// The color scheme, which says which half of the theme draws. Saved between runs.
+    appearance_mode: AppearanceMode,
+    /// The system's appearance as last read, for the System scheme. `None` before a read has
+    /// answered.
+    system_appearance: Option<Appearance>,
+    /// How many reads of the system's appearance have started since the one at start, which
+    /// numbers each.
+    system_reads: u64,
+    /// The number of the read `system_appearance` came from. Reads can answer out of order,
+    /// and an answer from an older read is dropped.
+    system_read_kept: u64,
     /// T3's configuration, with its providers and models. The config subscription keeps it
     /// current, and it stays as it was while the subscription reconnects.
     config: Option<Value>,
@@ -636,7 +657,19 @@ async fn event_loop(terminal: &mut Term, client: Arc<Client>) -> Result<()> {
     // Dropped when the loop ends, which ends the subscription.
     let mut config_events = client.watch_config();
     let settings = Settings::load().await;
-    let mut app = App::new(client, Theme::detect(), &settings, actions);
+    // Read before the first frame, so System on a light Mac draws no dark frame first.
+    let system = match settings.appearance_mode {
+        AppearanceMode::System => appearance::system().await,
+        _ => None,
+    };
+    let shown = appearance::resolve(settings.appearance_mode, system, Appearance::Dark);
+    let mut app = App::new(
+        client,
+        Theme::of(shown, Depth::detect()),
+        &settings,
+        actions,
+    );
+    app.system_appearance = system;
     let mut input = EventStream::new();
     let mut dirty = true;
     let mut last_draw = Instant::now() - FRAME;
@@ -840,6 +873,10 @@ impl App {
         App {
             client,
             theme,
+            appearance_mode: settings.appearance_mode,
+            system_appearance: None,
+            system_reads: 0,
+            system_read_kept: 0,
             config: None,
             config_subscribed: true,
             config_revision: 0,
@@ -1907,6 +1944,13 @@ impl App {
                 self.toggle_details();
                 return;
             }
+            // The color scheme, from any pane, an open menu or dialog included. The desktop's
+            // Cmd+Option+Shift+A. Terminals send Esc then `A` for it, which Alt+A below for an
+            // approval doesn't take.
+            KeyCode::Char('A') if alt => {
+                self.cycle_appearance();
+                return;
+            }
             // A dialog of the details takes every other key, so Esc closes it before it moves
             // focus anywhere, and nothing reaches the conversation under it.
             _ if self.details_modal() => {
@@ -2114,6 +2158,55 @@ impl App {
         }
     }
 
+    /// Turns the color scheme to the next of System, Light and Dark, as the desktop's
+    /// Cmd+Option+Shift+A does, saves it and says which it is, as the desktop's toast does. Turning
+    /// to System reads the system's appearance again, since it may have changed. Until the read
+    /// answers, the screen keeps the appearance it has.
+    fn cycle_appearance(&mut self) {
+        let mode = self.appearance_mode.next();
+        self.appearance_mode = mode;
+        Settings::update(move |settings| settings.appearance_mode = mode);
+        if mode == AppearanceMode::System {
+            self.read_system_appearance();
+        }
+        self.follow_appearance();
+        self.message = Some((format!("Appearance: {}", mode.label()), false));
+    }
+
+    /// Reads the system's appearance in the background. The answer arrives as an action with
+    /// the read's number, and a read that can't tell sends nothing.
+    fn read_system_appearance(&mut self) {
+        self.system_reads += 1;
+        let read = self.system_reads;
+        let results = self.actions.clone();
+        tokio::spawn(async move {
+            if let Some(appearance) = appearance::system().await {
+                let _ = results.send(ActionResult::SystemAppearance { appearance, read });
+            }
+        });
+    }
+
+    /// Draws the half of the theme the color scheme calls for, when it isn't the one drawing.
+    fn follow_appearance(&mut self) {
+        let current = self.theme.appearance;
+        let wanted = appearance::resolve(self.appearance_mode, self.system_appearance, current);
+        if wanted != current {
+            self.theme = Theme::of(wanted, self.theme.depth);
+            self.restyle();
+        }
+    }
+
+    /// Drops every row laid out in the old colors, so the next frame draws all of it in the
+    /// new ones, at once.
+    fn restyle(&mut self) {
+        self.cache.clear();
+        self.details.restyle();
+        if let Some(open) = self.open.as_mut() {
+            open.setup.restyle();
+        }
+        self.layout_changed = true;
+    }
+
     /// Turns verbose mode on or off and remembers it, the way the GUI keeps a view setting.
     /// It opens every run of calls at once, instead of one click at a time.
     fn toggle_verbose(&mut self) {
@@ -2182,6 +2275,13 @@ impl App {
         match result {
             ActionResult::Info(text) => self.message = Some((text, false)),
             ActionResult::Error(text) => self.message = Some((text, true)),
+            // An older read than the one kept says less about the system now.
+            ActionResult::SystemAppearance { appearance, read } if read > self.system_read_kept => {
+                self.system_read_kept = read;
+                self.system_appearance = Some(appearance);
+                self.follow_appearance();
+            }
+            ActionResult::SystemAppearance { .. } => {}
             ActionResult::Config { config, revision } => {
                 // A change from the subscription since the read was asked for is newer than
                 // the answer.
@@ -3355,7 +3455,7 @@ impl App {
             frame.render_widget(
                 Paragraph::new(Line::styled(
                     label.clone(),
-                    Style::new().fg(t.fg).bg(t.primary),
+                    Style::new().fg(t.on_primary).bg(t.primary),
                 )),
                 Rect::new(x, area.y + area.height - 1, label.width() as u16, 1),
             );
@@ -3481,7 +3581,7 @@ impl App {
         let button = |label: &str, primary: bool| {
             let style = if primary {
                 Style::new()
-                    .fg(t.fg)
+                    .fg(t.on_primary)
                     .bg(t.primary)
                     .add_modifier(Modifier::BOLD)
             } else {
@@ -3695,7 +3795,7 @@ impl App {
             Style::new().fg(t.muted).bg(t.chip_bg)
         } else {
             Style::new()
-                .fg(t.fg)
+                .fg(t.on_primary)
                 .bg(t.primary)
                 .add_modifier(Modifier::BOLD)
         };
@@ -4612,7 +4712,6 @@ fn render_block(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use theme::Depth;
 
     fn block(kind: BlockKind, item_type: &str, header: &str, body: &str) -> transcript::Block {
         transcript::Block {
@@ -14082,5 +14181,249 @@ mod tests {
         assert_eq!(app.composer.text(), "half a reply");
         // None of it asked T3 for anything.
         assert_eq!(reads(&runtime), 0);
+    }
+
+    // ---- appearance ----
+
+    fn alt_shift_a(app: &mut App) {
+        let key = KeyEvent::new(KeyCode::Char('A'), KeyModifiers::ALT | KeyModifiers::SHIFT);
+        app.on_terminal_event(Event::Key(key));
+    }
+
+    /// Each color `buffer` draws that `theme` doesn't have, with the first cell that draws it.
+    fn foreign_colors(buffer: &ratatui::buffer::Buffer, theme: &Theme) -> Vec<(Color, u16, u16)> {
+        let palette: HashSet<Color> = theme.colors().into_iter().chain([Color::Reset]).collect();
+        let mut seen = HashSet::new();
+        let mut foreign = Vec::new();
+        for y in 0..buffer.area.height {
+            for x in 0..buffer.area.width {
+                let cell = &buffer[(x, y)];
+                for color in [cell.fg, cell.bg] {
+                    if !palette.contains(&color) && seen.insert(color) {
+                        foreign.push((color, x, y));
+                    }
+                }
+            }
+        }
+        foreign
+    }
+
+    #[test]
+    fn alt_shift_a_redraws_everything_in_the_other_half_at_once() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        // The crowded thread, then with its details beside it, and a linked pull request's
+        // details: every part of the screen that keeps its rows from one frame to the next.
+        let crowded_details = || {
+            let mut app = crowded();
+            alt(&mut app, 'b');
+            app
+        };
+        let pull_details = || {
+            let mut app = pulls_tui(vec![long_linked(32), long_linked(31)], false);
+            app.focus = Focus::Transcript;
+            cells(&mut app, 120, 40);
+            alt(&mut app, 'b');
+            press(&mut app, KeyCode::Right);
+            cells(&mut app, 120, 40);
+            press(&mut app, KeyCode::Enter);
+            app
+        };
+        // And one whose host answered, with its description and a remark laid out.
+        let pull_answered = || {
+            let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+            note_reads(&mut app);
+            press(&mut app, KeyCode::Enter);
+            let parts = vec![
+                Part::Detail(Ok(Box::new(host_detail()))),
+                Part::Activity(Ok(Box::new(host_activity()))),
+                Part::Done,
+            ];
+            hear(&mut app, 1, parts);
+            let shown = text_in(&cells(&mut app, 200, 50), Rect::new(0, 0, 200, 50));
+            assert!(shown.contains("Second paragraph.") && shown.contains("Looks close."));
+            app
+        };
+        let scenes = [
+            ("crowded", crowded(), 80, 24),
+            ("crowded with details", crowded_details(), 200, 50),
+            ("a pull request's details", pull_details(), 120, 40),
+            ("a pull request's host answer", pull_answered(), 200, 50),
+        ];
+        for (scene, mut app, width, height) in scenes {
+            let composer = app.composer.text();
+            let dark = cells(&mut app, width, height);
+            assert_eq!(app.theme.appearance, Appearance::Dark, "{scene}");
+            assert_eq!(foreign_colors(&dark, &app.theme), [], "{scene}");
+
+            // Dark goes to System, which keeps what draws until the system's appearance is
+            // read, and the read never answers here. Then Light.
+            alt_shift_a(&mut app);
+            assert_eq!(app.appearance_mode, AppearanceMode::System, "{scene}");
+            assert_eq!(app.theme.appearance, Appearance::Dark, "{scene}");
+            alt_shift_a(&mut app);
+            assert_eq!(app.appearance_mode, AppearanceMode::Light, "{scene}");
+            assert_eq!(app.theme.appearance, Appearance::Light, "{scene}");
+            // The next frame draws at once, in the new colors only.
+            assert!(app.layout_changed, "{scene}");
+            let light = cells(&mut app, width, height);
+            assert_eq!(foreign_colors(&light, &app.theme), [], "{scene}");
+            let canvas = light.content.iter().filter(|cell| cell.bg == app.theme.bg);
+            assert!(canvas.count() > 0, "{scene}");
+
+            // And back to Dark.
+            alt_shift_a(&mut app);
+            assert_eq!(app.theme.appearance, Appearance::Dark, "{scene}");
+            let dark = cells(&mut app, width, height);
+            assert_eq!(foreign_colors(&dark, &app.theme), [], "{scene}");
+            // No key reached the composer, and each choice was saved.
+            assert_eq!(app.composer.text(), composer, "{scene}");
+            assert_eq!(
+                crate::settings::saved_in_test().appearance_mode,
+                AppearanceMode::Dark
+            );
+        }
+        // Only the turn to System read anything.
+        assert_eq!(reads(&runtime), 4);
+    }
+
+    #[test]
+    fn system_draws_the_systems_appearance_read_each_time_it_is_chosen() {
+        use appearance::fake::{READS, SYSTEM};
+        use theme::Appearance::{Dark, Light};
+        let runtime = tokio::runtime::Builder::new_current_thread()
+            .build()
+            .unwrap();
+        runtime.block_on(async {
+            let mut app = tui(&Settings::default());
+            let (sender, mut results) = mpsc::unbounded_channel();
+            app.actions = sender;
+            READS.set(0);
+            let message = |app: &App| app.message.as_ref().map(|(text, _)| text.clone());
+
+            // Dark to System keeps dark until the read says the system is light.
+            SYSTEM.set(Some(Light));
+            alt_shift_a(&mut app);
+            assert_eq!(message(&app).as_deref(), Some("Appearance: System"));
+            assert_eq!(app.theme.appearance, Dark);
+            app.on_action_result(results.recv().await.unwrap());
+            assert_eq!((app.theme.appearance, READS.get()), (Light, 1));
+            assert_eq!(
+                crate::settings::saved_in_test().appearance_mode,
+                AppearanceMode::System
+            );
+
+            // Light and Dark read nothing.
+            alt_shift_a(&mut app);
+            assert_eq!(message(&app).as_deref(), Some("Appearance: Light"));
+            assert_eq!(app.theme.appearance, Light);
+            alt_shift_a(&mut app);
+            assert_eq!(message(&app).as_deref(), Some("Appearance: Dark"));
+            assert_eq!(app.theme.appearance, Dark);
+            tokio::task::yield_now().await;
+            assert_eq!(READS.get(), 1);
+
+            // Back on System, the last read draws at once, and the system is read again.
+            SYSTEM.set(Some(Dark));
+            alt_shift_a(&mut app);
+            assert_eq!(app.theme.appearance, Light);
+            app.on_action_result(results.recv().await.unwrap());
+            assert_eq!((app.theme.appearance, READS.get()), (Dark, 2));
+
+            // A read that can't tell sends nothing, and what draws stays.
+            SYSTEM.set(None);
+            for _ in 0..3 {
+                alt_shift_a(&mut app);
+            }
+            assert_eq!(app.appearance_mode, AppearanceMode::System);
+            tokio::task::yield_now().await;
+            assert_eq!(READS.get(), 3);
+            assert!(results.try_recv().is_err());
+            assert_eq!(app.theme.appearance, Dark);
+
+            // A read that answers after the reader moved on is kept for the next turn to
+            // System and draws nothing now.
+            SYSTEM.set(Some(Light));
+            for _ in 0..3 {
+                alt_shift_a(&mut app);
+            }
+            alt_shift_a(&mut app);
+            assert_eq!(app.appearance_mode, AppearanceMode::Light);
+            app.on_action_result(results.recv().await.unwrap());
+            assert_eq!(app.system_appearance, Some(Light));
+            alt_shift_a(&mut app);
+            alt_shift_a(&mut app);
+            assert_eq!(app.appearance_mode, AppearanceMode::System);
+            assert_eq!(app.theme.appearance, Light);
+            app.on_action_result(results.recv().await.unwrap());
+            assert!(results.try_recv().is_err());
+
+            // Two reads that answer out of order: the newer one's answer draws, and the
+            // older one's, arriving after it, is dropped.
+            for system in [Light, Dark] {
+                SYSTEM.set(Some(system));
+                for _ in 0..3 {
+                    alt_shift_a(&mut app);
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(app.appearance_mode, AppearanceMode::System);
+            let older = results.recv().await.unwrap();
+            let newer = results.recv().await.unwrap();
+            app.on_action_result(newer);
+            assert_eq!(app.theme.appearance, Dark);
+            app.on_action_result(older);
+            assert_eq!(app.system_appearance, Some(Dark));
+            assert_eq!(app.theme.appearance, Dark);
+        });
+    }
+
+    #[test]
+    fn text_on_the_primary_color_takes_its_own_color() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = crowded();
+        let request = json!({"id": "q1", "kind": "command", "status": "pending"});
+        app.on_thread_event(live(2, "runtime-request.updated", request));
+        app.composer.insert('x');
+        cells(&mut app, 80, 24);
+        press(&mut app, KeyCode::PageUp);
+        for mode in [AppearanceMode::Light, AppearanceMode::Dark] {
+            while app.appearance_mode != mode {
+                alt_shift_a(&mut app);
+            }
+            let t = app.theme.clone();
+            let buffer = cells(&mut app, 80, 24);
+            // The send button, Approve and how far the transcript is scrolled, and nothing on
+            // the primary color in another.
+            let on_primary: String = buffer
+                .content
+                .iter()
+                .filter(|cell| cell.bg == t.primary)
+                .inspect(|cell| assert_eq!(cell.fg, t.on_primary, "{mode:?}"))
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(on_primary.contains("Approve"), "{mode:?}: {on_primary}");
+            assert!(on_primary.contains('↑'), "{mode:?}: {on_primary}");
+            assert!(on_primary.contains("more"), "{mode:?}: {on_primary}");
+        }
+    }
+
+    #[test]
+    fn alt_a_still_answers_an_approval_and_alt_shift_a_never_does() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = crowded();
+        let request = json!({"id": "q1", "kind": "command", "status": "pending"});
+        app.on_thread_event(live(2, "runtime-request.updated", request));
+        cells(&mut app, 80, 24);
+        alt_shift_a(&mut app);
+        assert_eq!(app.appearance_mode, AppearanceMode::System);
+        // The turn to System read the system, and nothing answered the request.
+        assert_eq!(reads(&runtime), 1);
+        alt(&mut app, 'a');
+        assert_eq!(app.appearance_mode, AppearanceMode::System);
+        // Alt+A sent the answer.
+        assert_eq!(reads(&runtime), 2);
     }
 }

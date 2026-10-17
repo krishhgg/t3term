@@ -583,6 +583,12 @@ impl Details {
         self.shift();
     }
 
+    /// Drops the rows laid out in the old colors, after the theme changed.
+    pub fn restyle(&mut self) {
+        self.rows = None;
+        self.pulls.restyle();
+    }
+
     /// Notes that the screen resized, which can move the details and every row in them.
     pub fn resized(&mut self) {
         self.moved = true;

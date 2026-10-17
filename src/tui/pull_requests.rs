@@ -857,6 +857,16 @@ impl Read {
             (Answer::Read(_), Answer::Read(_)) => now.saturating_sub(self.at) < FRESH,
         }
     }
+
+    /// Drops the description and the remarks laid out in the old colors.
+    fn restyle(&mut self) {
+        if let Answer::Read(summary) = &mut self.answer {
+            summary.laid_out = None;
+        }
+        if let Answer::Read(conversation) = &mut self.conversation {
+            conversation.restyle();
+        }
+    }
 }
 
 /// What the details show of a pull request's detail, as the desktop's Summary tab does. Each
@@ -1038,6 +1048,16 @@ impl PullRequests {
         self.asking = false;
         self.shown = Shown::default();
         self.pick = None;
+    }
+
+    /// Drops the page, the details and the host's answer laid out in the old colors, after the
+    /// theme changed. A click lands on nothing until the next frame lays them out again.
+    pub fn restyle(&mut self) {
+        self.page = None;
+        self.detail = None;
+        if let Some(read) = self.read.as_mut() {
+            read.restyle();
+        }
     }
 
     /// Whether this frame has to work the links out for thread `open_id`: an event may have

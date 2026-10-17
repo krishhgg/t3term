@@ -88,7 +88,7 @@ The TUI follows the desktop app closely, because muscle memory is worth more tha
 
 | Where | Keys |
 | --- | --- |
-| Anywhere | Tab / Shift+Tab move focus, Ctrl+B hide or show the sidebar, Alt+B open or close the thread's details, PgUp/PgDn scroll, Ctrl+X interrupt, Ctrl+C quit |
+| Anywhere | Tab / Shift+Tab move focus, Ctrl+B hide or show the sidebar, Alt+B open or close the thread's details, Alt+Shift+A [light, dark or the system's colors](#light-and-dark), PgUp/PgDn scroll, Ctrl+X interrupt, Ctrl+C quit |
 | Anywhere, approval pending | Alt+A accept, Alt+S accept for session, Alt+D decline. Alt+↑/↓ or the wheel scrolls a long request |
 | Anywhere, thread open | Alt+M model, Alt+E reasoning effort and other model options, Alt+P access, and plan mode once it's turned on |
 | Anywhere, tasks drawer showing | Alt+T open or close the task list. Alt+↑/↓ or the wheel scrolls a long list |
@@ -421,6 +421,20 @@ There is no turn diff yet, and nothing opens an edit's full diff. Paths show as 
 
 The thread is invented and comes from a fake T3 server that sends what the pinned nightly sends. The image renders t3term's captured terminal output. [File change verification](docs/file-change-verification.md) lists what was checked, with captures of the bounds, 256 colors, a narrow screen and a patch that only the fake server sends. A [screen tour](docs/screenshots/file-change-screen-tour.mp4) shows the live edit's captures in order. It is a slideshow of the captures, not a recording.
 
+### Light and dark
+
+Alt+Shift+A switches the colors to the next of System, Light and Dark, in the order the desktop's Cmd+Option+Shift+A uses, and the status line names the choice, such as `Appearance: Light`. Light draws T3 Code's light colors and Dark its dark ones. System draws whichever macOS shows. t3term reads that at start and again each time Alt+Shift+A comes back to System, so a change to macOS's appearance while t3term runs shows the next time you switch to System. On other systems System draws dark. On macOS, when the setting can't be read, System keeps what the last read that worked found, and draws dark when none has. The key works from any pane, over a menu or a dialog too, and never types into the composer. Like Alt+A, it needs Option to send Meta on a Mac.
+
+| Dark, 120x48 | Light, 120x48 |
+|---|---|
+| ![A thread's details as a dialog over the conversation in the dark colors, listing linked pull requests with their states in green, blue, amber, violet and red](docs/screenshots/appearance-dark.png) | ![The same screen after Alt+Shift+A twice: the light colors, the same states in darker shades, and the status line reads Appearance: Light](docs/screenshots/appearance-light.png) |
+
+The threads and pull requests are invented and come from a fake T3 server. The images render t3term's captured terminal output in truecolor.
+
+t3term saves the choice in `~/.config/t3term/settings.json` under `appearanceMode`, as `system`, `light` or `dark`. A file without the key, or with a value t3term doesn't know, draws dark, as t3term did before it had a choice. The desktop starts on System and keeps its choice in the browser's storage, so this key is t3term's.
+
+Light uses the desktop's light colors, with a few exceptions. Where the desktop tells two surfaces apart by a border, or by a shade too faint for a terminal, t3term uses a darker gray: code blocks, inline code, a menu's highlighted row and the sidebar's active and selected rows. Chips are filled, as in dark. In 256 colors the light grays round to three, so the composer, menus and the sidebar share the canvas's white, and a code block in your own message has the message's background.
+
 ## It's a CLI too
 
 ```text
@@ -512,6 +526,7 @@ The tests draw frames on a test backend, so they don't show what the built binar
 - Provider setup. The provider banner names T3 Code's provider setup, but t3term can't install a provider, sign in to one or update it. The banner follows the provider the model chip names. The desktop also weighs the thread's running session and the project's default model, and falls back to another provider when the chosen one is off or unavailable. t3term has none of those fallbacks, so where they apply the banner can name a different provider from the desktop's, or none.
 - Acting on a proposed plan. The desktop's card menu copies a plan, downloads it as Markdown or saves it to the workspace, and its composer offers Implement and Implement in a new thread. t3term only shows the plan. Its collapsed card also ends at ten lines with text and `...`, where the desktop clips the preview to a fixed height and fades it out.
 - Pinning, snoozing, settling and reordering threads. The sidebar shows the shelves, but moving a thread between them still takes the desktop app. The Snoozed shelf also stays open, where the desktop starts it closed. Snoozed threads are full cards, where the desktop shows a one-line row with the wake time.
+- The rest of the desktop's appearance settings. t3term has the stock theme's light and dark colors, but not the built-in themes T3 Chat, Grove, Ocean, Ember and Iris, custom themes, contrast or the blue and orange diff colors. System picks up a change to macOS's appearance only when you switch to it again.
 - Marking threads seen. The sidebar reads Done and Woke against the visit time the server keeps for each thread, but t3term doesn't report a visit when you open one, so only the desktop or another client clears those words. A server too old to keep visit times gets no Done from t3term at all, because the desktop's fallback is a visit time saved in the browser.
 
 ## Credit
