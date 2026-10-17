@@ -21,7 +21,7 @@ Don't use it for claims nothing can measure, like "the code is cleaner". Ask for
    - One function's behavior: a focused `cargo test`.
    - CPU, memory or energy: `benchmarks/`, vetted with the benchmark-checklist skill.
 3. **Capture a baseline** from the old state: the merge base, the parent commit or the build that shows the bug. `t3v build <rev>` builds any commit without touching your checkout.
-4. **Capture the treatment** from the changed state with the same command, scenario, size, color depth and steps.
+4. **Capture the treatment** from the changed state with the same command, scenario, size, color depth and steps. When both runs are live at once, keep each one's path from `t3v start --json` and pass it with `--run` or `T3V_RUN` to every command, because `/tmp/t3v-current` names only the newest run on the machine.
 5. **Compare the raw artifacts:** screen captures (`diff` the `.txt` files), rendered PNGs, `t3v status --json` counters, CLI output and exit codes, test output.
 6. **Return exactly one verdict.**
 

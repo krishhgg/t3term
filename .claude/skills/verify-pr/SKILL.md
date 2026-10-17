@@ -21,9 +21,11 @@ gh pr view N --json number,title,body,headRefOid,headRefName,baseRefName,files,c
 gh pr diff N
 ```
 
-Read the description, the decision log and any verification page the pull request adds under `docs/`. Then write each claim in a form a run can disprove: the state, the user's action, what the screen or output shows, and what must not happen. One to five claims. For example: "With the terminal drawer open, Ctrl+Alt+A opens the theme list over it, and the shell receives no keys while the list is open."
+Read the description, the decision log and any verification page the pull request adds under `docs/`. Then write each claim in a form a run can disprove: the state, the user's action, what the screen or output shows, and what must not happen. Usually one to five claims, and every claim the requester names, however many. For example: "With the terminal drawer open, Ctrl+Alt+A opens the theme list over it, and the shell receives no keys while the list is open."
 
 A pull request that changes nothing a user sees (CI, docs, a refactor) still gets a verdict. Its claim is "nothing a user sees changes". It has nothing for step 3 to drive, so step 5's sweep is its proof.
+
+A pull request that changes verify-t3term itself (t3v, a scenario, smoke or a recipe) builds the same binary on both sides, so its claims are about the tool. Drive each one with head's t3v against one build of the product, usually master's, and pair it with a negative control: a step that must make the tool fail, such as a recipe line given the wrong exit code or a token written into the evidence, which `check` must catch. A tool that passes everything proves nothing.
 
 ## 2. Find the baseline and build both sides
 
@@ -32,10 +34,12 @@ A pull request that changes nothing a user sees (CI, docs, a refactor) still get
 
 ```bash
 T3V=.claude/skills/verify-t3term/scripts/t3v
-git fetch origin "pull/N/head"
+git fetch origin <baseRefName> "pull/N/head"   # both, so the merge base isn't from a stale base branch
 $T3V build <base sha>     # prints /tmp/t3v-bin/<sha>/t3term
 $T3V build <head sha>
 ```
+
+A base that predates t3v, such as the commit before the pull request that adds it, can't drive itself. Use head's t3v and recipes against the base build, and say so in the verdict.
 
 Record the patch id. It identifies the change independent of the commits, and step 7 uses it to decide whether a verdict still holds:
 
@@ -45,11 +49,12 @@ git diff <base sha> <head sha> | git patch-id --stable
 
 ## 3. Drive the claims on base, then on head
 
-Read the matching file under `.claude/skills/verify-t3term/features/` first, and follow verify-t3term's Launch, Doctor, Drive and Evidence sections. Use the same scenario, size, color depth and steps on both sides, each in its own run:
+Read the matching file under `.claude/skills/verify-t3term/features/` first, and follow verify-t3term's Launch, Doctor, Drive and Evidence sections. Use the same scenario, size, color depth and steps on both sides, each in its own run. Take the scenario and size from the feature file's recipe. Most recipes run at the default 200x50. Two runs are live at once, so keep each run's path and pass it to every command. `/tmp/t3v-current` names only the newest run on the machine, which may be another agent's:
 
 ```bash
-$T3V start --binary /tmp/t3v-bin/<base>/t3term --evidence /tmp/t3v-verdict/N/base --cols 140 --rows 44
-$T3V start --binary /tmp/t3v-bin/<head>/t3term --evidence /tmp/t3v-verdict/N/head --cols 140 --rows 44
+BASE=$($T3V start --scenario links --binary /tmp/t3v-bin/<base>/t3term --evidence /tmp/t3v-verdict/N/base --json | jq -r .run)
+HEAD=$($T3V start --scenario links --binary /tmp/t3v-bin/<head>/t3term --evidence /tmp/t3v-verdict/N/head --json | jq -r .run)
+T3V_RUN=$BASE $T3V keys M-b; T3V_RUN=$HEAD $T3V keys M-b
 ```
 
 - **A bug fix.** The symptom must show on base twice, from a reset state each time. If it doesn't, there is no baseline and the claim is inconclusive. Don't call the fix verified. Then the same steps on head, twice: the broken state is gone and the expected state is there.
@@ -60,9 +65,9 @@ $T3V start --binary /tmp/t3v-bin/<head>/t3term --evidence /tmp/t3v-verdict/N/hea
 ## 4. Check the rules and the counters on both runs
 
 ```bash
-$T3V check --run <base run>; $T3V check --run <head run>
-$T3V status --json --run <base run> > base-status.json
-$T3V status --json --run <head run> > head-status.json
+$T3V check --run "$BASE"; $T3V check --run "$HEAD"
+$T3V status --json --run "$BASE" > base-status.json
+$T3V status --json --run "$HEAD" > head-status.json
 ```
 
 `check` must pass on head. Compare `rpcRequestsByTag` between the two runs for the same steps. Head sending a request base didn't send, or more of one, is a finding unless the pull request says why. Idle cost is a requirement in this repo (`.greptile/config.json`, rule `idle-cost`).
@@ -79,7 +84,7 @@ git worktree add /tmp/t3v-verdict/N/head-tree <head sha>
 git worktree remove /tmp/t3v-verdict/N/base-tree; git worktree remove /tmp/t3v-verdict/N/head-tree
 ```
 
-A recipe that passes on base and fails on head is a regression unless the pull request changed it. A recipe the pull request changed must pass on head. A side that predates smoke has no recipes. Then run master's smoke and recipes against both builds. A head failure in a feature the pull request changes on purpose means the recipe needs updating. Drive that feature by hand, and ask the author to update its feature file. Until they do, the verdict is FAIL, because master's smoke would fail after the merge. Any other head failure that base passes is a regression.
+A recipe that passes on base and fails on head is a regression unless the pull request changed it. A recipe the pull request changed must pass on head. A side that predates smoke has no recipes, and its missing sweep isn't a failure. Then, when master has smoke and the pull request isn't against master, run master's smoke and recipes against both builds. A head failure in a feature the pull request changes on purpose means the recipe needs updating. Drive that feature by hand, and ask the author to update its feature file. Until they do, the verdict is FAIL, because master's smoke would fail after the merge. Any other head failure that base passes is a regression.
 
 Then list the features the diff can reach: map each changed file under `src/` to the feature files that drive it, and add the feature the claims name. Drive each of those features' recipes on head. For each one that the pull request doesn't mean to change, capture the same screens on base and head and compare them:
 
@@ -92,7 +97,7 @@ Any difference the pull request doesn't explain is a finding. For a small diff y
 ## 6. Check the tests and the review
 
 - CI on the head SHA: `gh pr checks N`. macOS must pass.
-- Greptile: every finding fixed or answered. A thread counts as answered when someone other than Greptile replied or it is resolved.
+- Greptile: every finding fixed or answered. A thread counts as answered when someone other than Greptile replied or it is resolved. Greptile reviews only pull requests that aren't drafts. If its review hasn't finished, write `Greptile: pending` in the verdict. The verdict doesn't hold until Greptile finishes, and a finding that needs a code change means a new patch and a new verdict.
 - A bug fix carries a test that fails with the fix reverted. In a scratch worktree at head, revert the non-test part of the fix, run that test and see it fail, then delete the worktree. A test that still passes proves nothing (the tdd skill).
 - The pull request adds or updates its feature file under `.claude/skills/verify-t3term/features/` when it adds or changes something a user sees.
 
@@ -111,7 +116,7 @@ Write it to a file and post it as one comment. Start with the marker line so lat
 ```markdown
 <!-- t3v-verdict -->
 **PASS** for head `<head sha>`, patch id `<patch id>`.
-Verifier: <agent and model>, not the author. Base `<base sha>`. Scenario `links`, 140x44, truecolor.
+Verifier: <agent and model>, not the author. Base `<base sha>`. Scenario `links`, 200x50, truecolor.
 
 | Claim | Base | Head |
 | --- | --- | --- |
