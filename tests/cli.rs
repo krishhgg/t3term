@@ -6,6 +6,7 @@
 //! T3 server. Any server it finds is a fake one that this file starts on 127.0.0.1, and any `t3`
 //! command it runs either fails or is a script this file writes.
 
+use std::cell::Cell;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -28,25 +29,41 @@ type Socket = WebSocket<TcpStream>;
 /// t3term's write to a closed stdout then goes through.
 static SPAWNING: Mutex<()> = Mutex::new(());
 
+thread_local! {
+    /// Whether this thread holds `SPAWNING`. A process this thread starts begins as a copy of
+    /// it, so the process can tell whether the lock was held when it started.
+    static HOLDING: Cell<bool> = const { Cell::new(false) };
+}
+
+/// `SPAWNING`, held by this thread until this is dropped.
+struct Spawning {
+    _held: MutexGuard<'static, ()>,
+}
+
+impl Drop for Spawning {
+    fn drop(&mut self) {
+        HOLDING.set(false);
+    }
+}
+
 /// Holds `SPAWNING`. A test that panicked while holding it left nothing to undo.
-fn spawning() -> MutexGuard<'static, ()> {
-    SPAWNING.lock().unwrap_or_else(PoisonError::into_inner)
+fn spawning() -> Spawning {
+    let held = SPAWNING.lock().unwrap_or_else(PoisonError::into_inner);
+    HOLDING.set(true);
+    Spawning { _held: held }
 }
 
 /// Starts `command` while no other test starts a process, so it inherits no other test's pipe,
 /// and gives back the lock with it. A test that closes its end of a pipe keeps the lock until
 /// that end is closed.
-fn spawn_alone(command: &mut Command) -> (Child, MutexGuard<'static, ()>) {
+fn spawn_alone(command: &mut Command) -> (Child, Spawning) {
     spawn_holding(spawning(), command)
 }
 
 /// Starts `command` while `alone` holds `SPAWNING`, and gives the lock back with the child. A
 /// test that makes a pipe for t3term takes the lock before it makes the pipe and passes it here.
 /// This is the one place in this file that starts a process.
-fn spawn_holding(
-    alone: MutexGuard<'static, ()>,
-    command: &mut Command,
-) -> (Child, MutexGuard<'static, ()>) {
+fn spawn_holding(alone: Spawning, command: &mut Command) -> (Child, Spawning) {
     let child = command.spawn().expect("run t3term");
     (child, alone)
 }
@@ -62,26 +79,67 @@ fn output(command: &mut Command) -> Output {
     spawn(command).wait_with_output().expect("run t3term")
 }
 
-/// Every process these tests start goes through `spawn_holding`, which takes the held lock: no
-/// other function in this file calls `Command::output`, `Command::spawn` or `Command::status`. A
-/// test that calls one of them straight, as a merge from master can bring in, fails here rather
-/// than now and then on macOS.
+/// Every process these tests start goes through `spawn_holding`, which takes the held lock.
+/// Outside its body no line of code in this file names a process's `output`, `spawn` or
+/// `status`, as a method call or by its path, as in `Command::spawn(command)` or
+/// `.map(Command::spawn)`. `thread::spawn` starts no process. A test that starts one straight,
+/// as a merge from master can bring in, fails here rather than now and then on macOS.
 #[test]
 fn every_process_starts_through_spawn_holding() {
-    let calls = ["output", "spawn", "status"].map(|name| format!(".{name}()"));
-    let lines: Vec<&str> = include_str!("cli.rs").lines().map(str::trim).collect();
-    let mut within = "";
+    let lines: Vec<&str> = include_str!("cli.rs").lines().collect();
+    // Built here, so that this line doesn't count as one.
+    let head = format!("fn {}(", "spawn_holding");
+    let heads: Vec<usize> = (0..lines.len())
+        .filter(|&at| lines[at].contains(&head))
+        .collect();
+    assert_eq!(heads.len(), 1, "one spawn_holding");
+    let start = heads[0];
+    assert!(
+        lines[start].starts_with(&head),
+        "spawn_holding is in no other item"
+    );
+    // rustfmt ends a function at the top of the file with a `}` alone at the start of a line.
+    let end = start + lines[start..].iter().position(|line| *line == "}").unwrap();
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
     let mut elsewhere = Vec::new();
-    for line in &lines {
-        if let Some(name) = line.strip_prefix("fn ") {
-            within = name.split('(').next().unwrap_or(name);
+    for (at, line) in lines.iter().enumerate() {
+        if (start..=end).contains(&at) || line.trim_start().starts_with("//") {
+            continue;
         }
-        let starts = calls.iter().any(|call| line.contains(call.as_str()));
-        if starts && within != "spawn_holding" {
-            elsewhere.push((within, *line));
+        let code: String = line.split_whitespace().collect();
+        let starts = ["output", "spawn", "status"].iter().any(|name| {
+            let called = code.contains(&format!(".{name}("));
+            let named = code.match_indices(&format!("::{name}")).any(|(i, path)| {
+                let after = code[i + path.len()..].chars().next();
+                !after.is_some_and(ident) && !code[..i].ends_with("thread")
+            });
+            called || named
+        });
+        if starts {
+            elsewhere.push((at + 1, line.trim()));
         }
     }
     assert!(elsewhere.is_empty(), "{elsewhere:#?}");
+}
+
+/// A process starts while the test that started it holds `SPAWNING`, at the moment it starts
+/// and not only when `spawn_alone` is called: a `spawn_holding` that let the lock go before it
+/// started the process fails here.
+#[test]
+fn a_process_starts_while_its_test_holds_the_spawn_lock() {
+    use std::os::unix::process::CommandExt;
+    let mut command = Command::new("true");
+    // SAFETY: the hook only reads a thread local that needs no setup and makes an error.
+    unsafe {
+        // Runs in the new process before `true` does, with this thread's memory as it was when
+        // the process started.
+        command.pre_exec(|| match HOLDING.get() {
+            true => Ok(()),
+            false => Err(std::io::Error::other("started without the spawn lock")),
+        });
+    }
+    let (mut child, _alone) = spawn_alone(&mut command);
+    assert!(child.wait().unwrap().success());
 }
 
 /// `spawn_alone` starts nothing while another test holds `SPAWNING`, and starts its process once
