@@ -5,6 +5,7 @@
 - **Reading from the host.** Opening a link's details asks T3 for that pull request. Under the link's status rows the details read `Reading from github.com…` until T3 answers, then `Read from github.com just now`, or how long ago.
 - **The summary.** Under that row, as the desktop's Summary tab has them: `This branch is out-of-date with main by 3 commits.` for an open, mergeable pull request behind its base, then `Reviewers`, `Labels` (or `None`), `Checks`, `Description` and `Comments`. Each reviewer has a row of their own, with `(bot)` after a bot's login and their last verdict at the row's end: `Approved` or `Changes requested`, muted with ` earlier changes` after it when commits landed after it, and nothing when it was dismissed. Someone who gave a verdict without being asked is added, and the section reads `None` when there is nobody. Each check has a mark, its name and a status: `✓ Passed`, `✗ Failed`, `✗ Cancelled`, `○ Running`, `◉ Awaiting action`, `◉ Awaiting approval` for one that waits on a GitHub Actions run, `– Skipped` or `– Neutral`. A name too long for its row wraps under its mark. With no checks the section reads `No checks reported.`. The description is Markdown, or `No description provided.` in muted italics. `URL`, `Repository`, `Branches`, `Author` and `Activity` follow, as linked-pull-requests.md describes.
 - **Comments.** The heading reads `Comments` with `Reading the conversation…` under it until the conversation comes, then `Comments (28)` with the count the host gave and the order switch, `Newest first`, at the row's end. The 10 newest remarks that aren't a bot's, resolved or dismissed show newest first. Each has a header with the author (`ghost` for a deleted account), their verdict or review state and how long ago, then its file and line with `· Outdated` where its thread is, then its text as Markdown without HTML comments, two columns in. A header too wide for its row puts the author on a row of its own. With no remarks the section reads `No comments yet.`, and a failed read `Could not load pull request activity` with the reason under it.
+- **Reactions.** A remark's reactions show on a row under its header as pills two columns apart, such as `👀 4  👍 1  😕 1  😄 12`, in the order T3 sent them. They show under an active remark, a bot's and a finished one, closed or open, in Comments, and under a remark in an open run on the Timeline. The reader's own are in the primary color and the rest grey. A pill that doesn't fit goes whole to the next row, and a remark with none has no row. A verdict on the Timeline shows none. The heart is `❤` without U+FE0F.
 - **Older remarks and the order.** `+ Show 2 older comments (2 hidden)` brings in up to 10 older remarks where it was, and once every remark shows, `Show only 10 recent comments` after the remarks goes back to 10. The order switch turns `Newest first` into `Oldest first`, which runs the remarks oldest first with Show older before them.
 - **The folded groups.** After the remarks come `› 14 bot comments` and `› 2 resolved or dismissed comments`, each with `2 authors · 3 files · Latest 15m ago` under it. Opening one turns `›` into `⌄`. The bots' group shows its 10 newest remarks with its own `+ Show 4 older bot comments (4 hidden)` and `Show only 10 recent bot comments`. The other shows each remark's author, `› Resolved` or `› Review dismissed`, its place and one row of its text ending in `…`, and each of those opens to its whole text, with `⌄` in place of `›`.
 - **Choosing a control.** ↓ chooses the next button, group or finished remark with a row in view and ↑ the one before. Where none is in view they scroll, as before. The chosen one is lit across the pane, and the status line leads with what Enter does: `Enter show 2 older`, `Enter show only 10 recent`, `Enter oldest first`, `Enter newest first`, `Enter show bot comments`, `Enter hide bot comments`, `Enter show resolved`, `Enter hide resolved`, `Enter show comment` or `Enter hide comment`. Enter or a click acts and the details keep their scroll. When a button goes, as Show older does, its partner is chosen. None of them asks T3 for anything, and opening the details again starts them over.
@@ -21,7 +22,7 @@ Open a thread, open its details (Alt+B), press → or click `Pull requests`, cho
 
 ## Driving it with t3v
 
-Scenario `links` at 200x60, so the pane shows the start of the comments under the summary. `pullRequests.detail` answers 1.5 s late with the same invented summary for every link but two: #42 fails as a host without a GitHub credential and #62 as one the host can't find. `pullRequests.activity` answers 3 s late: #41 has 28 remarks, 12 of them active, 14 a bot's and 2 resolved or dismissed, #43's read fails as a host that timed out, #51 has none and every other link has one. In `thr-mixed`'s list #62 is first, #41 third, #42 fourth, #43 fifth, the merged #60 tenth and the closed #61 last. #41's and #60's conversations have commits for the Timeline. `t3v refresh` raises the refresh number T3 sends, and each of the first three adds a remark after #60's merge. `pullRequests.invalidate` raises it too, and the event log keeps the link it names as `pr.invalidate`.
+Scenario `links` at 200x60, so the pane shows the start of the comments under the summary. In #41's conversation `octo-ops`'s remark has `👀 4  👍 1  😕 1  😄 12` with the reader's `👍`, fixture-reviewer's approval `🎉 3  ❤ 2`, `fixture-dev`'s rebase note `👍 2  🚀 1`, mona's resolved remark `👀 2` and review-bot's `No new findings.` `👎 2`. `pullRequests.detail` answers 1.5 s late with the same invented summary for every link but two: #42 fails as a host without a GitHub credential and #62 as one the host can't find. `pullRequests.activity` answers 3 s late: #41 has 28 remarks, 12 of them active, 14 a bot's and 2 resolved or dismissed, #43's read fails as a host that timed out, #51 has none and every other link has one. In `thr-mixed`'s list #62 is first, #41 third, #42 fourth, #43 fifth, the merged #60 tenth and the closed #61 last. #41's and #60's conversations have commits for the Timeline. `t3v refresh` raises the refresh number T3 sends, and each of the first three adds a remark after #60's merge. `pullRequests.invalidate` raises it too, and the event log keeps the link it names as `pr.invalidate`.
 
 ```bash
 $T3V start --rows 60
@@ -36,10 +37,16 @@ $T3V wait --text "Read from github.com" --text "This branch is out-of-date with"
 $T3V capture summary
 $T3V wait --text "fixture-reviewer        Approved" --text "Changes requested earlier" --text "config, needs-review"
 $T3V wait --text "✓ macOS" --text "Awaiting approval" --text "– Windows" --text "Splits the config reader so each" --gone "Reading from"
-$T3V wait --text "Comments (28)       Newest first" --text "octo-ops                  5m ago" --text "The deploy preview waits for" --text "Approved                 20m ago" --gone "Reading the conversation…"
+$T3V wait --text "Comments (28)       Newest first" --text "octo-ops                  5m ago" --text "👀 4  👍 1  😕 1  😄 12" --text "The deploy preview waits for" --gone "Reading the conversation…"
 $T3V capture comments
 $T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 1 and .rpcRequestsByTag["pullRequests.activity"] == 1'
 jq -se '[.[] | select(.event == "pr.detail")][0] | .projectId == "proj-links" and .host == "github.com" and .repository == "fixture-org/linked-desk" and .number == 41' "$($T3V status --json | jq -r .evidence)/events.jsonl"
+
+# A remark's reactions show on a row under its header, in the order T3 sent them, the reader's own in the primary color and the rest grey. The heart has no variation selector.
+grep -aq $'\e\\[38;2;52;107;241m👍 1' "$($T3V status --json | jq -r .evidence)/comments.ans" && grep -aq $'\e\\[38;2;129;129;129m👀 4' "$($T3V status --json | jq -r .evidence)/comments.ans"
+$T3V keys PageDown && $T3V wait --text "Approved                 20m ago" --text "🎉 3  ❤ 2" --text "Looks good. Thanks for" --text "👍 2  🚀 1" --text "Rebased on main." --idle 300
+$T3V capture reactions
+! grep -aq $'\xef\xb8\x8f' "$($T3V status --json | jq -r .evidence)/reactions.txt"
 
 # Under the remarks, Show older and two folded groups. ↑ chooses one and the status line says what Enter does.
 $T3V keys End && $T3V wait --text "mona  Changes requested   3h ago" --text "+ Show 2 older comments (2" --text "› 14 bot comments" --text "2 authors · 3 files · Latest 15m" --text "› 2 resolved or dismissed" --idle 300
@@ -50,14 +57,14 @@ $T3V keys Up && $T3V wait --text "Enter show 2 older"
 
 # Enter opens the finished group, a row of text for each remark, and Enter on a remark opens it.
 $T3V keys Down Down && $T3V wait --text "Enter show resolved"
-$T3V keys Enter && $T3V wait --text "⌄ 2 resolved or dismissed" --text "lee  › Review dismissed   2h ago" --text "mona  › Resolved          2h ago" --text "This parses the file a second t…" --text "Enter hide resolved"
+$T3V keys Enter && $T3V wait --text "⌄ 2 resolved or dismissed" --text "lee  › Review dismissed   2h ago" --text "mona  › Resolved          2h ago" --text "👀 2" --text "This parses the file a second t…" --text "Enter hide resolved"
 $T3V capture finished
 $T3V keys Down Down && $T3V wait --text "Enter show comment" --idle 300
-$T3V keys Enter && $T3V wait --text "mona  ⌄ Resolved" --text "▎ [!NOTE]" --text "second time. See the reader" --text "Enter hide comment" --gone "second t…"
+$T3V keys Enter && $T3V wait --text "mona  ⌄ Resolved" --text "👀 2" --text "▎ [!NOTE]" --text "second time. See the reader" --text "Enter hide comment" --gone "second t…"
 $T3V capture finished-remark
 
 # A click opens the bots' group. Its own Show older brings in the rest, and its partner takes the choice.
-$T3V click --text "› 14 bot comments" && $T3V wait --text "⌄ 14 bot comments" --text "review-bot  Commented    15m ago" --text "No new findings." --text "Enter hide bot comments"
+$T3V click --text "› 14 bot comments" && $T3V wait --text "⌄ 14 bot comments" --text "review-bot  Commented    15m ago" --text "👎 2" --text "No new findings." --text "Enter hide bot comments"
 $T3V capture bots
 $T3V keys PageDown && $T3V wait --text "+ Show 4 older bot comments (4" --idle 300
 $T3V keys Down && $T3V wait --text "Enter show 4 older"
@@ -77,7 +84,7 @@ $T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 2 and .r
 $T3V keys Home && $T3V wait --text "Read from github.com" --text "→ timeline" --idle 300
 $T3V keys Right && $T3V wait --text "28 comments · 2 commits" --text "1 approval" --text "Newest first" --text "← summary" --gone "Read from github.com"
 $T3V wait --text "› 2 comments" --text "2 authors · 5m ago" --text "✓ fixture-reviewer approved" --text "○ Reuse the parsed confi… +30 -2" --text "9dc565a · fixture-dev · 1h ago"
-$T3V wait --text "› 11 comments" --text "– lee" --text "review dismissed, before the" --text "✗ mona" --text "○ Split the config reader +90 -6" --text "Pull request opened" --idle 300
+$T3V wait --text "› 11 comments" --text "– lee" --text "review dismissed, before the" --text "✗ mona" --text "○ Split the config reader +90 -6" --text "Pull request opened" --gone "🎉 3" --idle 300
 $T3V capture timeline
 
 # ↓ chooses the switch, then each run. Enter opens a run.
@@ -87,8 +94,13 @@ $T3V keys Down && $T3V wait --idle 300
 $T3V keys Enter && $T3V wait --text "⌄ 3 comments" --text "fixture-reviewer commented" --text "Can this reuse parse_once?" --text "Enter hide comments"
 $T3V capture timeline-run
 
-# The switch turns the Timeline oldest first. Each tab keeps its scroll and the Timeline its order.
+# The first run's remarks show their reactions once it opens.
 $T3V keys Up && $T3V wait --text "Enter show comments"
+$T3V keys Enter && $T3V wait --text "⌄ 2 comments" --text "👀 4  👍 1  😕 1  😄 12" --text "👎 2" --text "Enter hide comments"
+$T3V capture timeline-reactions
+$T3V keys Enter && $T3V wait --text "› 2 comments" --text "Enter show comments" --gone "👀 4"
+
+# The switch turns the Timeline oldest first. Each tab keeps its scroll and the Timeline its order.
 $T3V keys Up && $T3V wait --text "Enter oldest first"
 $T3V keys Enter && $T3V wait --text "Oldest first" --text "Enter newest first" --text "› 5 comments" --text "1 author · 1d ago" --gone "Newest first"
 $T3V capture timeline-oldest
@@ -242,4 +254,6 @@ $T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.invalidate"] == 2 an
 - An answer clears the chosen control, so after a refresh the status line drops `Enter hide comments` while the run stays open.
 - The status line offers `r refresh` from 100 columns. At 80x24 it ends before there, though `r` still reads.
 - `r` raises the refresh number as `t3v refresh` does, so with fewer than three refreshes before it, #60's conversation gains a remark.
+- The recipe checks the reader's pill in `comments.ans` as truecolor `38;2;52;107;241`, the theme's primary #346bf1, and the others as `38;2;129;129;129`, its muted #818181. A terminal with fewer colors draws others.
+- No pill row wraps in the 32-column pane or the 80x24 dialog, since the widest takes 23 columns. The unit test `a_remarks_reactions_show_under_its_header_wherever_it_shows` covers wrapping at 9 and 8 columns.
 - At 200x50 the comments start below the pane's last row, so `Reading the conversation…` shows only after a scroll. The recipe runs at 200x60 to see it without one.
