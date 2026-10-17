@@ -16790,9 +16790,17 @@ mod tests {
             }));
             app.on_action_result(ActionResult::PullRequestDiff { ticket, answer });
             cells(&mut app, 200, 50);
-            press(&mut app, KeyCode::Down);
+            // Down past the toolbar's rows to the file's own.
+            for _ in 0..4 {
+                press(&mut app, KeyCode::Down);
+                let shown = text_in(&cells(&mut app, 200, 50), Rect::new(0, 0, 200, 50));
+                if shown.contains("Enter expand file") {
+                    break;
+                }
+            }
             press(&mut app, KeyCode::Enter);
             let shown = text_in(&cells(&mut app, 200, 50), Rect::new(0, 0, 200, 50));
+            assert!(shown.contains("Enter collapse file"), "{shown}");
             assert!(shown.contains("old") && shown.contains("new"), "{shown}");
             app
         };
