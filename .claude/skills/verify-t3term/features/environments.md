@@ -103,7 +103,7 @@ $T3V keys Escape && $T3V wait --gone "Connected to"
 - Saving `ready` as the default sends every later CLI line without `--environment` to it. It is the run's own server, so commands work as before.
 - `t3v expect` names the label of the last descriptor read, a CLI line's included. After the huge label's steps it names the huge label, while the TUI still shows `Fixture Mac` until a restart.
 - `t3v status --json` counts the TUI's descriptor reads with the CLI's. The TUI reads one as it starts and no more while idle, so compare counts from after the start.
-- The recipe ends with an `environments.json` that doesn't parse. Write the file again before you drive more `environment` commands in the same run.
+- The recipe ends with no `environments.json`, because it removes the file that doesn't parse. Run the three `environment add` lines again before you drive more `environment` commands in the same run.
 - The dialog's check against 127.0.0.1 ends within milliseconds, so `checking…` is rarely on screen long enough for a wait. Wait for the facts instead, or compare `descriptorReads`.
 - The dialog covers the environment row it opens from, and its own rows hold the same label and address. Click the environment only while the dialog is closed.
 - `environment status` without a name exits 0 even when every environment is offline. Read the phases, not the exit code.
