@@ -17,6 +17,7 @@ Read the file for a feature before you drive it, and fix the file when a drive s
 | Linked pull requests: the details' Pull requests tab | [linked-pull-requests.md](linked-pull-requests.md) | `links` |
 | Lineage: related threads, forks and agents in the details | [lineage.md](lineage.md) | `lineage` |
 | CLI: commands, `--json` and exit codes against a fake server | [cli.md](cli.md) | `links` |
+| Appearance: Alt+Shift+A, System, Light and Dark, and the light colors | [appearance.md](appearance.md) | `links` |
 
 ## Not mapped yet
 
