@@ -4,7 +4,9 @@
 import os
 import sys
 
-# First on the path by hand, so `python3 -I t3v` finds the package beside this file.
+# First on the path by hand, so `python3 -I t3v` finds the package beside this file. No .pyc
+# files, so running t3v leaves the repository as it was.
+sys.dont_write_bytecode = True
 sys.path.insert(0, os.path.dirname(os.path.realpath(__file__)))
 
 from t3v_lib.cli import main  # noqa: E402

@@ -167,8 +167,8 @@ def stop_run(root: Path, state: dict) -> list:
             notes.append(f't3term: exited with status {info[1]}')
             mark(state, 'fixture.t3term_exit', status=info[1])
         notes.append(terminate(state.get('t3termPid'), [state['binary']['path']], 't3term'))
-        tmux(state, 'kill-server')
-        notes.append("tmux: the run's own server stopped")
+        killed = tmux(state, 'kill-server').returncode == 0
+        notes.append("tmux: the run's own server stopped" if killed else "tmux: no server on the run's socket")
         # pipe-sink ends once tmux closes its pipe; wait for it so raw.ansi is whole.
         deadline = time.monotonic() + 3
         while sinks_of(root) and time.monotonic() < deadline:
