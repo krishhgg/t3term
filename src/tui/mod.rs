@@ -35,8 +35,9 @@ use std::time::{Duration, Instant};
 
 use anyhow::Result;
 use crossterm::event::{
-    DisableBracketedPaste, DisableMouseCapture, EnableBracketedPaste, EnableMouseCapture, Event,
-    EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
+    DisableBracketedPaste, DisableFocusChange, DisableMouseCapture, EnableBracketedPaste,
+    EnableFocusChange, EnableMouseCapture, Event, EventStream, KeyCode, KeyEvent, KeyEventKind,
+    KeyModifiers, MouseButton, MouseEventKind,
 };
 use futures_util::StreamExt;
 use ratatui::backend::CrosstermBackend;
@@ -593,7 +594,13 @@ struct App {
 
 pub async fn run(client: Arc<Client>) -> Result<()> {
     let mut screen = Screen(Some(init()));
-    crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
+    // Focus reports say when the terminal gains focus, which reads the open details again.
+    crossterm::execute!(
+        std::io::stdout(),
+        EnableMouseCapture,
+        EnableBracketedPaste,
+        EnableFocusChange
+    )?;
     let Some(terminal) = screen.0.as_mut() else {
         return Ok(());
     };
@@ -631,7 +638,8 @@ impl Drop for Screen {
         let _ = crossterm::execute!(
             std::io::stdout(),
             DisableMouseCapture,
-            DisableBracketedPaste
+            DisableBracketedPaste,
+            DisableFocusChange
         );
         // Once the terminal has closed, ratatui's own Drop for Terminal and `ratatui::restore`
         // print their errors with `eprintln!`, which panics. A panic here aborts the process
@@ -1795,17 +1803,23 @@ impl App {
     fn on_terminal_event(&mut self, event: Event) -> bool {
         let now = now_ms().max(self.now);
         let input = matches!(event, Event::Key(_) | Event::Mouse(_) | Event::Paste(_));
-        let returned = input && now - self.input_at >= pull_requests::IDLE;
+        let idle = now - self.input_at >= pull_requests::IDLE;
+        // You arrive at the open details with your first input after an idle spell, or when
+        // the terminal gains focus while you use t3term, as the desktop's window does. Focus
+        // after an idle spell waits for that input, as the desktop's does.
+        let arrived = match event {
+            Event::FocusGained => !idle,
+            _ => input && idle,
+        };
         if input {
             self.input_at = now;
         }
         let changed = self.on_input(event);
         // A read asked for changes what the details show, though the input itself may not,
-        // as a mouse move doesn't.
+        // as a mouse move or focus doesn't.
         let mut asked = self.read_opened_pull();
-        // Coming back after an idle spell reads what the details then show, once this input
-        // has done what it does.
-        if returned && self.pulls_project().is_some() && self.details.pulls.returned(now) {
+        // The read follows what the input showed.
+        if arrived && self.pulls_project().is_some() && self.details.pulls.arrive(now) {
             asked |= self.read_opened_pull();
         }
         changed || asked
@@ -14387,6 +14401,51 @@ mod tests {
         app.config = Some(json!({"environment": {"capabilities": capabilities}}));
         assert!(app.details.pulls.live_at().is_some());
         assert_eq!(app.live_at(), None);
+    }
+
+    #[test]
+    fn the_terminal_gaining_focus_reads_the_open_details_again_while_you_use_t3term() {
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        let asked = note_reads(&mut app);
+        let reads = |asked: &std::cell::RefCell<Vec<Noted>>| {
+            let asked = asked.borrow();
+            asked
+                .iter()
+                .map(|ask| (ask.4, ask.6.clone()))
+                .collect::<Vec<_>>()
+        };
+        let shown = Some("2026-10-13T11:00:00Z".to_string());
+        press(&mut app, KeyCode::Enter);
+        let came = now_ms().max(app.now);
+        app.now = came;
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        let activity = Part::Activity(Ok(Box::new(host_activity())));
+        hear(&mut app, 1, vec![detail, activity, Part::Done]);
+
+        // Within ten seconds of the detail, focus reads nothing, and losing it never does.
+        app.now = came + 9_000;
+        assert!(!app.on_terminal_event(Event::FocusGained));
+        app.now = came + 20_000;
+        assert!(!app.on_terminal_event(Event::FocusLost));
+        assert_eq!(reads(&asked).len(), 1);
+
+        // Later, focus reads the detail again, and draws that it does.
+        assert!(app.on_terminal_event(Event::FocusGained));
+        assert_eq!(reads(&asked), [(1, None), (2, shown)]);
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Refreshing from github.com…"), "{text}");
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        hear(&mut app, 2, vec![detail, Part::Done]);
+
+        // Focus after six minutes without input waits for the next input, as it isn't input.
+        app.now = came + 40_000;
+        let input = app.now - pull_requests::IDLE;
+        app.input_at = input;
+        assert!(!app.on_terminal_event(Event::FocusGained));
+        assert_eq!(app.input_at, input);
+        assert_eq!(reads(&asked).len(), 2);
+        assert!(mouse(&mut app, MouseEventKind::Moved, 1, 1));
+        assert_eq!(reads(&asked).len(), 3);
     }
 
     #[test]
