@@ -65,7 +65,8 @@
 //! Unwrapped, both sides' text scrolls sideways by the same columns.
 //!
 //! The lines wrap at first, as the desktop's `wordWrap` setting is true until changed
-//! (packages/contracts/src/settings.ts:506). A row under the layout row lets them run on past
+//! (packages/contracts/src/settings.ts:506), each where a browser would break it, as `wrapped`
+//! says. A row under the layout row lets them run on past
 //! the end of their rows, or wraps them again, as the desktop's toolbar toggle does
 //! (PullRequestCodeTab.tsx:1279-1298). Each line then takes one row, and the panel scrolls the
 //! text of those rows sideways while their numbers stay, as `Sideways` says, as the desktop's
@@ -90,6 +91,7 @@ use std::ops::Range;
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
+use textwrap::WordSeparator;
 use unicode_width::{UnicodeWidthChar, UnicodeWidthStr};
 
 use super::super::setup::bounded;
@@ -2487,7 +2489,7 @@ fn line_rows(
     let lead = lead(gutter, width);
     let room = width.saturating_sub(lead).max(1);
     let pieces = match wrap {
-        true => broken(&shown, room),
+        true => wrapped(&shown, room),
         false => vec![shown],
     };
     let mut rows = Vec::new();
@@ -2536,6 +2538,54 @@ fn shown(text: &str) -> String {
         }
     }
     out
+}
+
+/// `text` in rows of at most `width` columns, as the desktop wraps a line of the diff with
+/// `white-space: pre-wrap` and `word-break: break-word` (@pierre/diffs 1.5.2, dist/style.js). A
+/// row ends only where the Unicode line breaking rules allow, as textwrap finds those places
+/// with ICU's rules, such as after a run of spaces or between two CJK characters. Every space
+/// stays, and those that end a row take no room, as a browser lets them hang past the edge, so
+/// the row is cut where it shows. A word wider than a row starts one and breaks between any two
+/// characters, as `broken` breaks it. An empty text takes one row.
+fn wrapped(text: &str, width: usize) -> Vec<String> {
+    if columns(text) <= width {
+        return vec![text.to_string()];
+    }
+    let mut rows = vec![String::new()];
+    let mut used = 0;
+    for word in WordSeparator::UnicodeBreakProperties.find_words(text) {
+        let taken = columns(word.word);
+        if used > 0 && used + taken > width {
+            rows.push(String::new());
+            used = 0;
+        }
+        if taken > width {
+            // The row is empty, as nothing can come before a word wider than it.
+            rows.pop();
+            rows.extend(broken(word.word, width));
+            used = columns(rows.last().map(String::as_str).unwrap_or_default());
+        } else {
+            rows.last_mut().expect("a row").push_str(word.word);
+            used += taken;
+        }
+        // The spaces past the row's end hang unseen, so it keeps only those that fit, though
+        // each takes its column.
+        let fit = width.saturating_sub(used).min(word.whitespace.len());
+        rows.last_mut()
+            .expect("a row")
+            .push_str(&word.whitespace[..fit]);
+        used += word.whitespace.len();
+    }
+    rows
+}
+
+/// The columns `text` takes, each piece `clusters` finds measured whole. Text that is all
+/// ASCII has no control characters here, so each of its characters takes one.
+fn columns(text: &str) -> usize {
+    match text.is_ascii() {
+        true => text.len(),
+        false => clusters(text).iter().map(|piece| piece.width()).sum(),
+    }
 }
 
 /// `text` broken into rows of at most `width` columns, between any two characters, so its
