@@ -831,8 +831,9 @@ def links_summary(record: dict) -> str:
 
 # thr-legacy's last reply, for features/transcript.md. Each block shows one rule of how a fence
 # opens and closes: a four-backtick fence that holds a three-backtick one, a tilde fence, a
-# backtick run with text after it inside a fence, and backticks that are inline code. Every line
-# is invented.
+# backtick run with text after it inside a fence, backticks that are inline code, and a run
+# followed by U+00A0 inside a fence. The U+00A0 is written as an escape, so it shows here. Every
+# line is invented.
 FENCE_REPLY = '''Fence check: a longer fence holds a shorter one.
 
 ````markdown
@@ -857,6 +858,15 @@ let once = true;
 ```
 
 ```x`y``` is inline code, not a fence.
+
+A run with U+00A0 after it stays code:
+
+````rust
+before_nbsp
+````\u00a0
+AFTER_NBSP_MUST_STAY_CODE
+- still in the panel
+````
 
 End of the fence check.'''
 

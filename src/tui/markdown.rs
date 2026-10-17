@@ -348,8 +348,13 @@ pub fn render(text: &str, width: usize, styles: &Styles, margin: usize) -> Vec<L
             None => {
                 if let Some((open, info)) = Fence::opening(raw) {
                     fence = Some(open);
-                    // The fence's language names the panel, like the GUI's code block header.
-                    let language = info.split_whitespace().next().unwrap_or_default();
+                    // The fence's language names the panel, like the GUI's code block header:
+                    // the info string's first word, after the spaces or tabs CommonMark trims.
+                    let language = info
+                        .trim_start_matches(FENCE_SPACE)
+                        .split(char::is_whitespace)
+                        .next()
+                        .unwrap_or_default();
                     lines.push(Line::from(vec![
                         Span::styled(pad.clone(), base),
                         Span::styled(
@@ -444,6 +449,10 @@ pub fn render(text: &str, width: usize, styles: &Styles, margin: usize) -> Vec<L
     lines
 }
 
+/// The whitespace CommonMark allows before and after a fence's marks. Any other, such as U+00A0,
+/// is text, so a line that has it there opens or closes no fence.
+const FENCE_SPACE: [char; 2] = [' ', '\t'];
+
 /// A code fence: a run of three or more backticks or tildes, as CommonMark reads one.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 struct Fence {
@@ -460,15 +469,18 @@ impl Fence {
     }
 
     /// Whether `line` closes this fence: the same mark, at least as long, with nothing after
-    /// it. So a fence of four backticks can show an example of three.
+    /// it but spaces or tabs. So a fence of four backticks can show an example of three.
     fn closes(self, line: &str) -> bool {
         Fence::start(line).is_some_and(|(fence, rest)| {
-            fence.mark == self.mark && fence.length >= self.length && rest.trim().is_empty()
+            fence.mark == self.mark
+                && fence.length >= self.length
+                && rest.trim_start_matches(FENCE_SPACE).is_empty()
         })
     }
 
+    /// The fence that starts `line` after any spaces or tabs, and the rest of the line.
     fn start(line: &str) -> Option<(Fence, &str)> {
-        let line = line.trim_start();
+        let line = line.trim_start_matches(FENCE_SPACE);
         let mark = line
             .chars()
             .next()
@@ -639,6 +651,69 @@ mod tests {
                 .all(|span| !panels.contains(&span.style)),
             "{:?}",
             plain(&inline)
+        );
+    }
+
+    #[test]
+    fn a_fence_takes_only_spaces_and_tabs_around_its_marks() {
+        let styles = styles();
+        // Each row's text without its padding, and whether it is a panel's label, code or prose.
+        let rows = |text: &str| -> Vec<(String, &str)> {
+            render(text, 40, &styles, 0)
+                .iter()
+                .map(|line| {
+                    let row: String = line
+                        .spans
+                        .iter()
+                        .map(|span| span.content.as_ref())
+                        .collect();
+                    let kind = match line.spans.last().map(|span| span.style) {
+                        Some(style) if style == styles.code_label => "label",
+                        Some(style) if style == styles.code_block => "code",
+                        _ => "prose",
+                    };
+                    (row.trim_end_matches(' ').to_string(), kind)
+                })
+                .collect()
+        };
+        let row = |text: &str, kind| (text.to_string(), kind);
+
+        // U+00A0 after a closing fence's marks is text, so the line is a row of code.
+        assert_eq!(
+            rows("````rust\nbefore_nbsp\n````\u{a0}\nAFTER_NBSP_MUST_STAY_CODE"),
+            [
+                row(" rust", "label"),
+                row(" before_nbsp", "code"),
+                row(" ````\u{a0}", "code"),
+                row(" AFTER_NBSP_MUST_STAY_CODE", "code"),
+            ]
+        );
+        // So is U+00A0 before them. Spaces and tabs before and after close the fence.
+        assert_eq!(
+            rows("```\nx\n\u{a0}```\n  ```\t \nafter"),
+            [
+                row("", "label"),
+                row(" x", "code"),
+                row(" \u{a0}```", "code"),
+                row("after", "prose"),
+            ]
+        );
+        // U+00A0 before an opening fence's marks opens no panel. A tab before them opens one, as
+        // four spaces do.
+        let opening = rows("\u{a0}```\nprose\n\t```\ncode");
+        let kinds: Vec<&str> = opening.iter().map(|(_, kind)| *kind).collect();
+        assert_eq!(kinds, ["prose", "prose", "label", "code"], "{opening:?}");
+        assert_eq!(opening[3].0, " code");
+        // The info string drops only the spaces and tabs before it. Its first word, the label,
+        // ends at any whitespace, as the desktop's language does.
+        assert_eq!(
+            rows("```\u{a0}rust\nx\n```\n```\trust\u{a0}ignore\ny"),
+            [
+                row("", "label"),
+                row(" x", "code"),
+                row(" rust", "label"),
+                row(" y", "code"),
+            ]
         );
     }
 

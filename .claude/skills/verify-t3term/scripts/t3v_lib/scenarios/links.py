@@ -44,7 +44,8 @@ The threads, in the shell's order. Each is in proj-links, with no worktree and t
 
 thr-legacy's last reply, after its second turn's, is Markdown with code fences for
 features/transcript.md: a four-backtick fence that holds a three-backtick one, a tilde fence, a
-backtick run with text after it inside a fence, and backticks that are inline code.
+backtick run with text after it inside a fence, backticks that are inline code, and a run followed
+by U+00A0 inside a fence.
 
 The presets `t3v links THREAD PRESET` sets:
 
