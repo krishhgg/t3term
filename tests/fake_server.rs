@@ -1600,7 +1600,7 @@ async fn a_history_over_the_byte_budget_stops_the_attach_and_the_socket_goes_on(
 
     match terminal_end(&mut stream).await {
         Some(RpcError::Stopped(reason)) => {
-            assert_eq!(reason, "a chunk was over the 4096-byte limit by itself");
+            assert_eq!(reason, "a chunk was over the limit of 4 KiB by itself");
         }
         other => panic!("expected a stop, got {other:?}"),
     }
@@ -1664,7 +1664,7 @@ async fn a_history_over_16_mib_as_json_arrives_whole_and_a_smaller_budget_stops_
     assert_eq!(within(recv(&mut socket)).await, interrupt(&small_id));
     match terminal_end(&mut small).await {
         Some(RpcError::Stopped(reason)) => {
-            assert_eq!(reason, "a chunk was over the 16777216-byte limit by itself");
+            assert_eq!(reason, "a chunk was over the limit of 16 MiB by itself");
         }
         other => panic!("expected a stop, got {other:?}"),
     }
