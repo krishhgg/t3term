@@ -8,16 +8,18 @@
 - **Older remarks and the order.** `+ Show 2 older comments (2 hidden)` brings in up to 10 older remarks where it was, and once every remark shows, `Show only 10 recent comments` after the remarks goes back to 10. The order switch turns `Newest first` into `Oldest first`, which runs the remarks oldest first with Show older before them.
 - **The folded groups.** After the remarks come `› 14 bot comments` and `› 2 resolved or dismissed comments`, each with `2 authors · 3 files · Latest 15m ago` under it. Opening one turns `›` into `⌄`. The bots' group shows its 10 newest remarks with its own `+ Show 4 older bot comments (4 hidden)` and `Show only 10 recent bot comments`. The other shows each remark's author, `› Resolved` or `› Review dismissed`, its place and one row of its text ending in `…`, and each of those opens to its whole text, with `⌄` in place of `›`.
 - **Choosing a control.** ↓ chooses the next button, group or finished remark with a row in view and ↑ the one before. Where none is in view they scroll, as before. The chosen one is lit across the pane, and the status line leads with what Enter does: `Enter show 2 older`, `Enter show only 10 recent`, `Enter oldest first`, `Enter newest first`, `Enter show bot comments`, `Enter hide bot comments`, `Enter show resolved`, `Enter hide resolved`, `Enter show comment` or `Enter hide comment`. Enter or a click acts and the details keep their scroll. When a button goes, as Show older does, its partner is chosen. None of them asks T3 for anything, and opening the details again starts them over.
+- **Summary and Timeline.** Once T3 answers with the pull request, the row above the details reads `← List  Summary  Timeline` with the open tab lit, and in the 32-column pane it drops `3 of 11` to fit. The details open on the Summary, which the bullets above describe. → or `l` shows the Timeline, ← or `h` goes back to the Summary and then to the list, and a click on a tab's name shows it. The status line reads `→ timeline` on the Summary and `← summary` on the Timeline. Each tab keeps its own scroll, and the Timeline keeps its order, while the details stay open. A read of the pull request that failed shows no tabs.
+- **The Timeline.** Under the link's status rows a header counts the comments, the commits and the approvals that still stand, `28 comments · 2 commits · 1 approval`, with the order switch at the end of its row, or on a row of its own when they don't fit. The opening, the commits, the verdicts, the runs of other comments and the merge or close follow in one list, newest first until the switch turns it to `Oldest first`. A commit shows `○`, its headline (`Untitled commit` without one, cut with `…` to leave room for the size), its size such as `+34 -6`, then its short id, its first author and when. A verdict shows `✓ fixture-reviewer approved`, `✗ mona` with `changes requested` or `– lee` with `review dismissed`, then when and its text, and one given before the newest commit adds `, before the latest commits`. A run of other comments is one closed row, `› 11 comments` with `2 authors · 1h ago` under it, whose age is its first remark's in the order shown. Open, `⌄ 3 comments` lists each remark's author with `commented` or the review's state, when, its place and its text. `● fixture-dev` with `Pull request opened` starts the pull request, and `● Pull request merged` or `● Pull request closed` ends it. ↓ and ↑ choose the switch and the runs as they do on the Summary, with `Enter oldest first`, `Enter newest first`, `Enter show comments` or `Enter hide comments` on the status line. A conversation that failed shows `Could not load pull request activity` here too. The Timeline asks T3 for nothing more. It shows the same detail and activity answers as the Summary.
 - **A failed read.** The reason shows in place of the summary and the comments: the desktop's sentence for a host T3 can't read, such as `No GitHub credential on the server.` with how to give it one, T3's words for one the host can't find, such as `Pull request #62 was not found.`, or `Couldn't read this pull request:` and the error.
 - **What it asks T3.** One `pullRequests.detail` and one `pullRequests.activity` per open, sent together, each with the thread's project and the link's host, repository and number. Each answer shows as it comes. t3term keeps the answers for the link whose details opened last and reuses them for 60 seconds from when the pull request came, so opening the same link again in that minute asks nothing, and opening another link drops them. A read where either answer failed is asked again on the next open. One read is under way at a time, until both its answers came: a link opened during it reads `Reading from…` and is asked for once that read is over, and leaving its details first drops it. Nothing is read on an environment without `pullRequests: true` in its capabilities, and nothing reads an answer again while the details show it.
 
 ## How to get to it (user POV)
 
-Open a thread, open its details (Alt+B), press → or click `Pull requests`, choose a link with ↑ and ↓ and press Enter, or click it twice. The details read from the host as they open. ↑, ↓, PgUp, PgDn and the wheel scroll them, and ← goes back to the list. Once a button or group of the comments is in view, ↑ and ↓ choose it instead, and Enter or a click on it acts. At 80x24 the details are a dialog, and the checks, the description and the comments are a page down or more. End shows the folded groups at the end of the comments.
+Open a thread, open its details (Alt+B), press → or click `Pull requests`, choose a link with ↑ and ↓ and press Enter, or click it twice. The details read from the host as they open. ↑, ↓, PgUp, PgDn and the wheel scroll them, and ← goes back to the list. Once a button or group of the comments is in view, ↑ and ↓ choose it instead, and Enter or a click on it acts. Once the pull request came, → or `l` shows the Timeline, and ← or `h` goes back to the Summary. A click on `Summary` or `Timeline` shows that tab. At 80x24 the details are a dialog, and the checks, the description and the comments are a page down or more. End shows the folded groups at the end of the comments.
 
 ## Driving it with t3v
 
-Scenario `links` at 200x60, so the pane shows the start of the comments under the summary. `pullRequests.detail` answers 1.5 s late with the same invented summary for every link but two: #42 fails as a host without a GitHub credential and #62 as one the host can't find. `pullRequests.activity` answers 3 s late: #41 has 28 remarks, 12 of them active, 14 a bot's and 2 resolved or dismissed, #43's read fails as a host that timed out, #51 has none and every other link has one. In `thr-mixed`'s list #62 is first, #41 third, #42 fourth and #43 fifth.
+Scenario `links` at 200x60, so the pane shows the start of the comments under the summary. `pullRequests.detail` answers 1.5 s late with the same invented summary for every link but two: #42 fails as a host without a GitHub credential and #62 as one the host can't find. `pullRequests.activity` answers 3 s late: #41 has 28 remarks, 12 of them active, 14 a bot's and 2 resolved or dismissed, #43's read fails as a host that timed out, #51 has none and every other link has one. In `thr-mixed`'s list #62 is first, #41 third, #42 fourth, #43 fifth, the merged #60 tenth and the closed #61 last. #41's and #60's conversations have commits for the Timeline.
 
 ```bash
 $T3V start --rows 60
@@ -28,7 +30,7 @@ $T3V keys Tab Tab Right && $T3V wait --text "#62" --text "9 open · 11 linked"
 # #41: the details read from the host, show its summary, then its conversation.
 $T3V keys Down Down Enter && $T3V wait --text "3 of 11" --text "Reading from github.com…"
 $T3V capture reading
-$T3V wait --text "Read from github.com" --text "This branch is out-of-date with" --text "Reading the conversation…"
+$T3V wait --text "Read from github.com" --text "This branch is out-of-date with" --text "Reading the conversation…" --text "← List  Summary  Timeline" --gone "3 of 11"
 $T3V capture summary
 $T3V wait --text "fixture-reviewer        Approved" --text "Changes requested earlier" --text "config, needs-review"
 $T3V wait --text "✓ macOS" --text "Awaiting approval" --text "– Windows" --text "Splits the config reader so each" --gone "Reading from"
@@ -63,22 +65,52 @@ $T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 1 and .r
 
 # The same link again within the minute: its answers are reused, with no second read, and the groups start folded.
 $T3V keys Left && $T3V wait --gone "← List"
-$T3V keys Enter && $T3V wait --text "3 of 11" --text "Read from github.com" --text "Comments (28)" --gone "Reading"
+$T3V keys Enter && $T3V wait --text "← List  Summary  Timeline" --text "#41 Stack base" --text "Read from github.com" --text "Comments (28)" --gone "Reading"
 $T3V keys End && $T3V wait --text "+ Show 2 older comments (2" --text "› 14 bot comments" --text "› 2 resolved or dismissed" --gone "⌄ 14 bot comments" --idle 300
 $T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 1 and .rpcRequestsByTag["pullRequests.activity"] == 1'
 
-# #42: a host T3 can't read says why in place of the summary.
+# The Timeline: → shows it, newest first, with the commits, the verdicts and the runs of comments.
+$T3V keys Home && $T3V wait --text "Read from github.com" --text "→ timeline" --idle 300
+$T3V keys Right && $T3V wait --text "28 comments · 2 commits" --text "1 approval" --text "Newest first" --text "← summary" --gone "Read from github.com"
+$T3V wait --text "› 2 comments" --text "2 authors · 5m ago" --text "✓ fixture-reviewer approved" --text "○ Reuse the parsed confi… +30 -2" --text "9dc565a · fixture-dev · 1h ago"
+$T3V wait --text "› 11 comments" --text "– lee" --text "review dismissed, before the" --text "✗ mona" --text "○ Split the config reader +90 -6" --text "Pull request opened" --idle 300
+$T3V capture timeline
+
+# ↓ chooses the switch, then each run. Enter opens a run.
+$T3V keys Down && $T3V wait --text "Enter oldest first"
+$T3V keys Down && $T3V wait --text "Enter show comments"
+$T3V keys Down && $T3V wait --idle 300
+$T3V keys Enter && $T3V wait --text "⌄ 3 comments" --text "fixture-reviewer commented" --text "Can this reuse parse_once?" --text "Enter hide comments"
+$T3V capture timeline-run
+
+# The switch turns the Timeline oldest first. Each tab keeps its scroll and the Timeline its order.
+$T3V keys Up && $T3V wait --text "Enter show comments"
+$T3V keys Up && $T3V wait --text "Enter oldest first"
+$T3V keys Enter && $T3V wait --text "Oldest first" --text "Enter newest first" --text "› 5 comments" --text "1 author · 1d ago" --gone "Newest first"
+$T3V capture timeline-oldest
+$T3V keys End && $T3V wait --text "2 authors · 15m ago" --gone "Pull request opened" --idle 300
+$T3V keys Left && $T3V wait --text "→ timeline" --text "Read from github.com"
+$T3V click --text "Timeline" && $T3V wait --text "← summary" --text "2 authors · 15m ago" --gone "Pull request opened"
+$T3V keys h && $T3V wait --text "→ timeline" --text "Read from github.com"
+$T3V keys l && $T3V wait --text "← summary" --text "2 authors · 15m ago"
+$T3V click --text "Summary" && $T3V wait --text "→ timeline" --text "Read from github.com"
+$T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 1 and .rpcRequestsByTag["pullRequests.activity"] == 1'
+
+# #42: a host T3 can't read says why in place of the summary, with no tabs.
 $T3V keys Left && $T3V wait --gone "← List"
 $T3V keys Down Enter && $T3V wait --text "4 of 11" --text "Reading from github.com…"
-$T3V wait --text "No GitHub credential on the" --gone "Reading from" --gone "Comments"
+$T3V wait --text "No GitHub credential on the" --gone "Reading from" --gone "Comments" --gone "Timeline"
 $T3V capture failed
 $T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 2 and .rpcRequestsByTag["pullRequests.activity"] == 2'
 
-# #43: the summary shows and its conversation fails. Opening it again asks for both again.
+# #43: the summary shows and its conversation fails, on both tabs. Opening it again asks for both again.
 $T3V keys Left && $T3V wait --gone "← List"
-$T3V keys Down Enter && $T3V wait --text "5 of 11" --text "Read from github.com" --text "Reading the conversation…"
+$T3V keys Down Enter && $T3V wait --text "5 of 11" --text "Reading from github.com…"
+$T3V wait --text "Read from github.com" --text "Reading the conversation…" --text "← List  Summary  Timeline"
 $T3V wait --text "Could not load pull request" --text "GitHub took too long to answer." --gone "Reading the conversation…"
 $T3V capture conversation-failed
+$T3V keys Right && $T3V wait --text "← summary" --text "Could not load pull request" --text "GitHub took too long to answer." --gone "Read from github.com"
+$T3V keys Left && $T3V wait --text "→ timeline"
 $T3V keys Left && $T3V wait --gone "← List"
 $T3V keys Enter && $T3V wait --text "5 of 11" --text "Reading from github.com…"
 $T3V wait --text "Could not load pull request" --gone "Reading"
@@ -102,6 +134,22 @@ $T3V keys Enter && $T3V wait --text "Older note 1 on the plan." --text "Older no
 $T3V capture dialog-older-80x24
 $T3V keys Enter && $T3V wait --text "+ Show 2 older comments (2 hidden)" --text "Enter show 2 older" --gone "Older note 1 on the plan."
 $T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 5 and .rpcRequestsByTag["pullRequests.activity"] == 5'
+
+# #60 is merged: its Timeline starts with the merge, and its commits show their size, id and author.
+$T3V keys Left && $T3V wait --gone "← List"
+$T3V keys Down Down Down Down Down Down Down Enter && $T3V wait --text "10 of 11" --text "Reading from github.com…"
+$T3V wait --text "#60 Merged: footer counts" --text "Read from github.com" --text "10 of 11" --gone "Reading from"
+$T3V keys Right && $T3V wait --text "5 comments · 3 commits · 1 approval" --text "Newest first" --text "● Pull request merged" --text "✓ fixture-reviewer approved" --text "○ Group the footer digits" --text "+34 -6" --idle 300
+$T3V capture timeline-merged-80x24
+$T3V keys End && $T3V wait --text "○ Untitled commit" --text "changes requested, before the latest commits" --text "5b7c0d2 · renovate[bot] · 1d ago" --text "● fixture-dev Pull request opened" --idle 300
+$T3V capture timeline-merged-end-80x24
+
+# #61 is closed: its Timeline starts with the close.
+$T3V keys Left Left && $T3V wait --gone "← List"
+$T3V keys Down Enter && $T3V wait --text "11 of 11" --text "Reading from github.com…"
+$T3V wait --text "#61 Closed: an older approach" --text "Read from github.com" --gone "Reading from"
+$T3V keys Right && $T3V wait --text "● Pull request closed" --text "← summary" --idle 300
+$T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 7 and .rpcRequestsByTag["pullRequests.activity"] == 7'
 ```
 
 ## Gotchas
@@ -110,10 +158,16 @@ $T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 5 and .r
 - `Read from github.com just now` turns into `1m ago` a minute after the answer. Wait on `Read from github.com`.
 - The pane is 32 columns inside, so long rows wrap: the credential sentence breaks after `No GitHub credential on the`, and a check's name wraps under its mark. Wait on text that fits one row.
 - Opening another link drops the last answers, so going back to a link read a moment ago reads it again. Count the reads after each open.
-- The recipe opens #41 again about 27 s after its answers came. Steps added before that open can push it past the minute, and then #41 is read again.
+- The recipe opens #41 again 15 to 30 s after its answers came. Steps added before that open can push it past the minute, and then #41 is read again.
 - A read under way holds back the next link's until both its answers came. Keys sent faster than 3 s apart can leave a link waiting with `Reading from…` until the first read is over.
 - The conversation arriving adds rows above the reader's place, and the details don't keep it, so what shows moves down. Wait for `Comments (` before you scroll.
 - ↑ and ↓ scroll only while no button or group has a row in view. PgDn and the other scrolling keys work as before, and a chosen control they scroll out of view counts as none chosen, so the next ↓ chooses the first one in view. An answer from T3 clears the choice too. Wait on the status line's `Enter …` after each arrow.
 - Lee's and mona's finished remarks both read `Enter show comment`, so the status line can't tell them apart. Wait for `--idle` after the arrows, then for the remark's text after Enter.
 - The bots' `Show only 10 recent bot comments` lands below the pane's last row after Show older, so the recipe checks it through the status line.
+- At 32 columns the row above the details shows `3 of 11` only until the pull request comes, then the tabs take its place. Wait on `3 of 11` with `Reading from github.com…`, and on the link's title after that. The 80x24 dialog keeps both.
+- `Read from github.com` shows only on the Summary and `28 comments · 2 commits` only on the Timeline, and the status line's `→ timeline` or `← summary` says which tab is open. Each tab comes back at its own scroll, so wait on text near where you left it.
+- On the Timeline `› 2 comments` and `› 3 comments` both read `Enter show comments`, so the recipe waits for `--idle` after the third ↓.
+- A run's age is its first remark's in the order shown, so `› 2 comments` reads `5m ago` newest first and `15m ago` oldest first.
+- The fixture opened every pull request on 2026-10-12, so `Pull request opened` is followed by an age that grows each day. Don't wait on it.
+- Pressing → in the 1.5 s between the detail and the conversation shows `Reading the conversation…` on the Timeline. Wait for its header before you look for rows.
 - At 200x50 the comments start below the pane's last row, so `Reading the conversation…` shows only after a scroll. The recipe runs at 200x60 to see it without one.
