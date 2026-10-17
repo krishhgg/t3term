@@ -88,7 +88,7 @@ The TUI follows the desktop app closely, because muscle memory is worth more tha
 
 | Where | Keys |
 | --- | --- |
-| Anywhere | Tab / Shift+Tab move focus, Ctrl+B hide or show the sidebar, Alt+B open or close the thread's details, Alt+Shift+A [light, dark or the system's colors](#light-and-dark), PgUp/PgDn scroll, Ctrl+X interrupt, Ctrl+C quit |
+| Anywhere | Tab / Shift+Tab move focus, Ctrl+B hide or show the sidebar, Alt+B open or close the thread's details, Alt+Shift+A [light, dark or the system's colors](#light-and-dark), Ctrl+Alt+A [change the theme](#light-and-dark), PgUp/PgDn scroll, Ctrl+X interrupt, Ctrl+C quit |
 | Anywhere, approval pending | Alt+A accept, Alt+S accept for session, Alt+D decline. Alt+↑/↓ or the wheel scrolls a long request |
 | Anywhere, thread open | Alt+M model, Alt+E reasoning effort and other model options, Alt+P access, and plan mode once it's turned on |
 | Anywhere, tasks drawer showing | Alt+T open or close the task list. Alt+↑/↓ or the wheel scrolls a long list |
@@ -435,7 +435,7 @@ t3term saves the choice in `~/.config/t3term/settings.json` under `appearanceMod
 
 Light uses the desktop's light colors, with a few exceptions. Where the desktop tells two surfaces apart by a border, or by a shade too faint for a terminal, t3term uses a darker gray: code blocks, inline code, a menu's highlighted row and the sidebar's active and selected rows. Chips are filled, as in dark. In 256 colors the light grays round to three, so the composer, menus and the sidebar share the canvas's white, and a code block in your own message has the message's background.
 
-t3term also draws the desktop's built-in themes T3 Chat, Grove, Ocean, Ember and Iris, each in a light and a dark half that Alt+Shift+A switches between. Set one under `theme` in `settings.json`, as `t3-chat`, `grove`, `ocean`, `ember` or `iris`, and t3term reads it at start. `t3-code`, a file without the key or a name t3term doesn't know draws T3 Code's own colors. The desktop keeps its choice in the browser's storage, so this key is t3term's too. Nothing in the TUI changes the theme yet.
+t3term also draws the desktop's built-in themes T3 Chat, Grove, Ocean, Ember and Iris, each in a light and a dark half that Alt+Shift+A switches between. Ctrl+Alt+A picks one, as the next paragraphs say. t3term saves the choice in `settings.json` under `theme`, as `t3-code`, `t3-chat`, `grove`, `ocean`, `ember` or `iris`, and reads it at start. A file without the key, or with a name t3term doesn't know, draws T3 Code's own colors. The desktop keeps its choice in the browser's storage, so this key is t3term's too.
 
 A theme sets the colors the desktop lets it set: the canvas, text, borders, the sidebar, the composer, menus, message bubbles, code, warnings and errors. Its action color fills the send and Approve buttons, and its focus color marks what is current, such as the sidebar's bar, a menu's check, the open tab and a running task step. Open, Merged, passing checks, approvals and Watching keep T3 Code's green, violet and blue, and so do the provider marks and the project badges. Closed, conflicts and failing checks take the theme's error color, pending checks and requested changes its warning color, and Draft its muted color. The desktop takes the theme's error color only for conflicts and failing checks, and keeps fixed red, gray and amber for Closed, Draft and pending checks.
 
@@ -444,6 +444,16 @@ A theme sets the colors the desktop lets it set: the canvas, text, borders, the 
 | ![The same thread's details in Grove's dark colors: a deep green canvas and sidebar, green message bubbles, a gray dialog with the Pull requests tab underlined in green, and the same pull request states as before](docs/screenshots/theme-grove-dark.png) | ![The same screen after Alt+Shift+A twice: Grove's light colors, a pale green canvas and sidebar, and the status line reads Appearance: Light](docs/screenshots/theme-grove-light.png) |
 
 These come from the same fake T3 server, with `"theme": "grove"` in the settings file.
+
+Ctrl+Alt+A opens Change theme, the list the desktop's Cmd+Option+A opens. It lists T3 Code's own colors and then the five built-in themes, in the desktop's order, and marks the one that draws Current. Each row ends with a dot for each half, light then dark, in the half's focus color on its canvas. The desktop shows a ball lit by the half's accent there, which is the same color in every half but T3 Chat's dark one.
+
+The highlight starts on the first row, as the desktop's does. ↑ and ↓, Home and End or the mouse wheel move it. Enter, or a click on a row, draws that theme at once in the half that shows and saves it. Esc, Ctrl+Alt+A again or a click outside the list closes it. The list works from any pane, over a menu or a dialog too, and closes an open menu. While it is open every key goes to it but Alt+Shift+A and Ctrl+C or Ctrl+Q to quit, so Ctrl+X can't stop a run under it. Like Alt+A, it needs Option to send Meta on a Mac.
+
+| Change theme over T3 Code's dark colors, 120x48 | After Enter |
+|---|---|
+| ![The Change theme list over a thread in T3 Code's dark colors. It lists T3 Code, marked Current, then T3 Chat, Grove, Ocean, Ember and Iris, each with a light and a dark dot in its own color, and the Grove row is highlighted. The status line reads ↑↓ choose · Enter select · Esc close](docs/screenshots/theme-list.png) | ![The same thread after Enter, in Grove's dark colors: a deep green canvas and sidebar and green message bubbles, with the list closed](docs/screenshots/theme-list-chosen.png) |
+
+These come from the same fake T3 server, which sent the keys through tmux.
 
 ## It's a CLI too
 
@@ -536,7 +546,7 @@ The tests draw frames on a test backend, so they don't show what the built binar
 - Provider setup. The provider banner names T3 Code's provider setup, but t3term can't install a provider, sign in to one or update it. The banner follows the provider the model chip names. The desktop also weighs the thread's running session and the project's default model, and falls back to another provider when the chosen one is off or unavailable. t3term has none of those fallbacks, so where they apply the banner can name a different provider from the desktop's, or none.
 - Acting on a proposed plan. The desktop's card menu copies a plan, downloads it as Markdown or saves it to the workspace, and its composer offers Implement and Implement in a new thread. t3term only shows the plan. Its collapsed card also ends at ten lines with text and `...`, where the desktop clips the preview to a fixed height and fades it out.
 - Pinning, snoozing, settling and reordering threads. The sidebar shows the shelves, but moving a thread between them still takes the desktop app. The Snoozed shelf also stays open, where the desktop starts it closed. Snoozed threads are full cards, where the desktop shows a one-line row with the wake time.
-- The rest of the desktop's appearance settings. t3term draws the stock theme and the built-in themes, but the TUI can't change the theme yet, and t3term has no custom themes, no mix of a different theme in each half, no contrast setting and not the blue and orange diff colors. System picks up a change to macOS's appearance only when you switch to it again.
+- The rest of the desktop's appearance settings. t3term draws the stock theme and the built-in themes, and Ctrl+Alt+A picks one, but it has no custom themes, no mix of a different theme in each half, no contrast setting and not the blue and orange diff colors. The theme list has no search box, where the desktop's command palette narrows its rows as you type. System picks up a change to macOS's appearance only when you switch to it again.
 - Marking threads seen. The sidebar reads Done and Woke against the visit time the server keeps for each thread, but t3term doesn't report a visit when you open one, so only the desktop or another client clears those words. A server too old to keep visit times gets no Done from t3term at all, because the desktop's fallback is a visit time saved in the browser.
 
 ## Credit

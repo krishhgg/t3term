@@ -7,8 +7,9 @@
 - **Saving.** settings.json keeps the choice as `appearanceMode`: `system`, `light` or `dark`. A file without the key, or with a value t3term doesn't know, draws dark and keeps the rest of the file.
 - **T3 Code's light colors in truecolor.** The canvas is `#fcfcfc`, the sidebar `#fafafa`, text `#27272a`, borders and chips `#e4e4e7`, the composer and menus white, and the primary color `#1b4ed8`. Dark's canvas is `#0a0a0a` and its sidebar `#000000`.
 - **Text on the primary color.** The send button's `↑` once the composer has a draft, Approve, and the label that says how far the transcript is scrolled. Light draws it white on `#1b4ed8`. Dark keeps `#f5f5f5` on `#346bf1`.
-- **Built-in themes.** `theme` in settings.json takes `t3-chat`, `grove`, `ocean`, `ember` or `iris`, the desktop's T3 Chat, Grove, Ocean, Ember and Iris, each with a light and a dark half. `t3-code`, no key or an id t3term doesn't know, such as the desktop's older `t3-grove`, draws T3 Code's colors. t3term reads it at start. Alt+Shift+A switches between the theme's halves, and its save keeps `theme`. Dark canvases in truecolor: T3 Chat `#1f1a24`, Grove `#1b2821`, Ocean `#17212b`, Ember `#291e1a`, Iris `#1d1929`. Grove light's is `#f3f7f4`.
+- **Built-in themes.** `theme` in settings.json takes `t3-chat`, `grove`, `ocean`, `ember` or `iris`, the desktop's T3 Chat, Grove, Ocean, Ember and Iris, each with a light and a dark half. `t3-code`, no key or an id t3term doesn't know, such as the desktop's older `t3-grove`, draws T3 Code's colors. t3term reads it at start, and the Change theme list saves it. Alt+Shift+A switches between the theme's halves, and its save keeps `theme`. Dark canvases in truecolor: T3 Chat `#1f1a24`, Grove `#1b2821`, Ocean `#17212b`, Ember `#291e1a`, Iris `#1d1929`. Grove light's is `#f3f7f4`.
 - **What a theme sets.** The canvas, text, borders, the sidebar, the composer, menus, message bubbles, code, warnings and errors, and the action color on the send button with the text on it. Status, provider and project colors stay T3 Code's: `LD` keeps `#05df72` in dark and Open keeps `#007a55` in light.
+- **The Change theme list.** A dialog titled `Change theme`, 40 columns wide, a third of the way down. Its rows are `T3 Code`, `T3 Chat`, `Grove`, `Ocean`, `Ember` and `Iris`. The theme that draws says `Current`, and each row ends with two `●`, the light half's focus color on its canvas and then the dark half's. The highlighted row takes the menu highlight, `#262626` in T3 Code's dark half, and starts on the first row. The status line reads `↑↓ choose · Enter select · Esc close`. Enter or a click on a row draws that theme at once in the half that shows and saves it as `theme`. While the list is open it takes every key, paste and click, but Alt+Shift+A and Ctrl+C or Ctrl+Q to quit, so nothing reaches the composer, the sidebar, a run or a dialog under it.
 - **Focus marks.** The theme's focus color marks what is current: the sidebar's `▎` while the sidebar has the keyboard, a menu's `✓`, the details' open tab, the open details button `◨`, a pull request's `← List` and a running task step. T3 Code's focus color is its primary blue, so its halves draw as before. Grove's is `#69d69a` in dark and `#1b7d50` in light.
 - **One redraw.** A switch redraws every row at once in the new colors: the transcript, the details, the linked pull requests' list and a pull request's details, and the worktree setup card. The composer keeps its draft and an open menu stays open.
 
@@ -16,7 +17,7 @@
 
 Alt+Shift+A from anywhere: the sidebar, the composer, the transcript, the details, over an open menu or the details dialog. It never types into the composer. On a Mac it needs Option to send Meta, as every Alt key does. Alt+A without Shift still answers an approval.
 
-A theme comes only from `theme` in `~/.config/t3term/settings.json`, which t3term reads at start. Nothing in the TUI changes it.
+Ctrl+Alt+A opens the Change theme list from any pane, over a menu, which it closes, or over the details dialog. ↑ and ↓, `j` and `k`, Ctrl+P and Ctrl+N, Home and End, Page Up and Page Down or the wheel move the highlight. Enter or a click on a row chooses. Esc, Ctrl+Alt+A again or a click outside the list closes it. Alt+Shift+A still switches the half under it. Like Alt+A, it needs Option to send Meta on a Mac. The theme is saved under `theme` in `~/.config/t3term/settings.json`, and t3term reads it at start.
 
 ## Driving it with t3v
 
@@ -89,6 +90,60 @@ printf '{"theme": "ember"}\n' > "$S" && $T3V restart && C=$($T3V capture ember |
 printf '{"theme": "iris"}\n' > "$S" && $T3V restart && C=$($T3V capture iris | grep 'ans$') && grep -q '48;2;29;25;41m' "$C"
 printf '{"theme": "t3-code"}\n' > "$S" && $T3V restart && C=$($T3V capture t3-code | grep 'ans$') && grep -q '48;2;10;10;10m' "$C" && grep -q '38;2;52;107;241m.\[48;2;[0-9;]*m▎' "$C"
 printf '{"theme": "t3-grove"}\n' > "$S" && $T3V restart && C=$($T3V capture old-id | grep 'ans$') && grep -q '48;2;10;10;10m' "$C" && ! grep -q '48;2;27;40;33m' "$C"
+
+# Ctrl+Alt+A, which tmux sends as C-M-a, opens Change theme over the model menu and closes the menu. A run is going, for the Ctrl+X check below.
+$T3V click --text "Mixed: every state" && $T3V wait --text "/  Mixed: every state"
+$T3V keys --literal draft && $T3V wait --text "│ draft"
+$T3V run thr-mixed running && $T3V wait --text "Working (1)"
+$T3V keys M-m && $T3V wait --text "Search models"
+$T3V keys C-M-a && $T3V wait --text "│ Change theme" --text "│ T3 Code             Current" --text "↑↓ choose · Enter select · Esc close" --gone "Search models"
+T=$($T3V capture theme-list | grep 'ans$') && grep -A6 '│ Change theme' "${T%.ans}.txt" | grep -o 'T3 Code\|T3 Chat\|Grove\|Ocean\|Ember\|Iris' | paste -sd, - | grep -qx 'T3 Code,T3 Chat,Grove,Ocean,Ember,Iris'
+grep -q '48;2;38;38;38mT3 Code ' "$T"                                     # the highlight starts on the first row
+grep -q '38;2;27;125;80m.\[48;2;243;247;244m ● .*38;2;105;214;154m.\[48;2;27;40;33m ● ' "$T"   # Grove's dots: each half's focus color on its canvas
+
+# The list takes a paste, a letter, Ctrl+B and Ctrl+X. Down Down and Enter draw Grove at once, save it and keep the draft.
+$T3V paste --text pasted && $T3V keys x C-b C-x Down Down && $T3V wait --text "│ Change theme" --idle 300
+$T3V status --json | grep -q '"commandsRefused": 0'                      # Ctrl+X sent no interrupt
+$T3V keys Enter && $T3V wait --gone "│ Change theme" --gone "pasted" --gone "draftx" --gone "Ctrl+B sidebar" --text "│ draft"
+C=$($T3V capture list-grove | grep 'ans$') && grep -q '48;2;27;40;33m' "$C" && ! grep -q '48;2;10;10;10m' "$C"
+grep -q '"theme": "grove"' "$S" && grep -q '"sidebarHidden": false' "$S"
+
+# Reopened, Grove is Current and the highlight is on the first row again. Each choice below lands on another theme, so a key that did nothing shows as the wrong canvas.
+$T3V keys C-M-a && $T3V wait --text "│ Grove               Current"
+$T3V keys End Up Enter && $T3V wait --gone "│ Change theme"
+C=$($T3V capture list-ember | grep 'ans$') && grep -q '48;2;41;30;26m' "$C"
+$T3V keys C-M-a && $T3V wait --text "│ Ember               Current"
+$T3V keys PageDown PageUp j j j j k Enter && $T3V wait --gone "│ Change theme"
+C=$($T3V capture list-ocean | grep 'ans$') && grep -q '48;2;23;33;43m' "$C"
+$T3V keys C-M-a && $T3V wait --text "│ Ocean               Current"
+$T3V keys PageDown Enter && $T3V wait --gone "│ Change theme"
+C=$($T3V capture list-iris | grep 'ans$') && grep -q '48;2;29;25;41m' "$C"
+$T3V keys C-M-a && $T3V wait --text "│ Iris                Current"
+$T3V keys End Home C-n C-n C-p Enter && $T3V wait --gone "│ Change theme"
+C=$($T3V capture list-t3-chat | grep 'ans$') && grep -q '48;2;31;26;36m' "$C"
+grep -q '"theme": "t3-chat"' "$S"
+
+# The wheel and a click. T3 Code also heads the sidebar, so the click starts looking at column 40.
+$T3V keys C-M-a && $T3V wait --text "│ T3 Chat             Current"
+$T3V click --text "Ocean" --button wheel-down --repeat 2 && $T3V wait --idle 300
+$T3V keys Enter && $T3V wait --gone "│ Change theme"
+C=$($T3V capture list-wheel | grep 'ans$') && grep -q '48;2;27;40;33m' "$C"
+$T3V keys C-M-a && $T3V wait --text "│ Grove               Current" --idle 300
+$T3V click --text "T3 Code" --from-col 40 && $T3V wait --gone "│ Change theme"
+C=$($T3V capture list-click | grep 'ans$') && grep -q '48;2;10;10;10m' "$C" && grep -q '"theme": "t3-code"' "$S"
+
+# Esc, Ctrl+Alt+A and a click outside close it and choose nothing.
+$T3V keys C-M-a && $T3V wait --text "│ Change theme" && $T3V keys Down Escape && $T3V wait --gone "│ Change theme"
+$T3V keys C-M-a && $T3V wait --text "│ Change theme" && $T3V keys Down C-M-a && $T3V wait --gone "│ Change theme"
+$T3V keys C-M-a && $T3V wait --text "│ Change theme" --idle 300 && $T3V click --at 150 40 && $T3V wait --gone "│ Change theme"
+grep -q '"theme": "t3-code"' "$S"
+
+# Alt+Shift+A switches the half under the open list, and a choice draws in that half.
+$T3V keys C-M-a && $T3V wait --text "│ Change theme"
+$T3V keys M-A M-A && $T3V wait --text "Appearance: Light" --text "│ Change theme"
+$T3V keys Down Down Enter && $T3V wait --gone "│ Change theme"
+C=$($T3V capture list-grove-light | grep 'ans$') && grep -q '48;2;243;247;244m' "$C" && ! grep -q '48;2;27;40;33m' "$C"
+grep -q '"theme": "grove"' "$S" && grep -q '"appearanceMode": "light"' "$S"
 ```
 
 `--color 256` shows the 256-color form: light's grays round to three, so the composer, menus and the sidebar share the canvas's white. `t3v render NAME NAME.png` draws a capture to look at.
@@ -102,6 +157,9 @@ printf '{"theme": "t3-grove"}\n' > "$S" && $T3V restart && C=$($T3V capture old-
 - Alt+A, Alt+S and Alt+D answer an approval, and the fake server serves none, so the recipe can't show that Alt+A still answers one. Alt+Shift+A never does.
 - The worktree setup card isn't reachable: the fake server answers `subscribeWorktreeSetup` with null only.
 - The choice is saved in the run's HOME and survives `restart`. A new run starts dark.
-- t3term reads `theme` only at start, so a recipe writes settings.json and then runs `t3v restart`. A file written without `appearanceMode` starts dark.
+- t3term reads `theme` from settings.json only at start, so a recipe that writes the file then runs `t3v restart`. A file written without `appearanceMode` starts dark. The Change theme list needs no restart.
+- tmux sends `C-M-a` as Esc then Ctrl+A, which t3term reads as Ctrl+Alt+A. Wait for `│ Change theme` before the next key: a key sent before the list draws goes to the pane under it.
+- `T3 Code` heads the sidebar too, so a click on the list's T3 Code row needs `--from-col`. A click on the list right after it opens does nothing until a frame draws it, so wait first.
+- The `Appearance:` toast replaces the list's keys in the status line until the next key.
 - The sidebar's `▎` takes the focus color only while the sidebar has the keyboard, as it does right after a start. Once a thread opens, the composer has it and the bar draws muted.
 - The approval and question panels' tints follow the theme too, but the fake server serves no request to show them.
