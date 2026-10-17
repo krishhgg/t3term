@@ -39,7 +39,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::environment::Identity;
 use super::lineage::{self, Group, Lineage, Paging, Target};
-use super::pull_requests::PullRequests;
+use super::pull_requests::{Part, PullRequests};
 use super::setup::bounded;
 use super::tasks::wrap;
 use super::theme::Theme;
@@ -826,10 +826,11 @@ impl Details {
 
     /// Chooses the next Lineage row, or with none chosen the first at or below the top of the
     /// text. Past the last one, or without Lineage rows, it scrolls the text down a row. On the
-    /// pull requests' tab it selects the next one, or scrolls the selected one's details.
+    /// pull requests' tab it selects the next one, or in the selected one's details chooses
+    /// the next control in view or scrolls.
     pub fn down(&mut self) {
         if self.tab == Tab::PullRequests {
-            self.pulls.move_by(1);
+            self.pulls.step(true);
             return;
         }
         let targets = self.lineage_targets();
@@ -846,10 +847,11 @@ impl Details {
 
     /// Chooses the Lineage row before the chosen one. From the first one, or with none chosen,
     /// it leaves none chosen and scrolls the text up a row. On the pull requests' tab it
-    /// selects the one before, or scrolls the selected one's details.
+    /// selects the one before, or in the selected one's details chooses the control before in
+    /// view or scrolls.
     pub fn up(&mut self) {
         if self.tab == Tab::PullRequests {
-            self.pulls.move_by(-1);
+            self.pulls.step(false);
             return;
         }
         let targets = self.lineage_targets();
@@ -953,23 +955,30 @@ impl Details {
         self.open && self.pulls.wants(open_id, supported)
     }
 
-    /// Shows the selected pull request's details in the list's place, or the list again, while
-    /// their tab shows.
-    pub fn toggle_pull(&mut self) {
-        if self.tab == Tab::PullRequests {
-            self.pulls.toggle();
+    /// Whether the details show the pull requests' tab.
+    pub fn shows_pulls(&self) -> bool {
+        self.open && self.tab == Tab::PullRequests
+    }
+
+    /// Takes part of what a host said of the pull request whose details asked with `ticket`,
+    /// or why the read failed, which came at `now`. The details lay out again when it is the
+    /// read they wait for.
+    pub fn answer_pull(&mut self, ticket: u64, part: Part, now: i64) {
+        if self.pulls.answer(ticket, part, now) {
             self.moved = true;
         }
     }
 
     /// Enter on the thread's tab hands back the Lineage row ↑ and ↓ chose, for the caller to
-    /// act on. On the pull requests' tab it shows the selected one's details in the list's
-    /// place, or the list again.
+    /// act on. On the pull requests' tab it does what the control ↑ and ↓ chose in a pull
+    /// request's details does, or else shows the selected one's details in the list's place,
+    /// or the list again.
     pub fn enter(&mut self) -> Option<Target> {
         match self.tab {
             Tab::Thread => self.selected.clone(),
             Tab::PullRequests => {
-                self.toggle_pull();
+                self.pulls.enter();
+                self.moved = true;
                 None
             }
         }
@@ -990,11 +999,25 @@ impl Details {
     /// first that fits, so Esc shows wherever it has room. `modal` says whether the details
     /// show as a dialog, which Esc closes, rather than a pane, which Esc leaves. With Lineage
     /// rows to choose on the thread's tab, ↑ and ↓ choose among them, and what Enter does with
-    /// the chosen row leads.
+    /// the chosen row leads. So does what Enter does with the control chosen in a pull
+    /// request's details.
     pub fn keys(&self, modal: bool) -> Vec<String> {
         let lineage = match self.tab {
             Tab::Thread => self.lineage_keys(),
-            Tab::PullRequests => None,
+            Tab::PullRequests => {
+                let action = self.pulls.action().filter(|_| self.pulls.viewing());
+                if let Some(action) = action {
+                    let plain = self.plain_keys(modal);
+                    let mut keys: Vec<String> = plain
+                        .iter()
+                        .map(|keys| format!("Enter {action} · {keys}"))
+                        .collect();
+                    // Esc still shows where what Enter does has no room.
+                    keys.extend(plain.last().map(|keys| keys.to_string()));
+                    return keys;
+                }
+                None
+            }
         };
         let Some(action) = lineage else {
             let plain = self.plain_keys(modal);
@@ -1346,7 +1369,7 @@ impl Details {
                 (scroll > 0, scroll + visible < total)
             }
             Tab::PullRequests => {
-                let page = self.pulls.page(width, visible, self.now, theme);
+                let page = self.pulls.page(width, visible, self.now, focused, theme);
                 lines.extend(page.lines.iter().cloned());
                 (page.above, page.below)
             }

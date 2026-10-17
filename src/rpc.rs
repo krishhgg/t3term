@@ -58,6 +58,9 @@ pub enum RpcError {
         tag: String,
         message: String,
         error_tag: Option<String>,
+        /// The failure's error as T3 encoded it, for a caller that reads its fields. Null when
+        /// the request died instead of failing. Boxed to keep the error small.
+        error: Box<Value>,
     },
     Protocol(String),
     /// t3term stopped a bounded stream on its own side and interrupted it on the server. A
@@ -535,6 +538,7 @@ fn failure(tag: &str, exit: &Value) -> RpcError {
         tag: tag.to_string(),
         message,
         error_tag: text(fail, "_tag"),
+        error: Box::new(fail.cloned().unwrap_or(Value::Null)),
     }
 }
 
