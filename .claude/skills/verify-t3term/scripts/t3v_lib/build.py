@@ -15,6 +15,7 @@ from __future__ import annotations
 
 import fcntl
 import hashlib
+import json
 import os
 import re
 import shutil
@@ -57,7 +58,8 @@ def version_of(binary: Path) -> str:
 def image_uuid(binary: Path):
     """The binary's LC_UUID, which ld makes from a hash of the linked image. Two builds of the same
     sources in /tmp/t3v-target share it, and a binary copied from another commit's build carries
-    that build's. None when otool can't read it."""
+    that build's. Commits whose sources differ only where the binary doesn't, such as in tests,
+    share it too. None when otool can't read it."""
     try:
         result = subprocess.run(['otool', '-l', str(binary)], capture_output=True, text=True, timeout=30)
     except (OSError, subprocess.TimeoutExpired):
@@ -107,6 +109,22 @@ def choose_binary(binary, rev, repo=None) -> Path:
     return path
 
 
+def built_binary(messages: str):
+    """The t3term executable cargo's JSON `messages` say it linked in this build, or None when
+    they call it fresh, which means the binary in the target directory came from an earlier one."""
+    for line in messages.splitlines():
+        try:
+            message = json.loads(line)
+        except ValueError:
+            continue
+        if not isinstance(message, dict) or message.get('reason') != 'compiler-artifact':
+            continue
+        target = message.get('target') or {}
+        if target.get('name') == 't3term' and 'bin' in (target.get('kind') or []) and message.get('executable'):
+            return Path(message['executable']) if message.get('fresh') is False else None
+    return None
+
+
 def build(rev: str, repo=None) -> Path:
     """Builds commit `rev` of `repo` once into /tmp/t3v-bin/<sha>/t3term and returns that path.
     Progress goes to stderr."""
@@ -137,21 +155,20 @@ def build(rev: str, repo=None) -> Path:
         git(repo, 'worktree', 'add', '--detach', '--quiet', str(tree), sha)
         try:
             env = dict(os.environ, CARGO_TARGET_DIR=str(TARGET))
-            cargo = subprocess.Popen(['cargo', 'build', '--locked'], cwd=tree, env=env, stdout=sys.stderr,
-                                     stderr=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True)
-            compiled = False
-            for line in cargo.stderr:
-                sys.stderr.write(line)
-                compiled = compiled or line.lstrip().startswith('Compiling t3term v')
-            if cargo.wait() != 0:
+            # Cargo's JSON messages say whether it built each target or found it fresh, whatever
+            # term.color and term.quiet say. Its progress and rustc's errors still go to stderr.
+            cargo = subprocess.run(['cargo', 'build', '--locked', '--message-format=json-render-diagnostics'],
+                                   cwd=tree, env=env, stdout=subprocess.PIPE, stdin=subprocess.DEVNULL, text=True)
+            if cargo.returncode != 0:
                 die(f'cargo build --locked failed at {sha[:12]}; its output is above', 1)
-            if not compiled:
+            binary = built_binary(cargo.stdout)
+            if binary is None:
                 die(f'cargo reused an earlier build instead of compiling {sha[:12]}, so t3v copied nothing; '
                     f'run `t3v build {sha[:12]}` again', 1)
             toolchain = subprocess.run(['rustc', '--version'], cwd=tree, capture_output=True, text=True)
             out.parent.mkdir(parents=True, exist_ok=True)
             partial = out.with_name(f't3term.partial-{os.getpid()}')
-            shutil.copy2(TARGET / 'debug' / 't3term', partial)
+            shutil.copy2(binary, partial)
             write_json(out.parent / 'built.json', {'sha': sha, 'rev': rev, 'toolchain': toolchain.stdout.strip(),
                                                    'builtAt': iso(now_ms()), 'repo': str(repo)}, mode=0o644)
             os.replace(partial, out)

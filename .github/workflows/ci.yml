@@ -139,6 +139,10 @@ jobs:
           tmux -V
           python3 --version
 
+      # t3v's own tests: they run a stand-in cargo in temporary directories.
+      - name: Test t3v
+        run: python3 -I -B -m unittest discover -v -s .claude/skills/verify-t3term/scripts/t3v_lib -t .claude/skills/verify-t3term/scripts
+
       - name: Build
         run: cargo build --locked
 
