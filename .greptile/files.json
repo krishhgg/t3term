@@ -32,6 +32,11 @@
       "path": "benchmarks/README.md",
       "description": "How to reproduce the CPU, memory and energy measurements",
       "scope": ["benchmarks/**", "research/**", "README.md"]
+    },
+    {
+      "path": ".claude/skills/verify-t3term/features/README.md",
+      "description": "The feature map: each feature a user can reach in the TUI or CLI, the file that says how to reach and drive it with the t3v driver, and the scenario that serves it",
+      "scope": ["src/tui/**", "src/main.rs", ".claude/skills/**"]
     }
   ]
 }
