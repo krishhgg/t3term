@@ -57,9 +57,16 @@
 //! above the files shows them, or hides them again, as the desktop's toolbar toggle does
 //! (PullRequestCodeTab.tsx:1211-1234), for every file and every diff the tab shows after.
 //!
+//! The lines stack at first, as the desktop's `diffLayout` setting is `stacked` until changed
+//! (packages/contracts/src/settings.ts:53-55). A row under the fold row sets the lines before
+//! the change on the left and those after it on the right, or stacks them again, as the
+//! desktop's toolbar toggle group does (PullRequestCodeTab.tsx:1259-1278). The lines pair as
+//! @pierre/diffs pairs them, as `pairs` says, and a file added or deleted keeps one column.
+//! Unwrapped, both sides' text scrolls sideways by the same columns.
+//!
 //! The lines wrap at first, as the desktop's `wordWrap` setting is true until changed
-//! (packages/contracts/src/settings.ts:506). A row under the fold row lets them run on past the
-//! end of their rows, or wraps them again, as the desktop's toolbar toggle does
+//! (packages/contracts/src/settings.ts:506). A row under the layout row lets them run on past
+//! the end of their rows, or wraps them again, as the desktop's toolbar toggle does
 //! (PullRequestCodeTab.tsx:1279-1298). Each line then takes one row, and the panel scrolls the
 //! text of those rows sideways while their numbers stay, as `Sideways` says, as the desktop's
 //! numbers stay while its lines scroll.
@@ -98,6 +105,14 @@ const PATH: usize = 1024;
 const EXPANSION: u64 = 100;
 /// The most files whose text the tab keeps. Reading one more forgets the first read.
 const MOST_TEXTS: usize = 64;
+/// The spans a side of a row of the lines side by side takes: the number, the mark and the
+/// text. The left side's, with empty ones in front where it has fewer, are followed by one
+/// that pads it to its columns and one of `BETWEEN`, then come the right side's.
+pub(super) const SIDE: usize = 3;
+/// The columns between the two sides of a row of the lines side by side: a bar, then a space
+/// so the right side's numbers stand apart from it as the left side's stand apart from the
+/// details' edge.
+const BETWEEN: &str = "│ ";
 
 const LOADING: &str = "Loading pull request diff…";
 const LOADING_MORE: &str = "Loading more files…";
@@ -125,6 +140,11 @@ const WHITESPACE_SHOWN: &str = "¶ Hide whitespace changes";
 /// `Expand all files` and `Collapse all files` with their chevrons.
 const FOLDED_ALL: &str = "⇊ Expand all files";
 const UNFOLDED_ANY: &str = "⇈ Collapse all files";
+/// The row that shows the lines side by side, and the one that shows them one under the other
+/// again, after the desktop's `Split diff view` and `Stacked diff view` with their icons of two
+/// columns and of rows.
+const STACKED: &str = "◫ Split diff view";
+const SPLIT: &str = "⊟ Stacked diff view";
 /// The row that lets the lines run on past their rows, and the one that wraps them again, after
 /// the desktop's `Disable line wrapping` and `Enable line wrapping` with its icon of a line
 /// that turns back.
@@ -169,6 +189,9 @@ pub(super) struct Code {
     /// `diffIgnoreWhitespace` setting is true until changed. Another diff picked from the
     /// commits keeps it, as the desktop's toggle does.
     whitespace: bool,
+    /// Whether the lines before and after the change show side by side: false at first, as
+    /// the desktop's `diffLayout` setting is `stacked` until changed.
+    split: bool,
     /// Whether the lines wrap: true at first, as the desktop's `wordWrap` setting is true until
     /// changed. Another diff picked from the commits keeps it, as the desktop's toggle does.
     wrap: bool,
@@ -216,19 +239,32 @@ impl Body {
 /// The rows a file's lines take while they don't wrap, one each, as `Body` keeps them.
 #[derive(Default)]
 struct Slides {
+    /// The sides of the rows where the file shows its lines side by side.
+    halves: Option<Halves>,
     /// Each run of rows that are lines, in order.
     runs: Vec<Range<usize>>,
-    /// The columns of the widest of those rows.
+    /// The columns of the widest of those rows, where each side of one side by side counts
+    /// as wide as the row would be with that side's text whole.
     widest: usize,
 }
 
 impl Slides {
-    /// Adds the rows of a line to `lines`, and where they don't wrap, to the runs.
+    /// Adds the rows of a line, or of two side by side, to `lines`, and where they don't wrap,
+    /// to the runs.
     fn add(&mut self, lines: &mut Vec<Line<'static>>, rows: Vec<Line<'static>>, wrap: bool) {
         if !wrap {
             let (start, end) = (lines.len(), lines.len() + rows.len());
-            let widest = rows.iter().map(Line::width).max().unwrap_or_default();
-            self.widest = self.widest.max(widest);
+            let width = |spans: &[Span]| spans.iter().map(Span::width).sum::<usize>();
+            let widest = rows.iter().map(|row| match self.halves {
+                None => row.width(),
+                Some(halves) => {
+                    let (left, right) = row.spans.split_at(SIDE.min(row.spans.len()));
+                    let right = right.get(2..).unwrap_or_default();
+                    let gap = BETWEEN.width();
+                    (width(left) + gap + halves.right).max(halves.left + gap + width(right))
+                }
+            });
+            self.widest = self.widest.max(widest.max().unwrap_or_default());
             match self.runs.last_mut() {
                 Some(run) if run.end == start => run.end = end,
                 _ => self.runs.push(start..end),
@@ -238,14 +274,43 @@ impl Slides {
     }
 }
 
+/// The columns of the two sides of a row of the lines side by side, with `BETWEEN` in the
+/// columns between them.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Halves {
+    left: usize,
+    right: usize,
+}
+
+impl Halves {
+    /// The sides of a row `width` columns wide, the right one a column wider where the two
+    /// can't be as wide, or None where the left would leave no column for its text after its
+    /// mark.
+    fn of(width: usize) -> Option<Halves> {
+        let gap = BETWEEN.width();
+        let left = width.saturating_sub(gap) / 2;
+        (left >= 2).then(|| Halves {
+            left,
+            right: width - gap - left,
+        })
+    }
+}
+
+/// How a file's lines lay out: wrapped or not, and side by side or one under the other.
+#[derive(Debug, Clone, Copy)]
+struct Layout {
+    wrap: bool,
+    split: bool,
+}
+
 /// The rows of the tab's lines while they don't wrap, which scroll sideways past their numbers
 /// and marks, as the desktop's numbers stay while its lines scroll (@pierre/diffs 1.5.2, whose
 /// style sets `[data-overflow=scroll] [data-gutter]{position:sticky}`).
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub(super) struct Sideways {
-    /// Each run of those rows, with the columns of the numbers and marks before their text, in
-    /// order.
-    pub runs: Vec<(Range<usize>, usize)>,
+    /// Each run of those rows, with the columns of the numbers and marks before their text,
+    /// and where they show the lines side by side, the columns of the left side, in order.
+    pub runs: Vec<(Range<usize>, usize, Option<usize>)>,
     /// The columns of the widest of them.
     pub widest: usize,
 }
@@ -317,6 +382,8 @@ enum Text {
 struct Stretch {
     /// The number after the change of its first line.
     first: u64,
+    /// The number before the change of its first line.
+    old: u64,
     /// How many lines it has, or None after the last hunk until the file's text says.
     size: Option<u64>,
 }
@@ -404,6 +471,7 @@ impl Code {
             unfolded: false,
             toggled: HashSet::new(),
             whitespace: false,
+            split: false,
             wrap: true,
             bodies: HashMap::new(),
             commit: None,
@@ -637,7 +705,9 @@ impl Code {
         let open = self.commits_open && !commits.is_empty();
         match control {
             Control::File(at) => at < self.files.len(),
-            Control::Whitespace | Control::Folds | Control::Wrap => !self.files.is_empty(),
+            Control::Whitespace | Control::Folds | Control::Layout | Control::Wrap => {
+                !self.files.is_empty()
+            }
             Control::Retry => self.retries(),
             Control::Commits => !commits.is_empty(),
             Control::AllCommits => open,
@@ -710,6 +780,10 @@ impl Code {
             Control::Folds => {
                 self.unfolded = self.all_folded();
                 self.toggled.clear();
+            }
+            Control::Layout => {
+                self.split = !self.split;
+                self.bodies.clear();
             }
             Control::Wrap => {
                 self.wrap = !self.wrap;
@@ -900,6 +974,8 @@ impl Code {
             Control::Whitespace => "show whitespace changes".to_string(),
             Control::Folds if self.all_folded() => "expand all files".to_string(),
             Control::Folds => "collapse all files".to_string(),
+            Control::Layout if self.split => "show stacked diff view".to_string(),
+            Control::Layout => "show split diff view".to_string(),
             Control::Wrap if self.wrap => "disable line wrapping".to_string(),
             Control::Wrap => "enable line wrapping".to_string(),
             Control::Commits if self.commits_open => "hide commits".to_string(),
@@ -929,6 +1005,16 @@ impl Code {
         let &(slice, file) = self.files.get(at)?;
         let slice = &self.slices[slice];
         Some((&slice.diff.patch, &slice.files(self.whitespace)[file]))
+    }
+
+    /// How `file`'s lines lay out. A file added or deleted has one side, as @pierre/diffs
+    /// shows it in one column (renderers/DiffHunksRenderer.js:916-922).
+    fn layout(&self, file: &patch::File) -> Layout {
+        let one = matches!(file.status, patch::Status::Added | patch::Status::Deleted);
+        Layout {
+            wrap: self.wrap,
+            split: self.split && !one,
+        }
     }
 
     /// Whether the file at `path` shows unfolded.
@@ -1059,7 +1145,15 @@ impl Code {
                     }
                     let context = find(&self.contexts, file.path(), slice.prints[place]);
                     let text = &slice.diff.patch;
-                    body(text, file, withheld, context, width, self.wrap, theme)
+                    body(
+                        text,
+                        file,
+                        withheld,
+                        context,
+                        width,
+                        self.layout(file),
+                        theme,
+                    )
                 }
             };
             bodies.insert((at, place), laid);
@@ -1200,6 +1294,13 @@ impl Code {
             let start = lines.len();
             lines.extend(whole(label, width, fg));
             targets.push((start..lines.len(), Control::Folds));
+            let label = match self.split {
+                true => SPLIT,
+                false => STACKED,
+            };
+            let start = lines.len();
+            lines.extend(whole(label, width, fg));
+            targets.push((start..lines.len(), Control::Layout));
             let label = match self.wrap {
                 true => WRAPPED,
                 false => UNWRAPPED,
@@ -1288,7 +1389,8 @@ impl Code {
                         let (slice, place) = self.files[at];
                         let print = self.slices[slice].prints[place];
                         let context = find(&self.contexts, file.path(), print);
-                        fresh = body(text, file, withheld, context, width, self.wrap, theme);
+                        let layout = self.layout(file);
+                        fresh = body(text, file, withheld, context, width, layout, theme);
                         &fresh
                     }
                 };
@@ -1301,9 +1403,9 @@ impl Code {
                     let shift = lines.len() - rows.start;
                     while let Some(run) = slides.peek_mut().filter(|run| run.start < rows.end) {
                         let end = run.end.min(rows.end);
-                        sideways
-                            .runs
-                            .push((run.start + shift..end + shift, laid.lead));
+                        let left = laid.slides.halves.map(|halves| halves.left);
+                        let rows = run.start + shift..end + shift;
+                        sideways.runs.push((rows, laid.lead, left));
                         match end == run.end {
                             true => _ = slides.next(),
                             false => run.start = end,
@@ -1606,12 +1708,12 @@ fn body(
     withheld: bool,
     context: Option<&Context>,
     width: usize,
-    wrap: bool,
+    layout: Layout,
     theme: &Theme,
 ) -> Body {
+    let Layout { wrap, split } = layout;
     let muted = Style::new().fg(theme.muted);
     let mut lines = Vec::new();
-    let mut slides = Slides::default();
     let mut marks: Vec<Mark> = Vec::new();
     let mut counted = Vec::new();
     // A file past the bound or with a broken hunk header can have no hunks, and its notes
@@ -1628,7 +1730,7 @@ fn body(
             width,
             withheld,
             lines: whole(note, width, muted),
-            slides,
+            slides: Slides::default(),
             lead: 0,
             marks,
             stretches: counted,
@@ -1647,12 +1749,21 @@ fn body(
         _ => "",
     };
     let mut wanted = Vec::new();
+    // The largest number before the change of those lines, which only the left side shows.
+    let mut old_last = 0;
     for (stretch, showing) in stretches.iter().zip(&showings) {
         let end = stretch.first + showing.head + showing.tail + rest(showing.rest);
+        let before = wanted.len();
         wanted.extend(stretch.first..stretch.first + showing.head);
         wanted.extend(end - showing.tail..end);
+        if let Some(&number) = wanted[before..].last() {
+            old_last = old_last.max(stretch.old + (number - stretch.first));
+        }
     }
     let mut found = lines_at(contents, &wanted).into_iter();
+    // Side by side, each side has its own numbers and marks, as the narrower left one has room
+    // for them.
+    let halves = split.then(|| Halves::of(width)).flatten();
     let last = file
         .hunks
         .iter()
@@ -1661,16 +1772,22 @@ fn body(
             old.max(hunk.new_start + hunk.new_count.saturating_sub(1))
         })
         .chain(wanted.last().copied())
+        .chain(halves.map(|_| old_last))
         .max()
         .unwrap_or_default();
     let digits = last.max(1).ilog10() as usize + 1;
+    let mut slides = Slides {
+        halves,
+        ..Slides::default()
+    };
+    let side = halves.map_or(width, |halves| halves.left);
     // The number, a space, the mark and a space, while the text keeps a few columns.
-    let gutter = if width >= digits + 3 + 8 {
+    let gutter = if side >= digits + 3 + 8 {
         Some(digits)
     } else {
         None
     };
-    let lead = lead(gutter, width);
+    let lead = lead(gutter, side);
     // A run of unchanged lines: those from its start, the row that counts the rest, then those
     // at its end.
     let mut stretch = |lines: &mut Vec<Line<'static>>, slides: &mut Slides, place: usize| {
@@ -1684,11 +1801,17 @@ fn body(
                 };
                 let line = patch::Line {
                     kind: patch::Kind::Context,
-                    old: None,
+                    old: Some(stretch.old + (number - stretch.first)),
                     new: Some(number),
                     text,
                 };
-                let rows = line_rows(contents, &line, gutter, width, wrap, theme);
+                let rows = match halves {
+                    Some(halves) => {
+                        let pair = (Some(&line), Some(&line));
+                        beside(contents, pair, gutter, halves, wrap, theme)
+                    }
+                    None => line_rows(contents, &line, gutter, width, wrap, theme),
+                };
                 slides.add(lines, rows, wrap);
             }
         };
@@ -1733,18 +1856,47 @@ fn body(
             stretch(&mut lines, &mut slides, place);
         }
         after = first + hunk.old_count;
-        for line in &hunk.lines {
-            let rows = line_rows(text, line, gutter, width, wrap, theme);
+        let Some(halves) = halves else {
+            for line in &hunk.lines {
+                let rows = line_rows(text, line, gutter, width, wrap, theme);
+                slides.add(&mut lines, rows, wrap);
+                let end = lines.len();
+                match (line.kind, marks.last_mut()) {
+                    (patch::Kind::NoNewline, Some(last)) => last.end = end,
+                    (patch::Kind::NoNewline, None) => {}
+                    _ => marks.push(Mark {
+                        old: line.old,
+                        new: line.new,
+                        end,
+                    }),
+                }
+            }
+            continue;
+        };
+        for pair in pairs(&hunk.lines) {
+            let rows = beside(text, pair, gutter, halves, wrap, theme);
             slides.add(&mut lines, rows, wrap);
-            let end = lines.len();
-            match (line.kind, marks.last_mut()) {
-                (patch::Kind::NoNewline, Some(last)) => last.end = end,
-                (patch::Kind::NoNewline, None) => {}
-                _ => marks.push(Mark {
-                    old: line.old,
-                    new: line.new,
-                    end,
-                }),
+            marks.push(Mark {
+                old: pair.0.and_then(|line| line.old),
+                new: pair.1.and_then(|line| line.new),
+                end: lines.len(),
+            });
+        }
+        // The note that a side's last line has no line end shows under the hunk's last row,
+        // on that side, as @pierre/diffs puts it (renderers/DiffHunksRenderer.js:863-898).
+        let (old_end, new_end) = ends(&hunk.lines);
+        if old_end || new_end {
+            let note = patch::Line {
+                kind: patch::Kind::NoNewline,
+                old: None,
+                new: None,
+                text: 0..0,
+            };
+            let pair = (old_end.then_some(&note), new_end.then_some(&note));
+            let rows = beside(text, pair, gutter, halves, wrap, theme);
+            slides.add(&mut lines, rows, wrap);
+            if let Some(last) = marks.last_mut() {
+                last.end = lines.len();
             }
         }
     }
@@ -1772,6 +1924,105 @@ fn body(
         marks,
         stretches: counted,
     }
+}
+
+/// A line of a hunk, or none, on each side of a row of the lines side by side.
+type Pair<'a> = (Option<&'a patch::Line>, Option<&'a patch::Line>);
+
+/// A hunk's lines in the rows they take side by side: a line in context beside itself, and in
+/// each run of lines changed, those removed beside those added, the first beside the first,
+/// with nothing beside the rest of the longer side. @pierre/diffs 1.5.2 counts every line
+/// removed or added between two in context as one run, in whatever order they come
+/// (utils/parsePatchFiles.js:182-205), and pairs its lines so (utils/iterateOverDiff.js:213
+/// and 443-446).
+fn pairs(lines: &[patch::Line]) -> Vec<Pair<'_>> {
+    fn pair<'a>(
+        rows: &mut Vec<Pair<'a>>,
+        removed: &mut Vec<&'a patch::Line>,
+        added: &mut Vec<&'a patch::Line>,
+    ) {
+        let count = removed.len().max(added.len());
+        rows.extend((0..count).map(|at| (removed.get(at).copied(), added.get(at).copied())));
+        removed.clear();
+        added.clear();
+    }
+    let mut rows = Vec::new();
+    let (mut removed, mut added) = (Vec::new(), Vec::new());
+    for line in lines {
+        match line.kind {
+            patch::Kind::Context => {
+                pair(&mut rows, &mut removed, &mut added);
+                rows.push((Some(line), Some(line)));
+            }
+            patch::Kind::Removed => removed.push(line),
+            patch::Kind::Added => added.push(line),
+            patch::Kind::NoNewline => {}
+        }
+    }
+    pair(&mut rows, &mut removed, &mut added);
+    rows
+}
+
+/// Whether the last line of a hunk's side before the change, and of its side after, has no
+/// line end, as @pierre/diffs reads the note: after a line in context it is both sides', and
+/// after a line removed or added that side's (utils/parsePatchFiles.js:225-230).
+fn ends(lines: &[patch::Line]) -> (bool, bool) {
+    let (mut old, mut new) = (false, false);
+    let mut before = None;
+    for line in lines {
+        match (line.kind, before) {
+            (patch::Kind::NoNewline, Some(patch::Kind::Context)) => (old, new) = (true, true),
+            (patch::Kind::NoNewline, Some(patch::Kind::Removed)) => old = true,
+            (patch::Kind::NoNewline, Some(patch::Kind::Added)) => new = true,
+            (patch::Kind::NoNewline, _) => {}
+            (kind, _) => before = Some(kind),
+        }
+    }
+    (old, new)
+}
+
+/// The rows of a pair of lines side by side in `halves`, for as many as the taller side takes:
+/// each line in its side with its number on that side, its mark and its text, as `line_rows`
+/// lays it out, and a side with no line blank. Where the lines don't wrap, each side keeps the
+/// whole of its text, so `Sideways` scrolls each within its columns.
+fn beside(
+    text: &str,
+    (old, new): Pair,
+    gutter: Option<usize>,
+    halves: Halves,
+    wrap: bool,
+    theme: &Theme,
+) -> Vec<Line<'static>> {
+    let side = |line: Option<&patch::Line>, before: bool, width: usize| {
+        let Some(line) = line else {
+            return Vec::new();
+        };
+        // `line_rows` shows the number after the change where a line has one, so the left
+        // side drops it to show the number before.
+        let line = patch::Line {
+            new: line.new.filter(|_| !before),
+            ..line.clone()
+        };
+        line_rows(text, &line, gutter, width, wrap, theme)
+    };
+    let left = side(old, true, halves.left);
+    let right = side(new, false, halves.right);
+    let count = left.len().max(right.len());
+    let (mut left, mut right) = (left.into_iter(), right.into_iter());
+    let between = Style::new().fg(theme.muted);
+    (0..count)
+        .map(|_| {
+            let mut spans = left.next().map(|row| row.spans).unwrap_or_default();
+            while spans.len() < SIDE {
+                spans.insert(0, Span::raw(""));
+            }
+            let used: usize = spans.iter().map(Span::width).sum();
+            spans.push(Span::raw(" ".repeat(halves.left.saturating_sub(used))));
+            spans.push(Span::styled(BETWEEN, between));
+            spans.extend(right.next().map(|row| row.spans).unwrap_or_default());
+            Line::from(spans)
+        })
+        .collect()
 }
 
 /// The lines a row counts as left.
@@ -1823,6 +2074,7 @@ fn stretches(file: &patch::File) -> Option<Vec<Stretch>> {
         }
         stretches.push(Stretch {
             first: new_after,
+            old: old_after,
             size: Some(size),
         });
         old_after = old_first.saturating_add(hunk.old_count);
@@ -1830,6 +2082,7 @@ fn stretches(file: &patch::File) -> Option<Vec<Stretch>> {
     }
     stretches.push(Stretch {
         first: new_after,
+        old: old_after,
         size: None,
     });
     Some(stretches)
