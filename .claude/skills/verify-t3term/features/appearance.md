@@ -39,16 +39,18 @@ L=$($T3V capture light | grep 'ans$') && grep -q '48;2;252;252;252m' "$L" && gre
 grep -q '38;2;255;255;255m.\[48;2;27;78;216m ↑' "$L"                    # white on light's primary on the send button
 grep -q '"appearanceMode": "light"' "$RUN/home/.config/t3term/settings.json"
 
-# A pull request's details in the dialog, then Dark over it. Down clears the toast, so the status line shows the dialog's Esc close.
-$T3V keys Down Enter && $T3V wait --text "← List" --text "Repository"
+# A pull request's details in the dialog, once the host's answer draws, then Dark over it. Down clears the toast, so the status line shows the dialog's Esc close.
+$T3V keys Down Enter && $T3V wait --text "← List" --text "Read from github.com"
 $T3V resize 120 40 && $T3V wait --text "Thread details" --text "Esc close" --idle 300
-$T3V keys M-A && $T3V wait --text "Appearance: Dark" --text "← List" --text "Repository"
+$T3V keys M-A && $T3V wait --text "Appearance: Dark" --text "← List" --text "Read from github.com"
 K=$($T3V capture dark-again | grep 'ans$') && grep -q '48;2;10;10;10m' "$K"
 ! grep -q '48;2;252;252;252m\|48;2;250;250;250m\|48;2;255;255;255m\|38;2;39;39;42m' "$K"   # no row kept a light color
-grep -q '38;2;245;245;245m.\[48;2;52;107;241m ↑' "$K"                   # dark keeps its text color on the send button
+
+# The dialog covers the send button at 120x40. Closed, it shows dark's text color there.
+$T3V keys Escape && $T3V wait --gone "Thread details"
+K=$($T3V capture dark-closed | grep 'ans$') && grep -q '38;2;245;245;245m.\[48;2;52;107;241m ↑' "$K"
 
 # Over an open menu, which stays open, and a restart that keeps Light.
-$T3V keys Escape && $T3V wait --gone "Thread details"
 $T3V keys M-m && $T3V wait --text "Search models"
 $T3V keys M-A && $T3V wait --text "Appearance: System" --text "Search models"
 $T3V keys M-A && $T3V wait --text "Appearance: Light" --text "Search models"
