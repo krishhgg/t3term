@@ -23,8 +23,10 @@ mod sidebar;
 mod tasks;
 mod theme;
 mod unsent;
+mod wide_emoji;
 
 use std::collections::{HashMap, HashSet, VecDeque};
+use std::io::Stdout;
 use std::sync::Arc;
 use std::time::{Duration, Instant};
 
@@ -34,11 +36,12 @@ use crossterm::event::{
     EventStream, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind,
 };
 use futures_util::StreamExt;
-use ratatui::Frame;
+use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Paragraph};
+use ratatui::{Frame, Terminal};
 use serde_json::{Value, json};
 use tokio::sync::mpsc;
 use unicode_width::UnicodeWidthStr;
@@ -541,7 +544,7 @@ struct App {
 }
 
 pub async fn run(client: Arc<Client>) -> Result<()> {
-    let mut screen = Screen(Some(ratatui::init()));
+    let mut screen = Screen(Some(init()));
     crossterm::execute!(std::io::stdout(), EnableMouseCapture, EnableBracketedPaste)?;
     let Some(terminal) = screen.0.as_mut() else {
         return Ok(());
@@ -549,9 +552,31 @@ pub async fn run(client: Arc<Client>) -> Result<()> {
     event_loop(terminal, client).await
 }
 
+/// The terminal the TUI draws on: ratatui's crossterm backend on stdout, through
+/// [`WideEmoji`](wide_emoji::WideEmoji).
+type Term = Terminal<wide_emoji::WideEmoji<CrosstermBackend<Stdout>>>;
+
+/// `ratatui::init` with the backend `Term` names: a panic hook that puts the terminal back,
+/// raw mode and the alternate screen. Like it, it panics when the terminal can't be set up.
+fn init() -> Term {
+    let hook = std::panic::take_hook();
+    std::panic::set_hook(Box::new(move |info| {
+        ratatui::restore();
+        hook(info);
+    }));
+    let set_up = || -> std::io::Result<Term> {
+        crossterm::terminal::enable_raw_mode()?;
+        crossterm::execute!(std::io::stdout(), crossterm::terminal::EnterAlternateScreen)?;
+        Terminal::new(wide_emoji::WideEmoji(CrosstermBackend::new(
+            std::io::stdout(),
+        )))
+    };
+    set_up().expect("failed to initialize terminal")
+}
+
 /// Owns the terminal while the TUI runs and puts it back when dropped, including when main
 /// drops the TUI after a signal.
-struct Screen(Option<ratatui::DefaultTerminal>);
+struct Screen(Option<Term>);
 
 impl Drop for Screen {
     fn drop(&mut self) {
@@ -588,7 +613,7 @@ async fn read_pull_request(
     }
 }
 
-async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>) -> Result<()> {
+async fn event_loop(terminal: &mut Term, client: Arc<Client>) -> Result<()> {
     let (actions, mut action_results) = mpsc::unbounded_channel();
     let mut shell_events = client.watch_shell(None);
     // Dropped when the loop ends, which ends the subscription.
