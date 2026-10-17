@@ -825,6 +825,182 @@ fn finished_remarks_open_one_at_a_time_from_a_row_of_their_text() {
     );
 }
 
+/// Reactions as T3 sends them: each one's `content`, how many reacted, and whether the reader
+/// is one of them.
+fn reactions(of: &[(&str, u64, bool)]) -> Value {
+    of.iter()
+        .map(|(content, count, mine)| {
+            json!({"content": content, "count": count, "actors": [], "viewerHasReacted": mine})
+        })
+        .collect()
+}
+
+#[test]
+fn no_reactions_emoji_carries_a_variation_selector() {
+    // An emoji with U+FE0F is a column wide in some terminals and two in others, and ratatui
+    // writes the cell after it without moving the cursor, so the row would move in one or the
+    // other. Without it, an emoji's width is its East Asian Width, as unicode-width counts it:
+    // two for each of these but the heart, and one for the heart.
+    let contents = [
+        ("thumbs-up", 2),
+        ("thumbs-down", 2),
+        ("laugh", 2),
+        ("hooray", 2),
+        ("confused", 2),
+        ("heart", 1),
+        ("rocket", 2),
+        ("eyes", 2),
+    ];
+    let mut each = remark("k1", actor("mona"), &ago_at(5), None, "All of them.");
+    each["reactions"] = reactions(&contents.map(|(content, _)| (content, 1, false)));
+    let value = activity(vec![each], vec![], vec![]);
+    let mut answer = Answer::Read(Box::new(conversation_of(&value)));
+    let (rows, _) = opened(&mut answer, &Shown::default(), 100);
+    let pills = rows.iter().find(|row| row.starts_with('👍')).unwrap();
+    let pills: Vec<&str> = pills.split("  ").collect();
+    assert_eq!(
+        pills,
+        [
+            "👍 1", "👎 1", "😄 1", "🎉 1", "😕 1", "❤ 1", "🚀 1", "👀 1"
+        ]
+    );
+    for (pill, (content, width)) in pills.iter().zip(contents) {
+        let emoji = pill.strip_suffix(" 1").unwrap();
+        assert!(!emoji.contains('\u{fe0f}'), "{content}");
+        assert_eq!(emoji.width(), width, "{content}");
+    }
+}
+
+#[test]
+fn a_remarks_reactions_show_under_its_header_wherever_it_shows() {
+    let mut reacted = remark("k1", actor("mona"), &ago_at(5), None, "Looks close.");
+    reacted["reactions"] = reactions(&[
+        ("thumbs-up", 3, false),
+        ("heart", 1, true),
+        ("eyes", 12, false),
+    ]);
+    let mut none = remark("k2", actor("lee"), &ago_at(10), None, "Nothing yet.");
+    none["reactions"] = json!([]);
+    // A host that takes no reactions sends no list at all.
+    let host = remark("k3", actor("kim"), &ago_at(15), None, "Nor here.");
+    let mut resolved = remark("r1", actor("octocat"), &ago_at(30), None, "Fixed.");
+    resolved["kind"] = json!("review-comment");
+    resolved["reactions"] = reactions(&[("hooray", 2, false)]);
+    let thread = json!({"id": "th", "path": "src/a.rs", "line": 3, "side": "right",
+        "isResolved": true, "isOutdated": false,
+        "comments": [{"id": "r1", "author": null, "body": "", "createdAt": NOW, "url": null}]});
+    let value = activity(vec![resolved, host, none, reacted], vec![thread], vec![]);
+    let at = |shown: &Shown, width: usize| {
+        let mut answer = Answer::Read(Box::new(conversation_of(&value)));
+        opened(&mut answer, shown, width)
+    };
+
+    // Under the header and over the text, in the order T3 sent them. A remark with none, or
+    // on a host that takes none, has no row for them.
+    let mut shown = Shown::default();
+    let (rows, _) = at(&shown, 40);
+    let expected = [
+        ends("mona", "5m ago", 40),
+        "👍 3  ❤ 1  👀 12".to_string(),
+        "  Looks close.".to_string(),
+        String::new(),
+        ends("lee", "10m ago", 40),
+        "  Nothing yet.".to_string(),
+        String::new(),
+        ends("kim", "15m ago", 40),
+        "  Nor here.".to_string(),
+    ];
+    assert_eq!(rows[1..10], expected);
+
+    // The reader's own is in the primary color, as the desktop marks it out, and the rest are
+    // grey.
+    let mut answer = Answer::Read(Box::new(conversation_of(&value)));
+    if let Answer::Read(conversation) = &mut answer {
+        conversation.lay_out(40, &theme(), &shown);
+    }
+    let section = section(&answer, &shown, 40, now(), &theme());
+    let pills = section
+        .lines
+        .iter()
+        .find(|line| line.to_string().starts_with('👍'));
+    let colors: Vec<(String, Option<Color>)> = pills
+        .expect("the row of reactions")
+        .spans
+        .iter()
+        .filter(|span| !span.content.trim().is_empty())
+        .map(|span| (span.content.to_string(), span.style.fg))
+        .collect();
+    let (grey, primary) = (Some(theme().muted), Some(theme().primary));
+    let expected = [
+        ("👍 3".to_string(), grey),
+        ("❤ 1".to_string(), primary),
+        ("👀 12".to_string(), grey),
+    ];
+    assert_eq!(colors, expected);
+
+    // Too narrow for all of them, each keeps its emoji and count together.
+    let (rows, _) = at(&shown, 9);
+    let first = rows.iter().position(|row| row.starts_with('👍')).unwrap();
+    assert_eq!(rows[first..first + 2], ["👍 3  ❤ 1", "👀 12"]);
+    let (rows, _) = at(&shown, 8);
+    let first = rows.iter().position(|row| row.starts_with('👍')).unwrap();
+    assert_eq!(rows[first..first + 3], ["👍 3", "❤ 1", "👀 12"]);
+
+    // A finished remark shows them closed and open, as the desktop's does, and only its header
+    // closes it once it is open.
+    shown.act(Control::Finished, &conversation_of(&value));
+    let (rows, targets) = at(&shown, 40);
+    let finished = rows_of_control(&targets, Control::Remark(0));
+    let expected = [
+        ends("octocat  › Resolved", "30m ago", 40),
+        "🎉 2".to_string(),
+        "src/a.rs:3".to_string(),
+        "Fixed.".to_string(),
+    ];
+    assert_eq!(rows[finished.clone()], expected);
+    shown.act(Control::Remark(0), &conversation_of(&value));
+    let (rows, targets) = at(&shown, 40);
+    let finished = rows_of_control(&targets, Control::Remark(0));
+    assert_eq!(finished.len(), 1);
+    let expected = [
+        ends("octocat  ⌄ Resolved", "30m ago", 40),
+        "🎉 2".to_string(),
+        "src/a.rs:3".to_string(),
+        "  Fixed.".to_string(),
+    ];
+    assert_eq!(rows[finished.start..finished.start + 4], expected);
+
+    // On the Timeline, a remark in an open run shows them under when and where it was written.
+    let mut conversation = conversation_of(&value);
+    conversation.follow(&lifecycle(&ago_at(60), None, Value::Null, Value::Null));
+    let mut answer = Answer::Read(Box::new(conversation));
+    let mut shown = Shown::default();
+    if let Answer::Read(conversation) = &answer {
+        shown.act(Control::Run(0), conversation);
+    }
+    let (rows, _) = timeline_rows(&mut answer, &shown, 60);
+    let card = rows
+        .iter()
+        .position(|row| row == "  mona commented")
+        .unwrap();
+    let expected = [
+        "  mona commented",
+        "  5m ago",
+        "  👍 3  ❤ 1  👀 12",
+        "  Looks close.",
+    ];
+    assert_eq!(rows[card..card + 4], expected);
+
+    // They fit every width, there and in the Comments section.
+    for width in 0..=70 {
+        let (timeline, _) = timeline_rows(&mut answer, &shown, width);
+        let (comments, _) = at(&shown, width);
+        for row in timeline.iter().chain(&comments) {
+            assert!(row.width() <= width.max(8), "{width}: {row:?}");
+        }
+    }
+}
+
 #[test]
 fn a_finished_remarks_row_reads_as_the_desktops_does() {
     let cases = [

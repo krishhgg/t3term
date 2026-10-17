@@ -15167,19 +15167,26 @@ mod tests {
             press(&mut app, KeyCode::Enter);
             app
         };
-        // And one whose host answered, with its description and a remark laid out.
+        // And one whose host answered, with its description and a remark laid out, the remark
+        // with your reaction in the primary color and another's in the muted one.
         let pull_answered = || {
             let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
             note_reads(&mut app);
             press(&mut app, KeyCode::Enter);
+            let mut sent = host_activity_sent();
+            sent["comments"][0]["reactions"] = json!([
+                {"content": "heart", "count": 2, "actors": [], "viewerHasReacted": true},
+                {"content": "laugh", "count": 1, "actors": [], "viewerHasReacted": false}
+            ]);
             let parts = vec![
                 Part::Detail(Ok(Box::new(host_detail()))),
-                Part::Activity(Ok(Box::new(host_activity()))),
+                Part::Activity(Ok(Box::new(pull_request::Activity::read(&sent).unwrap()))),
                 Part::Done,
             ];
             hear(&mut app, 1, parts);
             let shown = text_in(&cells(&mut app, 200, 50), Rect::new(0, 0, 200, 50));
             assert!(shown.contains("Second paragraph.") && shown.contains("Looks close."));
+            assert!(shown.contains("❤ 2"), "{shown}");
             app
         };
         // And its Timeline, with the verdict on a row of its own and the run with the remark open.
@@ -15196,6 +15203,7 @@ mod tests {
                 shown.contains("Newest first") && shown.contains("Looks close."),
                 "{shown}"
             );
+            assert!(shown.contains("❤ 2"), "{shown}");
             app
         };
         let scenes = [
