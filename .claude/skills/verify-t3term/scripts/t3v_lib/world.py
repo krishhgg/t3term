@@ -37,7 +37,10 @@ DOTS = {
 
 # ---- the descriptor's label: src/tui/environment.rs and src/tui/setup.rs's bounded ----
 
-LABEL_PRESETS = ('normal', 'absent', 'blank', 'hostile')
+LABEL_PRESETS = ('normal', 'absent', 'blank', 'hostile', 'huge')
+# The most of a descriptor's body t3term reads (MAX_DESCRIPTOR_BYTES in src/discovery.rs). The
+# huge preset's label alone is this long, so the descriptor passes it by its other fields.
+DESCRIPTOR_CAP = 256 * 1024
 LABEL_MAX = 64  # LABEL in src/tui/environment.rs; bounded reads at most four times as many
 JOINED = '\U0001f469\u200d\U0001f4bb'  # 👩 ZWJ 💻
 HOSTILE_HEAD = ('\t\x07 Fixture\r\nMac \x1b[31mred \x1b]52;c;eA==\x07osc \x9b2J \x07bel \x85'
@@ -65,6 +68,8 @@ def label_value(preset):
         return ' \t\x07\r\n\x1b '
     if preset == 'hostile':
         return hostile_label()
+    if preset == 'huge':
+        return 'Huge Mac ' + 'x' * (DESCRIPTOR_CAP - len('Huge Mac '))
     raise ValueError(f'no label preset {preset}')
 
 
