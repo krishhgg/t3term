@@ -118,6 +118,6 @@ Clean up failed attempts too. `ls -d /tmp/t3v-run-*` lists runs still on disk. R
 
 ## Keeping this skill true
 
-When a drive shows the map is wrong, fix the feature file in the same pull request as the change that made it wrong. smoke runs every recipe, so a recipe the app no longer matches fails there.
+When a drive shows the map is wrong, fix the feature file in the same pull request as the change that made it wrong. smoke runs every recipe, so a recipe the app no longer matches fails there. The maintain-verify-t3term skill checks this file and `features/` against the app between changes.
 
 Adapted from the create-verification-skill pattern in Cursor's pstack plugin (github.com/cursor/plugins, MIT) for this repo.
