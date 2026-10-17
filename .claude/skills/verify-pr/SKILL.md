@@ -23,7 +23,7 @@ gh pr diff N
 
 Read the description, the decision log and any verification page the pull request adds under `docs/`. Then write each claim in a form a run can disprove: the state, the user's action, what the screen or output shows, and what must not happen. One to five claims. For example: "With the terminal drawer open, Ctrl+Alt+A opens the theme list over it, and the shell receives no keys while the list is open."
 
-A pull request that changes nothing a user sees (CI, docs, a refactor) still gets a verdict. Its claims are "nothing a user sees changes", and the regression sweep in step 5 carries it.
+A pull request that changes nothing a user sees (CI, docs, a refactor) still gets a verdict. Its claim is "nothing a user sees changes". It has nothing for step 3 to drive, so step 5's sweep is its proof.
 
 ## 2. Find the baseline and build both sides
 
@@ -79,7 +79,7 @@ git worktree add /tmp/t3v-verdict/N/head-tree <head sha>
 git worktree remove /tmp/t3v-verdict/N/base-tree; git worktree remove /tmp/t3v-verdict/N/head-tree
 ```
 
-A recipe that passes on base and fails on head is a regression unless the pull request changed it. A recipe the pull request changed must pass on head. A side that predates smoke has no recipes. Then run master's smoke and recipes against both builds. A head failure in a feature the pull request changes on purpose means the recipe needs updating, so drive that feature by hand and ask the author to update its feature file. Any other head failure that base passes is a regression.
+A recipe that passes on base and fails on head is a regression unless the pull request changed it. A recipe the pull request changed must pass on head. A side that predates smoke has no recipes. Then run master's smoke and recipes against both builds. A head failure in a feature the pull request changes on purpose means the recipe needs updating. Drive that feature by hand, and ask the author to update its feature file. Until they do, the verdict is FAIL, because master's smoke would fail after the merge. Any other head failure that base passes is a regression.
 
 Then list the features the diff can reach: map each changed file under `src/` to the feature files that drive it, and add the feature the claims name. Drive each of those features' recipes on head. For each one that the pull request doesn't mean to change, capture the same screens on base and head and compare them:
 
@@ -98,9 +98,9 @@ Any difference the pull request doesn't explain is a finding. For a small diff y
 
 ## 7. Decide
 
-- **PASS.** Every claim held on head and the baseline showed the difference. The sweep found no regression, `check` passed, CI is green and Greptile is answered.
-- **PASS+NOTES.** The same, with notes that don't block: a missing feature file, a cosmetic difference, an edge case the pull request's Known limits already names.
-- **FAIL.** A claim didn't hold, the sweep found a regression, a rule broke, a regression test passes with its fix reverted, or CI is red.
+- **PASS.** Every claim held on head. A claim that something changes showed the old behavior on base. A claim that nothing a user sees changes held because the sweep found the same recipes passing, the same screens and the same requests on both sides. The sweep found no regression, `check` passed, CI is green, Greptile is answered and the feature files match the change.
+- **PASS+NOTES.** The same, with notes that don't block: a cosmetic difference, an edge case the pull request's Known limits already names, or a feature file that was already wrong where this pull request doesn't touch it. Report that last one for maintain-verify-t3term.
+- **FAIL.** A claim didn't hold, the sweep found a regression, a rule broke, a regression test passes with its fix reverted, CI is red, or the change needed a feature file update (step 6) that it doesn't have.
 
 A claim that couldn't run is inconclusive. Say which half couldn't run and why. A pull request with an inconclusive claim has no verdict yet, so it can't land.
 
