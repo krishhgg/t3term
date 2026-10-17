@@ -14479,11 +14479,28 @@ mod tests {
             assert!(shown.contains("Second paragraph.") && shown.contains("Looks close."));
             app
         };
+        // And its Timeline, with the verdict on a row of its own and the run with the remark open.
+        let pull_timeline = || {
+            let mut app = pull_answered();
+            press(&mut app, KeyCode::Right);
+            cells(&mut app, 200, 50);
+            // The run that holds the remark opens: Newest first, then the run.
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            let shown = text_in(&cells(&mut app, 200, 50), Rect::new(0, 0, 200, 50));
+            assert!(
+                shown.contains("Newest first") && shown.contains("Looks close."),
+                "{shown}"
+            );
+            app
+        };
         let scenes = [
             ("crowded", crowded(), 80, 24),
             ("crowded with details", crowded_details(), 200, 50),
             ("a pull request's details", pull_details(), 120, 40),
             ("a pull request's host answer", pull_answered(), 200, 50),
+            ("a pull request's Timeline", pull_timeline(), 200, 50),
         ];
         for (scene, mut app, width, height) in scenes {
             let composer = app.composer.text();
@@ -14518,8 +14535,8 @@ mod tests {
                 AppearanceMode::Dark
             );
         }
-        // Only the turn to System read anything.
-        assert_eq!(reads(&runtime), 4);
+        // Only the turn to System read anything, once a scene.
+        assert_eq!(reads(&runtime), 5);
     }
 
     #[test]
