@@ -1,8 +1,9 @@
-//! T3 Code's dark palette as terminal colors, plus the small formatting helpers the GUI uses
-//! for times, durations, model names and project badges.
+//! T3 Code's stock theme as terminal colors, in its light and dark halves, plus the small
+//! formatting helpers the GUI uses for times, durations, model names and project badges.
 //!
 //! True color is used when `COLORTERM` says the terminal supports it. Otherwise every value
-//! degrades to the nearest xterm-256 color at startup, so drawing never pays for the mapping.
+//! degrades to the nearest xterm-256 color when the theme is built, so drawing never pays for
+//! the mapping.
 
 use ratatui::style::{Color, Style};
 
@@ -79,9 +80,27 @@ const PROJECT_COLORS: [u32; 18] = [
     0x00d3f2, 0x00bcff, 0x51a2ff, 0x7c86ff, 0xa684ff, 0xc27aff, 0xed6bff, 0xfb64b6, 0xff637e,
 ];
 
+/// Tailwind's `-600` shades, the light half of the same palette (`text-{color}-600
+/// dark:text-{color}-400` in apps/web/src/projectIdentity.ts), in the same order.
+const PROJECT_COLORS_LIGHT: [u32; 18] = [
+    0x4a5565, 0xe7000b, 0xf54900, 0xe17100, 0xd08700, 0x5ea500, 0x00a63e, 0x009966, 0x009689,
+    0x0092b8, 0x0084d1, 0x155dfc, 0x4f39f6, 0x7f22fe, 0x9810fa, 0xc800de, 0xe60076, 0xec003f,
+];
+
+/// Which half of a theme draws: the desktop's resolved appearance.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Appearance {
+    Light,
+    Dark,
+}
+
 /// Semantic colors, named after the CSS variables in T3's `index.css` where one exists.
 #[derive(Debug, Clone)]
 pub struct Theme {
+    /// The half these colors are.
+    pub appearance: Appearance,
+    /// The depth they were built for, which another half is built for too.
+    pub depth: Depth,
     pub bg: Color,
     pub fg: Color,
     pub muted: Color,
@@ -126,9 +145,20 @@ pub struct Theme {
 }
 
 impl Theme {
+    /// The stock theme's `appearance` half.
+    pub fn of(appearance: Appearance, depth: Depth) -> Theme {
+        match appearance {
+            Appearance::Light => Theme::light(depth),
+            Appearance::Dark => Theme::new(depth),
+        }
+    }
+
+    /// The stock theme's dark half.
     pub fn new(depth: Depth) -> Theme {
         let c = |v: u32| hex(depth, v);
         Theme {
+            appearance: Appearance::Dark,
+            depth,
             bg: c(0x0a0a0a),
             fg: c(0xf5f5f5),
             muted: c(0x818181),
@@ -168,12 +198,167 @@ impl Theme {
         }
     }
 
-    pub fn detect() -> Theme {
-        Theme::new(Depth::detect())
+    /// The stock theme's light half: the desktop's light tokens, flattened to sRGB as the
+    /// desktop's own values are. Where a token would lose a difference the dark half draws,
+    /// the field takes a darker zinc shade and says so.
+    pub fn light(depth: Depth) -> Theme {
+        let c = |v: u32| hex(depth, v);
+        Theme {
+            appearance: Appearance::Light,
+            depth,
+            // `--background`, zinc-25, and `--foreground`, zinc-800.
+            bg: c(0xfcfcfc),
+            fg: c(0x27272a),
+            // `--muted-foreground`, zinc-500.
+            muted: c(0x71717b),
+            // `--border`, zinc-200, and `--input`, zinc-300.
+            border: c(0xe4e4e7),
+            border_strong: c(0xd4d4d8),
+            // `--primary`, oklch(0.488 0.217 264).
+            primary: c(0x1b4ed8),
+            // `--info`, blue-500, and `--info-foreground`, blue-700.
+            info: c(0x2b7fff),
+            info_fg: c(0x1447e6),
+            // `--success-foreground`, emerald-700, and `--success`, emerald-500.
+            success: c(0x007a55),
+            emerald: c(0x00bc7d),
+            // `--warning`, amber-500, and `--warning-foreground`, amber-700.
+            warning: c(0xfe9a00),
+            warning_fg: c(0xbb4d00),
+            // The approval panel's outline and fill: amber-500 at 28% and 8% over the canvas,
+            // as the dark half's are.
+            warning_border: c(0xfde1b5),
+            warning_surface: c(0xfcf4e8),
+            // `--error`, red-500, and `--error-foreground`, red-700.
+            error: c(0xfb2c36),
+            error_fg: c(0xc10007),
+            // The light half of `text-indigo-600 dark:text-indigo-300/90` and of
+            // `text-violet-600 dark:text-violet-300/90`.
+            indigo: c(0x4f39f6),
+            violet: c(0x7f22fe),
+            // `--message-surface`, zinc-100.
+            bubble: c(0xf4f4f5),
+            // The composer is `--card`, white, in light.
+            raised: c(0xffffff),
+            // The desktop sets code on zinc-50 inside a border t3term doesn't draw. Halfway
+            // between zinc-100 and zinc-200, a block shows on the canvas and in a message
+            // bubble, as the dark half's does.
+            code_bg: c(0xececee),
+            // zinc-200, so inline code shows inside a message bubble, which is zinc-100.
+            inline_code_bg: c(0xe4e4e7),
+            // The desktop draws chips with no fill. t3term fills them, as in the dark half.
+            chip_bg: c(0xe4e4e7),
+            // `--sidebar`, zinc-50, with `--sidebar-foreground` and the muted text and border.
+            sidebar_bg: c(0xfafafa),
+            sidebar_fg: c(0x27272a),
+            sidebar_muted: c(0x71717b),
+            sidebar_border: c(0xe4e4e7),
+            // The desktop's active and selected rows are white, which barely shows on zinc-50,
+            // so zinc-200 and zinc-100.
+            row_active: c(0xe4e4e7),
+            row_selected: c(0xf4f4f5),
+            // `--popover`, white. `--accent` is zinc-100, which barely shows on white, so the
+            // highlighted row is zinc-200.
+            popover: c(0xffffff),
+            highlight: c(0xe4e4e7),
+            // The question panel's outline and fill: indigo-600 at 28% and 8% over the canvas.
+            indigo_border: c(0xccc5fa),
+            indigo_surface: c(0xeeecfc),
+            claude: c(0xd97757),
+            // The OpenAI mark is black in light and white in dark, where the dark half takes
+            // neutral-300. neutral-700 mirrors it.
+            openai: c(0x404040),
+            project_colors: PROJECT_COLORS_LIGHT.map(c),
+        }
     }
 
     pub fn text(&self) -> Style {
         Style::new().fg(self.fg)
+    }
+
+    /// Every color the theme has. A field added to `Theme` fails to build here until it is
+    /// listed.
+    #[cfg(test)]
+    pub fn colors(&self) -> Vec<Color> {
+        let Theme {
+            appearance: _,
+            depth: _,
+            bg,
+            fg,
+            muted,
+            border,
+            border_strong,
+            primary,
+            info,
+            info_fg,
+            success,
+            emerald,
+            warning,
+            warning_fg,
+            warning_border,
+            warning_surface,
+            error,
+            error_fg,
+            indigo,
+            violet,
+            bubble,
+            raised,
+            code_bg,
+            inline_code_bg,
+            chip_bg,
+            sidebar_bg,
+            sidebar_fg,
+            sidebar_muted,
+            sidebar_border,
+            row_active,
+            row_selected,
+            popover,
+            highlight,
+            indigo_border,
+            indigo_surface,
+            claude,
+            openai,
+            project_colors,
+        } = self;
+        let mut colors = vec![
+            *bg,
+            *fg,
+            *muted,
+            *border,
+            *border_strong,
+            *primary,
+            *info,
+            *info_fg,
+            *success,
+            *emerald,
+            *warning,
+            *warning_fg,
+            *warning_border,
+            *warning_surface,
+            *error,
+            *error_fg,
+            *indigo,
+            *violet,
+            *bubble,
+            *raised,
+            *code_bg,
+            *inline_code_bg,
+            *chip_bg,
+            *sidebar_bg,
+            *sidebar_fg,
+            *sidebar_muted,
+            *sidebar_border,
+            *row_active,
+            *row_selected,
+            *popover,
+            *highlight,
+            *indigo_border,
+            *indigo_surface,
+            *claude,
+            *openai,
+        ];
+        colors.extend(project_colors);
+        colors
     }
 
     pub fn project_color(&self, badge: &Badge) -> Color {
@@ -407,6 +592,55 @@ mod tests {
         assert_eq!(
             Theme::new(Depth::TrueColor).primary,
             Color::Rgb(0x34, 0x6b, 0xf1)
+        );
+    }
+
+    #[test]
+    fn each_half_tells_apart_the_backgrounds_it_draws_on_one_another() {
+        for appearance in [Appearance::Light, Appearance::Dark] {
+            let t = Theme::of(appearance, Depth::TrueColor);
+            assert_eq!(t.appearance, appearance);
+            assert_eq!(t.depth, Depth::TrueColor);
+            // Each pair is something drawn and what it is drawn on.
+            let pairs = [
+                ("bubble on the canvas", t.bubble, t.bg),
+                ("a code block on the canvas", t.code_bg, t.bg),
+                ("a code block in a bubble", t.code_bg, t.bubble),
+                ("inline code on the canvas", t.inline_code_bg, t.bg),
+                ("inline code in a bubble", t.inline_code_bg, t.bubble),
+                ("the composer on the canvas", t.raised, t.bg),
+                ("a chip in the composer", t.chip_bg, t.raised),
+                ("a menu on the canvas", t.popover, t.bg),
+                ("a menu's highlighted row", t.highlight, t.popover),
+                ("the sidebar beside the canvas", t.sidebar_bg, t.bg),
+                ("the active row in the sidebar", t.row_active, t.sidebar_bg),
+                (
+                    "the selected row in the sidebar",
+                    t.row_selected,
+                    t.sidebar_bg,
+                ),
+                (
+                    "the active row beside the selected",
+                    t.row_active,
+                    t.row_selected,
+                ),
+                ("the approval panel on the canvas", t.warning_surface, t.bg),
+                ("the question panel on the canvas", t.indigo_surface, t.bg),
+            ];
+            for (what, drawn, on) in pairs {
+                assert_ne!(drawn, on, "{appearance:?}: {what}");
+            }
+        }
+        // The light half has the desktop's own canvas, text and blue.
+        let light = Theme::light(Depth::TrueColor);
+        assert_eq!(light.bg, Color::Rgb(0xfc, 0xfc, 0xfc));
+        assert_eq!(light.fg, Color::Rgb(0x27, 0x27, 0x2a));
+        assert_eq!(light.primary, Color::Rgb(0x1b, 0x4e, 0xd8));
+        // A project keeps its place in the palette and takes its -600 shade: red-600 for red.
+        assert_eq!(light.project_colors[1], Color::Rgb(0xe7, 0x00, 0x0b));
+        assert_eq!(
+            Theme::new(Depth::TrueColor).project_colors[1],
+            Color::Rgb(0xff, 0x64, 0x67)
         );
     }
 

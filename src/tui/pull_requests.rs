@@ -819,6 +819,13 @@ impl PullRequests {
         self.detail = None;
     }
 
+    /// Drops the page and the details laid out in the old colors, after the theme changed. A
+    /// click lands on nothing until the next frame lays them out again.
+    pub fn restyle(&mut self) {
+        self.page = None;
+        self.detail = None;
+    }
+
     /// Whether this frame has to work the links out for thread `open_id`: an event may have
     /// changed them, they are of another thread, or the environment's support changed.
     pub fn wants(&self, open_id: Option<&str>, supported: bool) -> bool {

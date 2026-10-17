@@ -67,6 +67,58 @@ pub struct Settings {
     /// it up to date. Every save writes the current version.
     #[serde(default)]
     pub sidebar_shelves_version: u32,
+    /// The color scheme: the system's appearance, or light or dark whatever the system shows.
+    /// Alt+Shift+A saves it, as the desktop's Cmd+Option+Shift+A saves its own under
+    /// `t3code:theme-appearance-mode` in the browser's storage, so this key is t3term's. A file
+    /// without it, or with a value this build doesn't know, draws dark.
+    pub appearance_mode: AppearanceMode,
+}
+
+/// Which appearance the TUI draws.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize)]
+#[serde(rename_all = "lowercase")]
+pub enum AppearanceMode {
+    /// The system's: light or dark as macOS shows, and dark on other systems.
+    System,
+    Light,
+    /// The desktop starts on System. t3term starts dark, as it drew before it had a choice.
+    #[default]
+    Dark,
+}
+
+impl AppearanceMode {
+    /// The mode after this one, in the order the desktop's key cycles them.
+    pub fn next(self) -> AppearanceMode {
+        match self {
+            AppearanceMode::System => AppearanceMode::Light,
+            AppearanceMode::Light => AppearanceMode::Dark,
+            AppearanceMode::Dark => AppearanceMode::System,
+        }
+    }
+
+    /// Its name, as the desktop shows it.
+    pub fn label(self) -> &'static str {
+        match self {
+            AppearanceMode::System => "System",
+            AppearanceMode::Light => "Light",
+            AppearanceMode::Dark => "Dark",
+        }
+    }
+}
+
+/// Reads anything but the three names as the default, so a value from a later build or a hand
+/// edit doesn't lose the rest of the file.
+impl<'de> Deserialize<'de> for AppearanceMode {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        Ok(
+            match serde_json::Value::deserialize(deserializer)?.as_str() {
+                Some("system") => AppearanceMode::System,
+                Some("light") => AppearanceMode::Light,
+                Some("dark") => AppearanceMode::Dark,
+                _ => AppearanceMode::default(),
+            },
+        )
+    }
 }
 
 /// The version of the sidebar's shelves this build saves. Version 1 has the Working, Done and
@@ -85,6 +137,7 @@ impl Default for Settings {
             sidebar_hidden: false,
             sidebar_width: None,
             sidebar_shelves_version: SHELVES_VERSION,
+            appearance_mode: AppearanceMode::default(),
         }
     }
 }
@@ -355,8 +408,50 @@ mod tests {
                 "sidebarSettledShelfExpanded": false,
                 "sidebarHidden": false,
                 "sidebarShelvesVersion": 1,
+                "appearanceMode": "dark",
             })
         );
+    }
+
+    #[test]
+    fn the_appearance_mode_reads_leniently() {
+        let mode = |raw: &str| parse(raw.as_bytes()).unwrap().appearance_mode;
+        assert_eq!(mode("{}"), AppearanceMode::Dark);
+        assert_eq!(
+            mode(r#"{"appearanceMode": "system"}"#),
+            AppearanceMode::System
+        );
+        assert_eq!(
+            mode(r#"{"appearanceMode": "light"}"#),
+            AppearanceMode::Light
+        );
+        assert_eq!(mode(r#"{"appearanceMode": "dark"}"#), AppearanceMode::Dark);
+        // A value this build doesn't know draws dark and keeps the rest of the file.
+        for unknown in [
+            r#""sepia""#,
+            r#""Light""#,
+            "null",
+            "3",
+            r#"{"mode": "light"}"#,
+        ] {
+            let raw = format!(r#"{{"verbose": true, "appearanceMode": {unknown}}}"#);
+            let read = parse(raw.as_bytes()).unwrap();
+            assert_eq!(read.appearance_mode, AppearanceMode::Dark, "{unknown}");
+            assert!(read.verbose, "{unknown}");
+        }
+        // Each saves as the name it reads back from.
+        for mode in [
+            AppearanceMode::System,
+            AppearanceMode::Light,
+            AppearanceMode::Dark,
+        ] {
+            let saved = serde_json::to_value(mode).unwrap();
+            assert_eq!(saved, mode.label().to_lowercase());
+            assert_eq!(
+                serde_json::from_value::<AppearanceMode>(saved).unwrap(),
+                mode
+            );
+        }
     }
 
     #[test]
@@ -483,6 +578,7 @@ mod tests {
                 sidebar_hidden: false,
                 sidebar_width: None,
                 sidebar_shelves_version: 1,
+                appearance_mode: AppearanceMode::Dark,
             }
         );
 
@@ -538,6 +634,7 @@ mod tests {
             sidebar_hidden: false,
             sidebar_width: Some(42),
             sidebar_shelves_version: SHELVES_VERSION,
+            appearance_mode: AppearanceMode::Light,
         };
         std::fs::write(&path, serde_json::to_string(&others).unwrap()).unwrap();
         update_at(&path, |settings| settings.sidebar_hidden = true).unwrap();
@@ -611,6 +708,7 @@ mod tests {
             sidebar_hidden: true,
             sidebar_width: None,
             sidebar_shelves_version: SHELVES_VERSION,
+            appearance_mode: AppearanceMode::System,
         };
         std::fs::write(&path, serde_json::to_string(&others).unwrap()).unwrap();
         update_at(&path, |settings| settings.sidebar_width = Some(42)).unwrap();
