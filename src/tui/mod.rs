@@ -16578,12 +16578,38 @@ mod tests {
             assert!(shown.contains("❤ 2"), "{shown}");
             app
         };
+        // And its Code tab, with a file unfolded.
+        let pull_code = || {
+            let mut app = pull_answered();
+            let diffs = note_diffs(&mut app);
+            press(&mut app, KeyCode::Right);
+            press(&mut app, KeyCode::Right);
+            assert_eq!(app.details.pulls.tabs(), Some(pull_requests::Tab::Code));
+            let ticket = diffs.borrow()[0].4;
+            let patch = "diff --git a/src/lib.rs b/src/lib.rs\n--- a/src/lib.rs\n+++ b/src/lib.rs\n\
+                         @@ -1,2 +1,2 @@\n same\n-old\n+new\n";
+            let answer = Ok(Box::new(pull_request::Diff {
+                patch: patch.into(),
+                truncated: false,
+                next_cursor: None,
+                omitted: Vec::new(),
+                omitted_cut: false,
+            }));
+            app.on_action_result(ActionResult::PullRequestDiff { ticket, answer });
+            cells(&mut app, 200, 50);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            let shown = text_in(&cells(&mut app, 200, 50), Rect::new(0, 0, 200, 50));
+            assert!(shown.contains("old") && shown.contains("new"), "{shown}");
+            app
+        };
         let scenes = [
             ("crowded", crowded(), 80, 24),
             ("crowded with details", crowded_details(), 200, 50),
             ("a pull request's details", pull_details(), 120, 40),
             ("a pull request's host answer", pull_answered(), 200, 50),
             ("a pull request's Timeline", pull_timeline(), 200, 50),
+            ("a pull request's Code tab", pull_code(), 200, 50),
         ];
         for (scene, mut app, width, height) in scenes {
             let composer = app.composer.text();
@@ -16619,7 +16645,7 @@ mod tests {
             );
         }
         // Only the turn to System read anything, once a scene.
-        assert_eq!(reads(&runtime), 5);
+        assert_eq!(reads(&runtime), 6);
     }
 
     #[test]
