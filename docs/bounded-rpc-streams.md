@@ -16,12 +16,12 @@ while let Some(chunk) = stream.next().await {
 
 `StreamLimits::new(chunks, bytes)` caps what the stream holds that the caller hasn't accepted. A chunk counts from the moment the reader queues it until the caller accepts or drops it, whether it waits in the stream or the caller holds it. `new` returns `None` if either limit is zero. A sum too big for `usize` counts as over the limit.
 
-A chunk's size, `BoundedChunk::bytes`, is the length of its whole `Chunk` message, `{"_tag":"Chunk","requestId":"7","values":[...]}`, as compact UTF-8 JSON. T3's terminal output window measures a chunk the same way, as `Buffer.byteLength(JSON.stringify(response))` in `apps/server/src/terminal/OutputProtocol.ts`. t3term has serde_json write the message into a counter that keeps nothing and stops at the byte limit, so sizing a chunk takes no second copy of it. serde_json writes strings and integers as JSON.stringify does, but can write a float with an exponent differently, such as `1e21` for `1e+21`.
+A chunk's size, `BoundedChunk::bytes`, is the length of its whole `Chunk` message, `{"_tag":"Chunk","requestId":"7","values":[...]}`, as compact UTF-8 JSON. T3's terminal output window measures a chunk the same way, as `Buffer.byteLength(JSON.stringify(response))` in `apps/server/src/terminal/OutputProtocol.ts`. t3term has serde_json write the message into a counter that keeps nothing and stops at the byte limit, so sizing a chunk takes no second copy of it. serde_json writes strings and integers as JSON.stringify does, but can write a float with an exponent differently, such as `1e21` for `1e+21`. Half a surrogate pair counts differently too: T3 counts its 6-byte escape, such as `\ud83d`, and t3term counts the 3 bytes of the U+FFFD it reads in its place.
 
 ## What the limits don't bound
 
 - Memory. The connection's reader holds a whole WebSocket message and the values it parses from it before the limits see any chunk in it. A parsed `serde_json::Value` can take more room than its JSON or less: an object takes more, a string of `\u001b` escapes less. So the byte limit isn't a limit on the heap or the process.
-- Reading. A chunk over the byte limit still costs its full read and parse before t3term refuses it. The reader takes a message of up to 64 MiB, tungstenite 0.28's default, and allows one frame to be just as large ([One frame per message](#one-frame-per-message)). A message over 64 MiB closes the socket and fails every call and stream on it.
+- Reading. A chunk over the byte limit still costs its full read and parse before t3term refuses it. The reader takes a message of up to 64 MiB, tungstenite 0.28's default, and allows one frame to be just as large ([One frame per message](#one-frame-per-message)). A message over 64 MiB closes the socket and fails every call and stream on it. The reader parses a text frame, or a binary frame of UTF-8, where it lies. A frame with a syntax error costs one copy of it, exactly as long as the message and so 64 MiB at most, and a scan of the copy for halves of surrogate pairs. Only a copy with a half replaced is parsed again. A binary frame that isn't UTF-8 ends the connection without a copy.
 - Accepted values. Once the caller accepts a chunk, bounding its values is up to the caller.
 
 ## Accepting a chunk
@@ -44,6 +44,7 @@ An end never needs room in the stream, so it reaches a full one. However a strea
 | The connection closes or goes silent | `RpcError::Disconnected` |
 | A `Chunk` without a `values` array | `RpcError::Protocol` |
 | A chunk over a limit, or a chunk dropped unaccepted | `RpcError::Stopped` with the reason |
+| A frame t3term can't parse, a binary one that isn't UTF-8 included, which also ends the connection | `RpcError::Protocol` |
 
 t3term forgets a request as soon as its stream ends, however it ends, so the requests it tracks don't build up over a long session.
 
@@ -78,6 +79,12 @@ T3 Code at `f570bd2` pins Effect 4.0.1, `@effect/platform-node` 4.0.1 and ws 8.2
 T3 turns on `perMessageDeflate` (`apps/server/src/server.ts`), but ws compresses only when the client offers the extension, and tungstenite doesn't. So frames from T3 arrive uncompressed.
 
 tungstenite's default caps a frame at 16 MiB. Under that default, any message from T3 over 16 MiB would close the socket, though the 64 MiB message limit allows it. `socket_config` in `src/rpc.rs` raises the frame limit to 64 MiB, so only the message limit decides. Both limits stay set. Nobody has measured a live T3 for this. It follows from the sources above.
+
+## Half a surrogate pair
+
+T3 keeps the first 128 UTF-16 code units of a terminal's label, in `truncateTerminalWireLabel` in `apps/server/src/terminal/Manager.ts`, so a label can end with the high half of an emoji's pair. The label goes out in the snapshot a terminal stream starts with and in each `activity` event, and JSON.stringify writes the half as an escape such as `\ud83d`. A Rust string can't hold half a pair, so serde_json refuses the whole frame. Before this change, t3term passed over the frame, so a chunk in it was never acked and kept one of T3's 8 slots for good.
+
+Now t3term parses such a frame again with U+FFFD in place of each half in a string value, and the chunk arrives and is acked as any other. The half itself is lost. A half in an object's key stays refused, since two keys could become one. A frame t3term still can't parse ends the connection, and every call and stream on it ends with `RpcError::Protocol`. So does a binary frame that isn't UTF-8, since JSON is UTF-8. Nothing in that frame is acked. `src/rpc/json.rs` has the details.
 
 ## Out of scope
 

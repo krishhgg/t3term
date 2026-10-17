@@ -57,7 +57,9 @@ impl BoundedChunk {
     /// as compact UTF-8 JSON. T3's terminal output window measures a chunk the same way, as
     /// `Buffer.byteLength(JSON.stringify(response))` in apps/server/src/terminal/
     /// OutputProtocol.ts. serde_json writes strings and integers as JSON.stringify does, but
-    /// can write a float with an exponent differently, such as `1e21` for `1e+21`.
+    /// can write a float with an exponent differently, such as `1e21` for `1e+21`. Half a
+    /// surrogate pair counts differently too: T3 counts its 6-byte escape, and t3term counts the
+    /// 3 bytes of the U+FFFD it reads in its place.
     ///
     /// It isn't the memory the values take. A parsed `Value` takes more than its JSON.
     pub fn bytes(&self) -> usize {

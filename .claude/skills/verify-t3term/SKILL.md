@@ -64,7 +64,7 @@ Do one action, then wait for what it should change. Never `sleep`.
 - `t3v drag TO` drags the sidebar's edge and releases at column TO.
 - `t3v resize COLS ROWS`.
 - `t3v wait --text T --gone T --idle MS --timeout S` polls the pane every 50 ms until every condition holds at once. `--text` and `--gone` repeat. On a timeout it exits 1 and prints which condition failed and the screen. If t3term exits, the wait fails at once and says how it ended, such as `t3term was killed by SIGKILL (9)`.
-- World controls change what the server sends, as T3 would: `t3v reconnect --hold 5` drops every socket for 5 s, `t3v shell fail` ends the sidebar's feed, `t3v run thr-single running` starts a run, `t3v links thr-single merged` changes a thread's links. `t3v --help` lists them all, and each feature file names the ones it uses.
+- World controls change what the server sends, as T3 would: `t3v reconnect --hold 5` drops every socket for 5 s, `t3v shell fail` ends the sidebar's feed, `t3v run thr-single running` starts a run, `t3v links thr-single merged` changes a thread's links, and `t3v frame json` sends the TUI's sockets a text frame that isn't JSON. `t3v frame binary` sends binary that isn't UTF-8 instead, and `--client cli` sends either to the CLI's sockets. `t3v --help` lists them all, and each feature file names the ones it uses.
 
 A click lands where the last frame drew. After a key, a wheel notch, a resize or a server event, wait for the frame that shows the change before you click. t3term ignores clicks on several widgets until that frame, on purpose, and a click sent too early does nothing.
 
