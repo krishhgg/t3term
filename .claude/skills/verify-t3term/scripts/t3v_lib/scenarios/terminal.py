@@ -21,7 +21,8 @@ apps/server/src/terminal/Manager.ts and OutputProtocol.ts, apps/server/src/auth/
 - Output goes in events of at most 4 KiB, at most 4 events to a chunk. History keeps the last
   5,000 lines and 8 MiB, counting bytes in UTF-8 as Buffer.byteLength counts them, and trims as
   BoundedTerminalHistory trims: whole lines from the front, then whole code points. The DSR, CPR
-  and DA queries T3 strips never reach it (a simpler match than T3's).
+  and DA queries T3 strips never reach it (a simpler match than T3's), even split between two
+  events, since it holds an unfinished CSI sequence until the next output as T3 does.
 - terminal.write: a missing terminal fails with TerminalSessionLookupError, an exited one succeeds
   and does nothing, and any other that isn't running fails with TerminalNotRunningError. A write
   takes at most 65,536 UTF-16 units. terminal.resize does nothing for a missing terminal or one
@@ -60,16 +61,19 @@ cursorkeys, fullscreen [--mouse], dsr, sync [--hang], paste on|off, hostile, sle
 exit [N] and kill [SIGNAL]. At the prompt, a key it has no use for (Tab, an arrow, Esc, a
 function key, Ctrl+X) prints a line such as `[key ^I  09]`, so you can see what reached it.
 Ctrl+C prints ^C and Ctrl+D on an empty line exits. Its prompt turns bracketed paste on, as zsh's
-does, and a bracketed paste prints `[paste N characters, LF n, CR n, sha256 XXXXXXXXXXXX]`. The
-log keeps a write's length and a hash, never what was typed.
+does, and a bracketed paste prints `[paste N characters, LF n, CR n, sha256 XXXXXXXXXXXX]`. What
+it prints while it takes one write goes out when the write ends, as one read of a PTY would
+gather it. The log keeps a write's length and a hash, never what was typed.
 
 Checks. On top of the shared rules, `t3v check` fails a run with an attach field the drawer
 never sends (attachViolations), a launch that differs from the thread's (launchMismatches), a
 terminal RPC the drawer never sends (unexpectedTerminalRpcs), more than 8 chunks unacked
 (maxUnacked), an Ack for no chunk (excessAcks) or for no attach stream on the terminal socket
 (acksOnOtherStreams.terminal), a write before the last one's answer (writesOverlapped), a write
-over 65,536 UTF-16 units (largestWrite), the duplicate event more than once per `term
-duplicate`, and, after stop, a terminal socket still open or a terminal session not revoked.
+over 65,536 UTF-16 units (largestWrite), a terminal request T3's schema refuses (badInput in
+attaches, terminalWrites or terminalResizes), one `term duplicate` event on screen more than once
+(duplicateOnScreen), and, after stop, a terminal socket still open or a terminal session not
+revoked.
 
 Cases worth driving. `t3v term list` shows each terminal and the header the drawer should show
 for it, and a failed shell's last row. `--thread` defaults to thr-running.
@@ -97,9 +101,10 @@ for it, and a failed shell's last row. `--thread` defaults to thr-running.
     (cleaned and cut to 64 columns), `--preset idle`; `term clear`; `term exit --code 3`; `term
     restart`; `term error --message "pty broke"` (the last row reads ` pty broke`); `term close`
     (closed, read-only, the stream stays open); `term start`.
-10. Events to skip: `term stranger`, `term old` and `term duplicate`. duplicateOnScreen is at
-    most 1 and screenLeaks stays 0. `term activity --preset split` cuts an emoji in half, which
-    JSON writes as a lone \\ud83d escape that a strict JSON reader refuses.
+10. Events to skip: `term stranger`, `term old` and `term duplicate`, which sends
+    DUPLICATE-CHECK-N twice. duplicateOnScreen is at most 1 and screenLeaks stays 0. `term
+    activity --preset split` cuts an emoji in half, which JSON writes as a lone \\ud83d escape
+    that a strict JSON reader refuses.
 11. Malformed: `term malformed` stops the drawer, naming the event and field. Enter attaches
     again.
 12. Limits: `term ignore-window --chunks 20` (which also breaks maxUnacked on purpose) and `term
@@ -287,8 +292,13 @@ class TerminalFixture(Orchestration):
     def output(self, session: Session, text: str):
         """Output from the shell, as T3 reads it from the PTY: events of at most OUTPUT_PIECE
         characters, each with its sequence, into the history, and to the attach streams at most
-        EVENTS_PER_CHUNK events to a chunk."""
+        EVENTS_PER_CHUNK events to a chunk. What the shell prints while it takes a write waits
+        until the write ends, as one read of a PTY gathers it, so a paste's echo is a few events
+        and not one a character."""
         if not self.current(session) or not text:
+            return
+        if session.held is not None:
+            session.held.append(text)
             return
         events = []
         for start in range(0, len(text), OUTPUT_PIECE):
@@ -299,16 +309,26 @@ class TerminalFixture(Orchestration):
             self.broadcast(session.key, events[start:start + EVENTS_PER_CHUNK])
         self.counts['term.outputEvents'] += len(events)
 
+    def send_held(self, session: Session):
+        """Sends what the shell printed during this write so far, before an event that follows it."""
+        held = session.held
+        if held:
+            session.held = None
+            self.output(session, ''.join(held))
+            session.held = []
+
     def activity(self, session: Session, label: str, busy: bool):
         """An activity event, with the label cut at 128 UTF-16 code units as T3 cuts it."""
         if not self.current(session):
             return
+        self.send_held(session)
         session.label, session.busy = utf16_cut(label, LABEL_LIMIT), busy
         self.broadcast(session.key, [session.event('activity', hasRunningSubprocess=busy, label=session.label)])
 
     def exit_session(self, session: Session, code, signum, why: str):
         if not self.current(session) or session.status in ('exited', 'error'):
             return
+        self.send_held(session)
         session.shell.stop()
         session.status, session.pid = 'exited', None
         session.exit_code, session.exit_signal = code, signum
@@ -337,9 +357,12 @@ class TerminalFixture(Orchestration):
             self.started(session, False)
         return session
 
-    def started(self, session: Session, banner: bool):
+    def started(self, session: Session, waited: bool):
+        """The started snapshot. `waited` is the `--starting` timer, which also starts the shell,
+        and does nothing once a restart, an exit or a close has moved the terminal on."""
         with self.lock:
-            if not self.current(session) or session.status not in ('starting', 'running'):
+            ready = ('starting',) if waited else ('starting', 'running')
+            if not self.current(session) or session.status not in ready:
                 return
             session.status = 'running'
             if session.pid is None:
@@ -347,7 +370,7 @@ class TerminalFixture(Orchestration):
             session.sequence += 1
             session.updated = iso(now_ms())
             self.broadcast(session.key, [{'type': 'snapshot', 'snapshot': session.snapshot()}])
-            if banner:
+            if waited:
                 session.shell.start()
 
     # -- the terminal RPCs --
@@ -526,7 +549,12 @@ class TerminalFixture(Orchestration):
             if slow:
                 self.busy_writes[session.key] -= 1
             if self.current(session) and session.status == 'running':
-                session.shell.feed(data)
+                session.held = []
+                try:
+                    session.shell.feed(data)
+                finally:
+                    self.send_held(session)
+                    session.held = None
                 self.counts['write.fed'] += 1
             connection.exit_success(request_id, None)
 
@@ -822,13 +850,15 @@ class TerminalFixture(Orchestration):
         return 'sent three events the drawer must skip; none of their text should show', None
 
     def term_duplicate(self, session: Session, request: dict):
-        # Not T3: the same event twice.
-        event = session.event('output', data=f'\r\n{DUPLICATE}\r\n')
+        # Not T3: the same event twice. term_action counted this control already, so each probe
+        # has its own number and an earlier one can't hide a copy of this one.
+        mark = f'{DUPLICATE}-{self.counts["term.control.duplicate"]}'
+        event = session.event('output', data=f'\r\n{mark}\r\n')
         session.history.add(event['data'])
         self.broadcast(session.key, [event])
         self.broadcast(session.key, [event])
         self.redraw(session)
-        return f'sent {DUPLICATE} twice at sequence {event["sequence"]}; it should show once', None
+        return f'sent {mark} twice at sequence {event["sequence"]}; it should show once', None
 
     def term_old(self, session: Session, request: dict):
         # Not T3: an event from before the last one.
@@ -935,7 +965,7 @@ def add_commands(commands, run_option):
                        ('clear', 'a cleared event'),
                        ('malformed', 'an output event whose data is 42 (not T3)'),
                        ('stranger', 'events for term-2, another thread and a future type (not T3)'),
-                       ('duplicate', f'{DUPLICATE} twice with one sequence (not T3)'),
+                       ('duplicate', f'{DUPLICATE}-N twice with one sequence (not T3)'),
                        ('old', 'an event from before the last one (not T3)'),
                        ('oversize', 'one output chunk of about 57.4 MiB (not T3)')):
         with_thread.append(actions.add_parser(name, help=what))

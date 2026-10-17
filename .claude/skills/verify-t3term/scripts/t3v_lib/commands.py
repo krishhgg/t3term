@@ -325,7 +325,11 @@ def cmd_type(args) -> int:
             die(f'tmux send-keys failed: {result.stderr.strip()}; `t3v doctor` checks the run')
     if not args.no_enter:
         time.sleep(0.05)
-        tmux(state, 'send-keys', '-t', state['session'], 'Enter')
+        result = tmux(state, 'send-keys', '-t', state['session'], 'Enter')
+        if result.returncode != 0:
+            if args.text:
+                mark(state, 'fixture.type', length=len(args.text), enter=False)
+            die(f'tmux send-keys Enter failed: {result.stderr.strip()}; `t3v doctor` checks the run')
     mark(state, 'fixture.type', length=len(args.text), enter=not args.no_enter)
     return 0
 

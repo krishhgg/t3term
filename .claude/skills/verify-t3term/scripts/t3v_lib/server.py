@@ -27,6 +27,7 @@ import struct
 import sys
 import threading
 import time
+import traceback
 import urllib.parse
 from collections import Counter
 from pathlib import Path
@@ -85,6 +86,16 @@ class FixtureBase(Auth):
                 text = text.replace(value, '<redacted>')
         return text
 
+    def failed(self, where: str, error: Exception) -> str:
+        """Counts a bug in the fake server itself, which fails `check`, and says where it was. The
+        log names the exception and its line, never its message, which can hold what was typed."""
+        frame = traceback.extract_tb(error.__traceback__)[-1]
+        what = f'{type(error).__name__} at {Path(frame.filename).name}:{frame.lineno} in {frame.name}'
+        with self.lock:
+            self.counts['fixtureErrors'] += 1
+        self.log('fixture.error', where=where, error=what)
+        return what
+
     def log(self, event: str, **fields):
         stamp = now_ms()
         record = {'wall': iso(stamp), 'wallMs': stamp, 'event': event}
@@ -105,7 +116,15 @@ class FixtureBase(Auth):
             self.maxima[name] = value
 
     def later(self, seconds: float, action):
-        timer = threading.Timer(max(0.0, seconds), action)
+        def run():
+            try:
+                action()
+            except (EOFError, OSError):
+                raise
+            except Exception as error:
+                self.failed('a timer', error)
+
+        timer = threading.Timer(max(0.0, seconds), run)
         timer.daemon = True
         timer.start()
         with self.lock:
@@ -425,7 +444,13 @@ class Connection:
                     continue
                 for message in decoded if isinstance(decoded, list) else [decoded]:
                     if isinstance(message, dict):
-                        self.handle(message)
+                        try:
+                            self.handle(message)
+                        except (EOFError, OSError):
+                            raise
+                        except Exception as error:
+                            reason = 'fixture error: ' + fixture.failed(f'socket {self.id}', error)
+                            return
         except (EOFError, OSError, ValueError) as error:
             reason = f'{type(error).__name__}: {error}'
         finally:

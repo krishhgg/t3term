@@ -13,7 +13,7 @@ from collections import Counter
 from .. import controls
 from ..rules import nonzero, rule
 from ..text import safe
-from .terminal_data import DUPLICATE, UNEXPECTED_TERMINAL, WINDOW_CHUNKS, WRITE_LIMIT
+from .terminal_data import DUPLICATE_MARK, UNEXPECTED_TERMINAL, WINDOW_CHUNKS, WRITE_LIMIT
 
 # What a helper did just before t3term asked for a terminal session, for firstTerminalIssueAfter.
 HELPER_STEPS = ('fixture.keys', 'fixture.click', 'fixture.type', 'fixture.paste', 'fixture.t3term_started',
@@ -127,7 +127,9 @@ def run_fields(server: dict, screen) -> dict:
         'terminalSocketsAtStop': (server.get('openSocketsAtStopByKind') or {}).get('terminal', 0) if stopped else None,
         'terminalSessionsUnrevoked': ([s.get('id') for s in sessions if s.get('kind') == 'terminal'
                                        and not s.get('revoked')] if stopped else None),
-        'duplicateOnScreen': screen.count(DUPLICATE) if screen is not None else None,
+        # The most copies of any one `term duplicate` on screen.
+        'duplicateOnScreen': (max(Counter(DUPLICATE_MARK.findall(screen)).values(), default=0)
+                              if screen is not None else None),
     }
 
 
@@ -158,6 +160,14 @@ def output_window(report):
 
 
 @rule
+def well_formed_requests(report):
+    for name in ('attaches', 'terminalWrites', 'terminalResizes'):
+        bad = (report.get(name) or {}).get('badInput', 0)
+        if bad:
+            yield f"{name}.badInput {bad}: a terminal request had a field T3's schema refuses"
+
+
+@rule
 def writes_in_order(report):
     if report.get('writesOverlapped'):
         yield f'writesOverlapped {report["writesOverlapped"]}: a write went before the last one was answered'
@@ -168,11 +178,8 @@ def writes_in_order(report):
 @rule
 def duplicate_once(report):
     shown = report.get('duplicateOnScreen')
-    if shown is None:
-        return
-    sent = (report.get('termControls') or {}).get('duplicate', 0)
-    if shown > sent:
-        yield f'duplicateOnScreen {shown} after {sent} `term duplicate`: an event showed twice'
+    if shown and shown > 1:
+        yield f'duplicateOnScreen {shown}: one `term duplicate` event showed {shown} times'
 
 
 @rule

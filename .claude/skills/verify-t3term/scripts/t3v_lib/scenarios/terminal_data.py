@@ -44,6 +44,9 @@ UNEXPECTED_TERMINAL = ('terminal.open', 'terminal.observe', 'terminal.clear', 't
 ATTACH_NEVER = ('cols', 'rows', 'restartIfNotRunning', 'providerInstanceId')
 # The queries T3 keeps out of history (shouldStripCsiSequence in Manager.ts), simplified.
 QUERY = re.compile(r'\x1b\[[0-9;?]*n|\x1b\[[0-9;?]*R|\x1b\[[>0-9;?]*c')
+# A CSI sequence that output ended before its final byte. T3 holds it until the next output
+# finishes it (pendingHistoryControlSequence in Manager.ts).
+UNFINISHED = re.compile(r'\x1b(?:\[[\x20-\x3f]*)?\Z')
 PASTE_START, PASTE_END = '\x1b[200~', '\x1b[201~'
 
 CLIPBOARD = 'T3V-CLIPBOARD'
@@ -89,8 +92,10 @@ LEAK_MARKERS = {
 # The markers above that are plain text, which a screen can show.
 SCREEN_MARKERS = ('clipboardText', 'windowTitle', 'linkTarget', 'dcsText', 'apcText', 'strangerTerminal',
                   'strangerThread', 'futureEvent', 'oldEvent')
-# The one marker that must show at most once for each `term duplicate`.
+# Each `term duplicate` sends DUPLICATE-CHECK-N, with N its own number, and each must show at
+# most once.
 DUPLICATE = 'DUPLICATE-CHECK'
+DUPLICATE_MARK = re.compile(re.escape(DUPLICATE) + r'-(\d+)(?!\d)')
 SIGNALS = {'HUP': 1, 'INT': 2, 'QUIT': 3, 'KILL': 9, 'TERM': 15}
 THREADS = (
     # thread id, title, worktree name or None, project id

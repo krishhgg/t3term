@@ -130,6 +130,7 @@ def build_report(root: Path, state: dict) -> dict:
         'scopeRefusals': prefixed(counts, 'scope.refused.'),
         'unknownRpcs': counts.get('unknownRpcs', 0),
         'unknownRpcTags': prefixed(counts, 'rpc.unknown.'),
+        'fixtureErrors': counts.get('fixtureErrors', 0),
         'openSockets': (server or {}).get('openSockets') if counts_from == 'the live server' else None,
         'openSocketsAtStop': (server or {}).get('openSocketsAtStop') if counts_from == 'summary.json' else None,
         'sessionsAtStop': (server or {}).get('sessions') if counts_from == 'summary.json' else None,

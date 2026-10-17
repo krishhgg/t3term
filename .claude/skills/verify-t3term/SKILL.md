@@ -88,7 +88,7 @@ What counts as proof:
 
 ## Check
 
-`t3v check` exits 1 with one line per broken rule. While the run is live: no request without its scope (`scopeViolations`), no RPC method the server doesn't know (`unknownRpcs`), no text that must stay hidden on screen (`screenLeaks`) or in `raw.ansi` (`controlLeaks`), and no token, ticket or control key the server issued on screen or in any file of the evidence directory (`secretLeaks`, counts by file, never the values). After `stop`: every session t3term issued was revoked and every socket closed, and the server's last search for its secrets, in `summary.json`, found none. The server refuses every orchestration command and `status` counts them as `commandsRefused`, which doesn't fail `check`.
+`t3v check` exits 1 with one line per broken rule. While the run is live: no request without its scope (`scopeViolations`), no RPC method the server doesn't know (`unknownRpcs`), no text that must stay hidden on screen (`screenLeaks`) or in `raw.ansi` (`controlLeaks`), no token, ticket or control key the server issued on screen or in any file of the evidence directory (`secretLeaks`, counts by file, never the values), and no bug in the fake server itself (`fixtureErrors`; `fixture.error` in `events.jsonl` names the exception and its line). A fixture bug fails the run because on screen it would only look like t3term reconnecting. After `stop`: every session t3term issued was revoked and every socket closed, and the server's last search for its secrets, in `summary.json`, found none. The server refuses every orchestration command and `status` counts them as `commandsRefused`, which doesn't fail `check`.
 
 ## Cleanup
 

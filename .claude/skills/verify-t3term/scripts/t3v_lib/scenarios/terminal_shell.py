@@ -15,8 +15,8 @@ import time
 
 from ..text import cells, encode, iso, now_ms, safe
 from .terminal_data import (DEFAULT_COLS, DEFAULT_ROWS, HISTORY_BYTES, HISTORY_LINES, HISTORY_PIECE, HOSTILE_OUTPUT,
-                            LINE_LIMIT, PASTE_END, PASTE_START, QUERY, SIGNALS, WINDOW_BYTES, WINDOW_CHUNKS, caret,
-                            hexes, printable, shown, utf8_len)
+                            LINE_LIMIT, PASTE_END, PASTE_START, QUERY, SIGNALS, UNFINISHED, WINDOW_BYTES,
+                            WINDOW_CHUNKS, caret, hexes, printable, shown, utf8_len)
 
 
 class History:
@@ -25,11 +25,14 @@ class History:
     the last newline counts as a line, as in T3. Like T3, it adds text in pieces of at most
     HISTORY_PIECE characters and trims after each piece: whole lines from the front until the
     lines fit, then whole code points from the front until the bytes fit. A trim copies at most
-    one piece, so a flood never copies the history."""
+    one piece, so a flood never copies the history. Like T3, it holds a CSI sequence that one
+    add ended early until the next add finishes it, so a query split between two output events
+    still stays out."""
 
     def __init__(self, text: str = ''):
         self.pieces = collections.deque()  # [text, its UTF-8 bytes, its newlines]
         self.bytes = self.newlines = 0
+        self.pending = ''
         if text:
             self.add(text)
 
@@ -40,7 +43,10 @@ class History:
         return self.newlines + (0 if self.pieces[-1][0].endswith('\n') else 1)
 
     def add(self, text: str):
-        text = QUERY.sub('', text)
+        text = self.pending + text
+        unfinished = UNFINISHED.search(text)
+        self.pending = unfinished.group(0) if unfinished else ''
+        text = QUERY.sub('', text[:len(text) - len(self.pending)])
         for start in range(0, len(text), HISTORY_PIECE):
             piece = text[start:start + HISTORY_PIECE]
             size, newlines = utf8_len(piece), piece.count('\n')
@@ -114,6 +120,7 @@ class Session:
         self.sizes = collections.deque(maxlen=20)
         self.updated = iso(now_ms())
         self.shell = FakeShell(fixture, self)
+        self.held = None  # what the shell printed during the write it is taking, or None between writes
 
     @property
     def key(self) -> tuple:
@@ -261,14 +268,20 @@ def colors() -> str:
     return '\r\n'.join(rows) + '\r\n'
 
 
+def decimal(word: str):
+    """`word` as a whole number when it is ASCII digits alone, or None. isdigit() alone also takes
+    a digit such as ², which int() refuses."""
+    return int(word) if word.isascii() and word.isdigit() else None
+
+
 def number(args: list, default: int, low: int, high: int):
     """The first word as a whole number from `low` to `high`, `default` without one, or None."""
     if not args:
         return default
-    word = args[0]
-    if not word.isdigit() or not low <= int(word) <= high:
+    value = decimal(args[0])
+    if value is None or not low <= value <= high:
         return None
-    return int(word)
+    return value
 
 
 COMMANDS = {name: f'do_{name}' for name in (
@@ -674,8 +687,9 @@ class FakeShell:
         name = (args[0] if args else 'KILL').upper().lstrip('-')
         name = name[3:] if name.startswith('SIG') else name
         signum = SIGNALS.get(name)
-        if signum is None and name.isdigit() and 0 < int(name) < 65:
-            signum = int(name)
+        value = decimal(name)
+        if signum is None and value is not None and 0 < value < 65:
+            signum = value
         if signum is None:
             self.done('kill: takes HUP, INT, QUIT, KILL, TERM or a number from 1 to 64\r\n')
             return
