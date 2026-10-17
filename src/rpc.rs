@@ -3,20 +3,28 @@
 //! Client frames: `Request`, `Ack` (after each stream chunk, or once the caller accepts a bounded
 //! stream's chunk), `Interrupt`, `Ping`. Server frames: `Chunk`, `Exit`, `Defect`,
 //! `ClientProtocolError`, `Pong`. A frame may hold one message or an array of them. One
-//! connection multiplexes any number of calls and streams.
+//! connection multiplexes any number of calls and streams. A frame t3term can't parse ends
+//! the connection, since t3term can't tell which call or stream it was for. JSON is UTF-8, so
+//! a binary frame that isn't UTF-8 is one of those. json.rs says how a frame with half a
+//! UTF-16 surrogate pair in it still parses.
 
 mod bounded;
+mod json;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::sync::Arc;
-use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
-use futures_util::{SinkExt, StreamExt};
+use futures_util::{Sink, SinkExt, StreamExt};
 use serde_json::{Value, json};
-use tokio::sync::{Mutex, mpsc, oneshot};
+use tokio::io::{AsyncRead, AsyncWrite};
+use tokio::sync::{Mutex, Notify, mpsc, oneshot};
+use tokio::task::JoinHandle;
+use tokio_tungstenite::WebSocketStream;
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::WebSocketConfig;
 
 use crate::discovery::{PROTOCOL_QUERY_PARAM, PROTOCOL_VERSION};
 use crate::error::{T3Error, exit};
@@ -24,9 +32,29 @@ use crate::http::Api;
 
 pub use bounded::{BoundedChunk, BoundedStream, StreamLimits};
 
+/// Why calls end after `RpcClient::close`.
+const CLOSED: &str = "t3term closed the connection";
+/// Why the requests still tracked end once no handle can use the connection.
+const ABANDONED: &str = "t3term dropped every handle on the connection";
+/// How long a connection that ended gives its WebSocket Close frame to go out, and after the
+/// last handle drops, the `Ack` and `Interrupt` frames still queued before it too. A peer that
+/// stopped reading never takes them, and the socket drops without them.
+const CLOSE_LIMIT: Duration = Duration::from_secs(1);
 const PING_INTERVAL: Duration = Duration::from_secs(10);
 /// No frame at all for this long means the socket is dead even if TCP has not noticed.
 const SILENCE_LIMIT: Duration = Duration::from_secs(30);
+/// The largest WebSocket message t3term reads, tungstenite's default. T3 sends each message
+/// in one frame, since Effect's RPC server hands each response to `ws.send` and ws doesn't
+/// split it. A terminal history full of escapes can pass tungstenite's default 16 MiB frame
+/// limit as JSON, so a frame here may take the whole message limit.
+const MAX_MESSAGE_BYTES: usize = 64 << 20;
+
+/// tungstenite's defaults, with a frame allowed as many bytes as a message.
+fn socket_config() -> WebSocketConfig {
+    WebSocketConfig::default()
+        .max_message_size(Some(MAX_MESSAGE_BYTES))
+        .max_frame_size(Some(MAX_MESSAGE_BYTES))
+}
 
 #[derive(Debug, Clone)]
 pub enum RpcError {
@@ -41,6 +69,10 @@ pub enum RpcError {
         /// the request died instead of failing. Boxed to keep the error small.
         error: Box<Value>,
     },
+    /// T3 sent what t3term can't follow: a `Defect`, a `ClientProtocolError`, a bounded
+    /// stream's `Chunk` without a `values` array, or a frame t3term can't parse, a binary one
+    /// that isn't UTF-8 among them. A frame it can't parse also closes the connection, and
+    /// [`RpcClient::is_closed`] says so.
     Protocol(String),
     /// t3term stopped a bounded stream on its own side and interrupted it on the server. A
     /// chunk would have taken the stream over its limits, and that chunk and everything after
@@ -88,11 +120,102 @@ enum Pending {
 
 type PendingMap = Arc<Mutex<HashMap<String, Pending>>>;
 
+/// A handle on one Effect RPC connection, which every clone shares.
+///
+/// The connection lasts while a clone, an [`RpcStream`] or a [`BoundedStream`] from it does.
+/// Once the last of them drops, its task ends every call and stream still waiting. Then it
+/// tries to send T3 the `Ack` and `Interrupt` frames still queued, in order, and a WebSocket
+/// Close frame. A request that hadn't started to go out never does, since nobody is left to
+/// read its answer, and neither does an `Interrupt` for it. No ping goes out either. The task
+/// gives all of that one second and then drops the socket, so a write T3 stopped reading
+/// partway through can't hold the socket open. Whether that write reached T3 stays unknown,
+/// and the task never sends it again.
+///
+/// The second starts once the calls and streams have ended, which takes time in proportion
+/// to how many were waiting. The task looks at the clock before each queued frame, so however
+/// many are queued, it goes past the second by one frame's work at most: taking the frame from
+/// the queue and passing over it, or handing it to a sink that takes it at once. It drops the
+/// socket before it frees the frames left in the queue and the ids of the requests it passed
+/// over.
+///
+/// A [`BoundedChunk`] doesn't keep the connection: it acks only while its stream is open, and
+/// an open stream does.
 #[derive(Clone)]
 pub struct RpcClient {
     outgoing: mpsc::UnboundedSender<Value>,
     pending: PendingMap,
     next_id: Arc<AtomicU64>,
+    owner: Arc<Owner>,
+}
+
+/// How [`RpcClient::close`] and the last handle dropping reach every clone and the
+/// connection's task.
+#[derive(Default)]
+struct Closing {
+    closed: AtomicBool,
+    /// No handle that can use the connection is left.
+    abandoned: AtomicBool,
+    wake: Notify,
+}
+
+/// Why a connection's task stops.
+enum Stop {
+    /// `RpcClient::close` ran. Nothing still queued goes out.
+    Closed,
+    /// The last handle dropped. The `Ack` and `Interrupt` frames still queued go out before
+    /// the Close frame, and no request does.
+    Abandoned,
+    /// The socket closed, failed or went silent, for this reason.
+    Lost(String),
+    /// T3 sent a frame t3term can't parse, for this reason. Nothing in it went to a call or
+    /// stream, and nothing acks it.
+    Malformed(String),
+}
+
+impl Closing {
+    fn is_closed(&self) -> bool {
+        self.closed.load(Ordering::Acquire)
+    }
+
+    /// Whether the task should stop now. A close outranks the last handle dropping.
+    fn stop(&self) -> Option<Stop> {
+        if self.is_closed() {
+            Some(Stop::Closed)
+        } else if self.abandoned.load(Ordering::Acquire) {
+            Some(Stop::Abandoned)
+        } else {
+            None
+        }
+    }
+
+    /// Returns once `close` has run or the last handle has dropped, whether that was before
+    /// this call or after it.
+    async fn stopping(&self) -> Stop {
+        loop {
+            // Made before the check, so a close or drop between the check and the wait still
+            // wakes it. `notify_waiters` reaches every `Notified` made before it runs.
+            let woken = self.wake.notified();
+            if let Some(stop) = self.stop() {
+                return stop;
+            }
+            woken.await;
+        }
+    }
+}
+
+/// A share in the connection. Each `RpcClient` clone, `RpcStream` and `BoundedStream` holds
+/// one, and when the last drops, the connection's task stops. The task and the map of
+/// requests hold none, since a share they held couldn't drop while the task runs. Neither
+/// does a bounded stream's `Shared`, which the map holds too.
+struct Owner {
+    closing: Arc<Closing>,
+}
+
+impl Drop for Owner {
+    fn drop(&mut self) {
+        self.closing.abandoned.store(true, Ordering::Release);
+        self.closing.wake.notify_waiters();
+    }
 }
 
 /// Items from a server stream. Dropping it interrupts the stream on the server.
@@ -100,6 +223,9 @@ pub struct RpcStream {
     pub items: mpsc::UnboundedReceiver<Result<Value, RpcError>>,
     request_id: String,
     outgoing: mpsc::UnboundedSender<Value>,
+    /// Keeps the connection open while the stream lives. It drops after `drop` has queued the
+    /// `Interrupt`.
+    _owner: Arc<Owner>,
 }
 
 impl RpcStream {
@@ -130,32 +256,67 @@ impl RpcClient {
     }
 
     pub async fn connect_url(url: &str) -> Result<RpcClient> {
-        let (socket, _) = tokio_tungstenite::connect_async(url)
+        // `false` leaves Nagle's algorithm on, as `connect_async` does.
+        let connecting =
+            tokio_tungstenite::connect_async_with_config(url, Some(socket_config()), false);
+        let (socket, _) = connecting
             .await
             .map_err(|e| RpcError::Disconnected(format!("could not open the WebSocket: {e}")))?;
+        Ok(RpcClient::run(socket).0)
+    }
+
+    /// Runs the connection over `socket` on a task of its own. Returns the client and the
+    /// task, which ends once the connection does and it has dropped the socket.
+    fn run<S>(socket: WebSocketStream<S>) -> (RpcClient, JoinHandle<()>)
+    where
+        S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
+    {
         let (mut sink, mut source) = socket.split();
         let (outgoing, mut outgoing_rx) = mpsc::unbounded_channel::<Value>();
         let pending: PendingMap = Arc::default();
 
         let reader_pending = pending.clone();
+        // The task's own sender keeps nothing open, as the task stops when the last `Owner`
+        // drops, not when the last sender does.
         let ack = outgoing.clone();
-        tokio::spawn(async move {
+        let closing = Arc::<Closing>::default();
+        let reader_closing = closing.clone();
+        let task = tokio::spawn(async move {
             let mut ping = tokio::time::interval(PING_INTERVAL);
             ping.tick().await;
             let mut last_frame = Instant::now();
-            let reason = loop {
+            // A frame the task took from the queue when `close` or the last handle dropping
+            // stopped it, before the sink took the frame. None of it went out.
+            let mut unsent: Option<Value> = None;
+            let stop = loop {
+                // `close`, or the last handle dropping, may have come while the task was busy,
+                // or before it first ran.
+                if let Some(stop) = reader_closing.stop() {
+                    break stop;
+                }
                 tokio::select! {
                     frame = source.next() => {
                         last_frame = Instant::now();
-                        let text = match frame {
-                            Some(Ok(Message::Text(text))) => text.to_string(),
-                            Some(Ok(Message::Binary(bytes))) => String::from_utf8_lossy(&bytes).into_owned(),
-                            Some(Ok(Message::Close(frame))) => break format!("server closed the socket ({frame:?})"),
+                        let decoded = match frame {
+                            Some(Ok(Message::Text(text))) => json::decode(&text),
+                            // A binary frame is read in place too, once it checks as UTF-8.
+                            // One that isn't ends the connection here, where a lossy copy
+                            // could have taken three times the frame's size. The reason is
+                            // where the UTF-8 stopped, never what the frame held.
+                            Some(Ok(Message::Binary(bytes))) => match std::str::from_utf8(&bytes) {
+                                Ok(text) => json::decode(text),
+                                Err(e) => break Stop::Malformed(format!("t3term couldn't read a binary frame as UTF-8 ({e})")),
+                            },
+                            Some(Ok(Message::Close(frame))) => break Stop::Lost(format!("server closed the socket ({frame:?})")),
                             Some(Ok(_)) => continue,
-                            Some(Err(e)) => break e.to_string(),
-                            None => break "socket ended".to_string(),
+                            Some(Err(e)) => break Stop::Lost(e.to_string()),
+                            None => break Stop::Lost("socket ended".to_string()),
                         };
-                        let Ok(decoded) = serde_json::from_str::<Value>(&text) else { continue };
+                        // The reason is where serde_json stopped, never what the frame held.
+                        let decoded = match decoded {
+                            Ok(decoded) => decoded,
+                            Err(e) => break Stop::Malformed(format!("t3term couldn't parse a frame as JSON ({e})")),
+                        };
                         let messages = match decoded {
                             Value::Array(items) => items,
                             single => vec![single],
@@ -168,42 +329,107 @@ impl RpcClient {
                         if message["_tag"] == "Interrupt" {
                             forget_bounded(&reader_pending, &message).await;
                         }
-                        if let Err(e) = sink.send(Message::Text(message.to_string().into())).await {
-                            break e.to_string();
+                        // The task keeps the frame until the sink takes it. If the task stops
+                        // first, the frame goes where the ones still queued go, after the loop.
+                        let text = Message::Text(message.to_string().into());
+                        tokio::select! {
+                            biased;
+                            stop = reader_closing.stopping() => {
+                                unsent = Some(message);
+                                break stop;
+                            }
+                            fed = sink.feed(text) => {
+                                if let Err(e) = fed {
+                                    break Stop::Lost(e.to_string());
+                                }
+                            }
+                        }
+                        // The frame has started to go out, and the task never sends it again.
+                        // A write T3 doesn't read can wait forever, so `close` and the last
+                        // handle dropping cut it short.
+                        tokio::select! {
+                            biased;
+                            stop = reader_closing.stopping() => break stop,
+                            flushed = sink.flush() => {
+                                if let Err(e) = flushed {
+                                    break Stop::Lost(e.to_string());
+                                }
+                            }
                         }
                     }
                     _ = ping.tick() => {
                         if last_frame.elapsed() > SILENCE_LIMIT {
-                            break format!("no frame from T3 for {} seconds", SILENCE_LIMIT.as_secs());
+                            break Stop::Lost(format!("no frame from T3 for {} seconds", SILENCE_LIMIT.as_secs()));
                         }
-                        if sink.send(Message::Text(json!({"_tag": "Ping"}).to_string().into())).await.is_err() {
-                            break "ping failed".to_string();
+                        tokio::select! {
+                            biased;
+                            stop = reader_closing.stopping() => break stop,
+                            sent = sink.send(Message::Text(json!({"_tag": "Ping"}).to_string().into())) => {
+                                if sent.is_err() {
+                                    break Stop::Lost("ping failed".to_string());
+                                }
+                            }
                         }
                     }
+                    stop = reader_closing.stopping() => break stop,
                 }
             };
+            let (error, abandoned) = match stop {
+                Stop::Closed => (RpcError::Disconnected(CLOSED.to_string()), false),
+                Stop::Abandoned => (RpcError::Disconnected(ABANDONED.to_string()), true),
+                Stop::Lost(reason) => (RpcError::Disconnected(reason), false),
+                Stop::Malformed(reason) => (RpcError::Protocol(reason), false),
+            };
             // A request made from here on fails at once, rather than joining the map after the
-            // drain below and waiting forever.
+            // drain below and waiting forever. After a close, one still queued never goes out.
             outgoing_rx.close();
-            let _ = sink.close().await;
+            // Calls and streams end before the Close frame, which may never go out.
             for (_, entry) in reader_pending.lock().await.drain() {
-                fail(entry, RpcError::Disconnected(reason.clone()));
+                fail(entry, error.clone());
             }
+            let mut finished = HashSet::new();
+            let socket = (sink, source);
+            end_socket(socket, &mut outgoing_rx, &mut finished, unsent, abandoned).await;
+            // The socket is gone. Only now does the task free the frames still queued and the
+            // ids of the requests `leave` passed over, which may be many.
+            drop((outgoing_rx, finished));
         });
 
-        Ok(RpcClient {
+        let rpc = RpcClient {
             outgoing,
             pending,
             next_id: Arc::new(AtomicU64::new(1)),
-        })
+            owner: Arc::new(Owner { closing }),
+        };
+        (rpc, task)
     }
 
-    /// True once the connection task has exited.
+    /// True once [`close`](Self::close) ran, or once the connection stopped taking requests.
     pub fn is_closed(&self) -> bool {
-        self.outgoing.is_closed()
+        self.owner.closing.is_closed() || self.outgoing.is_closed()
+    }
+
+    /// Closes the connection for this client and every clone of it, and returns at once.
+    ///
+    /// From its return, a call on any clone fails at once with [`RpcError::Disconnected`] and
+    /// sends nothing, and no request still queued goes out. The connection's task does the
+    /// rest soon after, on its own: it stops a write T3 hasn't taken, ends every call and
+    /// stream still waiting with `Disconnected`, gives a WebSocket Close frame a second to go
+    /// out and drops the socket. It sends T3 no request, so T3 sees a client that went away.
+    ///
+    /// Nothing calls it on its own. A connection nobody closes lasts until its socket drops,
+    /// T3 sends a frame t3term can't parse, or the last handle on it drops, which
+    /// [`RpcClient`] describes. Unlike the last handle dropping, a close sends nothing still
+    /// queued, a stream's `Interrupt` included.
+    pub fn close(&self) {
+        self.owner.closing.closed.store(true, Ordering::Release);
+        self.owner.closing.wake.notify_waiters();
     }
 
     fn request(&self, id: &str, tag: &str, payload: Value) -> Result<(), RpcError> {
+        if self.owner.closing.is_closed() {
+            return Err(RpcError::Disconnected(CLOSED.into()));
+        }
         self.outgoing
             .send(
                 json!({"_tag": "Request", "id": id, "tag": tag, "payload": payload, "headers": []}),
@@ -226,7 +452,10 @@ impl RpcClient {
                 reply,
             },
         );
-        self.request(&id, tag, payload)?;
+        if let Err(error) = self.request(&id, tag, payload) {
+            self.pending.lock().await.remove(&id);
+            return Err(error);
+        }
         match tokio::time::timeout(timeout, response).await {
             Ok(Ok(result)) => result,
             Ok(Err(_)) => Err(RpcError::Disconnected("connection closed".into())),
@@ -250,11 +479,15 @@ impl RpcClient {
                 items,
             },
         );
-        self.request(&id, tag, payload)?;
+        if let Err(error) = self.request(&id, tag, payload) {
+            self.pending.lock().await.remove(&id);
+            return Err(error);
+        }
         Ok(RpcStream {
             items: receiver,
             request_id: id,
             outgoing: self.outgoing.clone(),
+            _owner: self.owner.clone(),
         })
     }
 
@@ -285,7 +518,10 @@ impl RpcClient {
             self.pending.lock().await.remove(&id);
             return Err(error);
         }
-        Ok(BoundedStream { shared })
+        Ok(BoundedStream {
+            shared,
+            _owner: self.owner.clone(),
+        })
     }
 }
 
@@ -298,6 +534,93 @@ async fn forget_bounded(pending: &PendingMap, interrupt: &Value) {
     let mut map = pending.lock().await;
     if matches!(map.get(id), Some(Pending::Bounded { .. })) {
         map.remove(id);
+    }
+}
+
+/// Gives [`leave`] until `CLOSE_LIMIT` from now, then drops the socket, whether the frames
+/// went out or not. `leave` looks at the clock before each frame, and the timeout cuts short a
+/// write T3 doesn't read.
+///
+/// What `leave` works through stays with the caller: the frames left in `queue` and the ids of
+/// the requests it passed over, in `finished`. Both grow with the queue, and a timeout that
+/// cuts `leave` short frees neither, so the caller can free them once the socket has dropped
+/// rather than within the second.
+async fn end_socket<S, R>(
+    socket: (S, R),
+    queue: &mut mpsc::UnboundedReceiver<Value>,
+    finished: &mut HashSet<String>,
+    held: Option<Value>,
+    abandoned: bool,
+) where
+    S: Sink<Message> + Unpin,
+{
+    let (mut sink, source) = socket;
+    let deadline = tokio::time::Instant::now() + CLOSE_LIMIT;
+    let expired = || tokio::time::Instant::now() >= deadline;
+    let leaving = leave(&mut sink, queue, finished, held, abandoned, expired);
+    let _ = tokio::time::timeout_at(deadline, leaving).await;
+    drop((sink, source));
+}
+
+/// What a connection's task sends last, once it has ended every call and stream still
+/// waiting. After a close, or once the socket was lost, that is only the WebSocket Close
+/// frame. After the last handle dropped, the frames those handles queued come first, in
+/// order, starting with `held`, the one the task had taken from the queue. Of those, only the
+/// ones [`sent_after_abandon`] allows go out, and `finished` collects the ids it needs. The
+/// sink finishes a frame that had started to go out before any of them, if T3 reads it.
+///
+/// `expired` says whether the task's second is up, and `leave` asks before each frame. So a
+/// long run of requests it passes over, which never waits on the sink, can't keep the socket
+/// open past the second. Once it says yes, nothing more goes out, the Close frame included.
+/// The task's timeout cuts short a frame the sink is still waiting to write.
+async fn leave<S>(
+    sink: &mut S,
+    queue: &mut mpsc::UnboundedReceiver<Value>,
+    finished: &mut HashSet<String>,
+    mut held: Option<Value>,
+    abandoned: bool,
+    expired: impl Fn() -> bool,
+) where
+    S: Sink<Message> + Unpin,
+{
+    if abandoned {
+        loop {
+            if expired() {
+                return;
+            }
+            let Some(message) = held.take().or_else(|| queue.try_recv().ok()) else {
+                break;
+            };
+            if !sent_after_abandon(&message, finished) {
+                // Passing over a frame never waits, so once the task's budget runs out it
+                // gives the runtime its turn here, as a send would.
+                tokio::task::coop::consume_budget().await;
+                continue;
+            }
+            let text = Message::Text(message.to_string().into());
+            if sink.send(text).await.is_err() {
+                return;
+            }
+        }
+    }
+    let _ = sink.close().await;
+}
+
+/// Whether a frame still queued when the last handle dropped goes out before the Close frame.
+/// Nobody is left to read an answer, so a `Request` never starts then, and its id goes into
+/// `finished`. So does each `Interrupt`'s as it goes out. An `Ack` or `Interrupt` goes out
+/// unless its request is in `finished`: T3 needs neither for a request it never got, and
+/// needs nothing more for one after its `Interrupt`.
+fn sent_after_abandon(message: &Value, finished: &mut HashSet<String>) -> bool {
+    let field = |key: &str| message.get(key).and_then(Value::as_str).map(str::to_string);
+    match message.get("_tag").and_then(Value::as_str) {
+        Some("Request") => {
+            finished.extend(field("id"));
+            false
+        }
+        Some("Ack") => field("requestId").is_some_and(|id| !finished.contains(&id)),
+        Some("Interrupt") => field("requestId").is_some_and(|id| finished.insert(id)),
+        _ => false,
     }
 }
 
@@ -390,6 +713,11 @@ async fn handle_message(message: Value, pending: &PendingMap, ack: &mpsc::Unboun
     }
 }
 
+/// What a failure says when T3's error carries no message of its own.
+pub(crate) fn rejected(tag: &str) -> String {
+    format!("T3 rejected {tag}.")
+}
+
 /// Reads the most useful message out of an encoded Effect `Exit` failure.
 fn failure(tag: &str, exit: &Value) -> RpcError {
     let reasons = exit
@@ -413,7 +741,7 @@ fn failure(tag: &str, exit: &Value) -> RpcError {
     let base = text(fail, "detail")
         .or_else(|| text(fail, "message"))
         .or_else(|| defect.and_then(Value::as_str).map(str::to_string))
-        .unwrap_or_else(|| format!("T3 rejected {tag}."));
+        .unwrap_or_else(|| rejected(tag));
     let cause = fail
         .and_then(|f| f.get("cause"))
         .and_then(|c| c.get("message"))
@@ -432,8 +760,12 @@ fn failure(tag: &str, exit: &Value) -> RpcError {
 
 #[cfg(test)]
 mod tests {
+    use std::cell::Cell;
+
+    use futures_util::poll;
+    use tokio::io::{AsyncReadExt, DuplexStream};
     use tokio::net::{TcpListener, TcpStream};
-    use tokio_tungstenite::WebSocketStream;
+    use tokio_tungstenite::tungstenite::protocol::Role;
 
     use super::*;
 
@@ -458,7 +790,7 @@ mod tests {
     }
 
     /// Answers the next call, passing over the frames before it.
-    async fn answer(socket: &mut Socket) {
+    async fn answer<S: AsyncRead + AsyncWrite + Unpin>(socket: &mut WebSocketStream<S>) {
         loop {
             let Message::Text(text) = within(socket.next()).await.unwrap().unwrap() else {
                 continue;
@@ -474,6 +806,23 @@ mod tests {
                 return;
             }
         }
+    }
+
+    /// A frame may be as large as a message, and both stay capped at 64 MiB. The rest is
+    /// tungstenite's default.
+    #[test]
+    fn a_frame_may_take_the_whole_64_mib_a_message_may() {
+        let config = socket_config();
+        assert_eq!(config.max_message_size, Some(64 << 20));
+        assert_eq!(config.max_frame_size, Some(64 << 20));
+        let default = WebSocketConfig::default();
+        assert_eq!(config.read_buffer_size, default.read_buffer_size);
+        assert_eq!(config.write_buffer_size, default.write_buffer_size);
+        assert_eq!(config.max_write_buffer_size, default.max_write_buffer_size);
+        assert_eq!(
+            config.accept_unmasked_frames,
+            default.accept_unmasked_frames
+        );
     }
 
     /// However a bounded stream ends, the reader forgets its route, so the map of requests
@@ -514,5 +863,443 @@ mod tests {
         // ended.
         assert!(rpc.pending.lock().await.is_empty());
         drop((streams, fourth));
+    }
+
+    /// `close` on one clone closes the connection for all of them. The call and the bounded
+    /// stream still waiting end with `Disconnected`, a later call fails at once, and T3 gets
+    /// nothing after the two requests but the Close frame.
+    #[tokio::test]
+    async fn closing_a_connection_ends_the_calls_and_streams_of_every_clone() {
+        let (rpc, mut socket) = connected().await;
+        let limits = StreamLimits::new(1, 1024).unwrap();
+        let opening = rpc.bounded_stream("example.bounded", json!({}), limits);
+        let mut stream = opening.await.unwrap();
+        let held = rpc.clone();
+        let waiting = tokio::spawn(async move {
+            let calling = held.call("example.call", json!({}), Duration::from_secs(60));
+            calling.await
+        });
+        let mut requests = 0;
+        while requests < 2 {
+            let Message::Text(text) = within(socket.next()).await.unwrap().unwrap() else {
+                continue;
+            };
+            let frame: Value = serde_json::from_str(&text).unwrap();
+            if frame["_tag"] == "Request" {
+                requests += 1;
+            }
+        }
+
+        rpc.close();
+        let ended = within(waiting).await.unwrap();
+        assert!(matches!(ended, Err(RpcError::Disconnected(_))), "{ended:?}");
+        let end = within(stream.next()).await;
+        assert!(
+            matches!(end, Some(Err(RpcError::Disconnected(_)))),
+            "{end:?}"
+        );
+        assert!(within(stream.next()).await.is_none());
+        let later = rpc.call("example.call", json!({}), Duration::from_secs(60));
+        assert!(matches!(later.await, Err(RpcError::Disconnected(_))));
+        assert!(rpc.is_closed());
+
+        loop {
+            match within(socket.next()).await {
+                Some(Ok(Message::Text(text))) => {
+                    let frame: Value = serde_json::from_str(&text).unwrap();
+                    assert_eq!(frame["_tag"], "Ping", "{frame}");
+                }
+                Some(Ok(Message::Close(_))) | Some(Err(_)) | None => break,
+                Some(Ok(_)) => {}
+            }
+        }
+    }
+
+    /// Each way, the most a test's pipe holds that its other end hasn't read.
+    const PIPE: usize = 1024;
+    /// The data of the `terminal.write` T3 stops reading, far more than `PIPE`.
+    const WRITE: usize = 64 * 1024;
+
+    /// A client over an in-memory pipe, its connection's task, and the fake T3's end of the
+    /// pipe, raw. Once `PIPE` bytes wait in the pipe unread, a write waits too, as on a socket
+    /// whose peer stopped reading.
+    async fn piped() -> (RpcClient, JoinHandle<()>, DuplexStream) {
+        let (client, server) = tokio::io::duplex(PIPE);
+        let socket = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let (rpc, task) = RpcClient::run(socket);
+        (rpc, task, server)
+    }
+
+    /// T3 stops reading partway through a large `terminal.write`, so the write can never
+    /// finish. `close` still ends the write's call and a stream queued behind it before the
+    /// task gives up on the Close frame, and a later call fails without going out. The task
+    /// drops the socket at `CLOSE_LIMIT`. T3 got less than the write, so nothing after it, such
+    /// as a `terminal.close`, reached T3. Another connection still answers.
+    #[tokio::test]
+    async fn closing_a_connection_t3_stopped_reading_ends_it_within_the_close_limit() {
+        let (other, mut other_socket) = connected().await;
+        let (rpc, task, mut server) = piped().await;
+        let held = rpc.clone();
+        let writing = tokio::spawn(async move {
+            let data = "x".repeat(WRITE);
+            let write = json!({"threadId": "thread-1", "terminalId": "term-1", "data": data});
+            held.call("terminal.write", write, Duration::from_secs(60))
+                .await
+        });
+        // The write's first bytes arrive, so the task is sending it, and T3 reads no more.
+        let mut head = [0u8; 16];
+        within(server.read_exact(&mut head)).await.unwrap();
+        let limits = StreamLimits::new(1, 1024).unwrap();
+        let opening = rpc.bounded_stream("example.bounded", json!({}), limits);
+        let mut stream = opening.await.unwrap();
+
+        rpc.close();
+        let ended = within(writing).await.unwrap();
+        assert!(matches!(ended, Err(RpcError::Disconnected(_))), "{ended:?}");
+        let end = within(stream.next()).await;
+        assert!(
+            matches!(end, Some(Err(RpcError::Disconnected(_)))),
+            "{end:?}"
+        );
+        // The pipe stays full, so the Close frame can't go out and the task waits out
+        // `CLOSE_LIMIT`. The calls didn't wait for it.
+        assert!(!task.is_finished());
+        let later = rpc.call("example.call", json!({}), Duration::from_secs(60));
+        assert!(matches!(
+            within(later).await,
+            Err(RpcError::Disconnected(_))
+        ));
+
+        let limit = CLOSE_LIMIT + Duration::from_secs(2);
+        let ending = tokio::time::timeout(limit, task).await;
+        ending
+            .expect("the task ended within the close limit")
+            .unwrap();
+        // The task dropped the client's end, so T3 reads what the pipe held and then the end.
+        let mut rest = Vec::new();
+        within(server.read_to_end(&mut rest)).await.unwrap();
+        let received = head.len() + rest.len();
+        assert!(received < WRITE, "T3 got {received} bytes");
+
+        let calling = other.call("example.call", json!({}), Duration::from_secs(5));
+        let (reply, _) = tokio::join!(calling, answer(&mut other_socket));
+        reply.unwrap();
+    }
+
+    /// A close that comes before the connection's task first runs still reaches it. The task
+    /// sends nothing queued before the close, ends the stream that queued it and closes the
+    /// socket, so T3 reads a Close frame and nothing else.
+    #[tokio::test]
+    async fn a_close_before_the_connection_runs_sends_nothing_it_queued() {
+        let (rpc, task, server) = piped().await;
+        // The test runs on one thread and waits on nothing from here to the close, so the
+        // task hasn't run yet.
+        let limits = StreamLimits::new(1, 1024).unwrap();
+        let opening = rpc.bounded_stream("example.bounded", json!({}), limits);
+        let mut stream = opening.await.unwrap();
+        rpc.close();
+
+        let end = within(stream.next()).await;
+        assert!(
+            matches!(end, Some(Err(RpcError::Disconnected(_)))),
+            "{end:?}"
+        );
+        within(task).await.unwrap();
+        let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        let mut closes = 0;
+        loop {
+            match within(server.next()).await {
+                Some(Ok(Message::Close(_))) => closes += 1,
+                Some(Ok(message)) => panic!("T3 got {message:?} after the close"),
+                Some(Err(_)) | None => break,
+            }
+        }
+        assert_eq!(closes, 1);
+    }
+
+    /// The frames other than pings that T3 reads before the Close frame. Fails the test if
+    /// the socket ends without one, or after five seconds.
+    async fn before_close<S: AsyncRead + AsyncWrite + Unpin>(
+        socket: &mut WebSocketStream<S>,
+    ) -> Vec<Value> {
+        let mut frames = Vec::new();
+        loop {
+            match within(socket.next()).await {
+                Some(Ok(Message::Text(text))) => {
+                    let frame: Value = serde_json::from_str(&text).unwrap();
+                    if frame["_tag"] != "Ping" {
+                        frames.push(frame);
+                    }
+                }
+                Some(Ok(Message::Close(_))) => return frames,
+                Some(Ok(_)) => {}
+                other => panic!("expected a Close frame, got {other:?}"),
+            }
+        }
+    }
+
+    /// A connection lasts while any clone of its client does, so the clone left after one
+    /// drops still gets its answer. Once the last drops, nothing else does, and no one calls
+    /// `close`. T3 reads the Close frame and nothing else, and the task ends.
+    #[tokio::test]
+    async fn dropping_the_last_clone_closes_an_idle_connection_and_ends_its_task() {
+        let (rpc, task, server) = piped().await;
+        let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        let held = rpc.clone();
+        drop(rpc);
+        let calling = held.call("example.call", json!({}), Duration::from_secs(5));
+        let (reply, ()) = tokio::join!(calling, answer(&mut server));
+        reply.unwrap();
+        assert!(!task.is_finished());
+
+        drop(held);
+        assert_eq!(before_close(&mut server).await, Vec::<Value>::new());
+        within(task).await.unwrap();
+    }
+
+    /// T3 stops reading partway through a large `terminal.write`. The caller stops waiting
+    /// for it, and then drops a bounded stream it opened behind the write, and the client.
+    /// Nothing calls `close`. The stream's route is still in the map and its request and
+    /// Interrupt are still queued, since the task never got past the write, so neither goes
+    /// out. The task still cuts the write short and drops the socket at `CLOSE_LIMIT`, and T3
+    /// got less than the write, so nothing queued after it reached T3.
+    #[tokio::test]
+    async fn dropping_every_handle_ends_a_connection_t3_stopped_reading() {
+        let (rpc, task, mut server) = piped().await;
+        let held = rpc.clone();
+        let writing = tokio::spawn(async move {
+            let data = "x".repeat(WRITE);
+            let write = json!({"threadId": "thread-1", "terminalId": "term-1", "data": data});
+            held.call("terminal.write", write, Duration::from_secs(60))
+                .await
+        });
+        // The write's first bytes arrive, so the task is sending it, and T3 reads no more.
+        let mut head = [0u8; 16];
+        within(server.read_exact(&mut head)).await.unwrap();
+        let limits = StreamLimits::new(1, 1024).unwrap();
+        let opening = rpc.bounded_stream("example.bounded", json!({}), limits);
+        let stream = opening.await.unwrap();
+
+        // Stopping the write's task drops the clone it held.
+        writing.abort();
+        assert!(within(writing).await.unwrap_err().is_cancelled());
+        drop(stream);
+        drop(rpc);
+        let limit = CLOSE_LIMIT + Duration::from_secs(2);
+        let ending = tokio::time::timeout(limit, task).await;
+        ending
+            .expect("the task ended within the close limit")
+            .unwrap();
+        let mut rest = Vec::new();
+        within(server.read_to_end(&mut rest)).await.unwrap();
+        let received = head.len() + rest.len();
+        assert!(received < WRITE, "T3 got {received} bytes");
+    }
+
+    /// A close outranks the last handle dropping, as when the terminal's grant closes its
+    /// client and then drops it. The task sends nothing that was queued, the request and
+    /// Interrupt of a stream dropped after the close included, so T3 reads a Close frame and
+    /// nothing else.
+    #[tokio::test]
+    async fn the_last_handle_dropping_after_a_close_sends_nothing_queued() {
+        let (rpc, task, server) = piped().await;
+        // The test runs on one thread and waits on nothing from here to the last drop, so the
+        // task hasn't run yet.
+        let limits = StreamLimits::new(1, 1024).unwrap();
+        let opening = rpc.bounded_stream("example.bounded", json!({}), limits);
+        let stream = opening.await.unwrap();
+        rpc.close();
+        drop(stream);
+        drop(rpc);
+
+        within(task).await.unwrap();
+        let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        assert_eq!(before_close(&mut server).await, Vec::<Value>::new());
+    }
+
+    /// The next frame other than a ping that T3 reads. Fails the test after five seconds.
+    async fn next_frame<S: AsyncRead + AsyncWrite + Unpin>(
+        socket: &mut WebSocketStream<S>,
+    ) -> Value {
+        loop {
+            let Message::Text(text) = within(socket.next()).await.unwrap().unwrap() else {
+                continue;
+            };
+            let frame: Value = serde_json::from_str(&text).unwrap();
+            if frame["_tag"] != "Ping" {
+                return frame;
+            }
+        }
+    }
+
+    /// The task takes a stream's Interrupt from the queue and waits for the map of requests,
+    /// which the test holds. The last handle drops while it waits. Once the task has the map,
+    /// it stops before the sink takes the Interrupt. T3 still reads the Interrupt, and then
+    /// the Close frame.
+    #[tokio::test]
+    async fn an_interrupt_the_task_took_as_the_last_handle_dropped_still_goes_out() {
+        let (rpc, task, server) = piped().await;
+        let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        let stream = rpc.stream("example.stream", json!({})).await.unwrap();
+        let id = next_frame(&mut server).await["id"].clone();
+
+        let pending = rpc.pending.clone();
+        let map = pending.try_lock().unwrap();
+        drop(stream);
+        // The test runs on one thread, so the task runs once here. It takes the Interrupt and
+        // waits for the map.
+        tokio::task::yield_now().await;
+        drop(rpc);
+        drop(map);
+
+        let interrupt = json!({"_tag": "Interrupt", "requestId": id, "interruptors": []});
+        assert_eq!(before_close(&mut server).await, [interrupt]);
+        within(task).await.unwrap();
+    }
+
+    /// The caller queues a `terminal.write` before the connection's task first runs, gives up
+    /// on it and drops the client. The write never goes out, so T3 reads a Close frame and
+    /// nothing else.
+    #[tokio::test]
+    async fn a_request_queued_before_the_connection_ran_never_goes_out_once_every_handle_drops() {
+        let (rpc, task, server) = piped().await;
+        // The test runs on one thread and waits on nothing from here to the last drop, so the
+        // task hasn't run yet.
+        let write = json!({"threadId": "thread-1", "terminalId": "term-1", "data": "ls\r"});
+        let mut writing = Box::pin(rpc.call("terminal.write", write, Duration::from_secs(60)));
+        // The call queued its request and waits for the answer.
+        assert!(poll!(&mut writing).is_pending());
+        assert_eq!(rpc.pending.try_lock().unwrap().len(), 1);
+        drop(writing);
+        drop(rpc);
+
+        within(task).await.unwrap();
+        let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        assert_eq!(before_close(&mut server).await, Vec::<Value>::new());
+    }
+
+    /// T3 got a bounded stream's request and sent it a chunk. Then, while the task waits, the
+    /// caller queues a `terminal.write` and gives up on it, opens a second stream and drops
+    /// it, accepts the chunk, and drops the first stream and the client. T3 reads the chunk's
+    /// Ack once and the first stream's Interrupt, then the Close frame. Neither the write nor
+    /// the second stream's request or Interrupt goes out.
+    #[tokio::test]
+    async fn after_the_last_handle_drops_only_acks_and_interrupts_for_requests_t3_got_go_out() {
+        let (rpc, task, server) = piped().await;
+        let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        let limits = StreamLimits::new(4, 4096).unwrap();
+        let opening = rpc.bounded_stream("example.bounded", json!({}), limits);
+        let mut stream = opening.await.unwrap();
+        let id = next_frame(&mut server).await["id"].clone();
+        let chunk = json!({"_tag": "Chunk", "requestId": id, "values": ["a"]});
+        let sending = server.send(Message::Text(chunk.to_string().into()));
+        within(sending).await.unwrap();
+        let chunk = within(stream.next()).await.unwrap().unwrap();
+
+        // The test waits on nothing from here to the last drop, so the task doesn't run.
+        let write = json!({"threadId": "thread-1", "terminalId": "term-1", "data": "ls\r"});
+        let mut writing = Box::pin(rpc.call("terminal.write", write, Duration::from_secs(60)));
+        assert!(poll!(&mut writing).is_pending());
+        drop(writing);
+        let opening = rpc.bounded_stream("example.bounded", json!({}), limits);
+        drop(opening.await.unwrap());
+        assert_eq!(chunk.accept(), [json!("a")]);
+        drop(stream);
+        drop(rpc);
+
+        let ack = json!({"_tag": "Ack", "requestId": id});
+        let interrupt = json!({"_tag": "Interrupt", "requestId": id, "interruptors": []});
+        assert_eq!(before_close(&mut server).await, [ack, interrupt]);
+        within(task).await.unwrap();
+    }
+
+    /// After the last handle drops, the task passes over the requests still queued without
+    /// waiting on anything. Its second still runs out partway through a long run of them, and
+    /// then T3 gets nothing more: not the `Interrupt` queued after the run, and not the Close
+    /// frame. The rest of the queue stays where it was. Going through it later sends that
+    /// `Interrupt` and the Close frame, so only the deadline held them back.
+    #[tokio::test]
+    async fn the_close_limit_runs_out_partway_through_requests_the_task_passes_over() {
+        const REQUESTS: usize = 1000;
+        // How many frames the task takes from the queue before its second runs out.
+        const TAKEN: usize = 10;
+        let (client, server) = tokio::io::duplex(PIPE);
+        let socket = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let (mut sink, source) = socket.split();
+        let (outgoing, mut queue) = mpsc::unbounded_channel();
+        for id in 1..=REQUESTS {
+            let write = json!({"threadId": "thread-1", "terminalId": "term-1", "data": "ls\r"});
+            let request = json!({
+                "_tag": "Request",
+                "id": id.to_string(),
+                "tag": "terminal.write",
+                "payload": write,
+                "headers": []
+            });
+            outgoing.send(request).unwrap();
+        }
+        // The Interrupt of a stream whose request T3 got before the run.
+        let interrupt = json!({"_tag": "Interrupt", "requestId": "0", "interruptors": []});
+        outgoing.send(interrupt.clone()).unwrap();
+
+        let looks = Cell::new(0);
+        let expired = || {
+            looks.set(looks.get() + 1);
+            looks.get() > TAKEN
+        };
+        let mut finished = HashSet::new();
+        let leaving = leave(&mut sink, &mut queue, &mut finished, None, true, expired);
+        within(leaving).await;
+        assert_eq!(queue.len(), REQUESTS + 1 - TAKEN);
+        assert_eq!(finished.len(), TAKEN);
+
+        let leaving = leave(&mut sink, &mut queue, &mut finished, None, true, || false);
+        within(leaving).await;
+        assert!(queue.is_empty());
+        drop((sink, source));
+        let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
+        assert_eq!(before_close(&mut server).await, [interrupt]);
+    }
+
+    /// After the last handle drops, the task passes over a long run of requests and starts
+    /// an `Interrupt` too large for the pipe, which T3 never reads. The timeout cuts it short
+    /// at `CLOSE_LIMIT` and the socket drops. The ids `leave` collected, one for each request
+    /// it passed over and one for the `Interrupt`, are all still held then, so the task frees
+    /// them after the socket drops, not within its second.
+    #[tokio::test]
+    async fn the_socket_drops_before_the_ids_of_requests_passed_over_are_freed() {
+        const REQUESTS: usize = 1000;
+        let (client, mut server) = tokio::io::duplex(PIPE);
+        let socket = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let (outgoing, mut queue) = mpsc::unbounded_channel();
+        for id in 1..=REQUESTS {
+            let write = json!({"threadId": "thread-1", "terminalId": "term-1", "data": "ls\r"});
+            let request = json!({
+                "_tag": "Request",
+                "id": id.to_string(),
+                "tag": "terminal.write",
+                "payload": write,
+                "headers": []
+            });
+            outgoing.send(request).unwrap();
+        }
+        // The Interrupt of a stream whose request T3 got before the run, padded past `PIPE`.
+        let padding = "x".repeat(WRITE);
+        let interrupt = json!({"_tag": "Interrupt", "requestId": "0", "interruptors": [padding]});
+        outgoing.send(interrupt).unwrap();
+
+        let mut finished = HashSet::new();
+        let started = tokio::time::Instant::now();
+        let ending = end_socket(socket.split(), &mut queue, &mut finished, None, true);
+        within(ending).await;
+        assert!(started.elapsed() >= CLOSE_LIMIT, "{:?}", started.elapsed());
+        assert!(queue.is_empty());
+        // T3 reads what the pipe held and then the end, so the socket has dropped.
+        let mut received = Vec::new();
+        within(server.read_to_end(&mut received)).await.unwrap();
+        assert!(received.len() < WRITE, "T3 got {} bytes", received.len());
+        // Each request passed over, and the Interrupt that started to go out.
+        assert_eq!(finished.len(), REQUESTS + 1);
+        assert!((0..=REQUESTS).all(|id| finished.contains(&id.to_string())));
     }
 }
