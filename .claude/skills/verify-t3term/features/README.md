@@ -20,6 +20,7 @@ Read the file for a feature before you drive it, and fix the file when a drive s
 | CLI: commands, `--json` and exit codes against a fake server | [cli.md](cli.md) | `links` |
 | Saved environments: the `environment` commands, `environment status`, the descriptor cap and the TUI's Environments dialog | [environments.md](environments.md) | `links` |
 | Transcript: how a thread's replies draw | [transcript.md](transcript.md) | `links` |
+| Appearance: Alt+Shift+A, System, Light and Dark, and the light colors | [appearance.md](appearance.md) | `links` |
 
 ## Not mapped yet
 
