@@ -123,6 +123,12 @@ impl Code {
         }
     }
 
+    /// Forgets the files' rows laid out in the old colors, after the theme changed, so each
+    /// unfolded file is laid out again in the new ones.
+    pub(super) fn restyle(&mut self) {
+        self.bodies.clear();
+    }
+
     /// Whether showing the tab at `now` should read the diff again: the first slice came
     /// `FRESH` or more ago, or a read of it failed, as the desktop reads a stale diff again when
     /// its tab mounts (`Atom.swr` with `revalidateOnMount` in

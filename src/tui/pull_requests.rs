@@ -1141,13 +1141,16 @@ impl Read {
         }
     }
 
-    /// Drops the description and the remarks laid out in the old colors.
+    /// Drops the description, the remarks and the Code tab's files laid out in the old colors.
     fn restyle(&mut self) {
         if let Answer::Read(summary) = &mut self.answer {
             summary.laid_out = None;
         }
         if let Answer::Read(conversation) = &mut self.conversation {
             conversation.restyle();
+        }
+        if let Some(code) = self.code.as_mut() {
+            code.restyle();
         }
     }
 }
