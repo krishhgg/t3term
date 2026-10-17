@@ -328,8 +328,12 @@ enum ActionResult {
         /// One-message draft options this send took, such as ultrathink, to put back.
         reserved: Vec<(String, String)>,
     },
-    /// The system's appearance, read when the color scheme turned to System.
-    SystemAppearance(Appearance),
+    /// The system's appearance, read when the color scheme turned to System, from the read
+    /// numbered `read`.
+    SystemAppearance {
+        appearance: Appearance,
+        read: u64,
+    },
 }
 
 /// An open model, effort or mode menu.
@@ -438,6 +442,12 @@ struct App {
     /// The system's appearance as last read, for the System scheme. `None` before a read has
     /// answered.
     system_appearance: Option<Appearance>,
+    /// How many reads of the system's appearance have started since the one at start, which
+    /// numbers each.
+    system_reads: u64,
+    /// The number of the read `system_appearance` came from. Reads can answer out of order,
+    /// and an answer from an older read is dropped.
+    system_read_kept: u64,
     /// T3's configuration, with its providers and models. The config subscription keeps it
     /// current, and it stays as it was while the subscription reconnects.
     config: Option<Value>,
@@ -794,6 +804,8 @@ impl App {
             theme,
             appearance_mode: settings.appearance_mode,
             system_appearance: None,
+            system_reads: 0,
+            system_read_kept: 0,
             config: None,
             config_subscribed: true,
             config_revision: 0,
@@ -2031,13 +2043,15 @@ impl App {
         self.message = Some((format!("Appearance: {}", mode.label()), false));
     }
 
-    /// Reads the system's appearance in the background. The answer arrives as an action, and
-    /// a read that can't tell sends nothing.
-    fn read_system_appearance(&self) {
+    /// Reads the system's appearance in the background. The answer arrives as an action with
+    /// the read's number, and a read that can't tell sends nothing.
+    fn read_system_appearance(&mut self) {
+        self.system_reads += 1;
+        let read = self.system_reads;
         let results = self.actions.clone();
         tokio::spawn(async move {
             if let Some(appearance) = appearance::system().await {
-                let _ = results.send(ActionResult::SystemAppearance(appearance));
+                let _ = results.send(ActionResult::SystemAppearance { appearance, read });
             }
         });
     }
@@ -2131,10 +2145,13 @@ impl App {
         match result {
             ActionResult::Info(text) => self.message = Some((text, false)),
             ActionResult::Error(text) => self.message = Some((text, true)),
-            ActionResult::SystemAppearance(appearance) => {
+            // An older read than the one kept says less about the system now.
+            ActionResult::SystemAppearance { appearance, read } if read > self.system_read_kept => {
+                self.system_read_kept = read;
                 self.system_appearance = Some(appearance);
                 self.follow_appearance();
             }
+            ActionResult::SystemAppearance { .. } => {}
             ActionResult::Config { config, revision } => {
                 // A change from the subscription since the read was asked for is newer than
                 // the answer.
@@ -13804,6 +13821,26 @@ mod tests {
             alt_shift_a(&mut app);
             assert_eq!(app.appearance_mode, AppearanceMode::System);
             assert_eq!(app.theme.appearance, Light);
+            app.on_action_result(results.recv().await.unwrap());
+            assert!(results.try_recv().is_err());
+
+            // Two reads that answer out of order: the newer one's answer draws, and the
+            // older one's, arriving after it, is dropped.
+            for system in [Light, Dark] {
+                SYSTEM.set(Some(system));
+                for _ in 0..3 {
+                    alt_shift_a(&mut app);
+                }
+                tokio::task::yield_now().await;
+            }
+            assert_eq!(app.appearance_mode, AppearanceMode::System);
+            let older = results.recv().await.unwrap();
+            let newer = results.recv().await.unwrap();
+            app.on_action_result(newer);
+            assert_eq!(app.theme.appearance, Dark);
+            app.on_action_result(older);
+            assert_eq!(app.system_appearance, Some(Dark));
+            assert_eq!(app.theme.appearance, Dark);
         });
     }
 
