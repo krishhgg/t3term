@@ -19,6 +19,12 @@ pub const PROTOCOL_QUERY_PARAM: &str = "orchestrationProtocol";
 /// 200 bytes to each.
 const MAX_RECORD_BYTES: u64 = 16 * 1024;
 
+/// The longest descriptor body t3term reads. T3 f570bd21 sends about 1.3 KB from a desktop
+/// Mac: an id, a label, the platform, the version and some 40 capability flags
+/// (apps/server/src/environment/ServerEnvironment.ts:208-275). A long label or install path
+/// adds a few KB at most.
+const MAX_DESCRIPTOR_BYTES: usize = 256 * 1024;
+
 #[derive(Debug, Clone, Serialize)]
 #[serde(rename_all = "camelCase")]
 pub struct Runtime {
@@ -309,7 +315,8 @@ fn refused(error: &reqwest::Error) -> bool {
 }
 
 /// What the server at `origin` reports at `/.well-known/t3/environment`. `http` is a
-/// `direct_client`, so the answer comes from `origin` and no other server.
+/// `direct_client`, so the answer comes from `origin` and no other server. The 2.5 seconds
+/// cover the whole answer, body included.
 async fn fetch_descriptor(
     http: &reqwest::Client,
     origin: &str,
@@ -318,7 +325,7 @@ async fn fetch_descriptor(
         "{}/.well-known/t3/environment",
         origin.trim_end_matches('/')
     );
-    let response = http
+    let mut response = http
         .get(url)
         .timeout(Duration::from_millis(2500))
         .send()
@@ -337,15 +344,50 @@ async fn fetch_descriptor(
     if !status.is_success() {
         return Err(NoDescriptor::Invalid(format!("HTTP {status}")));
     }
-    let body = response.bytes().await.map_err(|error| {
-        if error.is_timeout() {
-            NoDescriptor::Unanswered
-        } else {
-            NoDescriptor::Invalid("the answer stopped partway".into())
-        }
-    })?;
+    let body = descriptor_body(&mut response).await?;
     serde_json::from_slice(&body)
         .map_err(|_| NoDescriptor::Invalid("the body doesn't parse as one".into()))
+}
+
+/// The body of a descriptor answer, read a chunk at a time, up to `MAX_DESCRIPTOR_BYTES`. A
+/// body that declares a longer length is refused before t3term reads any of it. One with no
+/// length, sent in chunks or until the server closes the connection, is refused as soon as
+/// what t3term has read passes the cap. Either way the body t3term keeps stays within the cap.
+async fn descriptor_body(response: &mut reqwest::Response) -> Result<Vec<u8>, NoDescriptor> {
+    let too_long = || {
+        let cap = MAX_DESCRIPTOR_BYTES / 1024;
+        NoDescriptor::Invalid(format!("the body is longer than {cap} KiB"))
+    };
+    if response
+        .content_length()
+        .is_some_and(|length| length > MAX_DESCRIPTOR_BYTES as u64)
+    {
+        return Err(too_long());
+    }
+    let mut body = Vec::new();
+    loop {
+        let chunk = response.chunk().await.map_err(|error| {
+            if error.is_timeout() {
+                NoDescriptor::Unanswered
+            } else {
+                NoDescriptor::Invalid("the answer stopped partway".into())
+            }
+        })?;
+        let Some(chunk) = chunk else {
+            return Ok(body);
+        };
+        if chunk.len() > MAX_DESCRIPTOR_BYTES - body.len() {
+            return Err(too_long());
+        }
+        // Double the buffer when the chunk doesn't fit, so a body read in small chunks is
+        // copied a few times at most, but never ask for more room than the cap.
+        let needed = body.len() + chunk.len();
+        if needed > body.capacity() {
+            let room = needed.max(2 * body.capacity()).min(MAX_DESCRIPTOR_BYTES);
+            body.reserve_exact(room - body.len());
+        }
+        body.extend_from_slice(&chunk);
+    }
 }
 
 struct Candidate {
@@ -875,5 +917,192 @@ mod tests {
         };
         let (read, ()) = tokio::join!(read, other);
         assert!(read.unwrap(), "the read held up the runtime");
+    }
+
+    const PADDED_ID: &str = "6f1c2a8e-3b7d-4e9a-9c41-2d5f8b0a7e13";
+
+    /// The capabilities T3 f570bd21 reports from a desktop Mac, in the order it sends them.
+    const CAPABILITIES: &[&str] = &[
+        "repositoryIdentity",
+        "connectionProbe",
+        "attachmentUploads",
+        "questionAttachments",
+        "fileAttachments",
+        "pullRequests",
+        "pullRequestChecks",
+        "inlineMessageContext",
+        "requiredWorktreeBootstrap",
+        "threadSettlement",
+        "threadAutoSettlement",
+        "storageCleanup",
+        "projectWorktreeCleanup",
+        "worktreesDirectory",
+        "threadRestartContinuation",
+        "projectSettingsOverrides",
+        "threadSnooze",
+        "environmentThemes",
+        "usageLimitSources",
+        "usagePriceOverrides",
+        "usageModelAliases",
+        "threadPinning",
+        "threadPinReorder",
+        "threadActiveReorder",
+        "threadAutoSettleOptOut",
+        "threadTitleRegeneration",
+        "threadVisitedTracking",
+        "threadPullRequests",
+        "threadPullRequestWatch",
+        "pullRequestStackActions",
+        "threadPullRequestLinking",
+        "serverResolvedCommandContext",
+        "environmentIcon",
+        "projectCloneTracking",
+        "serverSelfUpdate",
+        "serverSelfUpdateProgress",
+        "desktopAppUpdate",
+        "serverBrowser",
+        "agentActivityPublishing",
+    ];
+
+    /// A descriptor as T3 f570bd21 builds one on a desktop Mac
+    /// (apps/server/src/environment/ServerEnvironment.ts:208-275), with `padding`, a key t3term
+    /// ignores, long enough that the JSON is `size` bytes. The capabilities are built one at a
+    /// time because a single `json!` holding all of them passes the macro recursion limit.
+    fn padded_descriptor(size: usize) -> Vec<u8> {
+        let capabilities: serde_json::Map<String, Value> = CAPABILITIES
+            .iter()
+            .map(|&name| {
+                let value = match name {
+                    "fileAttachments" => serde_json::json!({"maxUploadBytes": 52428800}),
+                    "serverSelfUpdate" => Value::from("desktop-managed"),
+                    "agentActivityPublishing" => Value::Bool(false),
+                    _ => Value::Bool(true),
+                };
+                (name.to_owned(), value)
+            })
+            .collect();
+        let mut descriptor = serde_json::json!({
+            "environmentId": PADDED_ID,
+            "label": "Studio Mac",
+            "platform": {"os": "darwin", "arch": "arm64", "machine": "mac-studio"},
+            "serverVersion": "0.0.46-nightly.20261007.2787",
+            "orchestrationProtocolVersion": 2,
+            "capabilities": capabilities,
+            "padding": ""
+        });
+        let unpadded = descriptor.to_string().len();
+        descriptor["padding"] = Value::String("x".repeat(size - unpadded));
+        let text = descriptor.to_string().into_bytes();
+        assert_eq!(text.len(), size);
+        text
+    }
+
+    /// A 200 answer with `headers`, each ending in CRLF, and then `body` as it is.
+    fn answer(headers: &str, body: &[u8]) -> Vec<u8> {
+        let head = format!("HTTP/1.1 200 OK\r\nConnection: close\r\n{headers}\r\n");
+        [head.as_bytes(), body].concat()
+    }
+
+    /// A 200 answer that declares the length of `body`.
+    fn declared(body: &[u8]) -> Vec<u8> {
+        answer(&format!("Content-Length: {}\r\n", body.len()), body)
+    }
+
+    /// A 200 answer that sends `body` in chunks of 4 KiB and declares no length, ended by the
+    /// last, empty chunk when `ended`.
+    fn chunked(body: &[u8], ended: bool) -> Vec<u8> {
+        let mut sent = Vec::new();
+        for chunk in body.chunks(4096) {
+            sent.extend_from_slice(format!("{:x}\r\n", chunk.len()).as_bytes());
+            sent.extend_from_slice(chunk);
+            sent.extend_from_slice(b"\r\n");
+        }
+        if ended {
+            sent.extend_from_slice(b"0\r\n\r\n");
+        }
+        answer("Transfer-Encoding: chunked\r\n", &sent)
+    }
+
+    /// Starts a server on 127.0.0.1 that answers one request with `sent`, as it is written, and
+    /// returns its origin. It then holds the connection open until t3term closes it, or for 10
+    /// seconds at most, so an answer that hasn't ended never does.
+    fn answer_once(sent: Vec<u8>) -> String {
+        use std::io::{BufRead, BufReader, Write};
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let origin = format!("http://{}", listener.local_addr().unwrap());
+        std::thread::spawn(move || {
+            let Ok((mut stream, _)) = listener.accept() else {
+                return;
+            };
+            let mut reader = BufReader::new(stream.try_clone().unwrap());
+            let mut line = String::new();
+            while reader.read_line(&mut line).is_ok_and(|read| read > 2) {
+                line.clear();
+            }
+            let _ = stream.write_all(&sent);
+            let _ = stream.set_read_timeout(Some(Duration::from_secs(10)));
+            let _ = stream.read_to_end(&mut Vec::new());
+        });
+        origin
+    }
+
+    /// What `fetch_descriptor` found at `origin`, in words a test can compare.
+    async fn fetched(origin: &str) -> String {
+        match fetch_descriptor(&direct_client(), origin).await {
+            Ok(descriptor) => format!("descriptor {}", descriptor.environment_id),
+            Err(NoDescriptor::Refused) => "refused".into(),
+            Err(NoDescriptor::Unanswered) => "unanswered".into(),
+            Err(NoDescriptor::Redirected) => "redirected".into(),
+            Err(NoDescriptor::Invalid(why)) => format!("invalid: {why}"),
+        }
+    }
+
+    const TOO_LONG: &str = "invalid: the body is longer than 256 KiB";
+
+    /// A descriptor of 256 KiB is read whole, whether the server declares its length or sends
+    /// it in chunks. One byte more is refused either way, though it would parse.
+    #[tokio::test]
+    async fn a_descriptor_is_read_up_to_256_kib() {
+        let fits = padded_descriptor(MAX_DESCRIPTOR_BYTES);
+        let over = padded_descriptor(MAX_DESCRIPTOR_BYTES + 1);
+        let read = format!("descriptor {PADDED_ID}");
+        let cases = [
+            ("fits, declared", declared(&fits), read.as_str()),
+            ("fits, chunked", chunked(&fits, true), read.as_str()),
+            ("over, declared", declared(&over), TOO_LONG),
+            ("over, chunked", chunked(&over, true), TOO_LONG),
+        ];
+        for (case, sent, found) in cases {
+            assert_eq!(fetched(&answer_once(sent)).await, found, "{case}");
+        }
+    }
+
+    /// None of these servers ends its answer. Reading one to its end would wait out the 2.5
+    /// seconds and find the server unanswered, so an answer refused as too long shows t3term
+    /// stopped at the cap.
+    #[tokio::test]
+    async fn a_body_past_256_kib_is_refused_before_it_ends() {
+        let over = padded_descriptor(MAX_DESCRIPTOR_BYTES + 1);
+        let cases = [
+            // A length of 1 GiB, and none of the body.
+            (
+                "declared, unsent",
+                answer("Content-Length: 1073741824\r\n", b""),
+                TOO_LONG,
+            ),
+            // Chunks one byte past the cap, and no last chunk.
+            ("chunked, unended", chunked(&over, false), TOO_LONG),
+            // No length, so the body would end only when the server closed the connection.
+            ("until closed", answer("", &over), TOO_LONG),
+            // A body under the cap that stops partway still waits out the 2.5 seconds.
+            (
+                "short, unfinished",
+                answer("Content-Length: 4096\r\n", &over[..100]),
+                "unanswered",
+            ),
+        ];
+        for (case, sent, found) in cases {
+            assert_eq!(fetched(&answer_once(sent)).await, found, "{case}");
+        }
     }
 }
