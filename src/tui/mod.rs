@@ -14231,10 +14231,26 @@ mod tests {
             press(&mut app, KeyCode::Enter);
             app
         };
+        // And one whose host answered, with its description and a remark laid out.
+        let pull_answered = || {
+            let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+            note_reads(&mut app);
+            press(&mut app, KeyCode::Enter);
+            let parts = vec![
+                Part::Detail(Ok(Box::new(host_detail()))),
+                Part::Activity(Ok(Box::new(host_activity()))),
+                Part::Done,
+            ];
+            hear(&mut app, 1, parts);
+            let shown = text_in(&cells(&mut app, 200, 50), Rect::new(0, 0, 200, 50));
+            assert!(shown.contains("Second paragraph.") && shown.contains("Looks close."));
+            app
+        };
         let scenes = [
             ("crowded", crowded(), 80, 24),
             ("crowded with details", crowded_details(), 200, 50),
             ("a pull request's details", pull_details(), 120, 40),
+            ("a pull request's host answer", pull_answered(), 200, 50),
         ];
         for (scene, mut app, width, height) in scenes {
             let composer = app.composer.text();
@@ -14270,7 +14286,7 @@ mod tests {
             );
         }
         // Only the turn to System read anything.
-        assert_eq!(reads(&runtime), 3);
+        assert_eq!(reads(&runtime), 4);
     }
 
     #[test]
