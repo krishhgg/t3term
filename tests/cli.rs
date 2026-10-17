@@ -9,8 +9,8 @@
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output, Stdio};
-use std::sync::{Arc, Mutex};
+use std::process::{Child, Command, Output, Stdio};
+use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 
 use serde_json::{Value, json};
 use tempfile::TempDir;
@@ -20,6 +20,29 @@ use tokio_tungstenite::tungstenite::{Message, WebSocket};
 
 /// A WebSocket a client opened on a fake server, after the handshake.
 type Socket = WebSocket<TcpStream>;
+
+/// Every test holds this while it starts a process. A test that closes its end of a pipe to
+/// t3term holds it from when it starts t3term until that end is closed. On macOS, a process
+/// another test starts while the end is open can keep it open after the test closes it, and
+/// t3term's write to a closed stdout then goes through.
+static SPAWNING: Mutex<()> = Mutex::new(());
+
+/// Holds `SPAWNING`. A test that panicked while holding it left nothing to undo.
+fn spawning() -> MutexGuard<'static, ()> {
+    SPAWNING.lock().unwrap_or_else(PoisonError::into_inner)
+}
+
+/// Starts `command` while no other test starts a process, so it inherits no other test's pipe.
+fn spawn(command: &mut Command) -> Child {
+    let _alone = spawning();
+    command.spawn().expect("run t3term")
+}
+
+/// What `Command::output` gives, with the process started through `spawn`.
+fn output(command: &mut Command) -> Output {
+    command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    spawn(command).wait_with_output().expect("run t3term")
+}
 
 struct Home(TempDir);
 
@@ -86,7 +109,7 @@ impl Home {
     /// Runs t3term in the home directory, with `t3` as the command that issues and revokes its
     /// sessions.
     fn run_with(&self, args: &[&str], t3: &str) -> Output {
-        self.command(args, t3).output().expect("run t3term")
+        output(&mut self.command(args, t3))
     }
 
     /// The command `run_with` runs, for a test that changes its environment first.
@@ -1847,7 +1870,7 @@ fn a_named_environment_gets_every_request_and_every_login() {
     let near_a = |args: &[&str]| {
         let mut command = home.command(args, &t3);
         command.env("T3TERM_ORIGIN", &a.origin);
-        command.output().expect("run t3term")
+        output(&mut command)
     };
 
     // `--environment b` sends `threads`, `send` and `doctor` to B.
@@ -1943,7 +1966,7 @@ fn a_named_environment_that_fails_a_check_gets_no_login_and_no_other_server_is_t
     let near_a = |args: &[&str]| {
         let mut command = home.command(args, &t3);
         command.env("T3TERM_ORIGIN", &a.origin);
-        command.output().expect("run t3term")
+        output(&mut command)
     };
 
     let refusals = [
@@ -1980,7 +2003,7 @@ fn a_named_environment_that_fails_a_check_gets_no_login_and_no_other_server_is_t
     pinned_run
         .env("T3TERM_ORIGIN", &a.origin)
         .env_remove("T3TERM_T3_COMMAND");
-    assert_error(&pinned_run.output().unwrap(), 5, "T3_AUTH_UNAVAILABLE");
+    assert_error(&output(&mut pinned_run), 5, "T3_AUTH_UNAVAILABLE");
 
     // A default that names no saved environment, or a file that doesn't parse, stops every
     // command that names no environment, since t3term can't tell which server was chosen.
@@ -2017,7 +2040,7 @@ fn a_dangling_default_or_a_broken_file_is_passed_only_the_documented_ways() {
     let near_a = |args: &[&str]| {
         let mut command = home.command(args, &t3);
         command.env("T3TERM_ORIGIN", &a.origin);
-        command.output().expect("run t3term")
+        output(&mut command)
     };
     let named = ["--json", "--environment", "a", "threads"];
 
@@ -2076,7 +2099,7 @@ fn a_named_environment_whose_server_redirects_gets_no_login_and_its_target_no_re
     let near_a = |args: &[&str]| {
         let mut command = home.command(args, &t3);
         command.env("T3TERM_ORIGIN", &a.origin);
-        command.output().expect("run t3term")
+        output(&mut command)
     };
 
     // Each command stops at the redirect of B's descriptor, before it logs in, and `logout`
@@ -2092,7 +2115,7 @@ fn a_named_environment_whose_server_redirects_gets_no_login_and_its_target_no_re
     // finds no other server.
     let mut legacy = home.command(&["--json", "threads"], &t3);
     legacy.env("T3TERM_ORIGIN", &b);
-    assert_error(&legacy.output().unwrap(), 5, "T3_SERVER_UNAVAILABLE");
+    assert_error(&output(&mut legacy), 5, "T3_SERVER_UNAVAILABLE");
 
     // A was asked for nothing, B for its descriptor alone, and no session was issued.
     let reached = a.paths.lock().unwrap().clone();
@@ -2141,7 +2164,7 @@ fn a_named_environment_whose_server_answers_without_a_descriptor_gets_no_login()
     let near_a = |args: &[&str]| {
         let mut command = home.command(args, &t3);
         command.env("T3TERM_ORIGIN", &a.origin);
-        command.output().expect("run t3term")
+        output(&mut command)
     };
 
     let commands: [&[&str]; 3] = [&["threads"], &["send", THREAD_B, "Hi"], &["logout"]];
@@ -2215,7 +2238,7 @@ fn a_request_a_named_environment_redirects_stops_there_and_its_target_gets_nothi
     let near_a = |args: &[&str]| {
         let mut command = home.command(args, &t3);
         command.env("T3TERM_ORIGIN", &a.origin);
-        command.output().expect("run t3term")
+        output(&mut command)
     };
 
     // B's descriptor matches its home, so each command logs in and then stops at a redirect:
@@ -2288,7 +2311,7 @@ fn logging_out_of_a_named_environment_touches_its_login_alone() {
         command.env("T3TERM_ORIGIN", &a.origin);
         // `logout` locks a login in the temporary directory. Keep the lock in this home.
         command.env("TMPDIR", home.0.path());
-        command.output().expect("run t3term")
+        output(&mut command)
     };
 
     // B's server is down, so `logout` removes B's login without a revoke: B's alone, found by
@@ -2644,7 +2667,7 @@ fn launch_goes_to_the_named_environment_and_prints_the_ids_it_sent() {
     let near_a = |args: &[&str]| {
         let mut command = home.command(args, &t3);
         command.env("T3TERM_ORIGIN", &a.origin);
-        command.output().expect("run t3term")
+        output(&mut command)
     };
 
     // A launch into a new worktree, with the message padded as a script might leave it.
@@ -2820,7 +2843,7 @@ fn launch_reads_the_first_message_from_stdin() {
     let args = ["--json", "launch", "t3term", "--model", "claude-opus-5-5"];
     let mut command = home.command(&args, &t3);
     command.stdin(Stdio::piped()).stdout(Stdio::piped());
-    let mut child = command.spawn().expect("run t3term");
+    let mut child = spawn(&mut command);
     // An indented snippet keeps its indent and the final newline. The title is trimmed.
     let message = "    let x = 1;\n    assert_eq!(x, 2);\nWhy?\n";
     let mut stdin = child.stdin.take().unwrap();
@@ -3220,6 +3243,8 @@ fn launch_into_closed_stdout(json_mode: bool) {
     }
     let mut command = home.command(&args, &t3);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // No other test starts a process until stdout's reader is gone, so none holds it open.
+    let alone = spawning();
     let mut running = Running {
         child: command.spawn().expect("run t3term"),
         release: home.0.path().join("release"),
@@ -3230,6 +3255,7 @@ fn launch_into_closed_stdout(json_mode: bool) {
         .recv_timeout(GUARD)
         .expect("the launch reached T3");
     drop(running.child.stdout.take());
+    drop(alone);
     answer.send(()).unwrap();
 
     // t3term starts the revoke and is still running while the revoke is held.
