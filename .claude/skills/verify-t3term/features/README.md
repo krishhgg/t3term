@@ -16,6 +16,7 @@ Read the file for a feature before you drive it, and fix the file when a drive s
 | Thread details: opening, pane or dialog, tabs, the Thread tab's facts | [thread-details.md](thread-details.md) | `links` |
 | Linked pull requests: the details' Pull requests tab | [linked-pull-requests.md](linked-pull-requests.md) | `links` |
 | Pull request page: what a link's details read from its host, on a Summary and a Timeline | [pull-request-page.md](pull-request-page.md) | `links` |
+| Pull request code: a link's Code tab, its slices, folds and failures | [pull-request-code.md](pull-request-code.md) | `links` |
 | Pull request live refresh: the reads that keep a link's details current while you use t3term | [pull-request-live-refresh.md](pull-request-live-refresh.md) | `links` |
 | Lineage: related threads, forks and agents in the details | [lineage.md](lineage.md) | `lineage` |
 | CLI: commands, `--json` and exit codes against a fake server | [cli.md](cli.md) | `links` |
