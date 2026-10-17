@@ -843,6 +843,50 @@ def links_summary(record: dict) -> str:
     return text
 
 
+# ---- the transcript's code fences: src/tui/markdown.rs ----
+
+# thr-legacy's last reply, for features/transcript.md. Each block shows one rule of how a fence
+# opens and closes: a four-backtick fence that holds a three-backtick one, a tilde fence, a
+# backtick run with text after it inside a fence, backticks that are inline code, and a run
+# followed by U+00A0 inside a fence. The U+00A0 is written as an escape, so it shows here. Every
+# line is invented.
+FENCE_REPLY = '''Fence check: a longer fence holds a shorter one.
+
+````markdown
+Run the reader once:
+```sh
+t3term threads --json
+```
+````
+
+The config takes a tilde fence:
+
+~~~toml
+[reader]
+once = true
+~~~
+
+A run with text after it stays code:
+
+```rust ignore
+let once = true;
+```` not a close
+```
+
+```x`y``` is inline code, not a fence.
+
+A run with U+00A0 after it stays code:
+
+````rust
+before_nbsp
+````\u00a0
+AFTER_NBSP_MUST_STAY_CODE
+- still in the panel
+````
+
+End of the fence check.'''
+
+
 # ---- the invented world ----
 
 
@@ -869,6 +913,9 @@ def build_world(t0: int) -> dict:
     make('thr-many', 'Many: 1,005 links', 'huge', -6 * DAY, -5 * HOUR)
     make('thr-hostile', 'Hostile: text and sizes', 'hostile', -7 * DAY, -6 * HOUR)
     make('thr-malformed', 'Malformed: not a list', 'malformed', -8 * DAY, -7 * HOUR)
+    # The transcript's code fences: a reply after the last turn's on thr-legacy.
+    legacy = threads['thr-legacy']
+    legacy.reply(2, FENCE_REPLY, legacy.latest_run()['completedAt'])
     for thread in threads.values():
         thread.settle_record()
     # Emoji that end in U+FE0F: a reply after the last turn's on thr-none.
