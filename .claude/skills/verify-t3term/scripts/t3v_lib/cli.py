@@ -110,6 +110,9 @@ def add_run_commands(commands):
     marker = command('mark', c.cmd_mark, 'note where raw.ansi ends now, for controlLeaksSinceMark in status')
     marker.add_argument('name')
     restart = command('restart', c.cmd_restart, 'quit t3term and start it again with the same HOME')
+    restart.add_argument('--ready', metavar='TEXT',
+                         help="the text that means t3term is back (default: the run's ready text). A run "
+                              'whose saved settings hide the sidebar needs another, such as "Ctrl+B sidebar"')
     restart.add_argument('--ready-timeout', type=float, default=20.0, metavar='S',
                          help='seconds to wait for the ready text (default 20)')
     render = command('render', c.cmd_render, 'draw a capture as a PNG with render.swift')

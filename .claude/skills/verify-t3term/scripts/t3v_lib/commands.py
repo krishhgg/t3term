@@ -37,9 +37,9 @@ def watch_line(root: Path) -> str:
     return f'env -u TMUX tmux -S {root}/tmux.sock attach -r -t {SESSION}'
 
 
-def wait_ready(state: dict, timeout: float) -> dict:
-    """Waits until t3term shows the run's ready text, as `t3v wait --text` does."""
-    return wait_until(state, texts=[state['ready']], timeout=timeout)
+def wait_ready(state: dict, timeout: float, ready=None) -> dict:
+    """Waits until t3term shows `ready`, else the run's ready text, as `t3v wait --text` does."""
+    return wait_until(state, texts=[ready or state['ready']], timeout=timeout)
 
 
 def not_ready(args, root: Path, state: dict, waited: dict, what: str):
@@ -404,9 +404,10 @@ def cmd_restart(args) -> int:
     mark(state, 'fixture.t3term_restarted', restart=count, pid=pid)
     if pid is None:
         die(f't3term did not come back; see {state["evidence"]}/raw.ansi', 1)
-    waited = wait_ready(state, args.ready_timeout)
+    ready = args.ready or state['ready']
+    waited = wait_ready(state, args.ready_timeout, ready)
     if not waited['ok']:
-        not_ready(args, root, state, waited, f'restart: t3term did not show {json.dumps(state["ready"])}')
+        not_ready(args, root, state, waited, f'restart: t3term did not show {json.dumps(ready)}')
     print(f't3term restarted (restart {count}), pid {pid}, same HOME, after {waited["elapsed"]:.1f} s. It read the '
           f'descriptor again, so it shows the label served now, and its feed starts over.\n'
           f'recording: {state["evidence"]}/session-{count}.cast')

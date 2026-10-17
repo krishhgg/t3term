@@ -199,15 +199,17 @@ def send_mouse(state: dict, report: str):
 
 
 def sidebar_edge(screen: str):
-    """The sidebar's edge column: two right of the chevron that ends the Settled footer, which
-    is the last column of the sidebar's rows. None when the footer isn't whole on screen."""
+    """The sidebar's edge column: three right of the chevron that ends the Settled footer. The
+    footer leaves two columns after its chevron, and the edge is the sidebar's next column, its
+    last (src/tui/sidebar.rs and `drag_edge` in src/tui/mod.rs's tests). None when the footer
+    isn't whole on screen."""
     for line in reversed(screen.split('\n')):
         start = line.find('Settled (')
         if start < 0:
             continue
         for i in range(start, len(line)):
             if line[i] in '›⌄':
-                return cells(line[:i]) + 2
+                return cells(line[:i]) + 3
         return None
     return None
 
