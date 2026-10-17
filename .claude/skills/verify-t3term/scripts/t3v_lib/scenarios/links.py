@@ -72,6 +72,11 @@ The presets `t3v links THREAD PRESET` sets:
 `--via` sends a change on the thread's own subscription (thread), as a thread.updated on the
 shell's (shell), or on both (the default).
 
+The scenario serves `orchestration.launchThread` as T3 does (launches.py), so `t3term launch` makes a
+thread in Linked Desk with its first message and a run in `preparing`, and the sidebar and `t3term
+threads` list it. `t3v launches refuse` fails later launches with T3's launch error, `t3v launches
+drop` makes the thread and closes the socket without an answer, and `t3v launches accept` goes back.
+
 Where things are. The details' button ` ◨ ` takes columns COLS-4 to COLS-2 of the top row, with ◨
 at COLS-3, whenever the conversation's header has room for it. The details open as a 36-column pane
 when the main column, less a column at each side, has 97 columns (60 for the conversation and one
@@ -89,7 +94,8 @@ import copy
 import json
 import time
 
-from .. import controls
+from .. import controls, launches
+from ..launches import Launches
 from ..orchestration import Orchestration
 from ..text import MINUTE, iso, now_ms, safe
 from ..world import INSTANCE
@@ -109,11 +115,13 @@ def operation_error(operation: str, detail: str, **fields) -> dict:
     return dict({'_tag': 'PullRequestOperationError', 'operation': operation, 'detail': detail}, **fields)
 
 
-class LinksFixture(Orchestration):
-    """The linked pull requests world on the orchestration feeds, with the pull request reads."""
+class LinksFixture(Launches, Orchestration):
+    """The linked pull requests world on the orchestration feeds, with the pull request reads and
+    thread launches."""
 
     def __init__(self, root, run):
         super().__init__(root, run)
+        self.init_launches()
         self.refresh_streams = []  # (connection, request id)
         # pullRequests.subscribeRefreshes's number. It starts at 1, as T3's does after its first
         # turn, so a subscription opens with it; at 0 T3 sends nothing until it changes.
@@ -182,7 +190,7 @@ class LinksFixture(Orchestration):
         with self.lock:
             held, held_from = self.capability_held()
             return dict(super().expect(), capabilityServed=self.capability, capabilityHeld=held,
-                        capabilityFrom=held_from,
+                        capabilityFrom=held_from, launchMode=self.launch_mode,
                         pulls=({tid: self.pulls_for(tid, held == 'on') for tid in self.watches if tid in self.threads}
                                if self.threads else {}))
 
@@ -591,6 +599,8 @@ def options_of(args) -> dict:
 
 def print_expect(expect: dict):
     print_pulls(expect)
+    if expect.get('launchMode'):
+        print(f'  launches      {expect["launchMode"]}: `t3v launches` changes how the server answers them')
     controls.print_world_expect(expect)
 
 
@@ -609,6 +619,7 @@ def status_fields(records: list, live) -> dict:
         'syncs': sum(1 for r in changes if r.get('kind') == 'sync'),
         'capabilityChanges': [r.get('value') for r in records if r.get('event') == 'capability.change'],
         'lateSent': sum(r.get('delivered', 0) for r in records if r.get('event') == 'late.sent'),
+        **launches.status_fields(records, live),
     }
 
 
@@ -640,6 +651,11 @@ def cmd_refresh(args) -> int:
 
 def cmd_revise(args) -> int:
     controls.send(args, '/__fixture/revise', {})
+    return 0
+
+
+def cmd_launches(args) -> int:
+    controls.send(args, '/__fixture/launches', {'mode': args.mode})
     return 0
 
 
@@ -679,5 +695,10 @@ def add_commands(commands, run_option):
     revise = commands.add_parser('revise', help="links: change what the next pull request read gets, without a "
                                                 'refresh number')
     revise.set_defaults(func=cmd_revise)
-    for parser in (links, unlink, sync, capability, late, refresh, revise):
+    launch = commands.add_parser('launches', help='links: how the server answers orchestration.launchThread from '
+                                                  'now on: accept, refuse with T3\'s launch error, or drop the '
+                                                  'socket after it makes the thread')
+    launch.add_argument('mode', choices=launches.LAUNCH_MODES)
+    launch.set_defaults(func=cmd_launches)
+    for parser in (links, unlink, sync, capability, late, refresh, revise, launch):
         run_option(parser)

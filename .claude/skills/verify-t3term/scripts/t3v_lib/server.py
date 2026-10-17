@@ -2,9 +2,10 @@
 
 It listens on 127.0.0.1 alone, at a port the OS picks. It serves the environment descriptor, the
 auth routes t3term calls, the orchestration HTTP routes and Effect RPC over /ws. It runs no
-command, no git, no gh and no shell, and it refuses every orchestration command. A scenario
-(scenarios/) adds its world, its RPC methods (`rpc`), its control routes (`controls`) and its
-HTTP routes (`http`) to the base here. An RPC method nothing registered fails with
+command, no git, no gh and no shell, and it refuses every orchestration command that comes through
+orchestration.dispatchCommand. A scenario (scenarios/) adds its world, its RPC methods (`rpc`), its
+control routes (`controls`) and its HTTP routes (`http`) to the base here, as links adds
+orchestration.launchThread from launches.py. An RPC method nothing registered fails with
 FixtureUnknownTag and counts in unknownRpcs.
 """
 

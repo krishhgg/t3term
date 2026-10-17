@@ -43,7 +43,7 @@ T3V_RUN=$BASE $T3V keys Enter
 
 | Scenario | World | Ready text | Feature files |
 |---|---|---|---|
-| `links` | Project "Linked Desk" with 8 threads, one for each state of a thread's linked pull requests: every state, one open link, an emptied list, the old single link, no field, 1,005 links, hostile text and an unreadable list | `Mixed: every state` | sidebar, connection, thread-details, linked-pull-requests, cli |
+| `links` | Project "Linked Desk" with 8 threads, one for each state of a thread's linked pull requests: every state, one open link, an emptied list, the old single link, no field, 1,005 links, hostile text and an unreadable list. `t3term launch` adds threads to it, and `t3v launches` makes T3 refuse or drop them | `Mixed: every state` | sidebar, connection, thread-details, linked-pull-requests, cli |
 | `lineage` | Project "Lineage Desk" with 10 threads that fork, start agents and transfer context: a parent, forks running and done, archived forks and parents, 134 agents of which 124 are done, and a thread with no relations | `Main: open me first` | lineage |
 | `terminal` | Projects "Terminal Desk" and "Rootless Desk" with 8 threads, one for each state of the terminal drawer: running with history, no terminal yet, no worktree, exited, failed, busy, 8 MiB of history and no workspace root. The fake shell answers what the drawer types. Needs a build with the drawer (#41) | `Running: a shell` | none until the drawer merges |
 
@@ -88,7 +88,7 @@ What counts as proof:
 
 ## Check
 
-`t3v check` exits 1 with one line per broken rule. While the run is live: no request without its scope (`scopeViolations`), no RPC method the server doesn't know (`unknownRpcs`), no text that must stay hidden on screen (`screenLeaks`) or in `raw.ansi` (`controlLeaks`), no token, ticket or control key the server issued on screen or in any file of the evidence directory (`secretLeaks`, counts by file, never the values), and no bug in the fake server itself (`fixtureErrors`; `fixture.error` in `events.jsonl` names the exception and its line). A fixture bug fails the run because on screen it would only look like t3term reconnecting. After `stop`: every session t3term issued was revoked and every socket closed, and the server's last search for its secrets, in `summary.json`, found none. The server refuses every orchestration command and `status` counts them as `commandsRefused`, which doesn't fail `check`.
+`t3v check` exits 1 with one line per broken rule. While the run is live: no request without its scope (`scopeViolations`), no RPC method the server doesn't know (`unknownRpcs`), no text that must stay hidden on screen (`screenLeaks`) or in `raw.ansi` (`controlLeaks`), no token, ticket or control key the server issued on screen or in any file of the evidence directory (`secretLeaks`, counts by file, never the values), and no bug in the fake server itself (`fixtureErrors`; `fixture.error` in `events.jsonl` names the exception and its line). A fixture bug fails the run because on screen it would only look like t3term reconnecting. After `stop`: every session t3term issued was revoked and every socket closed, and the server's last search for its secrets, in `summary.json`, found none. The server refuses every command that comes through `orchestration.dispatchCommand`, and `status` counts them as `commandsRefused`, which doesn't fail `check`. In `links`, a `t3term launch` payload without a field T3 requires fails `check` (`launchesUnreadable`).
 
 ## Cleanup
 
@@ -113,7 +113,7 @@ Clean up failed attempts too. `ls -d /tmp/t3v-run-*` lists runs still on disk. R
 - t3term saves the sidebar's width, whether it is hidden, the shelves you opened or closed and verbose mode in the run's HOME. They last across `restart`. A new run starts from defaults.
 - The sidebar's width moves where the thread details stop being a pane and become a dialog: at 131 columns or more with the default sidebar, 99 or more with it hidden. A drive that dragged the sidebar changes what later steps see.
 - tmux sends `M-x` as Esc followed by x, which t3term reads as Alt+X. Option on a Mac keyboard does the same only when the terminal is set to send Esc.
-- The server refuses every orchestration command, so sending a message, answering an approval or a question, interrupting and changing a mode show t3term's refusal path. `features/README.md` lists what that leaves unreachable.
+- The server refuses every command that comes through `orchestration.dispatchCommand`, so sending a message, answering an approval or a question, interrupting and changing a mode show t3term's refusal path. `features/README.md` lists what that leaves unreachable. `links` serves `orchestration.launchThread`, so `t3term launch` works there and adds its thread to the run's world.
 - t3term can split a string across writes, so `controlLeaks` over `raw.ansi` may miss text that `screenLeaks` catches on screen.
 - PNGs differ slightly between machines in how fonts are smoothed. Compare `.txt` captures, not PNG bytes.
 - Every account can write to /tmp, so t3v uses a run directory, an evidence directory, /tmp/t3v-bin and /tmp/t3v-target only when this account owns it and no other account can write to it or to a directory on the way. If one belongs to another account, t3v stops and names it. Remove it, or pass `--evidence` somewhere of yours.
