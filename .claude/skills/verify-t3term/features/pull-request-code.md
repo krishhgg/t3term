@@ -8,7 +8,9 @@
 - **Files.** Each file starts folded: `› M src/config/reader.rs +7 -5`, with `A` green, `D` red, `R` blue and `M` yellow, and the counts in green and red. A rename shows both paths, `› R src/config/source.rs → src/config/sources.rs`, with the counts on the next row where they don't fit. A file whose hunks the host left out takes the host's counts, as in `› M Cargo.lock +40 -12`.
 - **Order.** Each slice's files show in the desktop's reading order, not the patch's. Source files come first, each after the changed files it imports and otherwise by path. Tests come next, each after the source file whose name it has, then lockfiles, snapshots and files under `dist`, `build`, `vendor`, `__generated__` or `__snapshots__`, by path. A later slice never moves the files above it. So the first slice reads `assets/config-flow.png`, `src/config/reader.rs`, `src/config/schema.rs`, the rename and `tests/config_reload.rs`, and the second `docs/config.md`, `src/legacy/reader_v1.rs` and `Cargo.lock`.
 - **Unfolding.** Enter on the chosen file, or a click on it, turns `›` into `⌄` and shows its lines. Each line has its number in grey, the new one or the old for a removed line, then `-` and the line in red, `+` and the line in green, or a space and the line. `⋯ 14 unmodified lines` comes before a hunk that doesn't start at line 1. A line that wraps leaves the number and the mark blank on its later rows, and a tab stops every 4 columns. A binary file reads `A binary file, whose changes have no lines to show.` and a file the host withheld `The host withheld this file's changes.` Enter or a click again folds the file.
-- **Choosing.** Once a file or `↻ Retry` is in view, ↓ chooses the next one and ↑ the one before, and the status line leads with what Enter does: `Enter expand file`, `Enter collapse file` or `Enter retry`. Where none is in view, they scroll.
+- **Review threads.** A thread on a line of an unfolded file shows under that line, behind a grey bar, where the line has that number on the thread's side. Its first row reads `⌄ Open · 4 comments`, with `Resolved` in green and `· outdated` where the host says so. A thread starts open unless it is resolved. Open, it shows each comment with its author and age, then `2 more comments on the host.` where the host counts more than T3 sent. On a row with both numbers, a thread on the old side comes before one on the new. Enter or a click on the first row opens or closes it, and it stays so across reads. A folded file shows none of its threads.
+- **Off the diff.** Threads on a line no file read so far shows go to a list above the files that starts closed: `› 1 conversation not on the diff read so far` while slices are left, then `› 1 conversation not on the current diff`. Open, it lists each path once, then `Line 12` and the thread.
+- **Choosing.** Once a file, a thread, the list or `↻ Retry` is in view, ↓ chooses the next one and ↑ the one before, and the status line leads with what Enter does: `Enter expand file`, `Enter collapse file`, `Enter show conversation`, `Enter hide conversation`, `Enter show conversations off the diff` or `Enter retry`. Where none is in view, they scroll.
 - **Reading again.** A new refresh number, `r` and a detail whose `updatedAt` changed each read the first slice again. The files read before stay, each with its fold, until the new slice replaces them, and the count goes back to `5 files+` until the end of the files comes near again. After `r` the diff waits for the refresh number `pullRequests.invalidate` raises, or for the end of the read that sent it, so T3 has forgotten the diff it held.
 - **Failures.** A first slice that fails shows `Couldn't read this diff: GitHub took too long to answer.` alone. Showing the Code after the details open again, or `r`, reads it again, and the failure stays until the files come. A later slice that fails shows `t3term couldn't read the rest of this diff.`, the reason and `↻ Retry` under the files, and Retry reads that slice again. A read again of the first slice that fails keeps the files under `May be out of date: t3term couldn't read the diff again.` and the reason.
 
@@ -18,7 +20,7 @@ Open a thread, open its details (Alt+B), press → for `Pull requests`, choose a
 
 ## Driving it with t3v
 
-Scenario `links` at 100x30. The diff route answers at once with two slices. The first holds `src/config/reader.rs`, `src/config/schema.rs`, the rename `src/config/source.rs → src/config/sources.rs`, the binary `assets/config-flow.png` and the new `tests/config_reload.rs`, with `truncated` and the cursor `s2`. The second holds `docs/config.md`, the deleted `src/legacy/reader_v1.rs` and a `Cargo.lock` with a header and no hunks, which the host counted at +40 -12. Files in the run directory change the reads: `diff-slow` holds each slice 4 s, `diff-fail` fails the first slice and `diff-fail-rest` the second with `GitHub took too long to answer.`, `diff-off` makes the detail say the host gives no diff, and `diff-ts` serves a TypeScript diff in one slice. Its patch has `src/settings/panel.tsx`, which imports `./store` and `../lib/format`, then `src/settings/panel.test.tsx`, `src/settings/store.ts`, which imports `../lib/format`, `pnpm-lock.yaml` and the new `src/lib/format.ts`. The server logs each read of the diff in events.jsonl as `pr.diff` with its cursor, and `reads` lists those cursors, `null` for the first slice.
+Scenario `links` at 100x30. The diff route answers at once with two slices. The first holds `src/config/reader.rs`, `src/config/schema.rs`, the rename `src/config/source.rs → src/config/sources.rs`, the binary `assets/config-flow.png` and the new `tests/config_reload.rs`, with `truncated` and the cursor `s2`. The second holds `docs/config.md`, the deleted `src/legacy/reader_v1.rs` and a `Cargo.lock` with a header and no hunks, which the host counted at +40 -12. Files in the run directory change the reads: `diff-slow` holds each slice 4 s, `diff-fail` fails the first slice and `diff-fail-rest` the second with `GitHub took too long to answer.`, `diff-off` makes the detail say the host gives no diff, `diff-ts` serves a TypeScript diff in one slice, and `diff-threads` gives #7's conversation four review threads: a resolved one on removed line 26 of `src/config/reader.rs`, an open one on added line 28 whose host counts 4 comments where T3 sent 2, an outdated one on added line 45 of `src/config/schema.rs`, and one on line 12 of `src/config/watch.rs`, which the diff doesn't touch. The TypeScript diff's patch has `src/settings/panel.tsx`, which imports `./store` and `../lib/format`, then `src/settings/panel.test.tsx`, `src/settings/store.ts`, which imports `../lib/format`, `pnpm-lock.yaml` and the new `src/lib/format.ts`. The server logs each read of the diff in events.jsonl as `pr.diff` with its cursor, and `reads` lists those cursors, `null` for the first slice.
 
 ```bash
 $T3V start --cols 100 --rows 30
@@ -126,6 +128,36 @@ $T3V wait --text "› A src/lib/format.ts" --text "› M pnpm-lock.yaml" --gone 
 rm "$RUN/diff-ts"
 T=$($T3V capture typescript-100x30 | grep 'txt$')
 [ "$(grep -o '› [AMDR] [^ ]*' "$T" | paste -sd' ' -)" = '› A src/lib/format.ts › M src/settings/store.ts › M src/settings/panel.tsx › M src/settings/panel.test.tsx › M pnpm-lock.yaml' ]
+
+# Review threads come with the conversation, 3 s late. One on a file the diff doesn't touch goes to a closed list above the files, whose label says whether slices are left.
+touch "$RUN/diff-threads"
+mark
+$T3V refresh && settle '[null,null]'
+$T3V wait --text "› 1 conversation not on the diff read so far" --text "⌄ M src/config/reader.rs +7 -5" --idle 300
+$T3V keys End && settle '[null,null,"s2"]'
+$T3V keys Home && $T3V wait --text "› 1 conversation not on the current diff" --idle 300
+# Under reader.rs, the resolved thread on removed line 26 starts closed, in green, and the open one on added line 28 shows its comments behind a bar, then the ones the host has beyond T3's.
+$T3V keys PgDn && $T3V wait --text "› Resolved · 1 comment" --text "⌄ Open · 4 comments" --text "Should reload check the schema too?" --idle 300
+C=$($T3V capture threads-100x30); S=$(echo "$C" | grep 'ans$'); T=$(echo "$C" | grep 'txt$')
+[ "$(grep -o -e '26 - ' -e 'Resolved · 1 comment' -e '28 + ' -e 'Open · 4 comments' "$T" | paste -sd'|' -)" = '26 - |Resolved · 1 comment|28 + |Open · 4 comments' ]
+grep -q '38;2;0;212;146m› Resolved.\[38;2;129;129;129m · 1 comment' "$S" && grep -q '38;2;58;58;58m│ .\[38;2;245;245;245m⌄ Open.\[38;2;129;129;129m · 4 comments' "$S"
+$T3V keys PgDn && $T3V wait --text "It does now: reload goes through load." --text "2 more comments on the host." --idle 300
+$T3V keys PgUp && $T3V wait --text "› Resolved · 1 comment" --idle 300
+# A click opens the resolved thread and closes the open one, and each stays so across a read again.
+$T3V click --text "Resolved · 1 comment" && $T3V wait --text "⌄ Resolved · 1 comment" --text "This parsed the file twice." --text "Enter hide conversation"
+$T3V click --text "Open · 4 comments" && $T3V wait --text "› Open · 4 comments" --gone "Should reload check the schema too?" --text "Enter show conversation"
+mark
+$T3V refresh && settle '[null,null]'
+$T3V wait --text "⌄ Resolved · 1 comment" --text "› Open · 4 comments" --idle 300
+# ↓ from the top chooses the list, and Enter opens it: each path once, then the line and the thread.
+$T3V keys Home Down && $T3V wait --text "Enter show conversations off the diff"
+$T3V keys Enter && $T3V wait --text "⌄ 1 conversation not on the diff read so far" --text "src/config/watch.rs" --text "Line 12" --text "The watcher still calls load_unchecked." --text "Enter hide conversations off the diff"
+$T3V capture off-diff-100x30
+$T3V keys Enter && $T3V wait --text "› 1 conversation not on the diff read so far" --gone "Line 12"
+# A folded file's threads don't show. Below, schema.rs has an outdated thread on added line 45.
+$T3V click --text "src/config/reader.rs" && $T3V wait --text "› M src/config/reader.rs +7 -5" --gone "Resolved · 1 comment" --gone "Open · 4 comments"
+$T3V keys PgDn && $T3V wait --text "⌄ Open · 1 comment · outdated" --text "A config with no version reads as 0 here."
+rm "$RUN/diff-threads"
 
 # Another thread's link, whose first slice fails: the failure alone. Opening the details again reads it again.
 touch "$RUN/diff-fail"
