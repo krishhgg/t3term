@@ -3701,6 +3701,51 @@ fn unchanged_lines_side_by_side_show_their_number_on_each_side() {
 }
 
 #[test]
+fn the_numbers_side_by_side_fit_an_unchanged_line_s_old_place() {
+    // Five lines removed at the top put each line after them five places further on the left,
+    // so the last of those shown is old line 10 beside new line 5.
+    let patch = "diff --git a/g.rs b/g.rs
+--- a/g.rs
++++ b/g.rs
+@@ -1,6 +1 @@
+-o1
+-o2
+-o3
+-o4
+-o5
+ l1
+";
+    let mut code = read(slice(patch, None), 0);
+    code.act(Control::File(0), &[]);
+    code.act(Control::Layout, &[]);
+    for place in 0..2 {
+        code.act(Control::Stretch(0, place), &[]);
+    }
+    assert!(code.ask_text(2).is_some());
+    assert!(code.take_text(2, text(numbered(5))));
+    for place in 0..2 {
+        code.act(Control::Stretch(0, place), &[]);
+    }
+    let removed = (1..=5).map(|old| format!("{old:>2} - {:<14}│", format!("o{old}")));
+    let kept = (1..=5).map(|new| {
+        let old = new + 5;
+        format!("{old:>2}   {:<14}│ {new:>2}   l{new}", format!("l{new}"))
+    });
+    assert_eq!(
+        rows(&code, 40)[7..],
+        removed.chain(kept).collect::<Vec<_>>()
+    );
+    // Stacked, an unchanged line shows only its number after the change.
+    code.act(Control::Layout, &[]);
+    let removed = (1..=5).map(|old| format!("{old} - o{old}"));
+    let kept = (1..=5).map(|new| format!("{new}   l{new}"));
+    assert_eq!(
+        rows(&code, 40)[7..],
+        removed.chain(kept).collect::<Vec<_>>()
+    );
+}
+
+#[test]
 fn only_a_file_added_or_deleted_keeps_one_column_side_by_side() {
     let mut code = read(slice(PATCH, None), 0);
     code.act(Control::Folds, &[]);
