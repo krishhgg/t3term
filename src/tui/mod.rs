@@ -14,6 +14,7 @@ mod environment;
 mod label;
 mod lineage;
 mod markdown;
+mod palettes;
 mod picker;
 mod plan;
 mod provider;
@@ -585,7 +586,7 @@ async fn event_loop(terminal: &mut ratatui::DefaultTerminal, client: Arc<Client>
     let shown = appearance::resolve(settings.appearance_mode, system, Appearance::Dark);
     let mut app = App::new(
         client,
-        Theme::of(shown, Depth::detect()),
+        Theme::of(settings.theme, shown, Depth::detect()),
         &settings,
         actions,
     );
@@ -2047,7 +2048,7 @@ impl App {
         let current = self.theme.appearance;
         let wanted = appearance::resolve(self.appearance_mode, self.system_appearance, current);
         if wanted != current {
-            self.theme = Theme::of(wanted, self.theme.depth);
+            self.theme = Theme::of(self.theme.name, wanted, self.theme.depth);
             self.restyle();
         }
     }
@@ -2840,7 +2841,7 @@ impl App {
         };
         let button_style = if self.details.open {
             Style::new()
-                .fg(self.theme.primary)
+                .fg(self.theme.focus)
                 .bg(self.theme.chip_bg)
                 .add_modifier(Modifier::BOLD)
         } else {
@@ -3796,7 +3797,7 @@ impl App {
                     Item::Entry { label, current, .. } => {
                         let check = if *current { " ✓ " } else { "   " };
                         let left = vec![
-                            Span::styled(check, Style::new().fg(t.primary)),
+                            Span::styled(check, Style::new().fg(t.focus)),
                             Span::styled(
                                 fit(label, row_width.saturating_sub(4)),
                                 Style::new().fg(t.fg),
@@ -4559,6 +4560,7 @@ fn render_block(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::settings::ThemeName;
 
     fn block(kind: BlockKind, item_type: &str, header: &str, body: &str) -> transcript::Block {
         transcript::Block {
@@ -13805,6 +13807,123 @@ mod tests {
             assert_eq!(app.appearance_mode, AppearanceMode::System);
             assert_eq!(app.theme.appearance, Light);
         });
+    }
+
+    #[test]
+    fn a_built_in_theme_draws_both_halves_in_its_own_colors() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        // The crowded thread with its details, a pending approval and a scrolled transcript.
+        let crowded_details = || {
+            let mut app = crowded();
+            let request = json!({"id": "q1", "kind": "command", "status": "pending"});
+            app.on_thread_event(live(2, "runtime-request.updated", request));
+            app.composer.insert('x');
+            alt(&mut app, 'b');
+            cells(&mut app, 200, 50);
+            press(&mut app, KeyCode::PageUp);
+            app
+        };
+        // A running step, a menu's check and the sidebar's bar, which mark what is current.
+        let marks = || {
+            let mut app = tui(&Settings::default());
+            let thread = bound("t", "p", json!("/work/repo-t"), json!("t3code/t"));
+            app.on_shell_event(details_shell(vec![thread.clone()]));
+            let steps = json!([{"id": "s1", "text": "Fix the bug", "status": "running"}]);
+            let list = json!({"id": "l1", "threadId": "t", "runId": null, "nodeId": "n",
+                "kind": "todo_list", "status": "active", "steps": steps});
+            let more = json!({"thread": thread, "plans": [list]});
+            app.open_thread(codex_thread("t", None, more));
+            app.on_config_event(config_snapshot(vec![codex("ready")], json!({})));
+            cells(&mut app, 120, 40);
+            alt(&mut app, 't');
+            app.picker = Some(mode_menu());
+            app.focus = Focus::Sidebar;
+            app
+        };
+        // A linked pull request's details, with the way back to the list.
+        let pull_details = || {
+            let mut app = pulls_tui(vec![long_linked(32), long_linked(31)], false);
+            app.focus = Focus::Transcript;
+            cells(&mut app, 120, 40);
+            alt(&mut app, 'b');
+            press(&mut app, KeyCode::Right);
+            cells(&mut app, 120, 40);
+            press(&mut app, KeyCode::Enter);
+            app
+        };
+        for name in ThemeName::ALL.into_iter().skip(1) {
+            // Each scene with its size and the text it draws only in the focus color.
+            let pull = "a pull request's details";
+            let scenes = [
+                ("crowded with details", crowded_details(), 200, 50, &[][..]),
+                ("marks", marks(), 120, 40, &["◉", "✓", "▎"][..]),
+                (pull, pull_details(), 120, 40, &["← List"][..]),
+            ];
+            for (scene, mut app, width, height, marks) in scenes {
+                let at = format!("{name:?}, {scene}");
+                // As the event loop builds it from a file that names the theme.
+                app.theme = Theme::of(name, Appearance::Dark, Depth::TrueColor);
+                app.restyle();
+                let dark = cells(&mut app, width, height);
+                drawn_in_its_own_colors(&dark, &app.theme, marks, &at);
+                // Alt+Shift+A changes the half and keeps the theme.
+                alt_shift_a(&mut app);
+                alt_shift_a(&mut app);
+                assert_eq!(app.theme.name, name, "{at}");
+                assert_eq!(app.theme.appearance, Appearance::Light, "{at}");
+                assert_ne!(app.theme.bg, Theme::light(Depth::TrueColor).bg, "{at}");
+                let light = cells(&mut app, width, height);
+                drawn_in_its_own_colors(&light, &app.theme, marks, &at);
+                alt_shift_a(&mut app);
+                assert_eq!(app.theme.name, name, "{at}");
+            }
+        }
+    }
+
+    /// Checks that `buffer` draws only `theme`'s colors, on its canvas, with its focus color
+    /// drawing each of `marks`, which mark what is current, and its action color filling
+    /// buttons and never drawing text.
+    fn drawn_in_its_own_colors(
+        buffer: &ratatui::buffer::Buffer,
+        theme: &Theme,
+        marks: &[&str],
+        at: &str,
+    ) {
+        assert_eq!(foreign_colors(buffer, theme), [], "{at}");
+        let cells = || buffer.content.iter();
+        assert!(cells().any(|cell| cell.bg == theme.bg), "{at}");
+        assert!(cells().any(|cell| cell.fg == theme.focus), "{at}");
+        // Where each mark starts, as a run of cells that each hold one of its characters.
+        let area = buffer.area;
+        let starts = |mark: &str| {
+            let glyphs: Vec<String> = mark.chars().map(String::from).collect();
+            let rows = area.top()..area.bottom();
+            let spots = rows.flat_map(|y| (area.left()..area.right()).map(move |x| (x, y)));
+            spots
+                .filter(|&(x, y)| {
+                    let fits = x as usize + glyphs.len() <= area.right() as usize;
+                    fits && glyphs
+                        .iter()
+                        .enumerate()
+                        .all(|(at, glyph)| buffer[(x + at as u16, y)].symbol() == glyph)
+                })
+                .collect::<Vec<_>>()
+        };
+        for mark in marks {
+            let spots = starts(mark);
+            assert!(!spots.is_empty(), "{at}: no {mark}");
+            for spot in spots {
+                assert_eq!(buffer[spot].fg, theme.focus, "{at}: {mark} at {spot:?}");
+            }
+        }
+        if theme.primary != theme.focus {
+            assert_eq!(
+                cells().filter(|cell| cell.fg == theme.primary).count(),
+                0,
+                "{at}"
+            );
+        }
     }
 
     #[test]
