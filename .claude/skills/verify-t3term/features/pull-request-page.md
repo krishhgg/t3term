@@ -12,7 +12,7 @@
 - **The Timeline.** Under the link's status rows a header counts the comments, the commits and the approvals that still stand, `28 comments · 2 commits · 1 approval`, with the order switch at the end of its row, or on a row of its own when they don't fit. The approvals are left out when the host cut the conversation short or t3term kept only the first 2,000 remarks or 1,000 commits T3 sent. The opening, the commits, the verdicts, the runs of other comments and the merge or close follow in one list, newest first until the switch turns it to `Oldest first`. A commit shows `○`, its headline (`Untitled commit` without one, cut with `…` to leave room for the size), its size such as `+34 -6`, then its short id, its first author and when. A verdict shows `✓ fixture-reviewer approved`, `✗ mona` with `changes requested` or `– lee` with `review dismissed`, then when and its text, and one given before the newest commit adds `, before the latest commits`. A run of other comments is one closed row, `› 11 comments` with `2 authors · 1h ago` under it, whose age is its first remark's in the order shown. Open, `⌄ 3 comments` lists each remark's author with `commented` or the review's state, when, its place and its text. `● fixture-dev` with `Pull request opened` starts the pull request, and `● Pull request merged` or `● Pull request closed` ends it. ↓ and ↑ choose the switch and the runs as they do on the Summary, with `Enter oldest first`, `Enter newest first`, `Enter show comments` or `Enter hide comments` on the status line. A conversation that failed shows `Could not load pull request activity` here too. The Timeline asks T3 for nothing more. It shows the same detail and activity answers as the Summary.
 - **A failed read.** The reason shows in place of the summary and the comments: the desktop's sentence for a host T3 can't read, such as `No GitHub credential on the server.` with how to give it one, T3's words for one the host can't find, such as `Pull request #62 was not found.`, or `Couldn't read this pull request:` and the error.
 - **What it asks T3.** One `pullRequests.detail` and one `pullRequests.activity` per open, sent together, each with the thread's project and the link's host, repository and number. Each answer shows as it comes. t3term keeps the answers for the link whose details opened last and reuses them for 60 seconds from when the pull request came, so opening the same link again in that minute asks nothing unless T3's refresh number changed, and opening another link drops them. A read where either answer failed is asked again on the next open, over the answers it has. One read is under way at a time, until both its answers came: a link opened during it reads `Reading from…` and is asked for once that read is over, and leaving its details first drops it. Nothing is read on an environment without `pullRequests: true` in its capabilities, and only a refresh number reads an answer again while the details show it.
-- **Reading again.** While the details hold a read, t3term follows `pullRequests.subscribeRefreshes`, one subscription for every link. The first number it hears is where T3 stands. A later number that differs reads the detail and the conversation again at once while the details show them, and otherwise the next time they show, even within the minute. Opening a link's details again after the minute reads again the same way. Meanwhile the Summary's row reads `Refreshing from github.com…` over the last answers, and both new answers replace the old ones once both came. A failure replaces only a failure. On the Timeline a run is known by its newest remark, so a run that was open stays open when a read again adds rows above it, and a run that a newer remark joins starts closed. The subscription closes once the details hold no read, and one that T3 refuses or ends isn't asked for again.
+- **Reading again.** While the details hold a read, t3term follows `pullRequests.subscribeRefreshes`, one subscription for every link. The first number it hears is where T3 stands. A later number that differs reads the detail and the conversation again at once while the details show them, and otherwise the next time they show, even within the minute. Opening a link's details again after the minute reads again the same way. Meanwhile the Summary's row reads `Refreshing from github.com…` over the last answers, and both new answers replace the old ones once both came. A failure replaces only a failure. Where the detail failed there is no summary to show over, so the details read `Reading from github.com…` in place of the failure, as a first read does. On the Timeline a run is known by its newest remark, so a run that was open stays open when a read again adds rows above it, and a run that a newer remark joins starts closed. The subscription closes once the details hold no read, and one that T3 refuses or ends isn't asked for again.
 
 ## How to get to it (user POV)
 
@@ -103,6 +103,12 @@ $T3V keys Down Enter && $T3V wait --text "4 of 11" --text "Reading from github.c
 $T3V wait --text "No GitHub credential on the" --gone "Reading from" --gone "Comments" --gone "Timeline"
 $T3V capture failed
 $T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 2 and .rpcRequestsByTag["pullRequests.activity"] == 2'
+# Its conversation came, unseen, 3 s after the open. Opening it again reads again with no summary to show over, so it reads as a first read does.
+$T3V wait --idle 3000
+$T3V keys Left && $T3V wait --gone "← List"
+$T3V keys Enter && $T3V wait --text "4 of 11" --text "Reading from github.com…" --gone "No GitHub credential on the"
+$T3V wait --text "No GitHub credential on the" --gone "Reading from" --gone "Refreshing from"
+$T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 3 and .rpcRequestsByTag["pullRequests.activity"] == 3'
 
 # #43: the summary shows and its conversation fails, on both tabs. Opening it again asks for both again, over the last answers.
 $T3V keys Left && $T3V wait --gone "← List"
@@ -115,7 +121,7 @@ $T3V keys Left && $T3V wait --text "→ timeline"
 $T3V keys Left && $T3V wait --gone "← List"
 $T3V keys Enter && $T3V wait --text "#43 Stack top" --text "Refreshing from github.com…" --gone "Reading from"
 $T3V wait --text "Read from github.com" --text "Could not load pull request" --gone "Refreshing from"
-$T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 4 and .rpcRequestsByTag["pullRequests.activity"] == 4'
+$T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 5 and .rpcRequestsByTag["pullRequests.activity"] == 5'
 
 # 80x24: a dialog. #41 is read again, since only the last link's answers are kept.
 $T3V resize 80 24 && $T3V wait --text "Esc close" --idle 300
@@ -134,7 +140,7 @@ $T3V keys Down && $T3V wait --text "Enter show 2 older"
 $T3V keys Enter && $T3V wait --text "Older note 1 on the plan." --text "Older note 2 on the plan." --text "Enter show only 10 recent" --gone "+ Show 2 older"
 $T3V capture dialog-older-80x24
 $T3V keys Enter && $T3V wait --text "+ Show 2 older comments (2 hidden)" --text "Enter show 2 older" --gone "Older note 1 on the plan."
-$T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 5 and .rpcRequestsByTag["pullRequests.activity"] == 5'
+$T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 6 and .rpcRequestsByTag["pullRequests.activity"] == 6'
 
 # #60 is merged: its Timeline starts with the merge, and its commits show their size, id and author.
 $T3V keys Left && $T3V wait --gone "← List"
@@ -150,7 +156,7 @@ $T3V keys Left Left && $T3V wait --gone "← List"
 $T3V keys Down Enter && $T3V wait --text "11 of 11" --text "Reading from github.com…"
 $T3V wait --text "#61 Closed: an older approach" --text "Read from github.com" --gone "Reading from"
 $T3V keys Right && $T3V wait --text "● Pull request closed" --text "← summary" --idle 300
-$T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 7 and .rpcRequestsByTag["pullRequests.activity"] == 7'
+$T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 8 and .rpcRequestsByTag["pullRequests.activity"] == 8'
 
 # A refresh number reads #60 again at once, over its last answers, and its conversation gains a remark.
 $T3V keys Left Left && $T3V wait --gone "← List"
@@ -158,11 +164,11 @@ $T3V keys Up Enter && $T3V wait --text "10 of 11" --text "Reading from github.co
 $T3V wait --text "#60 Merged: footer counts" --text "Read from github.com" --gone "Reading from"
 $T3V keys Right && $T3V wait --text "5 comments · 3 commits · 1 approval" --text "← summary" --idle 300
 $T3V keys Left && $T3V wait --text "→ timeline" --text "Read from github.com"
-$T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.subscribeRefreshes"] == 1 and .rpcRequestsByTag["pullRequests.detail"] == 8 and .rpcRequestsByTag["pullRequests.activity"] == 8'
+$T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.subscribeRefreshes"] == 1 and .rpcRequestsByTag["pullRequests.detail"] == 9 and .rpcRequestsByTag["pullRequests.activity"] == 9'
 $T3V refresh && $T3V wait --text "Refreshing from github.com…" --text "Reviewers" --text "fixture-reviewer" --gone "Read from"
 $T3V capture refreshing-80x24
 $T3V wait --text "Read from github.com just now" --gone "Refreshing from"
-$T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 9 and .rpcRequestsByTag["pullRequests.activity"] == 9'
+$T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 10 and .rpcRequestsByTag["pullRequests.activity"] == 10'
 
 # The Timeline shows the new remark, and a run that was open stays open when the next one adds rows above it.
 $T3V keys Right && $T3V wait --text "6 comments · 3 commits · 1 approval" --text "› 1 comment" --text "1 author · 3m ago" --idle 300
@@ -172,23 +178,23 @@ $T3V keys Down && $T3V wait --idle 300
 $T3V keys Enter && $T3V wait --text "⌄ 1 comment" --text "Enter hide comments"
 $T3V refresh && $T3V wait --text "7 comments · 3 commits · 1 approval" --text "› 2 comments" --text "2 authors · 2m ago" --text "⌄ 1 comment" --idle 300
 $T3V capture refreshed-run-80x24
-$T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 10 and .rpcRequestsByTag["pullRequests.activity"] == 10'
+$T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 11 and .rpcRequestsByTag["pullRequests.activity"] == 11'
 
 # A refresh number heard while the list shows reads nothing until #60 opens again, then reads it within the minute.
 $T3V keys Left && $T3V wait --text "→ timeline"
 $T3V keys Left && $T3V wait --gone "← List"
 $T3V refresh && $T3V wait --idle 500
-$T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 10 and .rpcRequestsByTag["pullRequests.activity"] == 10'
+$T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 11 and .rpcRequestsByTag["pullRequests.activity"] == 11'
 $T3V keys Enter && $T3V wait --text "Refreshing from github.com…" --text "10 of 11" --gone "Reading from"
 $T3V wait --text "Read from github.com just now" --gone "Refreshing from"
-$T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 11 and .rpcRequestsByTag["pullRequests.activity"] == 11'
+$T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 12 and .rpcRequestsByTag["pullRequests.activity"] == 12'
 
 # After the minute, opening it again reads again the same way, where it used to start over with Reading from.
 $T3V wait --idle 61000 --timeout 75
 $T3V keys Left && $T3V wait --gone "← List"
 $T3V keys Enter && $T3V wait --text "Refreshing from github.com…" --text "10 of 11" --gone "Reading from"
 $T3V wait --text "Read from github.com just now" --gone "Refreshing from"
-$T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.subscribeRefreshes"] == 1 and .rpcRequestsByTag["pullRequests.detail"] == 12 and .rpcRequestsByTag["pullRequests.activity"] == 12'
+$T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.subscribeRefreshes"] == 1 and .rpcRequestsByTag["pullRequests.detail"] == 13 and .rpcRequestsByTag["pullRequests.activity"] == 13'
 ```
 
 ## Gotchas
