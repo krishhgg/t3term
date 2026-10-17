@@ -1,6 +1,6 @@
 # Pull request reads
 
-`src/pull_request.rs` reads one pull request from T3's server: its detail, its checks and its conversation. It is the first part of PR reviews in the TUI ([parity.md, group 12](parity.md#12-pull-requests)). The thread details call `detail` when a link's details open, as [linked pull requests](pull-request-panel.md#what-a-links-details-read-from-its-host) says. Nothing calls the other three yet.
+`src/pull_request.rs` reads one pull request from T3's server: its detail, its checks and its conversation. It is the first part of PR reviews in the TUI ([parity.md, group 12](parity.md#12-pull-requests)). The thread details call `detail` and `activity` at once when a link's details open, as [linked pull requests](pull-request-panel.md#what-a-links-details-read-from-its-host) says. Nothing calls `checks` or `invalidate` yet.
 
 ```rust
 let reference = Reference::new(&thread_project_id, Some(&link.host), &link.repository, link.number)?;
@@ -74,7 +74,7 @@ The unit tests read a detail with every field filled in, then without each optio
 
 ## Not done yet
 
-- The TUI calls only `detail`. It doesn't read `checks` or `activity`, so a pull request's conversation, review threads and commits don't show, and it never sends `invalidate`.
+- The TUI calls only `detail` and `activity`. It shows the activity's remarks and verdicts, not its review threads, commits or reactions. It never reads `checks` or sends `invalidate`.
 - There is no CLI command for a pull request.
 - The list of pull requests, the diff, viewed files, reviewer and label candidates, and `pullRequests.subscribeRefreshes` aren't read.
 - Nothing writes: no comment, review, reaction, resolution, label, reviewer or action. Those need `source-control:write`.

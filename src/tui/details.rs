@@ -39,7 +39,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::environment::Identity;
 use super::lineage::{self, Group, Lineage, Paging, Target};
-use super::pull_requests::PullRequests;
+use super::pull_requests::{Part, PullRequests};
 use super::setup::bounded;
 use super::tasks::wrap;
 use super::theme::Theme;
@@ -958,16 +958,11 @@ impl Details {
         self.open && self.tab == Tab::PullRequests
     }
 
-    /// Takes what a host said of the pull request whose details asked with `ticket`, or why
-    /// the read failed, which came at `now`. The details lay out again when it is the read
-    /// they wait for.
-    pub fn answer_pull(
-        &mut self,
-        ticket: u64,
-        answer: Result<Box<crate::pull_request::Detail>, String>,
-        now: i64,
-    ) {
-        if self.pulls.answer(ticket, answer, now) {
+    /// Takes part of what a host said of the pull request whose details asked with `ticket`,
+    /// or why the read failed, which came at `now`. The details lay out again when it is the
+    /// read they wait for.
+    pub fn answer_pull(&mut self, ticket: u64, part: Part, now: i64) {
+        if self.pulls.answer(ticket, part, now) {
             self.moved = true;
         }
     }

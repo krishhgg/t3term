@@ -57,6 +57,7 @@ use details::Details;
 use environment::{Feed, Identity};
 use markdown::Styles;
 use picker::{Item, Kind, Pick};
+use pull_requests::Part;
 use scroll::{Pin, Scroll};
 use sidebar::{Badges, Capabilities, Shelf, ShelfChoices, Sidebar, View};
 use theme::{Theme, duration_label, model_display_name, now_ms, parse_iso_ms, runtime_mode_label};
@@ -326,7 +327,7 @@ enum ActionResult {
     /// this ticket.
     PullRequest {
         ticket: u64,
-        answer: Result<Box<pull_request::Detail>, String>,
+        part: Part,
     },
     /// A send that failed. The composer gets its text back.
     SendFailed {
@@ -597,20 +598,36 @@ impl Drop for Screen {
     }
 }
 
-/// The pull request `reference` names, read from its host through T3, or why that failed. A
-/// sentence of T3's own, such as a host the server has no credentials for, reads as T3 wrote
-/// it, and the rest say that the read failed.
-async fn read_pull_request(
-    client: &Client,
-    reference: &Reference,
-) -> Result<Box<pull_request::Detail>, String> {
-    let failed = |e: &dyn std::fmt::Display| format!("Couldn't read this pull request: {e}");
-    let rpc = client.rpc().await.map_err(|e| failed(&e))?;
-    match pull_request::detail(&rpc, reference).await {
-        Ok(detail) => Ok(Box::new(detail)),
-        Err(e @ PullRequestError::Rpc(_)) => Err(failed(&e)),
-        Err(e) => Err(e.to_string()),
+/// Reads the pull request `reference` names from its host through T3: its detail and its
+/// conversation at once, as the desktop's panel asks for them. Gives `send` each answer as it
+/// comes, or why it failed, and then `Part::Done`. A sentence of T3's own, such as a host the
+/// server has no credentials for, reads as T3 wrote it. Any other failure of the detail says
+/// that the read failed, and the Comments section says that of the conversation.
+async fn read_pull_request(client: &Client, reference: &Reference, send: impl Fn(Part)) {
+    fn failed(e: &dyn std::fmt::Display) -> String {
+        format!("Couldn't read this pull request: {e}")
     }
+    match client.rpc().await {
+        Ok(rpc) => {
+            let detail = async {
+                let answer = match pull_request::detail(&rpc, reference).await {
+                    Ok(detail) => Ok(Box::new(detail)),
+                    Err(e @ PullRequestError::Rpc(_)) => Err(failed(&e)),
+                    Err(e) => Err(e.to_string()),
+                };
+                send(Part::Detail(answer));
+            };
+            let activity = async {
+                let answer = pull_request::activity(&rpc, reference).await;
+                send(Part::Activity(
+                    answer.map(Box::new).map_err(|e| e.to_string()),
+                ));
+            };
+            tokio::join!(detail, activity);
+        }
+        Err(e) => send(Part::Detail(Err(failed(&e)))),
+    }
+    send(Part::Done);
 }
 
 async fn event_loop(terminal: &mut Term, client: Arc<Client>) -> Result<()> {
@@ -882,8 +899,10 @@ impl App {
             read_pull: Box::new(move |reference, ticket| {
                 let (client, answers) = (reader.clone(), answers.clone());
                 tokio::spawn(async move {
-                    let answer = read_pull_request(&client, &reference).await;
-                    let _ = answers.send(ActionResult::PullRequest { ticket, answer });
+                    let send = |part| {
+                        let _ = answers.send(ActionResult::PullRequest { ticket, part });
+                    };
+                    read_pull_request(&client, &reference, send).await;
                 });
             }),
             setup_refused: false,
@@ -1174,8 +1193,9 @@ impl App {
         match Reference::new(&project, Some(&ask.host), &ask.repository, ask.number) {
             Ok(reference) => (self.read_pull)(reference, ask.ticket),
             Err(failure) => {
-                let failure = Err(failure.to_string());
+                let failure = Part::Detail(Err(failure.to_string()));
                 self.details.answer_pull(ask.ticket, failure, now);
+                self.details.answer_pull(ask.ticket, Part::Done, now);
             }
         }
     }
@@ -2172,10 +2192,10 @@ impl App {
                     });
                 }
             }
-            ActionResult::PullRequest { ticket, answer } => {
+            ActionResult::PullRequest { ticket, part } => {
                 let now = now_ms().max(self.now);
-                self.details.answer_pull(ticket, answer, now);
-                // A link opened while that read was under way is asked for now.
+                self.details.answer_pull(ticket, part, now);
+                // A link opened while that read was under way is asked for once it is done.
                 self.read_opened_pull();
             }
             ActionResult::Output {
@@ -13114,6 +13134,32 @@ mod tests {
         pull_request::Detail::read(&detail).unwrap()
     }
 
+    /// The conversation on `host_detail`'s pull request: a remark, then octocat's approval
+    /// under another casing of their login.
+    fn host_activity() -> pull_request::Activity {
+        let activity = json!({
+            "reviewers": [{"login": "octocat", "name": null, "isBot": false}],
+            "comments": [
+                {"id": "c1", "kind": "issue-comment", "author": {"login": "mona",
+                    "name": null}, "body": "Looks close.<!-- bot: state -->",
+                    "createdAt": "2026-10-13T09:00:00Z", "url": null, "path": null,
+                    "reviewState": null},
+                {"id": "r1", "kind": "review", "author": {"login": "Octocat", "name": null},
+                    "body": "", "createdAt": "2026-10-13T10:00:00Z", "url": null,
+                    "path": null, "reviewState": "APPROVED"}
+            ],
+            "commentCount": 2, "commentsTruncated": false, "reviewThreads": [], "commits": []
+        });
+        pull_request::Activity::read(&activity).unwrap()
+    }
+
+    /// Gives `app` the parts of read `ticket`'s answer, in order.
+    fn hear(app: &mut App, ticket: u64, parts: Vec<Part>) {
+        for part in parts {
+            app.on_action_result(ActionResult::PullRequest { ticket, part });
+        }
+    }
+
     /// What a read of a pull request named: the project, the host, the repository, the number
     /// and the ticket.
     type Noted = (String, String, String, u64, u64);
@@ -13167,12 +13213,16 @@ mod tests {
         let text = details_after(&mut app, 200, 50);
         assert!(text.contains("Reading from github.com…"), "{text}");
 
-        // The answer shows the Summary tab's sections, before the link's own. The pane is
-        // narrow, so its rows are read as one text, each row a word apart.
-        app.on_action_result(ActionResult::PullRequest {
-            ticket: 1,
-            answer: Ok(Box::new(host_detail())),
-        });
+        // The detail shows the Summary tab's sections, and the Comments section waits for the
+        // conversation.
+        hear(&mut app, 1, vec![Part::Detail(Ok(Box::new(host_detail())))]);
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Reading the conversation…"), "{text}");
+
+        // With the conversation, the sections come before the link's own. The pane is narrow,
+        // so its rows are read as one text, each row a word apart.
+        let activity = Part::Activity(Ok(Box::new(host_activity())));
+        hear(&mut app, 1, vec![activity, Part::Done]);
         let rows = body_after(&mut app, 200, 120);
         let text = rows
             .iter()
@@ -13180,12 +13230,14 @@ mod tests {
             .collect::<Vec<_>>()
             .join(" ");
         assert!(!text.contains("Reading from"), "{text}");
+        assert!(!text.contains("bot: state"), "{text}");
         let order = [
             "#31 Bound titles",
             "Read from github.com just now",
             "This branch is out-of-date with master by 3 commits.",
             "Reviewers",
             "octocat",
+            "Approved",
             "Labels",
             "ui",
             "Checks",
@@ -13194,6 +13246,11 @@ mod tests {
             "Description",
             "Adds a drawer.",
             "Second paragraph.",
+            "Comments (2)",
+            "Octocat",
+            "Approved",
+            "mona",
+            "Looks close.",
             "URL",
             "Linked by the agent",
         ];
@@ -13217,10 +13274,7 @@ mod tests {
         press(&mut app, KeyCode::Left);
         press(&mut app, KeyCode::Enter);
         assert_eq!(asked.borrow().len(), 1);
-        app.on_action_result(ActionResult::PullRequest {
-            ticket: 7,
-            answer: Err("stale".into()),
-        });
+        hear(&mut app, 7, vec![Part::Detail(Err("stale".into()))]);
         let again = details_after(&mut app, 200, 50);
         assert!(
             again.contains("octocat") && !again.contains("stale"),
@@ -13232,19 +13286,17 @@ mod tests {
         press(&mut app, KeyCode::Left);
         press(&mut app, KeyCode::Enter);
         assert_eq!(asked.borrow().last(), Some(&ask(2)));
-        app.on_action_result(ActionResult::PullRequest {
-            ticket: 1,
-            answer: Ok(Box::new(host_detail())),
-        });
+        hear(&mut app, 1, vec![Part::Detail(Ok(Box::new(host_detail())))]);
         let text = details_after(&mut app, 200, 50);
         assert!(text.contains("Reading from github.com…"), "{text}");
 
         // A failed read says why, and opening the details again asks at once.
         let failure = "Couldn't read this pull request: \u{1b}]52;c;bad\u{7}lost";
-        app.on_action_result(ActionResult::PullRequest {
-            ticket: 2,
-            answer: Err(failure.into()),
-        });
+        hear(
+            &mut app,
+            2,
+            vec![Part::Detail(Err(failure.into())), Part::Done],
+        );
         let rows = body_after(&mut app, 200, 120);
         let text = rows
             .iter()
@@ -13261,17 +13313,17 @@ mod tests {
         assert_eq!(asked.borrow().last(), Some(&ask(3)));
 
         // Another link opened while #31's read is under way waits for it, and says it reads.
-        // Only the last read is kept, so #31's answer is dropped and #32 is asked for then.
+        // Only the last read is kept, so #31's answer is dropped and #32 is asked for once
+        // #31's read is done.
         press(&mut app, KeyCode::Left);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter);
         assert_eq!(asked.borrow().last(), Some(&ask(3)));
         let text = details_after(&mut app, 200, 50);
         assert!(text.contains("Reading from github.com…"), "{text}");
-        app.on_action_result(ActionResult::PullRequest {
-            ticket: 3,
-            answer: Ok(Box::new(host_detail())),
-        });
+        hear(&mut app, 3, vec![Part::Detail(Ok(Box::new(host_detail())))]);
+        assert_eq!(asked.borrow().len(), 3);
+        hear(&mut app, 3, vec![Part::Done]);
         let last = asked.borrow().last().cloned().expect("a read");
         assert_eq!((last.3, last.4), (32, 4));
         let text = details_after(&mut app, 200, 50);
@@ -13285,10 +13337,11 @@ mod tests {
         press(&mut app, KeyCode::Up);
         press(&mut app, KeyCode::Enter);
         press(&mut app, KeyCode::Left);
-        app.on_action_result(ActionResult::PullRequest {
-            ticket: 4,
-            answer: Err("late".into()),
-        });
+        hear(
+            &mut app,
+            4,
+            vec![Part::Detail(Err("late".into())), Part::Done],
+        );
         assert_eq!(asked.borrow().len(), 4);
         press(&mut app, KeyCode::Enter);
         assert_eq!(asked.borrow().last(), Some(&ask(5)));
@@ -13304,10 +13357,8 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         alt(&mut app, 'b');
         assert!(!app.details.open);
-        app.on_action_result(ActionResult::PullRequest {
-            ticket: 5,
-            answer: Ok(Box::new(host_detail())),
-        });
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        hear(&mut app, 5, vec![detail, Part::Done]);
         assert_eq!(asked.borrow().len(), 5);
         alt(&mut app, 'b');
         assert_eq!(numbers(&asked).last(), Some(&(32, 6)));
@@ -13324,10 +13375,8 @@ mod tests {
         assert_eq!(asked.borrow().len(), 6);
         cells(&mut app, 200, 50);
         assert!(mouse(&mut app, CLICK, tabs[0].x, tabs[0].y));
-        app.on_action_result(ActionResult::PullRequest {
-            ticket: 6,
-            answer: Ok(Box::new(host_detail())),
-        });
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        hear(&mut app, 6, vec![detail, Part::Done]);
         assert_eq!(asked.borrow().len(), 6);
         cells(&mut app, 200, 50);
         assert!(mouse(&mut app, CLICK, tabs[1].x, tabs[1].y));
