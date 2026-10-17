@@ -101,6 +101,18 @@ type WatchSetup = Box<dyn Fn(&str) -> mpsc::UnboundedReceiver<WatchEvent>>;
 /// Reads a pull request from its host in the background, and sends the answer as an action
 /// with the ticket it was given.
 type ReadPull = Box<dyn Fn(Reference, u64)>;
+/// Opens T3's `pullRequests.subscribeRefreshes`: `Client::watch_pull_request_refreshes`, or a
+/// test's stand-in.
+type WatchRefreshes = Box<dyn Fn() -> mpsc::UnboundedReceiver<WatchEvent>>;
+
+/// T3's refresh numbers while a read of a link's pull request is held, and the last one heard.
+struct Refreshes {
+    events: mpsc::UnboundedReceiver<WatchEvent>,
+    /// The last number heard. The first sets where the numbers stand, and each that differs
+    /// from the last says T3's reads may have changed. A reconnect keeps it, so a number that
+    /// moved while the connection was down counts.
+    heard: Option<u64>,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum Focus {
@@ -564,6 +576,12 @@ struct App {
     watch_setup: WatchSetup,
     /// Reads the pull request whose details opened.
     read_pull: ReadPull,
+    /// Opens T3's refresh numbers for pull requests.
+    watch_refreshes: WatchRefreshes,
+    /// T3's refresh numbers, open while the details hold a read of a link's pull request.
+    refreshes: Option<Refreshes>,
+    /// Set once T3 refuses or ends the refresh subscription, which no read asks for again.
+    refreshes_refused: bool,
     /// Set once T3 refuses the worktree setup subscription. T3 refuses it for the session or
     /// the server, never for one thread, so no thread asks again.
     setup_refused: bool,
@@ -718,6 +736,13 @@ async fn event_loop(terminal: &mut Term, client: Arc<Client>) -> Result<()> {
                 None => std::future::pending().await,
             }
         };
+        // T3's refresh numbers, while the details hold a read of a link's pull request.
+        let refresh_event = async {
+            match app.refreshes.as_mut() {
+                Some(refreshes) => refreshes.events.recv().await,
+                None => std::future::pending().await,
+            }
+        };
         tokio::select! {
             event = input.next() => match event {
                 Some(Ok(event)) => dirty |= app.on_terminal_event(event),
@@ -738,6 +763,7 @@ async fn event_loop(terminal: &mut Term, client: Arc<Client>) -> Result<()> {
             }
             // `None` once the subscription has ended, which closes it for good.
             event = setup_event => dirty |= app.on_setup_event(event),
+            event = refresh_event => dirty |= app.on_refresh_event(event),
             Some(result) = action_results.recv() => {
                 app.on_action_result(result);
                 dirty = true;
@@ -873,6 +899,7 @@ impl App {
         actions: mpsc::UnboundedSender<ActionResult>,
     ) -> App {
         let watcher = client.clone();
+        let refresher = client.clone();
         let (reader, answers) = (client.clone(), actions.clone());
         let environment = Identity::new(client.runtime.label.as_deref(), &client.runtime.origin);
         App {
@@ -948,6 +975,9 @@ impl App {
                     read_pull_request(&client, &reference, send).await;
                 });
             }),
+            watch_refreshes: Box::new(move || refresher.watch_pull_request_refreshes()),
+            refreshes: None,
+            refreshes_refused: false,
             setup_refused: false,
             quit: false,
         }
@@ -1211,7 +1241,8 @@ impl App {
     /// open thread's project, as the desktop's panel reads a link
     /// (apps/web/src/components/pullRequest/ThreadPullRequestsPanel.tsx). Only an environment
     /// whose capabilities have `pullRequests` reads them. The details show the answer when it
-    /// comes, and a reference T3's schema would refuse fails at once.
+    /// comes, and a reference T3's schema would refuse fails at once. While the details hold a
+    /// read, T3's refresh numbers say when to read it again.
     fn read_opened_pull(&mut self) {
         let project = match self.details_record() {
             details::Record::Found(thread) => thread
@@ -1221,15 +1252,17 @@ impl App {
             _ => None,
         };
         let enabled = project.is_some() && self.environment_can("pullRequests");
-        // A read that waits goes once its details don't show.
+        // A read that waits goes once its details don't show, and nothing is asked for until
+        // they do. The refresh numbers go on while a read is held.
         let shown = self.details.shows_pulls();
         self.details.pulls.shown(shown);
-        if !shown {
-            return;
-        }
         // The last frame's time can be long past, and a test can move it on.
         let now = now_ms().max(self.now);
-        let Some(ask) = self.details.pulls.take_ask(enabled, now) else {
+        let ask = shown
+            .then(|| self.details.pulls.take_ask(enabled, now))
+            .flatten();
+        self.follow_refreshes(enabled);
+        let Some(ask) = ask else {
             return;
         };
         let project = project.unwrap_or_default();
@@ -1241,6 +1274,54 @@ impl App {
                 self.details.answer_pull(ask.ticket, Part::Done, now);
             }
         }
+    }
+
+    /// Opens T3's refresh numbers once the details hold a read of a link's pull request on an
+    /// environment that reads them, and closes them once they don't, as the desktop follows
+    /// `pullRequests.subscribeRefreshes` while it shows a pull request
+    /// (packages/client-runtime/src/state/pullRequests.ts). A subscription T3 refused or ended
+    /// isn't opened again.
+    fn follow_refreshes(&mut self, enabled: bool) {
+        let wanted = enabled && !self.refreshes_refused && self.details.pulls.holds_read();
+        match (wanted, self.refreshes.is_some()) {
+            (true, false) => {
+                self.refreshes = Some(Refreshes {
+                    events: (self.watch_refreshes)(),
+                    heard: None,
+                });
+            }
+            (false, true) => self.refreshes = None,
+            _ => {}
+        }
+    }
+
+    /// Takes an event of T3's refresh numbers, or `None` once the subscription ended. A number
+    /// that differs from the last one heard reads the held pull request again, as
+    /// `PullRequests::refresh` says. Says whether the details changed.
+    fn on_refresh_event(&mut self, event: Option<WatchEvent>) -> bool {
+        let Some(refreshes) = self.refreshes.as_mut() else {
+            return false;
+        };
+        let number = match event {
+            Some(WatchEvent::Item(item)) => pull_request::refresh_revision(&item),
+            Some(WatchEvent::Reconnecting { .. }) => None,
+            Some(WatchEvent::Failed(_)) | None => {
+                self.refreshes = None;
+                self.refreshes_refused = true;
+                return false;
+            }
+        };
+        let Some(number) = number else {
+            return false;
+        };
+        let changed = refreshes.heard.is_some_and(|heard| heard != number);
+        refreshes.heard = Some(number);
+        if !changed {
+            return false;
+        }
+        let showing = self.details.pulls.refresh();
+        self.read_opened_pull();
+        showing
     }
 
     /// Hides or shows the sidebar and remembers it, as Ctrl+B and the desktop's Mod+B do. Focus
@@ -13407,7 +13488,8 @@ mod tests {
     /// and the ticket.
     type Noted = (String, String, String, u64, u64);
 
-    /// Replaces how `app` reads a pull request, so a read only notes what it named.
+    /// Replaces how `app` reads a pull request, so a read only notes what it named, and how it
+    /// opens T3's refresh numbers, so they never come.
     fn note_reads(app: &mut App) -> std::rc::Rc<std::cell::RefCell<Vec<Noted>>> {
         let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
         let noted = asked.clone();
@@ -13420,7 +13502,23 @@ mod tests {
                 ticket,
             ));
         });
+        note_refreshes(app);
         asked
+    }
+
+    /// Replaces how `app` opens T3's refresh numbers, so each subscription only notes its
+    /// sender, which a test sends numbers on.
+    fn note_refreshes(
+        app: &mut App,
+    ) -> std::rc::Rc<std::cell::RefCell<Vec<mpsc::UnboundedSender<WatchEvent>>>> {
+        let opened = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let noted = opened.clone();
+        app.watch_refreshes = Box::new(move || {
+            let (sender, events) = mpsc::unbounded_channel();
+            noted.borrow_mut().push(sender);
+            events
+        });
+        opened
     }
 
     /// `pulls_tui` on an environment that also reads pull requests from their hosts, with
@@ -13678,33 +13776,34 @@ mod tests {
             "{again}"
         );
 
-        // A minute on, opening them reads again, and the first read's late answer is dropped.
+        // A minute on, opening them reads again while they show the last answers, and the
+        // first read's late answer is dropped.
         app.now += 61_000;
         press(&mut app, KeyCode::Left);
         press(&mut app, KeyCode::Enter);
         assert_eq!(asked.borrow().last(), Some(&ask(2)));
         hear(&mut app, 1, vec![Part::Detail(Ok(Box::new(host_detail())))]);
         let text = details_after(&mut app, 200, 50);
-        assert!(text.contains("Reading from github.com…"), "{text}");
+        assert!(
+            text.contains("Refreshing from github.com…") && text.contains("octocat"),
+            "{text}"
+        );
 
-        // A failed read says why, and opening the details again asks at once.
+        // A read again that fails leaves the last answers, and opening the details again asks
+        // at once.
         let failure = "Couldn't read this pull request: \u{1b}]52;c;bad\u{7}lost";
         hear(
             &mut app,
             2,
             vec![Part::Detail(Err(failure.into())), Part::Done],
         );
-        let rows = body_after(&mut app, 200, 120);
-        let text = rows
-            .iter()
-            .map(|row| row.trim())
-            .collect::<Vec<_>>()
-            .join(" ");
+        let text = details_after(&mut app, 200, 50);
         assert!(
-            text.contains("Couldn't read this pull request: ]52;c;badlost"),
+            text.contains("Read from github.com")
+                && text.contains("octocat")
+                && !text.contains("lost"),
             "{text}"
         );
-        assert!(!text.contains("octocat"), "{text}");
         press(&mut app, KeyCode::Left);
         press(&mut app, KeyCode::Enter);
         assert_eq!(asked.borrow().last(), Some(&ask(3)));
@@ -13726,6 +13825,19 @@ mod tests {
         let text = details_after(&mut app, 200, 50);
         assert!(
             text.contains("Reading from github.com…") && !text.contains("octocat"),
+            "{text}"
+        );
+
+        // A first read that fails says why.
+        hear(&mut app, 4, vec![Part::Detail(Err(failure.into()))]);
+        let rows = body_after(&mut app, 200, 120);
+        let text = rows
+            .iter()
+            .map(|row| row.trim())
+            .collect::<Vec<_>>()
+            .join(" ");
+        assert!(
+            text.contains("Couldn't read this pull request: ]52;c;badlost"),
             "{text}"
         );
 
@@ -13778,6 +13890,145 @@ mod tests {
         cells(&mut app, 200, 50);
         assert!(mouse(&mut app, CLICK, tabs[1].x, tabs[1].y));
         assert_eq!(numbers(&asked).last(), Some(&(31, 7)));
+    }
+
+    /// T3's refresh subscriptions a test opened, as `note_refreshes` notes them.
+    type Opened = std::rc::Rc<std::cell::RefCell<Vec<mpsc::UnboundedSender<WatchEvent>>>>;
+
+    /// Sends `event` on the last refresh subscription `app` opened and has `app` take it.
+    /// Says whether the details changed.
+    fn refresh_with(app: &mut App, opened: &Opened, event: WatchEvent) -> bool {
+        let sent = opened.borrow().last().map(|sender| sender.send(event));
+        assert!(matches!(sent, Some(Ok(()))), "an open subscription");
+        let event = app
+            .refreshes
+            .as_mut()
+            .and_then(|r| r.events.try_recv().ok());
+        app.on_refresh_event(event)
+    }
+
+    #[test]
+    fn t3s_refresh_numbers_read_the_open_details_again() {
+        let links = vec![linked(31, "Bound titles"), linked(32, "Lineage")];
+        let mut app = readable_pulls_tui(links);
+        let asked = note_reads(&mut app);
+        let opened = note_refreshes(&mut app);
+        let number = |number: u64| WatchEvent::Item(json!(number));
+        let reconnecting = || WatchEvent::Reconnecting {
+            reason: "closed".into(),
+            retry_in: Duration::from_secs(1),
+        };
+        let answered = |app: &mut App, ticket| {
+            let detail = Part::Detail(Ok(Box::new(host_detail())));
+            let activity = Part::Activity(Ok(Box::new(host_activity())));
+            hear(app, ticket, vec![detail, activity, Part::Done]);
+        };
+        let tickets = |asked: &std::cell::RefCell<Vec<Noted>>| {
+            asked.borrow().iter().map(|ask| ask.4).collect::<Vec<_>>()
+        };
+
+        // Nothing follows them until the details hold a read.
+        assert!(opened.borrow().is_empty());
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(opened.borrow().len(), 1);
+        answered(&mut app, 1);
+
+        // The first number is where T3 stands, and the same number again changes nothing,
+        // across a reconnection too.
+        assert!(!refresh_with(&mut app, &opened, number(5)));
+        assert!(!refresh_with(&mut app, &opened, number(5)));
+        assert!(!refresh_with(&mut app, &opened, reconnecting()));
+        assert!(!refresh_with(&mut app, &opened, number(5)));
+        assert!(!refresh_with(
+            &mut app,
+            &opened,
+            WatchEvent::Item(json!(-1))
+        ));
+        assert_eq!(tickets(&asked), [1]);
+
+        // Another number reads the details again, and they show the last answers until the
+        // new ones came.
+        assert!(refresh_with(&mut app, &opened, number(6)));
+        assert_eq!(tickets(&asked), [1, 2]);
+        let text = details_after(&mut app, 200, 50);
+        assert!(
+            text.contains("Refreshing from github.com…") && text.contains("octocat"),
+            "{text}"
+        );
+        answered(&mut app, 2);
+        let text = details_after(&mut app, 200, 50);
+        assert!(text.contains("Read from github.com just now"), "{text}");
+
+        // A number that changed while T3 was out of reach reads them again.
+        assert!(!refresh_with(&mut app, &opened, reconnecting()));
+        assert!(refresh_with(&mut app, &opened, number(9)));
+        assert_eq!(tickets(&asked), [1, 2, 3]);
+        answered(&mut app, 3);
+
+        // With the list showing, a number marks the read, which opening the details again
+        // reads again at once.
+        press(&mut app, KeyCode::Left);
+        assert!(!refresh_with(&mut app, &opened, number(10)));
+        assert_eq!(tickets(&asked), [1, 2, 3]);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(tickets(&asked), [1, 2, 3, 4]);
+        answered(&mut app, 4);
+        assert_eq!(opened.borrow().len(), 1);
+
+        // With the pane closed, a number marks the read too, and the subscription stays.
+        // Opening the pane on the details again reads again.
+        alt(&mut app, 'b');
+        assert!(!app.details.open);
+        assert!(!refresh_with(&mut app, &opened, number(11)));
+        assert_eq!(tickets(&asked), [1, 2, 3, 4]);
+        assert!(app.refreshes.is_some());
+        alt(&mut app, 'b');
+        assert_eq!(tickets(&asked), [1, 2, 3, 4, 5]);
+        answered(&mut app, 5);
+        assert_eq!(opened.borrow().len(), 1);
+
+        // Another thread drops the read, and with it the subscription, with the pane closed too.
+        alt(&mut app, 'b');
+        assert!(!app.details.open);
+        app.open_thread(open_bound(bound("u", "q", Value::Null, Value::Null)));
+        app.read_opened_pull();
+        assert!(app.refreshes.is_none());
+        assert!(opened.borrow()[0].is_closed());
+    }
+
+    #[test]
+    fn t3_ending_the_refresh_numbers_leaves_reads_as_they_were() {
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        let asked = note_reads(&mut app);
+        let opened = note_refreshes(&mut app);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(opened.borrow().len(), 1);
+        assert!(!refresh_with(&mut app, &opened, WatchEvent::Item(json!(3))));
+
+        // A refusal ends the subscription for the session, and reads go on without it.
+        let refused = WatchEvent::Failed("Not allowed".into());
+        assert!(!refresh_with(&mut app, &opened, refused));
+        assert!(app.refreshes.is_none());
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        let activity = Part::Activity(Ok(Box::new(host_activity())));
+        hear(&mut app, 1, vec![detail, activity, Part::Done]);
+        app.now += 61_000;
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(asked.borrow().len(), 2);
+        assert_eq!(opened.borrow().len(), 1);
+
+        // So does a subscription that ended.
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        note_reads(&mut app);
+        let opened = note_refreshes(&mut app);
+        press(&mut app, KeyCode::Enter);
+        assert!(app.refreshes.is_some());
+        assert!(!app.on_refresh_event(None));
+        assert!(app.refreshes.is_none() && app.refreshes_refused);
+        press(&mut app, KeyCode::Left);
+        press(&mut app, KeyCode::Enter);
+        assert_eq!(opened.borrow().len(), 1);
     }
 
     #[test]
