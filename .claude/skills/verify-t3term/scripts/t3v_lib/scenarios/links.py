@@ -42,6 +42,10 @@ The threads, in the shell's order. Each is in proj-links, with no worktree and t
   thr-hostile   Hostile: text and sizes  the `hostile` preset
   thr-malformed Malformed: not a list    an object where `pullRequests` goes
 
+thr-legacy's last reply, after its second turn's, is Markdown with code fences for
+features/transcript.md: a four-backtick fence that holds a three-backtick one, a tilde fence, a
+backtick run with text after it inside a fence, and backticks that are inline code.
+
 The presets `t3v links THREAD PRESET` sets:
 
   mixed       what thr-mixed starts with
