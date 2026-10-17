@@ -1159,6 +1159,16 @@ impl Read {
             StackRead::Failed => self.stack_failed = true,
         }
     }
+
+    /// Drops the description and the remarks laid out in the old colors.
+    fn restyle(&mut self) {
+        if let Answer::Read(summary) = &mut self.answer {
+            summary.laid_out = None;
+        }
+        if let Answer::Read(conversation) = &mut self.conversation {
+            conversation.restyle();
+        }
+    }
 }
 
 /// What the details show of a pull request's detail, as the desktop's Summary tab does. Each
@@ -1453,6 +1463,16 @@ impl PullRequests {
         self.kept = Default::default();
         self.mounted = false;
         self.mount = false;
+    }
+
+    /// Drops the page, the details and the host's answer laid out in the old colors, after the
+    /// theme changed. A click lands on nothing until the next frame lays them out again.
+    pub fn restyle(&mut self) {
+        self.page = None;
+        self.detail = None;
+        if let Some(read) = self.read.as_mut() {
+            read.restyle();
+        }
     }
 
     /// Whether this frame has to work the links out for thread `open_id`: an event may have
@@ -2633,7 +2653,7 @@ fn view(list: Option<&List>, detail: Option<&Detail>, shape: Shape, theme: &Them
         Some(detail) if detail.index == shape.selected => &detail.lines,
         _ => &[],
     };
-    let back = Style::new().fg(theme.primary).add_modifier(Modifier::BOLD);
+    let back = Style::new().fg(theme.focus).add_modifier(Modifier::BOLD);
     let mut left = vec![Span::styled("← List", back)];
     if let Some(shown) = shape.tabs {
         let active = back.add_modifier(Modifier::UNDERLINED);
@@ -3212,13 +3232,15 @@ fn host_lines(
     let warning = Style::new().fg(theme.warning_fg);
     let mut lines = vec![Line::default()];
     let summary = match &read.answer {
-        Answer::Reading => {
-            let reading = format!("Reading from {}…", entry.host);
-            lines.extend(whole(&reading, width, muted));
+        // A failure shows until a read again is under way, which has no summary to show over,
+        // so it reads as a first read does.
+        Answer::Failed(failure) if read.next.is_none() => {
+            lines.extend(whole(failure, width, warning));
             return (lines, Vec::new());
         }
-        Answer::Failed(failure) => {
-            lines.extend(whole(failure, width, warning));
+        Answer::Reading | Answer::Failed(_) => {
+            let reading = format!("Reading from {}…", entry.host);
+            lines.extend(whole(&reading, width, muted));
             return (lines, Vec::new());
         }
         Answer::Read(summary) => summary,
@@ -5528,6 +5550,58 @@ mod tests {
         assert_eq!((ask.ticket, ask.invalidate, ask.updated), (2, false, None));
         pulls.page(44, 60, t1, true, &theme());
         assert!(detail_rows(&pulls).contains(&"Reading from github.com…".to_string()));
+    }
+
+    #[test]
+    fn a_read_again_with_no_detail_to_show_says_it_reads() {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![link(
+            "krishhgg/t3term",
+            31,
+            "a",
+            "b",
+        )])));
+        let activity = || {
+            let activity = pull_request::Activity::read(&bare_activity()).unwrap();
+            Part::Activity(Ok(Box::new(activity)))
+        };
+        let ticket = |pulls: &mut PullRequests| pulls.take_ask(true, now()).map(|a| a.ticket);
+        let rows = |pulls: &mut PullRequests| {
+            pulls.page(44, 60, now(), true, &theme());
+            detail_rows(pulls)
+        };
+        let failure = "no credential".to_string();
+        let reading = "Reading from github.com…".to_string();
+        // The detail fails and the conversation comes, so the details say why.
+        pulls.toggle();
+        assert_eq!(ticket(&mut pulls), Some(1));
+        assert!(pulls.answer(1, Part::Detail(Err(failure.clone())), now()));
+        assert!(pulls.answer(1, activity(), now()));
+        assert!(!pulls.answer(1, Part::Done, now()));
+        assert!(rows(&mut pulls).contains(&failure));
+
+        // Opening them again reads again, and with no detail to show over, they say so in
+        // place of the old failure until both answers came.
+        pulls.back();
+        pulls.toggle();
+        assert_eq!(ticket(&mut pulls), Some(2));
+        let shown = rows(&mut pulls);
+        assert!(shown.contains(&reading), "{shown:#?}");
+        assert!(!shown.contains(&failure), "{shown:#?}");
+        assert!(!pulls.answer(2, Part::Detail(Err(failure.clone())), now()));
+        assert!(rows(&mut pulls).contains(&reading));
+        assert!(!pulls.answer(2, activity(), now()));
+        assert!(pulls.answer(2, Part::Done, now()));
+        let shown = rows(&mut pulls);
+        assert!(shown.contains(&failure), "{shown:#?}");
+        assert!(!shown.contains(&reading), "{shown:#?}");
+
+        // So does a refresh while the details show them.
+        assert!(pulls.refresh());
+        assert_eq!(ticket(&mut pulls), Some(3));
+        let shown = rows(&mut pulls);
+        assert!(shown.contains(&reading), "{shown:#?}");
+        assert!(!shown.contains(&failure), "{shown:#?}");
     }
 
     #[test]
