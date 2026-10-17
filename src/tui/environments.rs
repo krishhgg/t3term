@@ -102,6 +102,9 @@ impl Found {
 /// One saved environment as a check found it, cleaned and bounded once.
 #[derive(Debug, Clone, PartialEq)]
 pub(super) struct Saved {
+    /// The name as the file saves it. Two names can show the same once they are cleaned and
+    /// cut, and this tells them apart.
+    key: String,
     /// The name without its control characters, at most `NAME` characters.
     name: String,
     /// Whether it is the saved default.
@@ -129,6 +132,7 @@ impl Saved {
         };
         Saved {
             name: bounded(&probe.name, NAME),
+            key: probe.name,
             default: probe.default,
             current: ready && probe.environment_id.as_deref() == Some(current),
             phase: probe.phase,
@@ -259,11 +263,11 @@ impl Dialog {
             .found
             .as_ref()
             .and_then(|old| old.saved().get(self.selected))
-            .map(|saved| saved.name.clone());
+            .map(|saved| saved.key.clone());
         let saved = found.saved();
         self.name_width = saved.iter().map(|s| s.name.width()).max().unwrap_or(0);
         self.selected = match kept {
-            Some(name) => saved.iter().position(|s| s.name == name),
+            Some(key) => saved.iter().position(|s| s.key == key),
             None => saved.iter().position(|s| s.current),
         }
         .unwrap_or(0)
@@ -903,6 +907,38 @@ mod tests {
         dialog.select_by(1);
         dialog.choose(3);
         assert_eq!((dialog.selected, dialog.last()), (0, 0));
+    }
+
+    #[test]
+    fn the_choice_follows_the_saved_name_where_two_show_the_same() {
+        // A file edited by hand can save names that show the same once they are cut at 32
+        // characters or lose their control characters.
+        let long = "x".repeat(32);
+        let names = [
+            "a\u{7}b".to_string(),
+            "ab".to_string(),
+            format!("{long}-one"),
+            format!("{long}-two"),
+        ];
+        let probes: Vec<Probe> = names.iter().map(|n| probe(n, Phase::Offline)).collect();
+        let mut dialog = dialog(probes.clone());
+        let shown: Vec<&str> = dialog
+            .found
+            .as_ref()
+            .unwrap()
+            .saved()
+            .iter()
+            .map(|s| s.name.as_str())
+            .collect();
+        let cut = format!("{long}…");
+        assert_eq!(shown, ["ab", "ab", cut.as_str(), cut.as_str()]);
+        for chosen in [1, 3] {
+            dialog.choose(chosen);
+            let asked = dialog.ask();
+            let names: Vec<&str> = names.iter().map(String::as_str).collect();
+            assert!(dialog.found(asked, Found::of(&saved(&names), probes.clone(), CURRENT)));
+            assert_eq!(dialog.selected, chosen, "{:?}", names[chosen]);
+        }
     }
 
     #[test]

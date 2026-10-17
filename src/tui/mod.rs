@@ -15488,6 +15488,23 @@ mod tests {
     }
 
     #[test]
+    fn alt_shift_a_changes_the_appearance_over_the_environments_dialog() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let (mut app, asked) = tui_counting_checks();
+        alt(&mut app, 'c');
+        found(&mut app, 1, &["ready", "spare"]);
+        press(&mut app, KeyCode::Down);
+        let chosen = app.environments.selected();
+        alt_shift_a(&mut app);
+        let message = app.message.as_ref().map(|(text, _)| text.as_str());
+        assert_eq!(message, Some("Appearance: System"));
+        assert!(app.environments.is_open());
+        assert_eq!(app.environments.selected(), chosen);
+        assert_eq!(*asked.borrow(), [1]);
+    }
+
+    #[test]
     fn the_theme_list_opens_over_the_environments_dialog_and_esc_goes_back_to_it() {
         let (mut app, asked) = tui_counting_checks();
         alt(&mut app, 'c');
