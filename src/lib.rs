@@ -10,5 +10,6 @@ pub mod models;
 pub mod projection;
 pub mod rpc;
 pub mod settings;
+pub mod terminal;
 pub mod transcript;
 pub mod tui;
