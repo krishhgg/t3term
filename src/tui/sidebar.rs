@@ -1583,11 +1583,11 @@ impl View<'_> {
     /// and `bg` behind both and behind each span of `line` that has no background of its own.
     fn framed(&self, line: Line<'static>, cursor: bool, bg: Option<Color>) -> Line<'static> {
         let t = self.theme;
-        // The bar marks the highlight in the primary color while the sidebar has the
-        // keyboard, and in the muted tone while it doesn't.
+        // The bar marks the highlight in the focus color while the sidebar has the keyboard,
+        // and in the muted tone while it doesn't.
         let bar = match (cursor, self.focused) {
             (false, _) => Span::raw(" "),
-            (true, true) => Span::styled("▎", Style::new().fg(t.primary)),
+            (true, true) => Span::styled("▎", Style::new().fg(t.focus)),
             (true, false) => Span::styled("▎", Style::new().fg(t.sidebar_muted)),
         };
         let mut spans = vec![bar];
@@ -4501,9 +4501,9 @@ mod tests {
             let buffer = render_in(depth, &mut sidebar, Some(&listed), Some("b"), (30, 24));
             let lines = text(&buffer);
             let (a, b) = (row_of(&lines, "Thread a"), row_of(&lines, "Thread b"));
-            // The highlight is a bar in the primary color on the selected row's background.
+            // The highlight is a bar in the focus color on the selected row's background.
             assert_eq!(buffer[(1, a)].symbol(), "▎", "{depth:?}");
-            assert_eq!(buffer[(1, a)].fg, theme.primary);
+            assert_eq!(buffer[(1, a)].fg, theme.focus);
             assert_eq!(buffer[(2, a)].bg, theme.row_selected);
             assert!(!buffer[(2, a)].modifier.contains(Modifier::BOLD));
             // The open thread has no bar while the highlight is elsewhere, the open row's

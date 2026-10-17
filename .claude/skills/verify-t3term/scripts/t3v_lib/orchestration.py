@@ -1,7 +1,8 @@
 """T3's orchestration feeds over the fake server: the shell subscription that fills the sidebar,
 each thread's own subscription, the config and worktree setup streams, and the controls that hold,
-end, fail, refuse or feed them. It also works out what t3term should show from what reached it:
-the feed's dot, each thread watch and the descriptor's label.
+end, fail, refuse or feed them, drop their sockets or send a frame t3term can't parse. It also
+works out what t3term should show from what reached it: the feed's dot, each thread watch and the
+descriptor's label.
 
 A scenario subclasses Orchestration, builds its world in `build_world` and adds what it serves.
 """
@@ -18,6 +19,14 @@ from .world import (ACTIVE, DOTS, INSTANCE, LABEL_PRESETS, NOT_RUNNING, RUN_STAT
                     Thread, label_value, provider_entity, shown_label)
 
 ORCHESTRATION_THREAD = re.compile(r'/api/orchestration/threads/([A-Za-z0-9_-]+)(/bounded)?')
+# The frames `t3v frame` sends, as (opcode, payload, what to call it). The text frame's \uZZZZ is
+# no escape, so it isn't JSON and no repair of lone surrogates makes it JSON. 0x80 can't start a
+# UTF-8 sequence. Neither holds anything from the world.
+UNREADABLE = {
+    'json': (0x1, b'{"_tag":"Chunk","values":["\\uZZZZ"]}', "a text frame that isn't JSON"),
+    'binary': (0x2, b'\x80', "a binary frame that isn't UTF-8"),
+}
+CLIENTS = ('tui', 'cli')
 
 
 def is_sequence(value) -> bool:
@@ -71,6 +80,7 @@ class Orchestration(FixtureBase):
             '/__fixture/watch/hold': lambda request, _: self.watch_hold(request),
             '/__fixture/watch/refuse': lambda request, _: self.watch_refuse(request),
             '/__fixture/reconnect': lambda request, _: self.reconnect_control(request),
+            '/__fixture/frame': lambda request, _: self.frame_control(request),
         })
 
     # -- world --
@@ -481,6 +491,29 @@ class Orchestration(FixtureBase):
             self.log('reconnect', holdSeconds=hold, sockets=len(self.connections))
         closed = self.drop_sockets(hold)
         return self.answer(f'closed {closed} socket(s); /ws answers 503 for {hold:g} s'), None
+
+    def frame_control(self, request: dict):
+        """Sends one frame t3term can't parse, from UNREADABLE, on each open socket of the TUI or
+        the CLI. It picks sockets by the client their session was issued to, not by the
+        session's kind, as the TUI's login and terminal sessions are both the TUI's. It refuses
+        when no socket of that client is open, so a drive never sends nothing and goes on."""
+        frame, client = request.get('frame'), request.get('client') or 'tui'
+        if frame not in UNREADABLE or client not in CLIENTS:
+            return None, f'frame takes {" or ".join(UNREADABLE)}, and a client of {" or ".join(CLIENTS)}'
+        opcode, payload, what = UNREADABLE[frame]
+        with self.lock:
+            self.ensure_world()
+            targets = sorted((c for c in self.connections if c.open and c.session.get('client') == client),
+                             key=lambda c: c.id)
+            if not targets:
+                return None, f'no socket of the {client} is open, so no frame went out'
+            for connection in targets:
+                connection.send_frame(opcode, payload)
+            self.counts[f'frame.{frame}'] += len(targets)
+            self.log('frame.unreadable', frame=frame, client=client, conns=[c.id for c in targets])
+        return self.answer(f'sent {what} on {len(targets)} {client} socket(s); t3term should close each with a '
+                           f'T3 protocol error and connect again, and a build that passes over such frames '
+                           f'shows nothing'), None
 
     # -- streams --
 
