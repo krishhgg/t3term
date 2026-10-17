@@ -68,7 +68,8 @@ $T3V click --text "› 14 bot comments" && $T3V wait --text "⌄ 14 bot comments
 $T3V capture bots
 $T3V keys PageDown && $T3V wait --text "+ Show 4 older bot comments (4" --idle 300
 $T3V keys Down && $T3V wait --text "Enter show 4 older"
-$T3V keys Enter && $T3V wait --text "Summary. Four files change," --text "Enter show only 10 recent" --gone "review-bot: summary" --gone "+ Show 4 older"
+$T3V keys Enter && $T3V wait --text "Enter show only 10 recent" --gone "+ Show 4 older" --idle 300
+$T3V keys End && $T3V wait --text "Summary. Four files change," --text "Show only 10 recent bot comments" --gone "review-bot: summary" --idle 300
 $T3V capture bots-older
 $T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.detail"] == 1 and .rpcRequestsByTag["pullRequests.activity"] == 1'
 
@@ -241,7 +242,7 @@ $T3V status --json | jq -e '.rpcRequestsByTag["pullRequests.invalidate"] == 2 an
 - The conversation arriving adds rows above the reader's place, and the details don't keep it, so what shows moves down. Wait for `Comments (` before you scroll.
 - ↑ and ↓ scroll only while no button or group has a row in view. PgDn and the other scrolling keys work as before, and a chosen control they scroll out of view counts as none chosen, so the next ↓ chooses the first one in view. An answer from T3 clears the choice too. Wait on the status line's `Enter …` after each arrow.
 - Lee's and mona's finished remarks both read `Enter show comment`, so the status line can't tell them apart. Wait for `--idle` after the arrows, then for the remark's text after Enter.
-- The bots' `Show only 10 recent bot comments` lands below the pane's last row after Show older, so the recipe checks it through the status line.
+- The bots' `Show only 10 recent bot comments` and the summary bot's text land below the pane's last row after Show older, so the recipe checks the button through the status line, then presses End to see both.
 - At 32 columns the row above the details shows `3 of 11` only until the pull request comes, then the tabs take its place. Wait on `3 of 11` with `Reading from github.com…`, and on the link's title after that. The 80x24 dialog keeps both.
 - `Read from github.com` shows only on the Summary and `28 comments · 2 commits` only on the Timeline, and the status line's `→ timeline` or `← summary` says which tab is open. Each tab comes back at its own scroll, so wait on text near where you left it.
 - On the Timeline `› 2 comments` and `› 3 comments` both read `Enter show comments`, so the recipe waits for `--idle` after the third ↓.
