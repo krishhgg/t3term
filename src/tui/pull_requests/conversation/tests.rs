@@ -1467,6 +1467,66 @@ fn the_timeline_reads_how_the_pull_request_opened_and_ended() {
 }
 
 #[test]
+fn the_timeline_counts_no_approvals_where_t3term_cut_the_remarks_or_commits() {
+    let header = |value: &Value| {
+        let mut conversation = conversation_of(value);
+        conversation.follow(&lifecycle(&ago_at(600), None, Value::Null, Value::Null));
+        let mut answer = Answer::Read(Box::new(conversation));
+        timeline_rows(&mut answer, &Shown::default(), 60).0[0].clone()
+    };
+    // octocat approves and 1,999 other remarks follow, all of which t3term keeps.
+    let note = |n: usize| {
+        remark(
+            &format!("k{n}"),
+            actor("hubot"),
+            &ago_at(400),
+            None,
+            "Noted.",
+        )
+    };
+    let approved = remark("a", actor("octocat"), &ago_at(500), Some("APPROVED"), "");
+    let mut comments = vec![approved.clone()];
+    comments.extend((1..2_000).map(note));
+    assert_eq!(
+        header(&activity(comments.clone(), vec![], vec![])),
+        ends(
+            "2,000 comments · 0 commits · 1 approval",
+            "Newest first",
+            60
+        )
+    );
+    // octocat then asks for changes in the 2,001st, which t3term leaves out. The host didn't
+    // cut the conversation, but the approval t3term kept no longer stands.
+    let changes = remark(
+        "r",
+        actor("octocat"),
+        &ago_at(300),
+        Some("CHANGES_REQUESTED"),
+        "",
+    );
+    comments.push(changes);
+    assert_eq!(
+        header(&activity(comments, vec![], vec![])),
+        ends("2,001 comments · 0 commits", "Newest first", 60)
+    );
+
+    // octocat approves after the 1,000th commit, which t3term keeps.
+    let approved = remark("a", actor("octocat"), &ago_at(60), Some("APPROVED"), "");
+    let step = |n: usize| commit(&format!("{n:012x}"), "Step", &ago_at(120), None, None);
+    let mut commits: Vec<Value> = (0..1_000).map(step).collect();
+    assert_eq!(
+        header(&activity(vec![approved.clone()], vec![], commits.clone())),
+        ends("1 comment · 1,000 commits · 1 approval", "Newest first", 60)
+    );
+    // A 1,001st commit after the approval makes it stale, but t3term leaves that commit out.
+    commits.push(commit("ffffffffffff", "Later", &ago_at(30), None, None));
+    assert_eq!(
+        header(&activity(vec![approved], vec![], commits)),
+        ends("1 comment · 1,000 commits", "Newest first", 60)
+    );
+}
+
+#[test]
 fn the_timeline_says_what_it_waits_for_and_what_it_left_out() {
     let shown = Shown::default();
     let (rows, targets) = timeline_rows(&mut Answer::Reading, &shown, 40);

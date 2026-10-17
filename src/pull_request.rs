@@ -1006,6 +1006,9 @@ pub struct Activity {
     pub reactions: Option<Vec<Reaction>>,
     /// t3term left remarks, threads, commits or reviewers out past its bounds.
     pub cut: bool,
+    /// t3term left remarks or commits out past its bounds, so a reviewer's last verdict, or a
+    /// commit after it, may be missing.
+    pub verdicts_cut: bool,
 }
 
 /// One slice of a pull request's diff. `PullRequestDiffResult`.
@@ -1186,12 +1189,12 @@ impl Activity {
             }
             None => None,
         };
-        let (comments, more) = object.entries("comments", MOST_COMMENTS, read_comment)?;
-        cut |= more;
+        let (comments, comments_cut) = object.entries("comments", MOST_COMMENTS, read_comment)?;
         let (threads, more) = object.entries("reviewThreads", MOST_THREADS, read_thread)?;
         cut |= more;
-        let (commits, more) = object.entries("commits", MOST_COMMITS, read_commit)?;
-        cut |= more;
+        let (commits, commits_cut) = object.entries("commits", MOST_COMMITS, read_commit)?;
+        let verdicts_cut = comments_cut || commits_cut;
+        cut |= verdicts_cut;
         Ok(Activity {
             author: object.optional("author").map(read_actor).transpose()?,
             reviewers,
@@ -1205,6 +1208,7 @@ impl Activity {
             commits,
             reactions: read_reactions(&object)?,
             cut,
+            verdicts_cut,
         })
     }
 }

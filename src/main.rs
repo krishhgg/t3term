@@ -12,7 +12,7 @@ use serde_json::{Value, json};
 use t3term::auth::Scope;
 use t3term::client::{Client, IfBusy, WatchEvent};
 use t3term::discovery::{self, Runtime, Target};
-use t3term::environments;
+use t3term::environments::{self, Phase, Probe};
 use t3term::error::{T3Error, err, err_exit, exit};
 use t3term::models::{self, Choice, Plan};
 use t3term::projection::{Applied, ThreadState, is_active_status, is_terminal_status, status};
@@ -117,7 +117,8 @@ enum Command {
     },
     /// Revoke the saved login for this server and remove it from the Keychain.
     Logout,
-    /// List, save, rename and remove named environments, and choose the default. Needs no server.
+    /// List, check, save, rename and remove named environments, and choose the default. Only
+    /// `status` reaches a server, and it never logs in.
     Environment {
         #[command(subcommand)]
         command: EnvironmentCommand,
@@ -130,6 +131,12 @@ enum Command {
 enum EnvironmentCommand {
     /// List the saved environments. `*` marks the default.
     List,
+    /// Check whether each saved environment's server answers: ready, offline or blocked. Reads
+    /// each server's descriptor and logs in to none.
+    Status {
+        /// Check this environment alone, and exit with its error's code unless it is ready.
+        name: Option<String>,
+    },
     /// Save a local environment: a T3 home and, optionally, the origin of its server.
     Add {
         name: String,
@@ -1211,9 +1218,13 @@ async fn logged_out(runtime: &Runtime) -> Result<String> {
 }
 
 /// `environment list`, `add`, `rename`, `remove` and `default`. Each reads or changes
-/// `environments.json` alone and reaches no server.
+/// `environments.json` alone and reaches no server. `environment status` is
+/// `environment_status`.
 async fn manage_environments(command: EnvironmentCommand, json_mode: bool) -> Result<i32> {
     let (body, message) = match command {
+        EnvironmentCommand::Status { name } => {
+            return environment_status(name.as_deref(), json_mode).await;
+        }
         EnvironmentCommand::List => {
             let saved = environments::load().await?;
             let list = saved.list();
@@ -1306,6 +1317,78 @@ fn environments_text(list: &[Value]) -> String {
             shown(&environment["kind"]),
             shown(&environment["t3Home"]),
             shown(&environment["origin"])
+        );
+        lines.push(line.trim_end().to_string());
+    }
+    lines.join("\n")
+}
+
+/// `environment status`. It reads `environments.json`, then probes every saved environment, or
+/// the one `name` names, once. A probe reads the T3 home and the server's descriptor and stops
+/// before a login: it runs no `t3`, reads no Keychain item and opens no WebSocket.
+///
+/// With no name it exits 0 whatever the probes found. With a name it exits 0 when the server is
+/// ready, and otherwise prints what it found and exits with the code of the error that stopped
+/// the check. A name that breaks the rule or isn't saved fails as `--environment NAME` does.
+async fn environment_status(name: Option<&str>, json_mode: bool) -> Result<i32> {
+    // `--environment` refuses a bad name before it reads the file, so this does too.
+    if let Some(name) = name {
+        environments::check_name(name)?;
+    }
+    let saved = environments::load().await?;
+    let probes = match name {
+        Some(name) => vec![saved.probe(name).await?],
+        None => saved.probe_all().await,
+    };
+    let failed = match (name, probes.first()) {
+        (Some(_), Some(probe)) if probe.phase != Phase::Ready => Some(probe),
+        _ => None,
+    };
+    if json_mode {
+        // One object, with `error` as every failed command has it and the probe beside it.
+        let mut body = json!({"ok": failed.is_none()});
+        if let Some(probe) = failed {
+            body["error"] = json!({"code": probe.code, "message": probe.message});
+        }
+        body["default"] = json!(saved.default);
+        body["environments"] = probes.iter().map(Probe::to_json).collect();
+        print_json(&body);
+    } else {
+        println!("{}", status_text(&probes));
+    }
+    Ok(failed.map_or(0, |probe| probe.exit_code))
+}
+
+/// One line per probe: a `*` for the default, the name and phase, then the origin and label
+/// when ready, or the error's message and code. Text from a server or the file loses its
+/// control characters, and a line break in it reads as a space, so each environment keeps to
+/// its line.
+fn status_text(probes: &[Probe]) -> String {
+    if probes.is_empty() {
+        return "No saved environments to check.".to_string();
+    }
+    let one_line = |text: &str| plain(text).replace('\n', " ");
+    let mut lines = Vec::new();
+    for probe in probes {
+        let marker = if probe.default { '*' } else { ' ' };
+        let detail = match probe.phase {
+            Phase::Ready => {
+                let origin = one_line(probe.origin.as_deref().unwrap_or_default());
+                match &probe.label {
+                    Some(label) => format!("{origin}  {}", one_line(label.as_str())),
+                    None => origin,
+                }
+            }
+            Phase::Offline | Phase::Blocked => format!(
+                "{} [{}]",
+                one_line(probe.message.as_deref().unwrap_or_default()),
+                probe.code.unwrap_or_default()
+            ),
+        };
+        let line = format!(
+            "{marker} {:<12} {:<7}  {detail}",
+            one_line(probe.name.as_str()),
+            probe.phase.as_str()
         );
         lines.push(line.trim_end().to_string());
     }
