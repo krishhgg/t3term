@@ -620,6 +620,11 @@ impl Watch {
         }
     }
 
+    /// Drops the card laid out in the old colors, after the theme changed.
+    pub fn restyle(&mut self) {
+        self.card = None;
+    }
+
     /// The card for the frame being drawn, when the setup shows.
     pub fn card(&self) -> Option<&Card> {
         self.card.as_ref().map(|(_, card)| card)
