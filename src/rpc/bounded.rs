@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc};
 
-use super::RpcError;
+use super::{Owner, RpcError};
 
 /// The most a bounded stream may hold that its caller has not accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +57,9 @@ impl BoundedChunk {
     /// as compact UTF-8 JSON. T3's terminal output window measures a chunk the same way, as
     /// `Buffer.byteLength(JSON.stringify(response))` in apps/server/src/terminal/
     /// OutputProtocol.ts. serde_json writes strings and integers as JSON.stringify does, but
-    /// can write a float with an exponent differently, such as `1e21` for `1e+21`.
+    /// can write a float with an exponent differently, such as `1e21` for `1e+21`. Half a
+    /// surrogate pair counts differently too: T3 counts its 6-byte escape, and t3term counts the
+    /// 3 bytes of the U+FFFD it reads in its place.
     ///
     /// It isn't the memory the values take. A parsed `Value` takes more than its JSON.
     pub fn bytes(&self) -> usize {
@@ -98,8 +100,13 @@ impl fmt::Debug for BoundedChunk {
 
 /// A stream from `RpcClient::bounded_stream`. Dropping it interrupts the stream on the
 /// server if it is still open, and discards the chunks still queued in it.
+///
+/// The connection stays open while the stream lives, even after every client has dropped.
 pub struct BoundedStream {
     pub(super) shared: Arc<Shared>,
+    /// Kept here and not in `Shared`, which the connection's map of requests holds too. It
+    /// drops after `drop` has queued the `Interrupt`.
+    pub(super) _owner: Arc<Owner>,
 }
 
 impl BoundedStream {
@@ -148,7 +155,9 @@ impl Drop for BoundedStream {
     }
 }
 
-/// What a bounded stream shares with its chunks and with the connection's reader.
+/// What a bounded stream shares with its chunks and with the connection's reader. It holds no
+/// share in the connection, so neither the reader's map nor a chunk the caller keeps after
+/// dropping the stream holds the connection open.
 pub(super) struct Shared {
     request_id: String,
     limits: StreamLimits,
@@ -288,10 +297,12 @@ impl Window {
     fn admit(&mut self, limits: StreamLimits, size: Option<usize>) -> Result<usize, String> {
         let StreamLimits { chunks, bytes } = limits;
         if self.chunks >= chunks {
-            return Err(format!("a chunk would go over the {chunks}-chunk limit"));
+            let limit = counted(chunks, "chunk", "chunks");
+            return Err(format!("a chunk would go over the limit of {limit}"));
         }
         let Some(size) = size else {
-            return Err(format!("a chunk was over the {bytes}-byte limit by itself"));
+            let limit = sized(bytes);
+            return Err(format!("a chunk was over the limit of {limit} by itself"));
         };
         let held = self.bytes;
         match held.checked_add(size) {
@@ -301,10 +312,48 @@ impl Window {
                 Ok(size)
             }
             _ => Err(format!(
-                "a {size}-byte chunk would take {held} unaccepted bytes past the {bytes}-byte limit"
+                "a chunk of {} on top of the {} not yet accepted would go over the limit of {}",
+                sized(size),
+                sized(held),
+                sized(bytes),
             )),
         }
     }
+}
+
+/// `bytes` in whole MiB or KiB where it divides evenly, as `56 MiB` or `256 KiB`, and
+/// otherwise in bytes grouped by thousands, as `1,025 bytes`. Every form is exact.
+fn sized(bytes: usize) -> String {
+    const KIB: usize = 1024;
+    const MIB: usize = 1024 * KIB;
+    if bytes >= MIB && bytes.is_multiple_of(MIB) {
+        format!("{} MiB", grouped(bytes / MIB))
+    } else if bytes >= KIB && bytes.is_multiple_of(KIB) {
+        format!("{} KiB", grouped(bytes / KIB))
+    } else {
+        counted(bytes, "byte", "bytes")
+    }
+}
+
+/// `count` grouped by thousands, with the word for one or for many.
+fn counted(count: usize, one: &str, many: &str) -> String {
+    match count {
+        1 => format!("1 {one}"),
+        _ => format!("{} {many}", grouped(count)),
+    }
+}
+
+/// `number` with a comma between each group of three digits, as `58,720,256`.
+fn grouped(number: usize) -> String {
+    let digits = number.to_string();
+    let mut out = String::with_capacity(digits.len() + digits.len() / 3);
+    for (at, digit) in digits.chars().enumerate() {
+        if at > 0 && (digits.len() - at).is_multiple_of(3) {
+            out.push(',');
+        }
+        out.push(digit);
+    }
+    out
 }
 
 /// The length of `message` as compact JSON, or `None` once it passes `limit`. It writes into
@@ -358,5 +407,45 @@ mod tests {
         assert_eq!((window.chunks, window.bytes), (1, usize::MAX - 10));
         assert_eq!(window.admit(limits, Some(10)), Ok(10));
         assert_eq!((window.chunks, window.bytes), (2, usize::MAX));
+    }
+
+    #[test]
+    fn a_refusal_names_sizes_as_a_person_reads_them() {
+        let terminal = StreamLimits::new(16, 56 << 20).unwrap();
+        let mut window = Window::open();
+        assert_eq!(window.admit(terminal, Some(58_720_200)), Ok(58_720_200));
+        let over = "a chunk of 57 bytes on top of the 58,720,200 bytes not yet accepted \
+            would go over the limit of 56 MiB";
+        assert_eq!(window.admit(terminal, Some(57)), Err(over.to_string()));
+        let alone = "a chunk was over the limit of 56 MiB by itself";
+        assert_eq!(window.admit(terminal, None), Err(alone.to_string()));
+        window.chunks = 16;
+        let full = "a chunk would go over the limit of 16 chunks";
+        assert_eq!(window.admit(terminal, Some(1)), Err(full.to_string()));
+
+        let one = StreamLimits::new(1, 1).unwrap();
+        let mut window = Window::open();
+        let over = "a chunk of 2 bytes on top of the 0 bytes not yet accepted \
+            would go over the limit of 1 byte";
+        assert_eq!(window.admit(one, Some(2)), Err(over.to_string()));
+        assert_eq!(window.admit(one, Some(1)), Ok(1));
+        let full = "a chunk would go over the limit of 1 chunk";
+        assert_eq!(window.admit(one, Some(1)), Err(full.to_string()));
+
+        let sizes = [
+            (0, "0 bytes"),
+            (1, "1 byte"),
+            (1023, "1,023 bytes"),
+            (1024, "1 KiB"),
+            (1025, "1,025 bytes"),
+            (256 * 1024, "256 KiB"),
+            (1 << 20, "1 MiB"),
+            ((1 << 20) + 1024, "1,025 KiB"),
+            (2048 << 20, "2,048 MiB"),
+            (usize::MAX, "18,446,744,073,709,551,615 bytes"),
+        ];
+        for (bytes, shown) in sizes {
+            assert_eq!(sized(bytes), shown);
+        }
     }
 }
