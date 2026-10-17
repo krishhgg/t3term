@@ -571,6 +571,7 @@ def person(login: str, bot: bool = False) -> dict:
 def activity_of(number: int, refreshes: int = 0, threads_on_diff: bool = False) -> dict:
     """A PullRequestActivity for a fixture link. Every value is invented. #41 has a full conversation
     (12 active remarks, 14 bots' remarks, a resolved thread and a dismissed review), #51 has none and the rest one each.
+    Five of #41's remarks carry reactions, one of them a bot's, and so do two of #60's.
     With `threads_on_diff`, #7 also has review threads on lines of DIFF_FIRST and one on a file the diff doesn't touch."""
     def ago(minutes: float) -> str:
         return iso(now_ms() - int(minutes * MINUTE))
@@ -677,7 +678,8 @@ def activity_of(number: int, refreshes: int = 0, threads_on_diff: bool = False) 
                     'One question on the schema check, otherwise this looks good.')
     approved = remark('r-reviewer', 'review', 'fixture-reviewer', 20, 'Looks good. Thanks for splitting it.',
                       state='APPROVED', reactions=[('hooray', 3, True), ('heart', 2, False)])
-    bot_review = remark('bot2', 'review', 'review-bot', 15, 'No new findings.', state='COMMENTED', bot=True)
+    bot_review = remark('bot2', 'review', 'review-bot', 15, 'No new findings.', state='COMMENTED', bot=True,
+                        reactions=[('thumbs-down', 2, False)])
     preview = remark('c3', 'issue-comment', 'octo-ops', 5, 'The deploy preview waits for an approval.',
                      reactions=[('eyes', 4, False), ('thumbs-up', 1, True), ('confused', 1, False),
                                 ('laugh', 12, False)])
