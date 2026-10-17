@@ -17,11 +17,12 @@ and may provide:
 
 from __future__ import annotations
 
-from . import lineage, links
+from . import lineage, links, terminal
 
-SCENARIOS = {links.NAME: links, lineage.NAME: lineage}
+SCENARIOS = {links.NAME: links, lineage.NAME: lineage, terminal.NAME: terminal}
 DEFAULT = links.NAME
-FIXTURES = {links.NAME: links.LinksFixture, lineage.NAME: lineage.LineageFixture}
+FIXTURES = {links.NAME: links.LinksFixture, lineage.NAME: lineage.LineageFixture,
+            terminal.NAME: terminal.TerminalFixture}
 
 
 def scenario_of(state: dict):
