@@ -1,12 +1,12 @@
 //! The terminal backend, with each emoji that ends in U+FE0F drawn so the rest of its row stays
 //! in place.
 //!
-//! Terminals disagree on how wide such an emoji is. tmux draws ⚠ and U+FE0F a column wide unless
-//! `variation-selector-always-wide` is on, and Ghostty, kitty and WezTerm draw it two wide, as
-//! unicode-width counts it. ratatui 0.30 writes the cell that follows it without moving the
-//! cursor first (ratatui-core 0.1.2, src/buffer/diff.rs:158-170), which is right where the
-//! terminal draws it a column wide. Where the terminal draws it two wide, that cell and the rest
-//! of the row land a column to the right, and the last of them can cover the border.
+//! Terminals disagree on how wide such an emoji is. Ghostty, kitty, WezTerm and tmux 3.6a draw ⚠
+//! and U+FE0F two wide, as unicode-width counts it, and tmux draws it a column wide when its
+//! `variation-selector-always-wide` option is off. ratatui 0.30 writes the cell that follows it
+//! without moving the cursor first (ratatui-core 0.1.2, src/buffer/diff.rs:158-170), which is right
+//! where the terminal draws it a column wide. Where the terminal draws it two wide, that cell and
+//! the rest of the row land a column to the right, and the last of them can cover the border.
 //!
 //! So this backend writes the cell after the emoji first, then moves back and writes the emoji,
 //! then moves to the next cell it writes. A terminal that draws the emoji a column wide shows
@@ -126,8 +126,8 @@ mod tests {
     use super::*;
 
     /// A terminal's screen that reads what a backend wrote, drawing an emoji with U+FE0F one
-    /// column wide, as tmux does by default, or two, as Ghostty does. It knows only moves and
-    /// text, which is all the backend writes but colors.
+    /// column wide, as tmux does with `variation-selector-always-wide` off, or two, as Ghostty
+    /// does. It knows only moves and text, which is all the backend writes but colors.
     struct Screen {
         wide: bool,
         /// Each cell's text, and `None` for the right half of a wide one.

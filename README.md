@@ -104,7 +104,7 @@ The wheel scrolls the transcript and the sidebar. Clicking ◧ at the top left o
 
 On macOS the Alt keys need Option to send Meta: "Use Option as Meta key" in Terminal, "Esc+" for the Option key in iTerm2, or `macos-option-as-alt = true` in Ghostty.
 
-An emoji that ends in U+FE0F, such as ⚠️ or ❤️, takes one column in some terminals, such as tmux by default, and two in others, such as Ghostty, kitty and WezTerm. t3term writes the cell after it before the emoji itself, so the rest of its row lands in place either way.
+An emoji that ends in U+FE0F, such as ⚠️ or ❤️, takes two columns in some terminals, such as Ghostty, kitty, WezTerm and tmux 3.6a, and one in others, such as tmux with `variation-selector-always-wide off`. t3term writes the cell after it before the emoji itself, so the rest of its row lands in place either way.
 
 ### Picking a model
 
