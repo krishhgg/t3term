@@ -101,3 +101,58 @@ jobs:
             ~/.cargo/git/db/
             target/
           key: ${{ steps.cache.outputs.cache-primary-key }}
+
+  # Runs every recipe under .claude/skills/verify-t3term/features against a debug build, in tmux
+  # against fake T3 servers on 127.0.0.1 with temporary homes. It is not a required check yet: a
+  # failure means a recipe no longer matches the app, so read its smoke.log in the evidence.
+  e2e:
+    name: E2E smoke (macOS)
+    runs-on: macos-26
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install Rust ${{ env.RUST_TOOLCHAIN }}
+        run: |
+          rustup toolchain install "$RUST_TOOLCHAIN" --profile minimal
+          rustup default "$RUST_TOOLCHAIN"
+
+      - name: Restore cache
+        uses: actions/cache/restore@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        with:
+          path: |
+            ~/.cargo/registry/index/
+            ~/.cargo/registry/cache/
+            ~/.cargo/git/db/
+            target/
+          key: ${{ runner.os }}-${{ runner.arch }}-rust-${{ env.RUST_TOOLCHAIN }}-${{ hashFiles('Cargo.lock') }}
+          restore-keys: ${{ runner.os }}-${{ runner.arch }}-rust-${{ env.RUST_TOOLCHAIN }}-
+
+      - name: Install tmux
+        env:
+          HOMEBREW_NO_AUTO_UPDATE: "1"
+          HOMEBREW_NO_INSTALL_CLEANUP: "1"
+        run: |
+          brew install tmux
+          tmux -V
+          python3 --version
+
+      - name: Build
+        run: cargo build --locked
+
+      - name: Run every feature recipe
+        run: python3 .claude/skills/verify-t3term/scripts/smoke --evidence "$RUNNER_TEMP/t3v-evidence"
+
+      # Every project, thread and line of text in the evidence is invented. t3v leaves tokens,
+      # tickets and keys out of its logs, and each recipe's `t3v check` fails on any the fake
+      # server issued that reached the evidence or the screen (secretLeaks).
+      - name: Upload evidence
+        if: always()
+        uses: actions/upload-artifact@cf430e030ddbb5b0abf93d22962f4752f3646cd9 # v7.0.2
+        with:
+          name: t3v-evidence
+          path: ${{ runner.temp }}/t3v-evidence
+          retention-days: 14
+          if-no-files-found: ignore
