@@ -122,6 +122,8 @@ fn t3_code_is_the_stock_theme_and_the_rest_are_built_in() {
         .flat_map(|(_, palette)| [palette.light.canvas.rgb(), palette.dark.canvas.rgb()])
         .collect();
     assert_eq!(canvases.len(), 10);
-    assert!(std::ptr::eq(GROVE.half(Appearance::Dark), &GROVE.dark));
-    assert!(std::ptr::eq(GROVE.half(Appearance::Light), &GROVE.light));
+    // One value, as each use of a const may be a value of its own.
+    let grove = &GROVE;
+    assert!(std::ptr::eq(grove.half(Appearance::Dark), &grove.dark));
+    assert!(std::ptr::eq(grove.half(Appearance::Light), &grove.light));
 }
