@@ -953,6 +953,25 @@ impl Details {
         self.open && self.pulls.wants(open_id, supported)
     }
 
+    /// Whether the details show the pull requests' tab.
+    pub fn shows_pulls(&self) -> bool {
+        self.open && self.tab == Tab::PullRequests
+    }
+
+    /// Takes what a host said of the pull request whose details asked with `ticket`, or why
+    /// the read failed, which came at `now`. The details lay out again when it is the read
+    /// they wait for.
+    pub fn answer_pull(
+        &mut self,
+        ticket: u64,
+        answer: Result<Box<crate::pull_request::Detail>, String>,
+        now: i64,
+    ) {
+        if self.pulls.answer(ticket, answer, now) {
+            self.moved = true;
+        }
+    }
+
     /// Shows the selected pull request's details in the list's place, or the list again, while
     /// their tab shows.
     pub fn toggle_pull(&mut self) {

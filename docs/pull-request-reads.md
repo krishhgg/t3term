@@ -1,6 +1,6 @@
 # Pull request reads
 
-`src/pull_request.rs` reads one pull request from T3's server: its detail, its checks and its conversation. It is the first part of PR reviews in the TUI ([parity.md, group 12](parity.md#12-pull-requests)). Nothing in t3term calls it yet. The linked pull requests tab still shows only what the thread's record holds ([pull-request-panel.md](pull-request-panel.md)).
+`src/pull_request.rs` reads one pull request from T3's server: its detail, its checks and its conversation. It is the first part of PR reviews in the TUI ([parity.md, group 12](parity.md#12-pull-requests)). The thread details call `detail` when a link's details open, as [linked pull requests](pull-request-panel.md#what-a-links-details-read-from-its-host) says. Nothing calls the other three yet.
 
 ```rust
 let reference = Reference::new(&thread_project_id, Some(&link.host), &link.repository, link.number)?;
@@ -74,8 +74,8 @@ The unit tests read a detail with every field filled in, then without each optio
 
 ## Not done yet
 
-- The TUI doesn't call these reads. A pull request's page with its checks and conversation comes next.
+- The TUI calls only `detail`. It doesn't read `checks` or `activity`, so a pull request's conversation, review threads and commits don't show, and it never sends `invalidate`.
 - There is no CLI command for a pull request.
 - The list of pull requests, the diff, viewed files, reviewer and label candidates, and `pullRequests.subscribeRefreshes` aren't read.
 - Nothing writes: no comment, review, reaction, resolution, label, reviewer or action. Those need `source-control:write`.
-- A project whose repository matches the link isn't looked for. The caller passes the thread's project, which T3 routes by host.
+- A project whose repository matches the link isn't looked for. The TUI passes the thread's project and the link's host, and T3 routes the ref by host.
