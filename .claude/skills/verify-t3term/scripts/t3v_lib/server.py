@@ -61,6 +61,7 @@ class FixtureBase(Auth):
         self.connections = set()
         self.connection_ids = itertools.count(1)
         self.ws_hold_until = 0  # /ws answers 503 until this wall-clock millisecond
+        self.ws_hold_kinds = {}  # session kind -> /ws answers that kind's tickets 503 until then
         self.sequence = FIRST_SEQUENCE
         self.t0 = None
         self.port = None
@@ -186,16 +187,27 @@ class FixtureBase(Auth):
         connection.exit_failure(request_id, 'orchestration.dispatchCommand', 'FixtureReadOnly',
                                 'The t3v fixture takes no commands. Nothing was sent anywhere.')
 
-    def drop_sockets(self, hold: float) -> int:
-        """Closes every WebSocket and answers /ws with 503 for `hold` seconds."""
+    def drop_sockets(self, hold: float, kinds=None) -> int:
+        """Closes every WebSocket, or only those whose session kind is in `kinds`, and answers
+        /ws with 503 to the same for `hold` seconds."""
         with self.lock:
-            self.ws_hold_until = now_ms() + int(hold * 1000)
-            connections = list(self.connections)
+            until = now_ms() + int(hold * 1000)
+            if kinds is None:
+                self.ws_hold_until = until
+            else:
+                for kind in kinds:
+                    self.ws_hold_kinds[kind] = until
+            connections = [c for c in self.connections if kinds is None or c.kind in kinds]
             for connection in connections:
                 self.on_close(connection)
         for connection in connections:
             connection.close()
         return len(connections)
+
+    def held(self, session) -> bool:
+        """Whether /ws answers 503 now to a socket for `session`, or None for a bad ticket."""
+        now = now_ms()
+        return now < self.ws_hold_until or (session is not None and now < self.ws_hold_kinds.get(session['kind'], 0))
 
     # -- reports --
 
@@ -236,11 +248,14 @@ class FixtureBase(Auth):
                 found['the screen'] = count
         return found
 
-    def summary(self, open_at_stop: int) -> dict:
+    def summary(self, open_at_stop: int, by_kind=None) -> dict:
+        """What summary.json holds. `by_kind` counts the sockets still open at stop by their
+        session's kind."""
         with self.lock:
             return dict(self.report(), run=self.root.name, scenario=self.run.get('scenario'),
                         options=copy.deepcopy(self.options), t0=iso(self.t0) if self.t0 else None,
-                        stoppedAt=iso(now_ms()), openSocketsAtStop=open_at_stop, secretLeaks=self.secret_leaks())
+                        stoppedAt=iso(now_ms()), openSocketsAtStop=open_at_stop,
+                        openSocketsAtStopByKind=by_kind or {}, secretLeaks=self.secret_leaks())
 
 
 def unmask(data: bytes, mask: bytes) -> bytes:
@@ -606,9 +621,10 @@ class Handler(http.server.BaseHTTPRequestHandler):
         protocol = (query.get('orchestrationProtocol') or [''])[0]
         session = fixture.take_ticket(ticket) if ticket else None
         key = self.headers.get('Sec-WebSocket-Key')
-        if now_ms() < fixture.ws_hold_until:
+        if fixture.held(session):
             with fixture.lock:
                 fixture.counts['ws.held'] += 1
+                fixture.counts[f'ws.held.{session["kind"] if session else "unknown"}'] += 1
             return self.reply('GET', '/ws', 503, {'message': 'The fixture is holding sockets closed.'}, 'held')
         if session is None:
             return self.reply('GET', '/ws', 401, {'message': 'The WebSocket ticket is missing, used or revoked.'},
@@ -694,6 +710,6 @@ def serve(root: Path, run: dict, fixture_class) -> int:
         runtime.unlink()
     except OSError:
         pass
-    write_json(fixture.evidence / 'summary.json', fixture.summary(len(left)))
+    write_json(fixture.evidence / 'summary.json', fixture.summary(len(left), dict(Counter(c.kind for c in left))))
     fixture.log('server.stopped', openSocketsAtStop=len(left))
     return 0
