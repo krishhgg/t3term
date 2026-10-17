@@ -1,7 +1,8 @@
 """Tests for `t3v build`: it checks out a commit only once it holds the build lock, and it caches a
 binary only when cargo built it. A stand-in `cargo` on PATH copies the checked-out commit's
-`marker` file to the binary's place and prints cargo's JSON messages, so no test runs the real
-cargo or touches /tmp/t3v-bin or /tmp/t3v-target.
+`marker` file to the binary's place and, like cargo, prints JSON messages only when
+--message-format asks for them, so no test runs the real cargo or touches /tmp/t3v-bin or
+/tmp/t3v-target.
 
 From the repository's root:
 python3 -I -B -m unittest discover -s .claude/skills/verify-t3term/scripts/t3v_lib -t .claude/skills/verify-t3term/scripts
@@ -23,10 +24,14 @@ from . import build
 CARGO = '''#!/bin/sh
 # Stands in for `cargo build`: links the tree's marker as t3term, or with FAKE_CARGO_FRESH=1 calls
 # the binary already in the target directory fresh. FAKE_CARGO_STDERR is what it shows a person.
+# Like cargo, it prints JSON messages on stdout only with --message-format=json...
 exe="$CARGO_TARGET_DIR/debug/t3term"
 mkdir -p "$CARGO_TARGET_DIR/debug"
 printf '%b' "${FAKE_CARGO_STDERR:-}" >&2
 if [ "${FAKE_CARGO_FRESH:-0}" = 1 ]; then fresh=true; else fresh=false; cp marker "$exe"; chmod 755 "$exe"; fi
+json=0
+for arg in "$@"; do case "$arg" in --message-format=json*) json=1 ;; esac; done
+[ "$json" = 1 ] || exit 0
 printf '{"reason":"compiler-artifact","target":{"kind":["lib"],"name":"t3term"},"fresh":%s,"executable":null}\\n' "$fresh"
 printf '{"reason":"compiler-artifact","target":{"kind":["bin"],"name":"t3term"},"fresh":%s,"executable":"%s"}\\n' "$fresh" "$exe"
 printf '{"reason":"build-finished","success":true}\\n'
