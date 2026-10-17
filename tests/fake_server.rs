@@ -2182,17 +2182,6 @@ fn read_label() -> String {
     format!("{}\u{fffd}", "x".repeat(127))
 }
 
-/// An event of `kind` on terminal term-1, with the fields of `rest`.
-fn terminal_event(kind: &str, sequence: u64, rest: Value) -> Value {
-    let mut event = json!({"type": kind, "threadId": "t1", "terminalId": "term-1",
-        "sequence": sequence});
-    event
-        .as_object_mut()
-        .unwrap()
-        .extend(rest.as_object().unwrap().clone());
-    event
-}
-
 /// T3 cuts a terminal's label inside a surrogate pair, both in the snapshot a terminal stream
 /// starts with and in each activity event. t3term reads the half left over as U+FFFD, and
 /// each chunk arrives and is acked once its caller accepts it, as any other is. T3 sends up
@@ -2201,7 +2190,7 @@ fn terminal_event(kind: &str, sequence: u64, rest: Value) -> Value {
 async fn a_terminal_label_cut_inside_a_pair_arrives_and_each_chunk_is_acked_when_accepted() {
     let (rpc, mut socket) = connected().await;
     let (mut stream, id) = open(&rpc, &mut socket, limits(8, 64 * 1024)).await;
-    let session = json!({"threadId": "t1", "terminalId": "term-1", "cwd": "/tmp",
+    let session = json!({"threadId": THREAD, "terminalId": TERM, "cwd": "/tmp",
         "status": "running", "history": "$ ", "label": cut_label(), "sequence": 1});
     let snapshot = json!({"type": "snapshot", "snapshot": session});
     let output = terminal_event("output", 2, json!({"data": format!("{PAIR} ok")}));
