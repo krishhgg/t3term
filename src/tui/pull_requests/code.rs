@@ -1944,12 +1944,21 @@ fn body(
         _ => "",
     };
     let mut wanted = Vec::new();
+    // The largest number before the change of those lines, which only the left side shows.
+    let mut old_last = 0;
     for (stretch, showing) in stretches.iter().zip(&showings) {
         let end = stretch.first + showing.head + showing.tail + rest(showing.rest);
+        let before = wanted.len();
         wanted.extend(stretch.first..stretch.first + showing.head);
         wanted.extend(end - showing.tail..end);
+        if let Some(&number) = wanted[before..].last() {
+            old_last = old_last.max(stretch.old + (number - stretch.first));
+        }
     }
     let mut found = lines_at(contents, &wanted).into_iter();
+    // Side by side, each side has its own numbers and marks, as the narrower left one has room
+    // for them.
+    let halves = split.then(|| Halves::of(width)).flatten();
     let last = file
         .hunks
         .iter()
@@ -1958,12 +1967,10 @@ fn body(
             old.max(hunk.new_start + hunk.new_count.saturating_sub(1))
         })
         .chain(wanted.last().copied())
+        .chain(halves.map(|_| old_last))
         .max()
         .unwrap_or_default();
     let digits = last.max(1).ilog10() as usize + 1;
-    // Side by side, each side has its own numbers and marks, as the narrower left one has room
-    // for them.
-    let halves = split.then(|| Halves::of(width)).flatten();
     let mut slides = Slides {
         halves,
         ..Slides::default()
