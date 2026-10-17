@@ -19,7 +19,8 @@ link the request names (#42 as a host without a GitHub credential, #62 as one th
 `pullRequests.activity` 3 s late (#43 times out); `pullRequests.stack` 0.8 s late; the diff route
 POST /api/pull-requests/diff at once, in two slices. `refresh` raises the refresh number
 `pullRequests.subscribeRefreshes` sends, as T3 does after a turn, and `revise` changes what the next
-read gets without one. A file of these names in the run directory changes the reads: stack-fail,
+read gets without one. `pullRequests.invalidate` raises it too, then answers at once, and the event
+log keeps the link its reference names as `pr.invalidate`. A file of these names in the run directory changes the reads: stack-fail,
 stack-slow (8 s), comments-fail, contents-fail, viewed-fail, viewed-short, diff-slow (4 s a slice),
 diff-fail, diff-fail-rest, diff-ts (a TypeScript diff) and diff-threads (review threads on the
 diff's lines).
@@ -372,6 +373,11 @@ class LinksFixture(Launches, Orchestration):
     def invalidate(self, connection, request_id: str, payload: dict):
         # As T3's handler does with notifyReaders: forget, raise the number on every
         # subscription, then answer (apps/server/src/ws.ts:2506).
+        reference = payload.get('reference')
+        reference = reference if isinstance(reference, dict) else {}
+        self.log('pr.invalidate', conn=connection.id, requestId=request_id, number=reference.get('number'),
+                 host=reference.get('host'), repository=str(reference.get('repository', '')).strip().lower(),
+                 projectId=reference.get('projectId'))
         with self.lock:
             self.counts['pr.invalidate'] += 1
             self.refresh_number += 1
