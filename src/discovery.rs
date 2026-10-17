@@ -652,6 +652,91 @@ async fn find_local(local: &LocalTarget, stopped: &mut Option<String>) -> Result
     ))
 }
 
+/// The server `runtime` describes, checked again at `runtime.origin` before t3term sends it a
+/// new credential, which can be hours after `discover` found it. It asks that origin alone,
+/// even when the T3 home now records another one, and fails unless the server there still
+/// reports `runtime`'s environment id on orchestration protocol 2. A named environment's server
+/// must also report the id its T3 home holds now, as `discover_local` checks.
+///
+/// The pid comes from the record again, and only when the record names this origin, so a
+/// restarted server's `t3` is the one that runs.
+pub async fn rediscover(target: &Target, runtime: &Runtime) -> Result<Runtime> {
+    let now = match target {
+        Target::Local(local) => {
+            let pinned = LocalTarget {
+                origin: Some(runtime.origin.clone()),
+                ..local.clone()
+            };
+            discover_local(&pinned)
+                .await
+                .map_err(|unreached| unreached.error)?
+        }
+        Target::Discover => describe_again(runtime).await?,
+    };
+    if now.environment_id != runtime.environment_id {
+        return Err(err_exit(
+            "T3_ENVIRONMENT_CHANGED",
+            exit::REJECTED,
+            format!(
+                "The server at {} is environment {} now, not {} as when t3term connected. t3term stopped before sending it a credential. Start t3term again to use it.",
+                runtime.origin, now.environment_id, runtime.environment_id
+            ),
+        ));
+    }
+    now.require_supported_protocol()?;
+    Ok(now)
+}
+
+/// `rediscover` for a server that `discover_any` found.
+async fn describe_again(runtime: &Runtime) -> Result<Runtime> {
+    let origin = runtime.origin.as_str();
+    let descriptor = fetch_descriptor(&direct_client(), origin)
+        .await
+        .map_err(|problem| match problem {
+            NoDescriptor::Refused | NoDescriptor::Unanswered => err_exit(
+                "T3_SERVER_UNAVAILABLE",
+                exit::UNAVAILABLE,
+                format!("The T3 server at {origin} did not answer. t3term does not try another server."),
+            ),
+            NoDescriptor::Redirected => err_exit(
+                "T3_REDIRECTED",
+                exit::REJECTED,
+                format!(
+                    "The T3 server at {origin} answered with a redirect. t3term doesn't follow one, since the answer would come from another server."
+                ),
+            ),
+            NoDescriptor::Invalid(answer) => err_exit(
+                "T3_DESCRIPTOR_INVALID",
+                exit::REJECTED,
+                format!(
+                    "The T3 server at {origin} answered /.well-known/t3/environment, but not with a T3 environment descriptor: {answer}."
+                ),
+            ),
+        })?;
+    let pid = match runtime.state_dir.clone() {
+        Some(state_dir) => {
+            let record =
+                off_runtime(move || read_record(&state_dir.join("server-runtime.json"))).await?;
+            match record {
+                // `discover_any` takes a record's origin as written, and `described` drops a
+                // trailing slash.
+                Record::Server(state) if state.origin.trim_end_matches('/') == origin => {
+                    Some(state.pid)
+                }
+                _ => None,
+            }
+        }
+        None => None,
+    };
+    Ok(described(
+        origin,
+        runtime.t3_home.clone(),
+        runtime.state_dir.clone(),
+        pid,
+        descriptor,
+    ))
+}
+
 /// The origin a home's record names, as `loopback_origin` writes it, or why t3term won't use
 /// it.
 fn recorded_origin(name: &str, recorded: &str) -> Result<String> {
@@ -691,10 +776,13 @@ fn described(
 
 #[cfg(test)]
 mod tests {
+    use std::sync::{Arc, Mutex};
+
     use super::*;
     use crate::auth::Scope;
     use crate::client::Client;
     use crate::error::T3Error;
+    use crate::http::fake;
 
     fn code(error: &anyhow::Error) -> Option<&'static str> {
         error.downcast_ref::<T3Error>().map(|e| e.code)
@@ -935,6 +1023,122 @@ mod tests {
         let unreached = discover_local(&b).await.unwrap_err();
         assert_eq!(code(&unreached.error), Some("T3_ENVIRONMENT_UNVERIFIED"));
         assert_eq!(unreached.stopped, None);
+    }
+
+    /// What a server of `environment_id` on orchestration protocol `protocol` answers at
+    /// `/.well-known/t3/environment`.
+    fn descriptor_of(environment_id: &str, protocol: u64) -> String {
+        let descriptor = serde_json::json!({
+            "environmentId": environment_id,
+            "serverVersion": "0.0.0",
+            "orchestrationProtocolVersion": protocol,
+        });
+        fake::response("200 OK", &[], &descriptor.to_string())
+    }
+
+    /// The server of environment `env-a` that `discover_any` found at `origin`, recorded in
+    /// `state_dir`.
+    fn found_at(origin: &str, state_dir: &Path) -> Runtime {
+        Runtime {
+            origin: origin.to_string(),
+            t3_home: state_dir.parent().unwrap().to_path_buf(),
+            state_dir: Some(state_dir.to_path_buf()),
+            pid: Some(1),
+            environment_id: "env-a".into(),
+            label: None,
+            server_version: "0.0.0".into(),
+            protocol_version: Some(PROTOCOL_VERSION),
+            capabilities: serde_json::json!({}),
+        }
+    }
+
+    /// Checked again, a server `discover_any` found is asked at its own origin, and its pid
+    /// comes from a record of that origin alone.
+    #[tokio::test]
+    async fn rediscovery_asks_the_origin_it_found_and_reads_the_pid_again() {
+        let home = tempfile::tempdir().unwrap();
+        let state_dir = home.path().join("userdata");
+        std::fs::create_dir_all(&state_dir).unwrap();
+        let answer = descriptor_of("env-a", 2);
+        let a = fake::Server::start(move |_| answer.clone());
+        let runtime = found_at(&a.origin, &state_dir);
+        // The server started again at the same origin, with a new pid.
+        let record = serde_json::json!({"version": 1, "pid": 4242, "origin": a.origin});
+        std::fs::write(state_dir.join("server-runtime.json"), record.to_string()).unwrap();
+        let now = rediscover(&Target::Discover, &runtime).await.unwrap();
+        assert_eq!(now.origin, a.origin);
+        assert_eq!(now.environment_id, "env-a");
+        assert_eq!(now.pid, Some(4242));
+        // A record of another origin gives no pid, so t3term can't run another server's `t3`.
+        std::fs::write(state_dir.join("server-runtime.json"), record_of(STOPPED)).unwrap();
+        let now = rediscover(&Target::Discover, &runtime).await.unwrap();
+        assert_eq!(now.pid, None);
+        let asked = ["/.well-known/t3/environment", "/.well-known/t3/environment"];
+        assert_eq!(a.paths(), asked);
+    }
+
+    /// Any other answer at the origin stops t3term there, and it asks no other server.
+    #[tokio::test]
+    async fn rediscovery_stops_at_another_environment_or_a_bad_answer() {
+        let home = tempfile::tempdir().unwrap();
+        let state_dir = home.path().join("userdata");
+        let elsewhere = fake::Server::start(|_| descriptor_of("env-a", 2));
+        let location = format!("location: {}/.well-known/t3/environment", elsewhere.origin);
+        let answers = [
+            (descriptor_of("env-other", 2), "T3_ENVIRONMENT_CHANGED"),
+            (descriptor_of("env-a", 1), "T3_PROTOCOL_UNSUPPORTED"),
+            (
+                fake::response("302 Found", &[location.as_str()], ""),
+                "T3_REDIRECTED",
+            ),
+            (
+                fake::response("500 Internal Server Error", &[], "{}"),
+                "T3_DESCRIPTOR_INVALID",
+            ),
+            (String::new(), "T3_SERVER_UNAVAILABLE"),
+        ];
+        for (answer, expected) in answers {
+            let a = fake::Server::start(move |_| answer.clone());
+            let checked = rediscover(&Target::Discover, &found_at(&a.origin, &state_dir)).await;
+            assert_eq!(code(&checked.unwrap_err()), Some(expected));
+            assert_eq!(a.paths(), ["/.well-known/t3/environment"], "{expected}");
+        }
+        let checked = rediscover(&Target::Discover, &found_at(STOPPED, &state_dir)).await;
+        assert_eq!(code(&checked.unwrap_err()), Some("T3_SERVER_UNAVAILABLE"));
+        assert_eq!(elsewhere.paths(), Vec::<String>::new());
+    }
+
+    /// A named environment is checked at the origin the client uses, even when its T3 home
+    /// records another server since, and its server must report the id the home holds now.
+    #[tokio::test]
+    async fn rediscovering_a_named_environment_keeps_to_the_clients_origin() {
+        let elsewhere = fake::Server::start(|_| descriptor_of("env-b", 2));
+        let answer = Arc::new(Mutex::new(descriptor_of("env-b", 2)));
+        let served = answer.clone();
+        let b_server = fake::Server::start(move |_| served.lock().unwrap().clone());
+        let home = tempfile::tempdir().unwrap();
+        let recorded = record_of(&b_server.origin);
+        let b = environment_b(home.path(), None, Some(recorded.as_str()));
+        let runtime = discover_local(&b).await.unwrap();
+        assert_eq!(runtime.pid, Some(1));
+        let target = Target::Local(b);
+        let state_dir = home.path().join("userdata");
+        let record = state_dir.join("server-runtime.json");
+        std::fs::write(&record, record_of(&elsewhere.origin)).unwrap();
+        let now = rediscover(&target, &runtime).await.unwrap();
+        assert_eq!(now.origin, b_server.origin);
+        assert_eq!(now.pid, None);
+        // Another server took the port, and the home still holds env-b.
+        *answer.lock().unwrap() = descriptor_of("env-other", 2);
+        let checked = rediscover(&target, &runtime).await;
+        assert_eq!(code(&checked.unwrap_err()), Some("T3_ENVIRONMENT_MISMATCH"));
+        // The home was made again with a new id, and its server reports that id.
+        std::fs::write(state_dir.join("environment-id"), "env-new\n").unwrap();
+        *answer.lock().unwrap() = descriptor_of("env-new", 2);
+        let checked = rediscover(&target, &runtime).await;
+        assert_eq!(code(&checked.unwrap_err()), Some("T3_ENVIRONMENT_CHANGED"));
+        assert_eq!(b_server.paths().len(), 4);
+        assert_eq!(elsewhere.paths(), Vec::<String>::new());
     }
 
     /// The read waits for a message that only another task on this single-threaded runtime

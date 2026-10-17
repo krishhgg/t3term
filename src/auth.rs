@@ -6,6 +6,11 @@
 //! Issuing a session starts T3's Node CLI, which costs about half a second of CPU. So on macOS one
 //! session per environment is saved in the Keychain and reused for 30 days. Elsewhere, or when
 //! `T3TERM_NO_SAVED_LOGIN` is set, each process issues a temporary session and revokes it on exit.
+//!
+//! A terminal needs `terminal:read` and `terminal:operate`, which no login carries. The first
+//! time a client asks for a terminal connection, `Session::issue_terminal` issues a temporary
+//! session with those two scopes alone, for at most 12 hours. It is never saved, and it is
+//! revoked when its client drops or the process exits, as any temporary session is.
 
 use std::fmt;
 use std::path::{Path, PathBuf};
@@ -30,11 +35,21 @@ const SAVED_SCOPES: &[Scope] = &[Scope::Read, Scope::Operate];
 /// Longer than one login takes, which includes issuing a session (up to 90 seconds when T3 is
 /// slow). Past this, `login` falls back to a temporary session.
 const LOCK_WAIT: Duration = Duration::from_secs(30);
+/// What T3 lists a login as, under `client.label`.
+const LABEL: &str = "t3term";
+/// The scopes of the terminal session, and the only session that carries them.
+pub const TERMINAL_SCOPES: &[Scope] = &[Scope::TerminalRead, Scope::TerminalOperate];
+const TERMINAL_TTL: &str = "12h";
+const TERMINAL_LABEL: &str = "t3term terminal";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Scope {
     Read,
     Operate,
+    /// Observes a terminal and subscribes to its events and metadata.
+    TerminalRead,
+    /// Opens, attaches to, writes to, resizes, clears, restarts and closes a terminal.
+    TerminalOperate,
 }
 
 impl Scope {
@@ -42,7 +57,28 @@ impl Scope {
         match self {
             Scope::Read => "orchestration:read",
             Scope::Operate => "orchestration:operate",
+            Scope::TerminalRead => "terminal:read",
+            Scope::TerminalOperate => "terminal:operate",
         }
+    }
+
+    fn is_terminal(self) -> bool {
+        matches!(self, Scope::TerminalRead | Scope::TerminalOperate)
+    }
+}
+
+/// Stops a login or a temporary session from carrying a terminal scope. A saved login would
+/// keep it for 30 days, so only `Session::issue_terminal` issues one.
+fn refuse_terminal_scopes(scopes: &[Scope]) -> Result<()> {
+    match scopes.iter().find(|scope| scope.is_terminal()) {
+        Some(scope) => Err(err(
+            "TERMINAL_SCOPE_NOT_ALLOWED",
+            format!(
+                "t3term puts {} in the terminal session alone, never in a login.",
+                scope.as_str()
+            ),
+        )),
+        None => Ok(()),
     }
 }
 
@@ -69,6 +105,10 @@ const SERVER_ENTRY_SUFFIX: &str = "apps/server/dist/bin.mjs";
 
 /// Resolves how to run `t3` for this server: `T3TERM_T3_COMMAND`, else the server process's own binary.
 pub fn resolve_t3_command(runtime: &Runtime) -> Result<T3Command> {
+    #[cfg(test)]
+    if let Some(command) = fake::t3() {
+        return Ok(command);
+    }
     if let Ok(configured) = std::env::var("T3TERM_T3_COMMAND") {
         let mut parts = configured.split_whitespace().map(str::to_string);
         let program = parts.next().context("T3TERM_T3_COMMAND is empty")?;
@@ -228,8 +268,10 @@ impl Session {
     /// Reuses the saved login for this environment, or issues and saves a new one.
     ///
     /// `scopes` and `ttl` apply only to a temporary session. A saved login always carries
-    /// read and operate, because the TUI and the write commands share it.
+    /// read and operate, because the TUI and the write commands share it. A terminal scope is
+    /// refused, since a saved login would drop it.
     pub async fn login(runtime: &Runtime, scopes: &[Scope], ttl: &str) -> Result<Session> {
+        refuse_terminal_scopes(scopes)?;
         if !keychain::available() {
             return Session::issue(runtime, scopes, ttl).await;
         }
@@ -254,7 +296,7 @@ impl Session {
             }
             other => other,
         };
-        let (issued, command) = issue_session(runtime, SAVED_SCOPES, SAVED_TTL).await?;
+        let (issued, command) = issue_session(runtime, SAVED_SCOPES, SAVED_TTL, LABEL).await?;
         let saved = SavedLogin {
             session_id: issued.session_id,
             token: issued.token,
@@ -291,7 +333,24 @@ impl Session {
 
     /// Issues a temporary session that is revoked when it drops or the process exits.
     pub async fn issue(runtime: &Runtime, scopes: &[Scope], ttl: &str) -> Result<Session> {
-        let (issued, command) = issue_session(runtime, scopes, ttl).await?;
+        refuse_terminal_scopes(scopes)?;
+        Session::issue_temporary(runtime, scopes, ttl, LABEL).await
+    }
+
+    /// Issues the terminal session: `terminal:read` and `terminal:operate` alone, for 12 hours,
+    /// listed in T3 as `t3term terminal`. Like any temporary session, it is never saved and is
+    /// revoked when it drops or the process exits.
+    pub async fn issue_terminal(runtime: &Runtime) -> Result<Session> {
+        Session::issue_temporary(runtime, TERMINAL_SCOPES, TERMINAL_TTL, TERMINAL_LABEL).await
+    }
+
+    async fn issue_temporary(
+        runtime: &Runtime,
+        scopes: &[Scope],
+        ttl: &str,
+        label: &str,
+    ) -> Result<Session> {
+        let (issued, command) = issue_session(runtime, scopes, ttl, label).await?;
         track_live(&issued.session_id, &command, runtime);
         Ok(Session {
             id: issued.session_id,
@@ -302,35 +361,66 @@ impl Session {
     }
 }
 
-/// Whether the server still accepts a saved login. One local request.
+/// What `/api/auth/session` says about a session.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Checked {
+    /// `authenticated: false`. The server no longer accepts the session, such as one that
+    /// expired or was revoked.
+    Rejected,
+    /// `authenticated: true`, with the scopes `permissions` lists, or `None` from a server
+    /// that sends no `permissions`.
+    Accepted(Option<Vec<String>>),
+}
+
+/// Asks the server what it makes of `api`'s session. One request, to `api`'s origin alone.
 ///
 /// T3 answers `/api/auth/session` with 200 and `authenticated: false` for a token it no longer
 /// accepts, such as an expired or revoked one (apps/server/src/auth/EnvironmentAuth.ts:770-789
 /// at T3 f570bd21), and T3's own client renews a login on that answer alone
 /// (packages/client-runtime/src/state/session.ts:65-66). Any other answer is an error the
-/// command reports: a redirect, an error status, an answer without `authenticated`, or none.
-/// Renewing then would replace a login that may still work, or send the new one to a server
-/// t3term didn't choose.
+/// caller reports: a redirect, an error status, an answer without `authenticated` or with a
+/// `permissions` that isn't a list of scopes, or none. Replacing a session then would replace
+/// one that may still work, or send the new one to a server t3term didn't choose.
+///
+/// The session's scopes are in `permissions`. The older `scopes` field lists only the scopes
+/// clients knew before T3 split them up, so it leaves out `terminal:read`
+/// (packages/contracts/src/auth.ts:131-149), and t3term doesn't read it.
+pub(crate) async fn check_session(api: &Api) -> Result<Checked> {
+    let state = api.get("/api/auth/session").await?;
+    let unclear = |what: &str| {
+        err(
+            "T3_API_ERROR",
+            format!("T3 at {} answered /api/auth/session {what}.", api.origin),
+        )
+    };
+    match state.get("authenticated").and_then(Value::as_bool) {
+        None => Err(unclear("without saying whether it accepts the session")),
+        Some(false) => Ok(Checked::Rejected),
+        Some(true) => match state.get("permissions") {
+            None => Ok(Checked::Accepted(None)),
+            Some(listed) => listed
+                .as_array()
+                .and_then(|scopes| {
+                    let scopes = scopes
+                        .iter()
+                        .map(|scope| scope.as_str().map(str::to_string));
+                    scopes.collect::<Option<Vec<String>>>()
+                })
+                .map(|scopes| Checked::Accepted(Some(scopes)))
+                .ok_or_else(|| unclear("with permissions that aren't a list of scopes")),
+        },
+    }
+}
+
+/// Whether the server still accepts a saved login, as `check_session` reads its answer. One
+/// local request.
 async fn accepted(runtime: &Runtime, saved: &SavedLogin) -> Result<bool> {
-    let state = Api::new(runtime, &saved.token)
-        .get("/api/auth/session")
-        .await?;
-    state
-        .get("authenticated")
-        .and_then(Value::as_bool)
-        .ok_or_else(|| {
-            err(
-                "T3_API_ERROR",
-                format!(
-                    "T3 at {} answered /api/auth/session without saying whether the saved login is accepted.",
-                    runtime.origin
-                ),
-            )
-        })
+    let checked = check_session(&Api::new(runtime, &saved.token)).await?;
+    Ok(checked != Checked::Rejected)
 }
 
 /// The file every t3term process that changes this environment's saved login locks.
-fn lock_path(environment_id: &str) -> PathBuf {
+pub(crate) fn lock_path(environment_id: &str) -> PathBuf {
     let name: String = environment_id
         .chars()
         .map(|c| if c.is_ascii_alphanumeric() { c } else { '_' })
@@ -483,6 +573,7 @@ async fn issue_session(
     runtime: &Runtime,
     scopes: &[Scope],
     ttl: &str,
+    label: &str,
 ) -> Result<(Issued, T3Command)> {
     let command = resolve_t3_command(runtime)?;
     let mut issue = tokio::process::Command::from(command.command());
@@ -494,7 +585,7 @@ async fn issue_session(
         "--ttl",
         ttl,
         "--label",
-        "t3term",
+        label,
         "--subject",
         "t3term",
     ]);
@@ -598,6 +689,167 @@ impl Drop for Session {
                     .unwrap_or_else(|e| e.into_inner())
                     .push(child);
             }
+        }
+    }
+}
+
+/// Whether session `id` is one this process issued and still has to revoke.
+#[cfg(test)]
+pub(crate) fn is_live(id: &str) -> bool {
+    let live = LIVE.lock().unwrap_or_else(|e| e.into_inner());
+    live.iter().any(|(live_id, ..)| live_id == id)
+}
+
+/// The `t3` of unit tests. While a test holds a `FakeT3`, every `t3` call on its thread runs
+/// the fake instead of the server's own `t3`, so no test sets `T3TERM_T3_COMMAND` for the tests
+/// on other threads or reaches a real T3.
+#[cfg(test)]
+pub(crate) mod fake {
+    use std::cell::RefCell;
+    use std::time::Duration;
+
+    use super::T3Command;
+
+    thread_local! {
+        static T3: RefCell<Option<T3Command>> = const { RefCell::new(None) };
+    }
+
+    /// The `t3` this thread's test installed.
+    pub(super) fn t3() -> Option<T3Command> {
+        T3.with_borrow(Option::clone)
+    }
+
+    /// The fake's script. It logs each call's arguments, joined by `|`, one call to a line.
+    /// `auth session issue` prints a session numbered by the issues logged so far, `auth
+    /// session revoke` succeeds and any other call fails. While the file `hold` exists, an issue
+    /// waits, for up to 20 seconds, and while `fail` exists, it fails.
+    const SCRIPT: &str = r#"dir='{dir}'
+tag='{tag}'
+(IFS='|'; printf '%s\n' "$*") >> "$dir/log"
+case "$1 $2 $3" in
+'auth session issue')
+    n=$(grep -c '^auth|session|issue|' "$dir/log")
+    waited=0
+    while [ -e "$dir/hold" ] && [ "$waited" -lt 400 ]; do
+        sleep 0.05
+        waited=$((waited + 1))
+    done
+    if [ -e "$dir/fail" ]; then
+        echo 'the fake t3 refused to issue a session' >&2
+        exit 1
+    fi
+    printf '{"sessionId":"%s-session-%s","token":"terminal-token-%s"}\n' "$tag" "$n" "$n"
+    ;;
+'auth session revoke')
+    ;;
+*)
+    exit 2
+    ;;
+esac
+"#;
+
+    /// A stand-in `t3` in a temporary directory. It runs under `env -i` with nothing but
+    /// `PATH` set, so it sees none of the test's environment, and it reaches no T3.
+    pub(crate) struct FakeT3 {
+        dir: tempfile::TempDir,
+        /// Begins each session id, so the ids of tests that run at once never match.
+        tag: String,
+    }
+
+    impl FakeT3 {
+        /// Makes this thread's `t3` calls run a new fake until it drops.
+        pub(crate) fn install() -> FakeT3 {
+            let dir = tempfile::tempdir().unwrap();
+            let path = dir.path().to_str().unwrap().to_string();
+            assert!(!path.contains('\''), "{path}");
+            let tag = format!("fake-{}", uuid::Uuid::new_v4().simple());
+            let script = SCRIPT.replace("{dir}", &path).replace("{tag}", &tag);
+            let script_path = dir.path().join("t3");
+            std::fs::write(&script_path, script).unwrap();
+            T3.set(Some(T3Command {
+                program: "/usr/bin/env".into(),
+                args_prefix: vec![
+                    "-i".into(),
+                    "PATH=/usr/bin:/bin".into(),
+                    "/bin/sh".into(),
+                    script_path.to_str().unwrap().into(),
+                ],
+                electron_as_node: false,
+            }));
+            FakeT3 { dir, tag }
+        }
+
+        /// The id of the `n`th session the fake issued, counting from 1.
+        pub(crate) fn session_id(&self, n: usize) -> String {
+            format!("{}-session-{n}", self.tag)
+        }
+
+        /// The token of the `n`th session the fake issued.
+        pub(crate) fn token(n: usize) -> String {
+            format!("terminal-token-{n}")
+        }
+
+        /// Each call so far, its arguments joined by `|`.
+        pub(crate) fn calls(&self) -> Vec<String> {
+            let log = std::fs::read_to_string(self.dir.path().join("log")).unwrap_or_default();
+            log.lines().map(str::to_string).collect()
+        }
+
+        /// How many issues have started.
+        pub(crate) fn issues(&self) -> usize {
+            let calls = self.calls();
+            let issues = calls
+                .iter()
+                .filter(|call| call.starts_with("auth|session|issue|"));
+            issues.count()
+        }
+
+        /// Makes the issues that start from now on wait, until this is called with `false`.
+        pub(crate) fn hold_issues(&self, hold: bool) {
+            self.flag("hold", hold);
+        }
+
+        /// Makes the issues that start from now on fail, until this is called with `false`.
+        pub(crate) fn fail_issues(&self, fail: bool) {
+            self.flag("fail", fail);
+        }
+
+        fn flag(&self, name: &str, on: bool) {
+            let path = self.dir.path().join(name);
+            if on {
+                std::fs::write(path, "").unwrap();
+            } else {
+                let _ = std::fs::remove_file(path);
+            }
+        }
+
+        /// Waits up to five seconds for a call logged as `call`, and fails the test without one.
+        pub(crate) async fn wait_for(&self, call: &str) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while !self.calls().iter().any(|logged| logged == call) {
+                let calls = self.calls();
+                assert!(
+                    tokio::time::Instant::now() < deadline,
+                    "no {call} in {calls:?}"
+                );
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+
+        /// Waits up to five seconds for `count` issues to start, and fails the test otherwise.
+        pub(crate) async fn wait_for_issues(&self, count: usize) {
+            let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+            while self.issues() < count {
+                let calls = self.calls();
+                assert!(tokio::time::Instant::now() < deadline, "{calls:?}");
+                tokio::time::sleep(Duration::from_millis(20)).await;
+            }
+        }
+    }
+
+    impl Drop for FakeT3 {
+        fn drop(&mut self) {
+            T3.set(None);
         }
     }
 }
@@ -772,6 +1024,93 @@ mod tests {
             let _ = std::fs::remove_file(lock_path(&id));
         }
         assert_eq!(a.paths(), Vec::<String>::new());
+    }
+
+    /// A saved login would keep a terminal scope for 30 days, or drop it, so neither a login
+    /// nor a temporary session takes one. Nothing is looked up, run or saved.
+    #[tokio::test]
+    async fn a_login_never_carries_a_terminal_scope() {
+        keychain::fake::reset(false);
+        let t3 = super::fake::FakeT3::install();
+        let b = fake::Server::start(|_| fake::response("200 OK", &[], "{}"));
+        let id = unique_id();
+        keychain::fake::hold(&id, &fresh_login());
+        let runtime = runtime_at(&b.origin, &id);
+        let asked = [
+            vec![Scope::Read, Scope::TerminalRead],
+            vec![Scope::Read, Scope::Operate, Scope::TerminalOperate],
+        ];
+        for scopes in asked {
+            let login = Session::login(&runtime, &scopes, "12h").await;
+            assert_eq!(
+                code(&login.unwrap_err()),
+                Some("TERMINAL_SCOPE_NOT_ALLOWED")
+            );
+            let issued = Session::issue(&runtime, &scopes, "12h").await;
+            assert_eq!(
+                code(&issued.unwrap_err()),
+                Some("TERMINAL_SCOPE_NOT_ALLOWED")
+            );
+        }
+        let issued = Session::issue(&runtime, TERMINAL_SCOPES, "30d").await;
+        assert_eq!(
+            code(&issued.unwrap_err()),
+            Some("TERMINAL_SCOPE_NOT_ALLOWED")
+        );
+        assert_eq!(t3.calls(), Vec::<String>::new());
+        assert_eq!(b.paths(), Vec::<String>::new());
+        assert_eq!(keychain::fake::calls(), Vec::<Vec<String>>::new());
+    }
+
+    /// A session's scopes come from `permissions`. T3 at f570bd21 writes the older `scopes`
+    /// without `terminal:read`, and a session with `terminal:operate` alone would show the
+    /// same `scopes`, so t3term never reads it. A `permissions` that isn't a list of scopes is
+    /// an error, and `authenticated: false` means rejected whatever else the answer holds.
+    #[tokio::test]
+    async fn a_sessions_scopes_are_read_from_permissions_alone() {
+        let both = || Some(vec!["terminal:read".to_string(), "terminal:operate".into()]);
+        let answers = [
+            (
+                r#"{"authenticated":true,"scopes":["terminal:operate"],"permissions":["terminal:read","terminal:operate"]}"#,
+                Ok(Checked::Accepted(both())),
+            ),
+            (
+                r#"{"authenticated":true,"scopes":["terminal:read","terminal:operate"]}"#,
+                Ok(Checked::Accepted(None)),
+            ),
+            (
+                r#"{"authenticated":true,"scopes":["terminal:operate"],"permissions":[]}"#,
+                Ok(Checked::Accepted(Some(Vec::new()))),
+            ),
+            (
+                r#"{"authenticated":false,"permissions":["terminal:read","terminal:operate"]}"#,
+                Ok(Checked::Rejected),
+            ),
+            (
+                r#"{"authenticated":true,"permissions":"terminal:read"}"#,
+                Err("T3_API_ERROR"),
+            ),
+            (
+                r#"{"authenticated":true,"permissions":["terminal:read",1]}"#,
+                Err("T3_API_ERROR"),
+            ),
+            (
+                r#"{"authenticated":true,"permissions":null}"#,
+                Err("T3_API_ERROR"),
+            ),
+            (r#"{"permissions":[]}"#, Err("T3_API_ERROR")),
+        ];
+        for (body, expected) in answers {
+            let answer = fake::response("200 OK", &[], body);
+            let b = fake::Server::start(move |_| answer.clone());
+            let checked = check_session(&Api::without_proxy(&b.origin)).await;
+            assert_eq!(
+                checked.map_err(|error| code(&error)),
+                expected.map_err(Some),
+                "{body}"
+            );
+            assert_eq!(b.paths(), ["/api/auth/session"], "{body}");
+        }
     }
 
     #[tokio::test]
