@@ -107,6 +107,8 @@ pub struct Theme {
     pub border: Color,
     pub border_strong: Color,
     pub primary: Color,
+    /// `--primary-foreground`, text on `primary`, as on the send button.
+    pub on_primary: Color,
     pub info: Color,
     pub info_fg: Color,
     pub success: Color,
@@ -165,6 +167,8 @@ impl Theme {
             border: c(0x262626),
             border_strong: c(0x3a3a3a),
             primary: c(0x346bf1),
+            // The desktop's is white. The dark half keeps the text color it drew before.
+            on_primary: c(0xf5f5f5),
             info: c(0x2b7fff),
             info_fg: c(0x51a2ff),
             success: c(0x00d492),
@@ -216,6 +220,8 @@ impl Theme {
             border_strong: c(0xd4d4d8),
             // `--primary`, oklch(0.488 0.217 264).
             primary: c(0x1b4ed8),
+            // `--primary-foreground`, white.
+            on_primary: c(0xffffff),
             // `--info`, blue-500, and `--info-foreground`, blue-700.
             info: c(0x2b7fff),
             info_fg: c(0x1447e6),
@@ -289,6 +295,7 @@ impl Theme {
             border,
             border_strong,
             primary,
+            on_primary,
             info,
             info_fg,
             success,
@@ -327,6 +334,7 @@ impl Theme {
             *border,
             *border_strong,
             *primary,
+            *on_primary,
             *info,
             *info_fg,
             *success,
@@ -576,6 +584,25 @@ pub fn duration_label(ms: i64) -> String {
 mod tests {
     use super::*;
 
+    /// WCAG 2's contrast ratio between two 24-bit colors.
+    fn contrast(a: Color, b: Color) -> f64 {
+        let luminance = |color: Color| {
+            let Color::Rgb(r, g, b) = color else {
+                panic!("{color:?} is not 24-bit");
+            };
+            let linear = |c: u8| {
+                let c = c as f64 / 255.0;
+                match c <= 0.04045 {
+                    true => c / 12.92,
+                    false => ((c + 0.055) / 1.055).powf(2.4),
+                }
+            };
+            0.2126 * linear(r) + 0.7152 * linear(g) + 0.0722 * linear(b)
+        };
+        let (a, b) = (luminance(a), luminance(b));
+        (a.max(b) + 0.05) / (a.min(b) + 0.05)
+    }
+
     #[test]
     fn maps_hex_to_the_nearest_256_color() {
         assert_eq!(nearest_256(0, 0, 0), 16);
@@ -630,6 +657,12 @@ mod tests {
             for (what, drawn, on) in pairs {
                 assert_ne!(drawn, on, "{appearance:?}: {what}");
             }
+            // The dark half's is 4.3 to 1. The light half's text color on its blue was 2.2.
+            let reads = contrast(t.on_primary, t.primary);
+            assert!(
+                reads >= 4.0,
+                "{appearance:?}: text on primary at {reads:.1} to 1"
+            );
         }
         // The light half has the desktop's own canvas, text and blue.
         let light = Theme::light(Depth::TrueColor);

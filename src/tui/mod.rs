@@ -3302,7 +3302,7 @@ impl App {
             frame.render_widget(
                 Paragraph::new(Line::styled(
                     label.clone(),
-                    Style::new().fg(t.fg).bg(t.primary),
+                    Style::new().fg(t.on_primary).bg(t.primary),
                 )),
                 Rect::new(x, area.y + area.height - 1, label.width() as u16, 1),
             );
@@ -3428,7 +3428,7 @@ impl App {
         let button = |label: &str, primary: bool| {
             let style = if primary {
                 Style::new()
-                    .fg(t.fg)
+                    .fg(t.on_primary)
                     .bg(t.primary)
                     .add_modifier(Modifier::BOLD)
             } else {
@@ -3642,7 +3642,7 @@ impl App {
             Style::new().fg(t.muted).bg(t.chip_bg)
         } else {
             Style::new()
-                .fg(t.fg)
+                .fg(t.on_primary)
                 .bg(t.primary)
                 .add_modifier(Modifier::BOLD)
         };
@@ -13805,6 +13805,37 @@ mod tests {
             assert_eq!(app.appearance_mode, AppearanceMode::System);
             assert_eq!(app.theme.appearance, Light);
         });
+    }
+
+    #[test]
+    fn text_on_the_primary_color_takes_its_own_color() {
+        let runtime = idle_runtime();
+        let _entered = runtime.enter();
+        let mut app = crowded();
+        let request = json!({"id": "q1", "kind": "command", "status": "pending"});
+        app.on_thread_event(live(2, "runtime-request.updated", request));
+        app.composer.insert('x');
+        cells(&mut app, 80, 24);
+        press(&mut app, KeyCode::PageUp);
+        for mode in [AppearanceMode::Light, AppearanceMode::Dark] {
+            while app.appearance_mode != mode {
+                alt_shift_a(&mut app);
+            }
+            let t = app.theme.clone();
+            let buffer = cells(&mut app, 80, 24);
+            // The send button, Approve and how far the transcript is scrolled, and nothing on
+            // the primary color in another.
+            let on_primary: String = buffer
+                .content
+                .iter()
+                .filter(|cell| cell.bg == t.primary)
+                .inspect(|cell| assert_eq!(cell.fg, t.on_primary, "{mode:?}"))
+                .map(|cell| cell.symbol())
+                .collect();
+            assert!(on_primary.contains("Approve"), "{mode:?}: {on_primary}");
+            assert!(on_primary.contains('↑'), "{mode:?}: {on_primary}");
+            assert!(on_primary.contains("more"), "{mode:?}: {on_primary}");
+        }
     }
 
     #[test]
