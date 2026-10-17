@@ -33,6 +33,7 @@ SCOPE_FOR = {
     'subscribeServerConfig': 'orchestration:read',
     'subscribeWorktreeSetup': 'orchestration:read',
     'orchestration.dispatchCommand': 'orchestration:operate',
+    'orchestration.launchThread': 'orchestration:operate',
     'terminal.open': 'terminal:operate',
     'terminal.attach': 'terminal:operate',
     'terminal.observe': 'terminal:read',

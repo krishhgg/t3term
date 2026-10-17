@@ -14,7 +14,8 @@ use t3term::client::{Client, IfBusy, WatchEvent};
 use t3term::discovery::{self, Runtime, Target};
 use t3term::environments::{self, Phase, Probe};
 use t3term::error::{T3Error, err, err_exit, exit};
-use t3term::models::{self, Choice, Plan};
+use t3term::launch::{self, LaunchReceipt, LaunchRequest, Workspace};
+use t3term::models::{self, Choice, ModeSource, Plan};
 use t3term::projection::{Applied, ThreadState, is_active_status, is_terminal_status, status};
 use t3term::transcript::{self, plain};
 
@@ -81,6 +82,32 @@ enum Command {
         /// What to do if the thread is already working.
         #[arg(long, value_enum, default_value_t = BusyArg::Refuse)]
         if_busy: BusyArg,
+        #[command(flatten)]
+        choice: ChoiceArgs,
+    },
+    /// Start a new thread in a project with its first message, and return once T3 accepts it.
+    /// The agent starts after T3 prepares the workspace; `t3term wait` follows it. Without
+    /// --mode, the thread takes the project's default runtime mode in T3's settings, else the
+    /// environment's, else full access, as the desktop app does.
+    Launch {
+        /// Project id, unique id prefix, or exact title. `t3term projects` lists them.
+        project: String,
+        /// The first message. Omit it to read stdin.
+        prompt: Option<String>,
+        /// The thread's title. Without it, the title starts as the message's first 50
+        /// characters and T3 writes a better one.
+        #[arg(long)]
+        title: Option<String>,
+        /// Work in a new git worktree made from this branch, tag or commit, instead of in the
+        /// project's folder.
+        #[arg(long, value_name = "BASE_REF")]
+        worktree: Option<String>,
+        /// The new worktree's branch. Without it, T3 makes a temporary branch and renames it.
+        #[arg(long, requires = "worktree")]
+        branch: Option<String>,
+        /// Fetch origin first and start the worktree from origin's copy of the base ref.
+        #[arg(long, requires = "worktree")]
+        from_origin: bool,
         #[command(flatten)]
         choice: ChoiceArgs,
     },
@@ -165,7 +192,8 @@ enum EnvironmentCommand {
     },
 }
 
-/// Model and mode choices. Anything left out keeps the thread's current value.
+/// Model and mode choices. Anything left out keeps the thread's current value. `launch` needs
+/// --model, and takes the default modes for what else is left out.
 #[derive(Args)]
 struct ChoiceArgs {
     /// Model as provider/model, a model id or its name. `t3term models` lists them.
@@ -457,15 +485,19 @@ async fn hangup_or_terminate() -> i32 {
 }
 
 fn report(error: &anyhow::Error, json_mode: bool) -> i32 {
-    let (code, exit_code) = match error.downcast_ref::<T3Error>() {
-        Some(t3) => (t3.code, t3.exit_code),
-        None => ("ERROR", exit::FAILURE),
-    };
+    let t3 = error.downcast_ref::<T3Error>();
+    let (code, exit_code) = t3.map_or(("ERROR", exit::FAILURE), |t3| (t3.code, t3.exit_code));
     // `println!` panics when the terminal is gone, and a panic here would skip the revoke in
     // `main`, so write without panicking.
     let message = error.to_string();
     if json_mode {
-        let body = json!({"ok": false, "error": {"code": code, "message": message}});
+        let mut body = json!({"ok": false, "error": {"code": code, "message": message}});
+        // Details sit beside `error` and never replace `ok` or `error`.
+        if let (Some(t3), Some(fields)) = (t3, body.as_object_mut()) {
+            for (key, value) in &t3.details {
+                fields.entry(key.as_str()).or_insert_with(|| value.clone());
+            }
+        }
         let _ = writeln!(std::io::stdout(), "{}", json_text(&body, false));
     } else {
         let _ = writeln!(std::io::stderr(), "t3term: {} [{code}]", plain(&message));
@@ -772,6 +804,76 @@ async fn run(cli: Cli) -> Result<i32> {
             )
             .await
         }
+        Command::Launch {
+            project,
+            prompt,
+            title,
+            worktree,
+            branch,
+            from_origin,
+            choice,
+        } => {
+            // Everything that needs no server is checked before t3term connects or logs in.
+            let choice = choice.choice()?;
+            if choice
+                .model
+                .as_deref()
+                .is_none_or(|model| model.trim().is_empty())
+            {
+                return Err(models::model_required());
+            }
+            if project.trim().is_empty() {
+                return Err(err_exit(
+                    "PROJECT_REQUIRED",
+                    exit::USAGE,
+                    "Name a project. `t3term projects` lists them.",
+                ));
+            }
+            let prompt = match prompt {
+                Some(prompt) => prompt,
+                None => read_stdin().await?,
+            };
+            launch::check_prompt(&prompt)?;
+            launch::launch_title(&prompt, title.as_deref())?;
+            let workspace = match worktree {
+                None => Workspace::Root,
+                Some(base_ref) => Workspace::Worktree {
+                    base_ref,
+                    branch,
+                    start_from_origin: from_origin,
+                },
+            }
+            .checked()?;
+
+            let client = connect(environment, OPERATE, "10m").await?;
+            let shell = client.shell().await?;
+            let project = resolve_project(&shell.projects, &project)?;
+            let project_id = text(&project["id"]);
+            let config = client.server_config().await?;
+            let (plan, source) = models::plan_new_thread(&config, project_id, &choice)?;
+            let request = LaunchRequest::new(
+                &client,
+                project_id,
+                &prompt,
+                title.as_deref(),
+                &plan,
+                workspace,
+            )?;
+            let receipt = client
+                .launch_thread(&request)
+                .await
+                .map_err(|error| with_next_step(error, environment))?;
+            let output = if json_mode {
+                json_text(&launch_json(&request, &receipt, project, source), true) + "\n"
+            } else {
+                launch_text(&request, &receipt, project, source, environment)
+            };
+            // T3 has the thread now. A reader that closed stdout must not panic past the revoke
+            // in `main`, and must not make the launch look unconfirmed.
+            write_stdout(&output)
+                .map_err(|error| unprinted_launch(&request, &receipt, environment, &error))?;
+            Ok(0)
+        }
         Command::Wait { thread, timeout } => {
             let ttl = format!("{}m", timeout / 60 + 10);
             let client = connect(environment, READ, &ttl).await?;
@@ -957,6 +1059,221 @@ async fn resolve_thread(client: &Client, query: &str) -> Result<String> {
             ),
         )),
     }
+}
+
+/// Accepts a full project id, a unique id prefix, or an exact title. T3's shell lists only the
+/// projects it hasn't deleted.
+fn resolve_project<'a>(projects: &'a [Value], query: &str) -> Result<&'a Value> {
+    if let Some(project) = projects.iter().find(|p| p["id"].as_str() == Some(query)) {
+        return Ok(project);
+    }
+    let matches: Vec<&Value> = projects
+        .iter()
+        .filter(|p| {
+            p["id"].as_str().is_some_and(|id| id.starts_with(query))
+                || p["title"].as_str() == Some(query)
+        })
+        .collect();
+    match matches.as_slice() {
+        [only] => Ok(*only),
+        [] => Err(err_exit(
+            "PROJECT_NOT_FOUND",
+            exit::NOT_FOUND,
+            format!("No project matches {query}. `t3term projects` lists them."),
+        )),
+        _ => Err(err_exit(
+            "AMBIGUOUS_PROJECT",
+            exit::USAGE,
+            format!(
+                "{} projects match {query}: {}. Use more of the id.",
+                matches.len(),
+                matches
+                    .iter()
+                    .map(|p| format!("{} {}", short(&p["id"]), shown(&p["title"])))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ),
+        )),
+    }
+}
+
+/// Reads stdin to the end on a blocking thread, so the runtime's other tasks keep running.
+async fn read_stdin() -> Result<String> {
+    let read = tokio::task::spawn_blocking(|| {
+        let mut buffer = String::new();
+        std::io::stdin().read_to_string(&mut buffer).map(|_| buffer)
+    });
+    Ok(read.await??)
+}
+
+/// A t3term command that goes to the same environment as this run. Environment names hold only
+/// a-z, 0-9, `-` and `_`, so the command needs no quoting.
+fn next_command(environment: Option<&str>, args: &[&str]) -> String {
+    let mut words = vec!["t3term"];
+    if let Some(name) = environment {
+        words.extend(["--environment", name]);
+    }
+    words.extend(args);
+    words.join(" ")
+}
+
+/// Adds the command that reads the thread to a launch error that carries its ids: in the
+/// message, and as `read` beside the error in `--json`.
+fn with_next_step(error: anyhow::Error, environment: Option<&str>) -> anyhow::Error {
+    let mut t3 = match error.downcast::<T3Error>() {
+        Ok(t3) => t3,
+        Err(error) => return error,
+    };
+    let detail = |key: &str| t3.details.get(key).and_then(Value::as_str);
+    let (Some(thread), Some(outcome)) = (detail("threadId"), detail("outcome")) else {
+        return t3.into();
+    };
+    let read = next_command(environment, &["read", thread]);
+    let hint = match outcome {
+        "unknown" => format!(
+            " Run `{read}` to look for it. If it isn't there, T3 may still create it, so launching again could start a second thread."
+        ),
+        _ => format!(" Run `{read}` to see whether T3 left the thread behind."),
+    };
+    t3.message.push_str(&hint);
+    t3.details.insert("read".into(), json!(read));
+    t3.into()
+}
+
+/// Writes `text` to stdout and flushes it. `print!` panics when stdout's reader has gone, and
+/// the panic would skip the revoke in `main`, so this returns the error instead.
+fn write_stdout(text: &str) -> std::io::Result<()> {
+    let mut stdout = std::io::stdout().lock();
+    stdout.write_all(text.as_bytes())?;
+    stdout.flush()
+}
+
+/// The error for a launch T3 accepted whose result t3term couldn't write. It names the thread,
+/// because launching again would start a second one.
+fn unprinted_launch(
+    request: &LaunchRequest,
+    receipt: &LaunchReceipt,
+    environment: Option<&str>,
+    error: &std::io::Error,
+) -> anyhow::Error {
+    let thread = receipt.thread_id.as_str();
+    let read = next_command(environment, &["read", thread]);
+    let mut details = request.ids();
+    details.insert("outcome".into(), json!("accepted"));
+    details.insert("read".into(), json!(read));
+    T3Error::new(
+        "OUTPUT_FAILED",
+        format!(
+            "T3 accepted the launch of thread {thread}, but t3term couldn't print it: {error}. Launching again would start a second thread. Run `{read}` to see this one."
+        ),
+    )
+    .with_details(details)
+    .into()
+}
+
+fn mode_source_text(source: ModeSource) -> &'static str {
+    match source {
+        ModeSource::Chosen => "chosen",
+        ModeSource::Project => "project default",
+        ModeSource::Environment => "environment default",
+    }
+}
+
+fn workspace_text(workspace: &Workspace) -> String {
+    match workspace {
+        Workspace::Root => "the project's folder".into(),
+        Workspace::Worktree {
+            base_ref,
+            branch,
+            start_from_origin,
+        } => {
+            let mut text = format!("a new worktree from {}", plain(base_ref));
+            if *start_from_origin {
+                text += ", fetched from origin if it has one";
+            }
+            if let Some(branch) = branch {
+                text += &format!(", on branch {}", plain(branch));
+            }
+            text
+        }
+    }
+}
+
+fn launch_json(
+    request: &LaunchRequest,
+    receipt: &LaunchReceipt,
+    project: &Value,
+    source: ModeSource,
+) -> Value {
+    let mut body = serde_json::Map::new();
+    body.insert("ok".into(), json!(true));
+    body.extend(request.ids());
+    body.extend([
+        ("runId".into(), json!(receipt.run_id)),
+        ("runStatus".into(), json!(receipt.run_status)),
+        ("resumed".into(), json!(receipt.resumed)),
+        ("projectTitle".into(), project["title"].clone()),
+        ("title".into(), json!(request.title())),
+        ("generateTitle".into(), json!(request.generate_title())),
+        ("modelSelection".into(), request.model_selection().clone()),
+        ("runtimeMode".into(), json!(request.runtime_mode())),
+        ("runtimeModeSource".into(), json!(source.as_str())),
+        ("interactionMode".into(), json!(request.interaction_mode())),
+        ("workspaceStrategy".into(), request.workspace().strategy()),
+    ]);
+    Value::Object(body)
+}
+
+fn launch_text(
+    request: &LaunchRequest,
+    receipt: &LaunchReceipt,
+    project: &Value,
+    source: ModeSource,
+    environment: Option<&str>,
+) -> String {
+    let id = receipt.thread_id.as_str();
+    let selection = request.model_selection();
+    let environment_id = plain(request.environment_id());
+    let title = plain(request.title());
+    let mut out = format!("launched {}  {title}\n", short(&json!(id)));
+    out += &match environment {
+        Some(name) => format!("  environment  {name} ({environment_id})\n"),
+        None => format!("  environment  {environment_id}\n"),
+    };
+    out += &format!(
+        "  project      {}  {}\n",
+        short(&project["id"]),
+        shown(&project["title"])
+    );
+    out += &format!(
+        "  model        {}/{}\n",
+        shown(&selection["instanceId"]),
+        shown(&selection["model"])
+    );
+    let plan_mode = if request.interaction_mode() == "plan" {
+        "on"
+    } else {
+        "off"
+    };
+    out += &format!(
+        "  mode         {} ({}), plan mode {plan_mode}\n",
+        models::runtime_mode_label(request.runtime_mode()),
+        mode_source_text(source),
+    );
+    out += &format!("  workspace    {}\n", workspace_text(request.workspace()));
+    if receipt.run_status == "preparing" {
+        out += "T3 accepted the launch and is preparing the workspace. The agent starts when it's ready.\n";
+    } else {
+        out += &format!(
+            "T3 accepted the launch. Its first run is {}.\n",
+            plain(&receipt.run_status)
+        );
+    }
+    out += &format!(
+        "Follow it with `{}`.\n",
+        next_command(environment, &["wait", id])
+    );
+    out
 }
 
 /// Streams the reply to `message_id` to stdout and returns when its run ends or needs a person.
