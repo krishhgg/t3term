@@ -1546,7 +1546,8 @@ impl App {
 
     /// A key for the details while they have the keyboard. Esc closes a dialog. On a pane it
     /// gives the keyboard back and leaves the pane open. → or `l` shows the thread's pull
-    /// requests, and ← or `h` goes back: from a pull request's details to the list, and from
+    /// requests, or a pull request's Timeline in place of its Summary, and ← or `h` goes back:
+    /// from the Timeline to the Summary, from a pull request's details to the list, and from
     /// the list to the thread's tab. On the thread's tab the up and down arrows, `j` and `k`
     /// choose among Lineage's rows, and scroll the text past them or without them, and Enter
     /// acts on the chosen row. On the pull requests' tab they move along the pull requests, or
@@ -1563,8 +1564,8 @@ impl App {
             KeyCode::Esc => self.close_details(),
             KeyCode::Left => self.details.back(),
             KeyCode::Char('h') if plain => self.details.back(),
-            KeyCode::Right => self.details.show(details::Tab::PullRequests),
-            KeyCode::Char('l') if plain => self.details.show(details::Tab::PullRequests),
+            KeyCode::Right => self.details.forward(),
+            KeyCode::Char('l') if plain => self.details.forward(),
             KeyCode::Enter => {
                 if let Some(target) = self.details.enter() {
                     self.act_on_lineage(target);
@@ -13340,7 +13341,12 @@ mod tests {
     /// The conversation on `host_detail`'s pull request: a remark, then octocat's approval
     /// under another casing of their login.
     fn host_activity() -> pull_request::Activity {
-        let activity = json!({
+        pull_request::Activity::read(&host_activity_sent()).unwrap()
+    }
+
+    /// `host_activity` as T3 sends it.
+    fn host_activity_sent() -> Value {
+        json!({
             "reviewers": [{"login": "octocat", "name": null, "isBot": false}],
             "comments": [
                 {"id": "c1", "kind": "issue-comment", "author": {"login": "mona",
@@ -13352,8 +13358,42 @@ mod tests {
                     "path": null, "reviewState": "APPROVED"}
             ],
             "commentCount": 2, "commentsTruncated": false, "reviewThreads": [], "commits": []
-        });
-        pull_request::Activity::read(&activity).unwrap()
+        })
+    }
+
+    /// The time `ms` after the Unix epoch as T3 writes it, in UTC to the second.
+    fn iso_at(ms: i64) -> String {
+        let (days, second) = (ms.div_euclid(86_400_000), ms.rem_euclid(86_400_000) / 1000);
+        // The inverse of `parse_iso_ms`'s days from a civil date.
+        let z = days + 719_468;
+        let era = z.div_euclid(146_097);
+        let doe = z - era * 146_097;
+        let yoe = (doe - doe / 1460 + doe / 36_524 - doe / 146_096) / 365;
+        let doy = doe - (365 * yoe + yoe / 4 - yoe / 100);
+        let mp = (5 * doy + 2) / 153;
+        let day = doy - (153 * mp + 2) / 5 + 1;
+        let month = if mp < 10 { mp + 3 } else { mp - 9 };
+        let year = yoe + era * 400 + i64::from(month <= 2);
+        let (hour, minute) = (second / 3600, second / 60 % 60);
+        format!(
+            "{year:04}-{month:02}-{day:02}T{hour:02}:{minute:02}:{:02}Z",
+            second % 60
+        )
+    }
+
+    #[test]
+    fn iso_at_writes_the_time_parse_iso_ms_reads() {
+        for ms in [
+            0,
+            951_782_400_000,
+            1_709_164_800_000,
+            1_791_882_000_000,
+            4_107_542_399_000,
+            now_ms() / 1000 * 1000,
+        ] {
+            assert_eq!(parse_iso_ms(&iso_at(ms)), Some(ms), "{ms}");
+        }
+        assert_eq!(iso_at(1_791_882_000_000), "2026-10-13T09:00:00Z");
     }
 
     /// Gives `app` the parts of read `ticket`'s answer, in order.
@@ -13459,6 +13499,97 @@ mod tests {
         press(&mut app, KeyCode::Left);
         assert!(!app.details.pulls.viewing());
         assert!(!status(&mut app).contains("Enter hide"));
+    }
+
+    #[test]
+    fn the_arrows_and_a_click_show_a_links_timeline_and_the_keys_say_so() {
+        use pull_requests::Tab;
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        let _asked = note_reads(&mut app);
+        press(&mut app, KeyCode::Enter);
+        let status = |app: &mut App| {
+            let buffer = cells(app, 200, 50);
+            text_in(&buffer, Rect::new(0, 49, 200, 1))
+        };
+        // Until the host's detail came, the details have no tabs, and → leaves them be.
+        press(&mut app, KeyCode::Right);
+        assert!(app.details.pulls.viewing());
+        assert_eq!(app.details.pulls.tabs(), None);
+        let shown = status(&mut app);
+        assert!(
+            shown.contains("↑↓/PgUp scroll · ← list · Esc leave"),
+            "{shown}"
+        );
+        // The frames read the real clock, so the remark and the review came 26 and 25 hours
+        // before it, and the remark's age reads the same on any day.
+        let mut activity = host_activity_sent();
+        for (at, hours) in [(0, 26), (1, 25)] {
+            let came = iso_at(now_ms() - hours * 3_600_000);
+            activity["comments"][at]["createdAt"] = json!(came);
+        }
+        let activity = pull_request::Activity::read(&activity).unwrap();
+        let parts = vec![
+            Part::Detail(Ok(Box::new(host_detail()))),
+            Part::Activity(Ok(Box::new(activity))),
+            Part::Done,
+        ];
+        hear(&mut app, 1, parts);
+        let shown = status(&mut app);
+        let hint = "↑↓/PgUp scroll · → timeline · ← list · Esc leave";
+        assert!(shown.contains(hint), "{shown}");
+        let rows = body_after(&mut app, 200, 50);
+        // The pane is too narrow for where the link is in the list as well.
+        assert_eq!(rows[0], "← List  Summary  Timeline");
+
+        // → or `l` shows the Timeline, and ← or `h` the Summary, then the list.
+        press(&mut app, KeyCode::Right);
+        assert_eq!(app.details.pulls.tabs(), Some(Tab::Timeline));
+        let shown = status(&mut app);
+        assert!(
+            shown.contains("↑↓/PgUp scroll · ← summary · Esc leave"),
+            "{shown}"
+        );
+        let rows = body_after(&mut app, 200, 50);
+        let text: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
+        for shown in [
+            "✓ Octocat approved",
+            "› 1 comment",
+            "1 author · 1d ago",
+            "● Pull request opened",
+        ] {
+            assert!(text.contains(&shown), "{shown:?} in {text:#?}");
+        }
+        let header = text.iter().position(|row| *row == "2 comments · 0 commits");
+        let header = header.expect("the header");
+        assert_eq!(text[header + 1..header + 3], ["1 approval", "Newest first"]);
+        assert!(!text.contains(&"Checks"), "{text:#?}");
+        for (code, tab, viewing) in [
+            (KeyCode::Char('l'), Some(Tab::Timeline), true),
+            (KeyCode::Left, Some(Tab::Summary), true),
+            (KeyCode::Char('l'), Some(Tab::Timeline), true),
+            (KeyCode::Char('h'), Some(Tab::Summary), true),
+            (KeyCode::Left, None, false),
+            (KeyCode::Enter, Some(Tab::Summary), true),
+        ] {
+            press(&mut app, code);
+            assert_eq!(app.details.pulls.tabs(), tab, "{code:?}");
+            assert_eq!(app.details.pulls.viewing(), viewing, "{code:?}");
+            assert_eq!(app.details.tab(), details::Tab::PullRequests, "{code:?}");
+        }
+
+        // A click on a tab's name shows it, and one on `← List` shows the list.
+        cells(&mut app, 200, 50);
+        let body = app.details.drawn.expect("the pane").body;
+        assert!(mouse(&mut app, CLICK, body.x + 18, body.y));
+        assert_eq!(app.details.pulls.tabs(), Some(Tab::Timeline));
+        cells(&mut app, 200, 50);
+        assert!(mouse(&mut app, CLICK, body.x + 9, body.y));
+        assert_eq!(app.details.pulls.tabs(), Some(Tab::Summary));
+        cells(&mut app, 200, 50);
+        assert!(mouse(&mut app, CLICK, body.x + 18, body.y));
+        cells(&mut app, 200, 50);
+        assert!(mouse(&mut app, CLICK, body.x + 1, body.y));
+        assert!(!app.details.pulls.viewing());
     }
 
     #[test]
@@ -14348,11 +14479,28 @@ mod tests {
             assert!(shown.contains("Second paragraph.") && shown.contains("Looks close."));
             app
         };
+        // And its Timeline, with the verdict on a row of its own and the run with the remark open.
+        let pull_timeline = || {
+            let mut app = pull_answered();
+            press(&mut app, KeyCode::Right);
+            cells(&mut app, 200, 50);
+            // The run that holds the remark opens: Newest first, then the run.
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Down);
+            press(&mut app, KeyCode::Enter);
+            let shown = text_in(&cells(&mut app, 200, 50), Rect::new(0, 0, 200, 50));
+            assert!(
+                shown.contains("Newest first") && shown.contains("Looks close."),
+                "{shown}"
+            );
+            app
+        };
         let scenes = [
             ("crowded", crowded(), 80, 24),
             ("crowded with details", crowded_details(), 200, 50),
             ("a pull request's details", pull_details(), 120, 40),
             ("a pull request's host answer", pull_answered(), 200, 50),
+            ("a pull request's Timeline", pull_timeline(), 200, 50),
         ];
         for (scene, mut app, width, height) in scenes {
             let composer = app.composer.text();
@@ -14387,8 +14535,8 @@ mod tests {
                 AppearanceMode::Dark
             );
         }
-        // Only the turn to System read anything.
-        assert_eq!(reads(&runtime), 4);
+        // Only the turn to System read anything, once a scene.
+        assert_eq!(reads(&runtime), 5);
     }
 
     #[test]

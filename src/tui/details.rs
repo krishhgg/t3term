@@ -39,7 +39,7 @@ use unicode_width::UnicodeWidthStr;
 
 use super::environment::Identity;
 use super::lineage::{self, Group, Lineage, Paging, Target};
-use super::pull_requests::{Part, PullRequests};
+use super::pull_requests::{Part, PullRequests, Tab as PullTab};
 use super::setup::bounded;
 use super::tasks::wrap;
 use super::theme::Theme;
@@ -990,8 +990,21 @@ impl Details {
         }
     }
 
-    /// Goes back a step: from a pull request's details to the list, or from the pull requests
-    /// to the thread's tab.
+    /// Goes a step on: from the thread's tab to the pull requests, or from a pull request's
+    /// Summary to its Timeline.
+    pub fn forward(&mut self) {
+        match self.tab {
+            Tab::Thread => self.show(Tab::PullRequests),
+            Tab::PullRequests => {
+                if self.pulls.forward() {
+                    self.moved = true;
+                }
+            }
+        }
+    }
+
+    /// Goes back a step: from a pull request's Timeline to its Summary, from its details to the
+    /// list, or from the pull requests to the thread's tab.
     pub fn back(&mut self) {
         if self.tab == Tab::PullRequests && self.pulls.back() {
             self.moved = true;
@@ -1058,9 +1071,15 @@ impl Details {
         keys
     }
 
-    /// The keys of `keys` for a tab with no Lineage rows to choose.
+    /// The keys of `keys` for a tab with no Lineage rows to choose. A pull request's details
+    /// offer → to the Timeline from the Summary, and ← back to the Summary from it, once they
+    /// have tabs.
     fn plain_keys(&self, modal: bool) -> &'static [&'static str] {
-        match (self.tab, self.pulls.viewing(), modal) {
+        let pulls = match (self.pulls.viewing(), self.pulls.tabs()) {
+            (false, _) => None,
+            (true, tab) => Some(tab),
+        };
+        match (self.tab, pulls, modal) {
             (Tab::Thread, _, true) => &[
                 "↑↓/PgUp scroll · Esc close · → pull requests",
                 "↑↓/PgUp scroll · Esc close · → PRs",
@@ -1075,30 +1094,56 @@ impl Details {
                 "Esc leave · → PRs",
                 "Esc leave",
             ],
-            (Tab::PullRequests, false, true) => &[
+            (Tab::PullRequests, None, true) => &[
                 "↑↓ select · Enter details · ← thread · Esc close",
                 "↑↓ · Enter details · ← thread · Esc close",
                 "↑↓ · Enter · ← thread · Esc close",
                 "Esc close · ← thread",
                 "Esc close",
             ],
-            (Tab::PullRequests, false, false) => &[
+            (Tab::PullRequests, None, false) => &[
                 "↑↓ select · Enter details · ← thread · Esc leave · Alt+B close · Tab focus",
                 "↑↓ · Enter details · ← thread · Esc leave · Alt+B close",
                 "↑↓ · Enter · ← thread · Esc leave",
                 "Esc leave · ← thread",
                 "Esc leave",
             ],
-            (Tab::PullRequests, true, true) => &[
+            (Tab::PullRequests, Some(None), true) => &[
                 "↑↓/PgUp scroll · ← list · Esc close",
                 "↑↓ scroll · ← list · Esc close",
                 "Esc close · ← list",
                 "Esc close",
             ],
-            (Tab::PullRequests, true, false) => &[
+            (Tab::PullRequests, Some(None), false) => &[
                 "↑↓/PgUp scroll · ← list · Esc leave · Alt+B close · Tab focus",
                 "↑↓ scroll · ← list · Esc leave · Alt+B close",
                 "Esc leave · ← list",
+                "Esc leave",
+            ],
+            (Tab::PullRequests, Some(Some(PullTab::Summary)), true) => &[
+                "↑↓/PgUp scroll · → timeline · ← list · Esc close",
+                "↑↓ scroll · → timeline · ← list · Esc close",
+                "→ timeline · ← list · Esc close",
+                "Esc close · ← list",
+                "Esc close",
+            ],
+            (Tab::PullRequests, Some(Some(PullTab::Summary)), false) => &[
+                "↑↓/PgUp scroll · → timeline · ← list · Esc leave · Alt+B close · Tab focus",
+                "↑↓ scroll · → timeline · ← list · Esc leave · Alt+B close",
+                "→ timeline · ← list · Esc leave",
+                "Esc leave · ← list",
+                "Esc leave",
+            ],
+            (Tab::PullRequests, Some(Some(PullTab::Timeline)), true) => &[
+                "↑↓/PgUp scroll · ← summary · Esc close",
+                "↑↓ scroll · ← summary · Esc close",
+                "Esc close · ← summary",
+                "Esc close",
+            ],
+            (Tab::PullRequests, Some(Some(PullTab::Timeline)), false) => &[
+                "↑↓/PgUp scroll · ← summary · Esc leave · Alt+B close · Tab focus",
+                "↑↓ scroll · ← summary · Esc leave · Alt+B close",
+                "Esc leave · ← summary",
                 "Esc leave",
             ],
         }
@@ -1106,7 +1151,8 @@ impl Details {
 
     /// A click at `column`, `row`, inside the card the last frame drew: on a tab's name it shows
     /// that tab, and on a pull request it selects it, or shows its details when it is selected
-    /// already. On the row above those details it shows the list again. Says whether it changed
+    /// already. On the row above those details it shows the Summary or the Timeline whose name
+    /// it is on, or else the list again. Says whether it changed
     /// what shows. A click on a Lineage row is the caller's, by `target_at`.
     pub fn click(&mut self, column: u16, row: u16) -> bool {
         let Some(drawn) = self.drawn else {
@@ -1122,7 +1168,8 @@ impl Details {
         if self.tab != Tab::PullRequests || !drawn.body.contains(at) {
             return false;
         }
-        let changed = self.pulls.click(usize::from(row - drawn.body.y));
+        let column = usize::from(column - drawn.body.x);
+        let changed = self.pulls.click(column, usize::from(row - drawn.body.y));
         if changed {
             self.moved = true;
         }
