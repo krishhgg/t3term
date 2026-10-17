@@ -10,7 +10,7 @@
 - **No fallback.** Each environment is checked at its own origin alone, never at `T3TERM_ORIGIN`, `T3CODE_HOME`'s server, the default's or another environment's.
 - **The Environments dialog.** Alt+C, or a click on the environment under the sidebar's wordmark, opens it over the sidebar. The title row reads `Environments` with `checking…` while a check runs and `×` at its end, then `Connected to` and the label and address the TUI is connected to. Each saved environment has a row in name order: a dot, the name, the phase, `connected` when its server reports the TUI's environment id, `default`, then its label and address as far as they fit. Under the list are the chosen environment's facts: for a ready one its label and address, `T3 <version>` and `T3 home <path>`, and for another its code, three rows of its message and its T3 home. A file that doesn't parse shows `Could not read` and the error, and no file shows `No saved environments.`
 - **The dialog's check.** The same check as `environment status`, once when the dialog opens and once for each `r`, never on a timer. It logs in nowhere and opens no socket.
-- **The dialog's keys.** ↑/↓, `j`/`k`, Home/End and `g`/`G` choose, as do a click on a row and the wheel. `r` checks again and keeps the choice. Esc, Alt+C, a click on `×` and a click outside close it. The status line reads `↑↓ select · r check again · Esc close`. While it shows, every other key but Ctrl+C, Ctrl+Q and Ctrl+X reaches nothing, and a paste goes nowhere.
+- **The dialog's keys.** ↑/↓, `j`/`k`, Home/End and `g`/`G` choose, as do a click on a row and the wheel. Each wheel notch moves the choice a row, however fast the notches come. `r` checks again and keeps the choice. Esc, Alt+C, a click on `×` and a click outside close it. The status line reads `↑↓ select · r check again · Esc close`. While it shows, every other key but Ctrl+C, Ctrl+Q and Ctrl+X reaches nothing, and a paste goes nowhere.
 - **The descriptor cap.** Every descriptor read, a command's or a status check's, stops at 256 KiB. A longer descriptor is `T3_DESCRIPTOR_INVALID`, exit 4 and `blocked` in status, and the command logs in nowhere.
 
 ## How to get to it (user POV)
@@ -21,7 +21,7 @@ In the TUI, Alt+C from any pane, or a click on the environment under the sidebar
 
 ## Driving it with t3v
 
-Scenario `links` at 200x50. One run stands for three environments. `ready` is the run's own T3 home, with the id its server reports written into `userdata/environment-id`. `moved` has a home of its own that holds another id, and saves the run's origin, so the server there answers as another environment. `gone` saves `http://127.0.0.1:1`, where nothing listens.
+Scenario `links` at 200x50. One run stands for four environments. `ready` is the run's own T3 home, with the id its server reports written into `userdata/environment-id`. `moved` has a home of its own that holds another id, and saves the run's origin, so the server there answers as another environment. `gone` saves `http://127.0.0.1:1`, where nothing listens. `spare` saves the same address and is added before the dialog's clicks, so the wheel has four rows to cross.
 
 ```bash
 $T3V start
@@ -69,9 +69,14 @@ $T3V keys w && $T3V wait --idle 300        # the sidebar's w reaches nothing whi
 $T3V keys M-c && $T3V wait --gone "Connected to" --text "Working (0) ──────────────── ⌄" --text "w working"
 
 # A click on the environment under the wordmark opens it, a click on a row or the wheel chooses, and × or a click outside closes it.
-$T3V click --text "Fixture Mac · 127.0.0.1:" && $T3V wait --text "Connected to" --text "T3 0.0.46-t3v"
+mkdir -p "$RUN/envs/spare/userdata" && echo env-spare > "$RUN/envs/spare/userdata/environment-id"
+eval "$L environment add spare --t3-home $RUN/envs/spare --origin http://127.0.0.1:1"
+$T3V click --text "Fixture Mac · 127.0.0.1:" && $T3V wait --text "Connected to" --text "T3 0.0.46-t3v" --text "● spare  offline"
 $T3V click --text "● moved" && $T3V wait --text "T3_ENVIRONMENT_MISMATCH"
 $T3V click --text "● moved" --button wheel-down && $T3V wait --text "T3 0.0.46-t3v"
+# Three notches in one write, faster than frames, each move the choice a row.
+$T3V click --text "● gone" && $T3V wait --text "T3 home $RUN/envs/gone"
+$T3V click --text "● gone" --button wheel-down --repeat 3 && $T3V wait --text "T3 home $RUN/envs/spare"
 $T3V click --text "×" && $T3V wait --gone "Connected to"
 $T3V keys M-c && $T3V wait --text "T3 0.0.46-t3v"
 $T3V click --text "Pick a thread in the sidebar to start" && $T3V wait --gone "Connected to"
@@ -103,7 +108,7 @@ $T3V keys Escape && $T3V wait --gone "Connected to"
 - Saving `ready` as the default sends every later CLI line without `--environment` to it. It is the run's own server, so commands work as before.
 - `t3v expect` names the label of the last descriptor read, a CLI line's included. After the huge label's steps it names the huge label, while the TUI still shows `Fixture Mac` until a restart.
 - `t3v status --json` counts the TUI's descriptor reads with the CLI's. The TUI reads one as it starts and no more while idle, so compare counts from after the start.
-- The recipe ends with no `environments.json`, because it removes the file that doesn't parse. Run the three `environment add` lines again before you drive more `environment` commands in the same run.
+- The recipe ends with no `environments.json`, because it removes the file that doesn't parse. Run the four `environment add` lines again before you drive more `environment` commands in the same run.
 - The dialog's check against 127.0.0.1 ends within milliseconds, so `checking…` is rarely on screen long enough for a wait. Wait for the facts instead, or compare `descriptorReads`.
 - The dialog covers the environment row it opens from, and its own rows hold the same label and address. Click the environment only while the dialog is closed.
 - `environment status` without a name exits 0 even when every environment is offline. Read the phases, not the exit code.

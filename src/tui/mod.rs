@@ -1606,8 +1606,10 @@ impl App {
                 }
                 // The Environments dialog takes the mouse. A click on its × or outside it closes
                 // it, a click on an environment chooses it, and the wheel over it moves the
-                // choice. Nothing reaches what it covers. Until a frame draws it after a
-                // change, it takes events and does nothing with them.
+                // choice. Nothing reaches what it covers. Until a frame draws it after it
+                // opens, a check or a resize, it takes events and does nothing with them. After
+                // a new choice only a click on an environment waits for that frame, since the
+                // list may scroll, so each notch of a fast wheel moves the choice.
                 if self.environments.is_open() {
                     let Some(drawn) = self.environments.drawn.clone() else {
                         return false;
@@ -13895,6 +13897,33 @@ mod tests {
         ctrl_b(&mut app);
         screen(&mut app, 120, 36);
         assert_eq!(app.sidebar.environment, Rect::default());
+    }
+
+    #[test]
+    fn each_wheel_notch_moves_the_environments_choice_before_the_next_frame() {
+        let (mut app, _) = tui_counting_checks();
+        alt(&mut app, 'c');
+        found(&mut app, 1, &["alpha", "beta", "delta", "gamma", "omega"]);
+        screen(&mut app, 120, 36);
+        assert_eq!(app.environments.selected(), 0);
+        let drawn = app.environments.drawn.clone().unwrap();
+        let (x, y) = (drawn.area.x + 3, drawn.rows[0].0);
+        // Notches that come faster than frames each move the choice, as a key would.
+        for _ in 0..3 {
+            assert!(mouse(&mut app, MouseEventKind::ScrollDown, x, y));
+        }
+        assert_eq!(app.environments.selected(), 3);
+        assert!(mouse(&mut app, MouseEventKind::ScrollUp, x, y));
+        assert!(mouse(&mut app, MouseEventKind::ScrollUp, x, y));
+        assert_eq!(app.environments.selected(), 1);
+        // A click on a row waits for the frame that draws the rows where they are now.
+        assert!(!mouse(&mut app, CLICK, x, drawn.rows[4].0));
+        assert_eq!(app.environments.selected(), 1);
+        screen(&mut app, 120, 36);
+        let (y, index) = app.environments.drawn.clone().unwrap().rows[4];
+        assert!(mouse(&mut app, CLICK, x, y));
+        assert_eq!(app.environments.selected(), index);
+        assert!(app.environments.is_open());
     }
 
     #[test]

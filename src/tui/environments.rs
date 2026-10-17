@@ -192,8 +192,9 @@ pub(super) struct Dialog {
     /// How many environment rows frames have laid out, so a test can count them.
     #[cfg(test)]
     laid_out: usize,
-    /// What the last frame drew. None until a frame draws the dialog after a change, and the
-    /// mouse acts on none of it until then.
+    /// What the last frame drew. None until a frame draws the dialog after it opens, a check
+    /// counts or the screen resizes, and the mouse acts on none of it until then. A new choice
+    /// empties only its rows.
     pub drawn: Option<Drawn>,
 }
 
@@ -284,17 +285,28 @@ impl Dialog {
         self.choose(next);
     }
 
-    /// Chooses the environment at `index`, the last when it is past the end.
+    /// Chooses the environment at `index`, the last when it is past the end. The list may
+    /// scroll to it, so a click finds no row until a frame draws the rows again. The dialog's
+    /// edges and × stay as the screen shows them until then, so the wheel, × and a click
+    /// outside still act.
     pub fn choose(&mut self, index: usize) {
         let index = index.min(self.count().saturating_sub(1));
         if index != self.selected {
             self.selected = index;
-            self.drawn = None;
+            if let Some(drawn) = self.drawn.as_mut() {
+                drawn.rows.clear();
+            }
         }
     }
 
     pub fn last(&self) -> usize {
         self.count().saturating_sub(1)
+    }
+
+    /// The chosen environment's place in the list.
+    #[cfg(test)]
+    pub fn selected(&self) -> usize {
+        self.selected
     }
 
     fn count(&self) -> usize {
@@ -1094,9 +1106,12 @@ mod tests {
             .map(|x| buffer[(x, drawn.close.y)].symbol())
             .collect();
         assert_eq!(close, " × ");
-        // Choosing another redraws the facts, so until the next frame the mouse finds nothing.
+        // Choosing another may scroll the list, so until the next frame a click finds no row.
+        // The edges and × stay for the wheel and the other clicks.
         dialog.choose(index);
         assert_eq!(dialog.row_at(y), None);
+        let kept = dialog.drawn.clone().unwrap();
+        assert_eq!((kept.area, kept.close), (drawn.area, drawn.close));
         draw(&mut dialog, 80, 24);
         assert_eq!(dialog.row_at(y), Some(index));
         dialog.resized();
