@@ -18,6 +18,7 @@ use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
 
 use t3term::client::{WatchEvent, spawn_config_watch, spawn_watch, spawn_worktree_setup_watch};
 use t3term::projection::{Applied, ThreadState, apply_config};
+use t3term::pull_request::{self, PullRequestError, Reference, State, Unavailable};
 use t3term::rpc::{BoundedChunk, BoundedStream, RpcClient, RpcError, StreamLimits};
 use t3term::terminal::{
     Launch, MetadataEvent, MetadataStream, Size, Terminal, TerminalBatch, TerminalError,
@@ -1886,4 +1887,166 @@ async fn metadata_passes_every_threads_terminals_on_and_acks_each_accepted_batch
     }
     assert!(within(stream.next()).await.is_none());
     assert_eq!(sent(&rpc, &mut socket).await, [interrupt(&id)]);
+}
+
+// ---- pull requests ----
+
+/// Answers the next request with `exit`, after checking that it is `tag` with `payload`.
+async fn answer_request(socket: &mut Socket, tag: &str, payload: &Value, exit: Value) {
+    let request = within(recv(socket)).await;
+    assert_eq!(request["_tag"], "Request");
+    assert_eq!(request["tag"], tag);
+    assert_eq!(&request["payload"], payload);
+    let reply = json!({"_tag": "Exit", "requestId": request["id"], "exit": exit});
+    send(socket, reply).await;
+}
+
+fn success(value: Value) -> Value {
+    json!({"_tag": "Success", "value": value})
+}
+
+/// The smallest detail T3's schema takes: every required field, no optional one.
+fn least_detail() -> Value {
+    json!({
+        "provider": "github",
+        "capabilities": {"diff": true, "comment": true, "actions": [], "mergeMethods": [],
+            "search": true, "review": {"inlineComment": false, "reply": false,
+            "resolve": false, "verdicts": []},
+            "reviewers": {"request": false, "listCandidates": false}},
+        "viewerPermissions": {"actions": [], "comment": false, "resolve": false,
+            "verdicts": [], "requestReviewers": false},
+        "projectId": "project-1", "projectTitle": "t3term", "workspaceRoot": "/work/t3term",
+        "repository": "krishhgg/t3term", "number": 41, "title": "Add a terminal drawer",
+        "body": "", "url": "https://github.com/krishhgg/t3term/pull/41", "author": null,
+        "state": "open", "isDraft": false, "mergeability": "unknown", "additions": 0,
+        "deletions": 0, "changedFiles": 0, "headBranch": "feature", "baseBranch": "master",
+        "createdAt": "2026-10-13T08:00:00Z", "updatedAt": "2026-10-14T08:00:00Z",
+        "mergedAt": null, "closedAt": null, "reviewers": [], "labels": [], "checks": [],
+        "mergeCapabilities": {"merge": false, "squash": false, "rebase": false}
+    })
+}
+
+#[tokio::test]
+async fn pull_request_reads_send_t3s_reference_and_read_its_answers() {
+    let (rpc, mut socket) = connected().await;
+    let reference = Reference::new("project-1", Some("github.com"), "krishhgg/t3term", 41).unwrap();
+    let payload = json!({"projectId": "project-1", "host": "github.com",
+        "repository": "krishhgg/t3term", "number": 41});
+
+    let (detail, ()) = tokio::join!(
+        pull_request::detail(&rpc, &reference),
+        answer_request(
+            &mut socket,
+            "pullRequests.detail",
+            &payload,
+            success(least_detail())
+        ),
+    );
+    let detail = detail.unwrap();
+    assert_eq!((detail.number, detail.state), (41, State::Open));
+    assert_eq!(detail.title, "Add a terminal drawer");
+
+    // A host with no checks to report answers null.
+    let (checks, ()) = tokio::join!(
+        pull_request::checks(&rpc, &reference),
+        answer_request(
+            &mut socket,
+            "pullRequests.checks",
+            &payload,
+            success(Value::Null)
+        ),
+    );
+    assert_eq!(checks.unwrap(), None);
+    let some = json!({"state": "open", "checks": [{"name": "macOS", "status": "pending",
+        "description": null, "url": null}]});
+    let (checks, ()) = tokio::join!(
+        pull_request::checks(&rpc, &reference),
+        answer_request(&mut socket, "pullRequests.checks", &payload, success(some)),
+    );
+    assert_eq!(checks.unwrap().unwrap().checks[0].name, "macOS");
+
+    let activity = json!({"comments": [], "commentCount": 0, "commentsTruncated": false,
+        "reviewThreads": [], "commits": []});
+    let (activity, ()) = tokio::join!(
+        pull_request::activity(&rpc, &reference),
+        answer_request(
+            &mut socket,
+            "pullRequests.activity",
+            &payload,
+            success(activity)
+        ),
+    );
+    assert_eq!(activity.unwrap().comment_count, 0);
+
+    // Invalidating names the one pull request, so T3 keeps its listings.
+    let named = json!({"reference": payload});
+    let (invalidated, ()) = tokio::join!(
+        pull_request::invalidate(&rpc, &reference),
+        answer_request(
+            &mut socket,
+            "pullRequests.invalidate",
+            &named,
+            success(Value::Null)
+        ),
+    );
+    invalidated.unwrap();
+}
+
+#[tokio::test]
+async fn a_pull_request_read_names_what_failed() {
+    let (rpc, mut socket) = connected().await;
+    let reference = Reference::new("project-1", None, "krishhgg/t3term", 41).unwrap();
+    let payload = json!({"projectId": "project-1", "repository": "krishhgg/t3term",
+        "number": 41});
+    let fail =
+        |error: Value| json!({"_tag": "Failure", "cause": [{"_tag": "Fail", "error": error}]});
+
+    let unavailable = fail(json!({"_tag": "PullRequestUnavailableError",
+        "reason": "cli-unauthenticated", "provider": "github",
+        "cause": {"name": "Error", "message": "HTTP 401"}}));
+    let (error, ()) = tokio::join!(
+        pull_request::detail(&rpc, &reference),
+        answer_request(&mut socket, "pullRequests.detail", &payload, unavailable),
+    );
+    let error = error.unwrap_err();
+    assert!(matches!(
+        error,
+        PullRequestError::Unavailable {
+            reason: Unavailable::CliUnauthenticated,
+            ..
+        }
+    ));
+    assert_eq!(
+        error.to_string(),
+        "GitHub has no working credential for this host. Run `gh auth login`, or check the account and hosts in Settings → Source Control."
+    );
+
+    let missing = fail(
+        json!({"_tag": "PullRequestOperationError", "operation": "activity",
+        "detail": "Pull request #41 was not found.", "reason": "not-found"}),
+    );
+    let (error, ()) = tokio::join!(
+        pull_request::activity(&rpc, &reference),
+        answer_request(&mut socket, "pullRequests.activity", &payload, missing),
+    );
+    let error = error.unwrap_err();
+    assert!(matches!(error, PullRequestError::NotFound(_)));
+    assert_eq!(error.to_string(), "Pull request #41 was not found.");
+
+    // An answer that breaks T3's schema is named, not guessed at.
+    let mut broken = least_detail();
+    broken["state"] = json!("draft");
+    let (error, ()) = tokio::join!(
+        pull_request::detail(&rpc, &reference),
+        answer_request(
+            &mut socket,
+            "pullRequests.detail",
+            &payload,
+            success(broken)
+        ),
+    );
+    assert_eq!(
+        error.unwrap_err().to_string(),
+        "T3 sent a pull request answer t3term can't read: a detail has no valid state"
+    );
 }

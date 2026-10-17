@@ -14,7 +14,7 @@ pub mod exit {
 }
 
 /// An error with a stable machine-readable code, shown to users and emitted in `--json` output.
-#[derive(Debug)]
+#[derive(Debug, Clone)]
 pub struct T3Error {
     pub code: &'static str,
     pub message: String,
