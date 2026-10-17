@@ -13,6 +13,7 @@ import codecs
 import json
 import os
 import re
+import select
 import shlex
 import signal
 import subprocess
@@ -298,49 +299,79 @@ def cast_name(state: dict) -> str:
 
 
 def note_resize(root: Path, state: dict, cols: int, rows: int):
-    """Adds a resize event to the recording, so a player redraws at the new size from there.
-    pipe-sink appends output to the same file, one line per write."""
-    name = cast_name(state)
+    """Hands a resize to the pipe-sink that records the pane now. It writes it between two output
+    records, so a player redraws at the new size from there."""
     try:
-        t0 = float((root / 'run' / f'{name}.t0').read_text())
-    except (OSError, ValueError):
-        return
-    line = json.dumps([round(time.time() - t0, 6), 'r', f'{cols}x{rows}']) + '\n'
-    try:
-        fd = os.open(evidence_of(state) / name, os.O_WRONLY | os.O_APPEND)
+        fd = os.open(root / 'run' / f'{cast_name(state)}.resize', os.O_WRONLY | os.O_NONBLOCK | os.O_NOFOLLOW)
     except OSError:
         return
     try:
-        os.write(fd, line.encode())
+        # Shorter than PIPE_BUF, so the sink reads it whole.
+        os.write(fd, f'{cols}x{rows}\n'.encode())
+    except OSError:
+        pass
     finally:
         os.close(fd)
 
 
 def pipe_sink(root: Path, cast_name: str) -> int:
     """Reads t3term's output from tmux pipe-pane into raw.ansi and an asciicast v2 file, both in
-    the evidence directory."""
+    the evidence directory. It is the recording's only writer. `t3v resize` hands it each size
+    through a FIFO, it reads a waiting size before more output, and it stamps each record from
+    a monotonic clock as it writes it, so the records stay in order."""
     state = read_json(root / 'run.json') or {}
     evidence = Path(state.get('evidence') or root / 'tmp')
-    started = time.time()
-    # `t3v resize` reads this to time the resize it adds to the recording.
-    (root / 'run' / f'{cast_name}.t0').write_text(repr(started))
+    started, clock = time.time(), time.monotonic()
+    fifo = root / 'run' / f'{cast_name}.resize'
+    try:
+        if fifo.is_symlink() or fifo.exists():
+            fifo.unlink()
+        os.mkfifo(fifo, 0o600)
+        sizes = os.open(fifo, os.O_RDONLY | os.O_NONBLOCK)
+        # Open for writing too, so the FIFO never reads as ended between two resizes.
+        keep = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+    except OSError:
+        sizes = keep = None  # the recording goes on without resize records
     decoder = codecs.getincrementaldecoder('utf-8')('replace')
+    waiting = b''
     with open(evidence / 'raw.ansi', 'ab') as raw, open(evidence / cast_name, 'a', encoding='utf-8') as cast:
         cast.write(json.dumps({'version': 2, 'width': state.get('cols', 200), 'height': state.get('rows', 50),
                                'timestamp': int(started), 'title': f't3v {root.name}',
                                'env': {'TERM': 'xterm-256color'}}) + '\n')
         cast.flush()
-        while True:
-            try:
-                data = os.read(0, 65536)
-            except OSError:
-                break
-            if not data:
-                break
-            raw.write(data)
-            raw.flush()
-            text = decoder.decode(data)
-            if text:
-                cast.write(json.dumps([round(time.time() - started, 6), 'o', text]) + '\n')
-                cast.flush()
+
+        def record(kind: str, data: str):
+            cast.write(json.dumps([round(time.monotonic() - clock, 6), kind, data]) + '\n')
+
+        try:
+            while True:
+                ready = select.select([0] if sizes is None else [0, sizes], [], [])[0]
+                if sizes in ready:
+                    waiting += os.read(sizes, 4096)
+                    *lines, waiting = waiting.split(b'\n')
+                    for line in lines:
+                        if re.fullmatch(rb'\d{1,4}x\d{1,4}', line):
+                            record('r', line.decode())
+                    cast.flush()
+                    continue
+                try:
+                    data = os.read(0, 65536)
+                except OSError:
+                    break
+                if not data:
+                    break
+                raw.write(data)
+                raw.flush()
+                text = decoder.decode(data)
+                if text:
+                    record('o', text)
+                    cast.flush()
+        finally:
+            if sizes is not None:
+                os.close(sizes)
+                os.close(keep)
+                try:
+                    fifo.unlink()
+                except OSError:
+                    pass
     return 0
