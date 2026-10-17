@@ -1049,6 +1049,7 @@ fn explain(error: RpcError) -> RpcError {
             tag,
             message,
             error_tag,
+            error,
         } => {
             let words = error_tag.as_deref().and_then(describe);
             let fallback = rpc::rejected(&tag);
@@ -1061,6 +1062,7 @@ fn explain(error: RpcError) -> RpcError {
                 tag,
                 message,
                 error_tag,
+                error,
             }
         }
         other => other,
@@ -1461,6 +1463,7 @@ mod tests {
             tag: ATTACH.into(),
             message: message.into(),
             error_tag: Some(error_tag.into()),
+            error: Box::new(json!({ "_tag": error_tag })),
         };
         let words = |error: RpcError| match explain(error) {
             RpcError::Failed {
@@ -1482,6 +1485,13 @@ mod tests {
         // So does a terminal error that came with a message.
         let own = failed("Unknown terminal thread", "TerminalSessionLookupError");
         assert_eq!(words(own).0, "Unknown terminal thread");
+        // The words replace the message only. The error as T3 encoded it stays for its fields.
+        match explain(failed("T3 rejected terminal.attach.", "TerminalWriteError")) {
+            RpcError::Failed { error, .. } => {
+                assert_eq!(*error, json!({ "_tag": "TerminalWriteError" }));
+            }
+            other => panic!("unexpected {other:?}"),
+        }
         let lost = RpcError::Disconnected("socket ended".into());
         assert!(matches!(explain(lost), RpcError::Disconnected(_)));
     }

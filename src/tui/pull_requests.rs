@@ -24,6 +24,7 @@
 
 use std::cmp::Reverse;
 use std::collections::{HashMap, HashSet};
+use std::ops::Range;
 
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span};
@@ -32,10 +33,17 @@ use unicode_width::UnicodeWidthStr;
 
 use super::details::Record;
 use super::label::cut;
+use super::markdown::{self, Styles};
 use super::setup::{bounded, middle};
 use super::tasks::wrap;
-use super::theme::{Theme, parse_iso_ms, relative_time};
+use super::theme::{Theme, age, parse_iso_ms, relative_time};
 use super::{clip, row, with_bg};
+use crate::pull_request::{self, BaseComparison, CheckStatus, Mergeability};
+use crate::transcript::without_controls;
+
+mod conversation;
+
+use conversation::{Control, Conversation, Reviewer, Shown, Targets};
 
 /// The most links read from a thread's record. The rest are counted and left unread.
 const MOST_LINKS: usize = 1000;
@@ -59,6 +67,12 @@ const NATIVE_STACK: &str = "merging a layer lands the ones below it.";
 /// What watching a pull request does, as the desktop's tooltip says it.
 const WATCHING: &str =
     "Watching: the agent wakes when checks finish, someone comments, or the branch conflicts";
+/// How long a read of a link's pull request stands, in milliseconds, as the desktop keeps
+/// `pullRequests.detail` for 60 seconds (packages/client-runtime/src/state/pullRequests.ts).
+/// Opening the link's details again within it shows that read rather than asking again.
+const FRESH: i64 = 60_000;
+/// The most characters kept of why a read failed.
+const FAILURE: usize = 1024;
 
 /// A link's state as the host last reported it. An open draft is a draft, and a closed or
 /// merged pull request is never one, as the desktop's `resolvePullRequestState` reads it.
@@ -184,6 +198,10 @@ struct Entry {
     key: Key,
     host: String,
     repository: String,
+    /// The host and the repository as T3 sent them, trimmed, which a read of the pull request
+    /// names. Each is at most `KEY` bytes, as `Key::of` checked.
+    ask_host: String,
+    ask_repository: String,
     number: u64,
     url: String,
     /// Whether `url` is cut short of the one T3 sent.
@@ -384,6 +402,8 @@ fn link_of(link: &Value) -> Option<Parsed> {
     let entry = Entry {
         host: bounded(host, NAME),
         repository: bounded(repository, NAME),
+        ask_host: host.trim().to_string(),
+        ask_repository: repository.trim().to_string(),
         key,
         number,
         url,
@@ -410,11 +430,14 @@ fn legacy_of(linked: &Value) -> Option<Raw> {
     let repository = linked.get("repository")?.as_str()?;
     let number = number_of(linked)?;
     let url = linked.get("url")?.as_str()?;
-    let key = Key::of(&host_of(url), repository, number)?;
+    let host = host_of(url);
+    let key = Key::of(&host, repository, number)?;
     let (url, url_cut) = url_of(url);
     let entry = Entry {
         host: bounded(&key.host, NAME),
         repository: bounded(&key.repository, NAME),
+        ask_host: host,
+        ask_repository: repository.trim().to_string(),
         number,
         url,
         url_cut,
@@ -721,6 +744,10 @@ struct Shape {
     scroll: usize,
     /// The minute the relative times read from.
     minute: i64,
+    /// The control ↑ and ↓ chose in the details, which shows highlighted while they have the
+    /// keyboard.
+    pick: Option<Control>,
+    focused: bool,
 }
 
 /// What a click on a row of a page reaches.
@@ -730,6 +757,8 @@ enum Spot {
     Link(usize),
     /// The row above a link's details, which leads back to the list.
     Back,
+    /// A row of a control in the details' Comments section.
+    Control(Control),
 }
 
 /// The rows a frame shows.
@@ -753,6 +782,8 @@ struct Detail {
     /// The width and the minute these lines are of.
     at: (usize, i64),
     lines: Vec<Line<'static>>,
+    /// The rows of each control among the lines, in the order they show.
+    targets: Targets,
 }
 
 /// How far the details are scrolled: a row from their top, or a number of rows up from where
@@ -767,6 +798,176 @@ enum Offset {
 impl Default for Offset {
     fn default() -> Offset {
         Offset::Top(0)
+    }
+}
+
+/// What reading a link's pull request from its host names: the link's host, repository and
+/// number as T3 sent them, and the ticket its answer comes back with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct Ask {
+    pub ticket: u64,
+    pub host: String,
+    pub repository: String,
+    pub number: u64,
+}
+
+/// Part of what a host said of a pull request. A read sends its detail and its conversation as
+/// each arrives, then `Done`.
+pub(super) enum Part {
+    /// The answer to `pullRequests.detail`, or why it failed.
+    Detail(Result<Box<pull_request::Detail>, String>),
+    /// The answer to `pullRequests.activity`, or why it failed.
+    Activity(Result<Box<pull_request::Activity>, String>),
+    /// Both answers came.
+    Done,
+}
+
+/// A read of one link's pull request from its host: `pullRequests.detail` and
+/// `pullRequests.activity` at once, as the desktop's panel asks for them.
+struct Read {
+    key: Key,
+    host: String,
+    repository: String,
+    number: u64,
+    /// The read's ticket, once it was asked for. A read waits without one while another is
+    /// under way.
+    ticket: Option<u64>,
+    /// The time its detail came, which `FRESH` and the age the details show count from, as
+    /// the desktop's `Atom.swr` counts from its result's timestamp. Until then, the time it
+    /// was asked for, or wanted while it waits.
+    at: i64,
+    answer: Answer<Summary>,
+    conversation: Answer<Conversation>,
+}
+
+enum Answer<T> {
+    Reading,
+    Read(Box<T>),
+    /// Why it failed, cleaned and bounded.
+    Failed(String),
+}
+
+impl Read {
+    /// Whether opening the link's details again should leave it be: it is under way, or both
+    /// its answers came within `FRESH` of `now`. A failure of either is never reused.
+    fn stands(&self, now: i64) -> bool {
+        match (&self.answer, &self.conversation) {
+            (Answer::Failed(_), _) | (_, Answer::Failed(_)) => false,
+            (Answer::Reading, _) | (_, Answer::Reading) => true,
+            (Answer::Read(_), Answer::Read(_)) => now.saturating_sub(self.at) < FRESH,
+        }
+    }
+}
+
+/// What the details show of a pull request's detail, as the desktop's Summary tab does. Each
+/// text is cleaned and bounded once, when the answer arrives.
+struct Summary {
+    /// The commits the head is behind its base, when the host says an open pull request that
+    /// merges cleanly is behind, as the desktop's `resolveBaseFreshness` warns of it. A
+    /// conflict or an unknown answer leaves the warning out. The inner None is a count the
+    /// host didn't give.
+    behind: Option<Option<u64>>,
+    /// The base branch, which the warning about being behind names.
+    base: String,
+    reviewers: Vec<Reviewer>,
+    /// None where the pull request has no labels and the host offers none, which the desktop
+    /// leaves out.
+    labels: Option<Vec<String>>,
+    checks: Vec<CheckRow>,
+    /// The description with its control characters removed, or empty.
+    body: String,
+    /// Whether T3 sent a longer description than t3term keeps.
+    body_cut: bool,
+    /// Whether T3 sent more reviewers, labels or checks than t3term keeps.
+    cut: bool,
+    /// The description laid out at one width, so a new minute doesn't lay it out again.
+    laid_out: Option<(usize, Vec<Line<'static>>)>,
+}
+
+/// One check on the pull request's head.
+struct CheckRow {
+    name: String,
+    status: CheckStatus,
+    /// A GitHub Actions run that waits for a maintainer's approval, which the desktop's
+    /// `isWorkflowApprovalCheck` names.
+    approval: bool,
+}
+
+impl Summary {
+    fn of(detail: &pull_request::Detail) -> Summary {
+        let behind = (detail.state == pull_request::State::Open
+            && detail.mergeability == Mergeability::Mergeable
+            && detail.base_comparison == Some(BaseComparison::Behind))
+        .then_some(detail.behind_by);
+        let reviewers = detail.reviewers.iter().map(Reviewer::of).collect();
+        let labels = (!detail.labels.is_empty() || detail.capabilities.labels).then(|| {
+            let names = detail.labels.iter();
+            names.map(|label| bounded(&label.name, NAME)).collect()
+        });
+        let checks = detail
+            .checks
+            .iter()
+            .map(|check| CheckRow {
+                name: bounded(&check.name, NAME),
+                status: check.status,
+                approval: check.status == CheckStatus::ActionRequired
+                    && check.url.as_deref().is_some_and(is_workflow_run),
+            })
+            .collect();
+        Summary {
+            behind,
+            base: bounded(&detail.base_branch, NAME),
+            reviewers,
+            labels,
+            checks,
+            body: without_controls(detail.body.text.trim()),
+            body_cut: detail.body.cut,
+            cut: detail.cut,
+            laid_out: None,
+        }
+    }
+
+    /// Lays the description out at `width`, unless it already is.
+    fn lay_out(&mut self, width: usize, theme: &Theme) {
+        if self.laid_out.as_ref().is_some_and(|(at, _)| *at == width) {
+            return;
+        }
+        let lines = if self.body.is_empty() {
+            let none = Style::new().fg(theme.muted).add_modifier(Modifier::ITALIC);
+            whole("No description provided.", width, none)
+        } else {
+            let styles = Styles::new(theme, Style::new().fg(theme.fg));
+            markdown::render(&self.body, width, &styles, 0)
+        };
+        self.laid_out = Some((width, lines));
+    }
+}
+
+/// Whether `url` is a GitHub Actions run, as the desktop's `/\/actions\/runs\/\d+(?:\/|$)/`
+/// matches it.
+fn is_workflow_run(url: &str) -> bool {
+    const RUNS: &str = "/actions/runs/";
+    url.match_indices(RUNS).any(|(at, _)| {
+        let rest = &url[at + RUNS.len()..];
+        let digits = rest.len() - rest.trim_start_matches(|c: char| c.is_ascii_digit()).len();
+        digits > 0 && matches!(rest[digits..].chars().next(), None | Some('/'))
+    })
+}
+
+impl CheckRow {
+    /// The check's mark, its status as the desktop's `pullRequestCheckStatusLabel` names it,
+    /// and their color.
+    fn shown(&self, theme: &Theme) -> (&'static str, &'static str, Color) {
+        match self.status {
+            _ if self.approval => ("◉", "Awaiting approval", theme.warning_fg),
+            CheckStatus::Pending => ("○", "Running", theme.warning_fg),
+            CheckStatus::ActionRequired => ("◉", "Awaiting action", theme.warning_fg),
+            CheckStatus::Success => ("✓", "Passed", theme.success),
+            CheckStatus::Failure => ("✗", "Failed", theme.error_fg),
+            CheckStatus::Cancelled => ("✗", "Cancelled", theme.error_fg),
+            CheckStatus::Skipped => ("–", "Skipped", theme.muted),
+            CheckStatus::Neutral => ("–", "Neutral", theme.muted),
+        }
     }
 }
 
@@ -793,6 +994,22 @@ pub(super) struct PullRequests {
     /// lands on nothing rather than on a row that moved.
     current: bool,
     detail: Option<Detail>,
+    /// The last read of a link's pull request from its host, of the link whose details opened
+    /// last. No other is kept.
+    read: Option<Read>,
+    /// Set when a link's details open, so the caller asks the host for its pull request.
+    asking: bool,
+    /// The ticket of the last read asked for.
+    tickets: u64,
+    /// The ticket of the read under way, until its answer comes. One read at a time is under
+    /// way, so links opened one after another don't each start a read. Another thread opening
+    /// leaves it, since its answer still comes.
+    running: Option<u64>,
+    /// What the reader opened of the conversation, which starts over each time a link's
+    /// details open.
+    shown: Shown,
+    /// The control in the Comments section that ↑ and ↓ chose, which Enter acts on.
+    pick: Option<Control>,
     /// How many times the links were worked out and a page laid out, so the tests can tell
     /// what a frame or an event did.
     #[cfg(test)]
@@ -817,6 +1034,10 @@ impl PullRequests {
         self.top = 0;
         self.page = None;
         self.detail = None;
+        self.read = None;
+        self.asking = false;
+        self.shown = Shown::default();
+        self.pick = None;
     }
 
     /// Drops the page and the details laid out in the old colors, after the theme changed. A
@@ -855,12 +1076,16 @@ impl PullRequests {
         if found.is_none() {
             self.viewing = false;
             self.scroll = Offset::Top(0);
+            self.pick = None;
         }
         let selected = found
             .unwrap_or(self.selected)
             .min(entries.len().saturating_sub(1));
         self.chosen = entries.get(selected).map(|entry| entry.key.clone());
         self.selected = selected;
+        if !self.viewing {
+            self.unqueue();
+        }
     }
 
     /// How many links show, once they are known.
@@ -878,6 +1103,19 @@ impl PullRequests {
     /// last frame showed they go, so a scroll back up after one past the end counts.
     pub fn move_by(&mut self, delta: isize) {
         if self.viewing {
+            self.pick = None;
+            self.scroll_rows(delta);
+            return;
+        }
+        let count = entries_of(self.list.as_ref()).len();
+        if count > 0 {
+            self.select(self.selected.saturating_add_signed(delta).min(count - 1));
+        }
+    }
+
+    /// Scrolls a link's details `delta` rows, no further than the last frame showed they go.
+    fn scroll_rows(&mut self, delta: isize) {
+        {
             let last = self.last_row();
             let within = |rows: usize| last.map_or(rows, |last| rows.min(last));
             let scroll = match self.scroll {
@@ -889,17 +1127,131 @@ impl PullRequests {
                 }
             };
             self.scroll_to(scroll);
+        }
+    }
+
+    /// ↓, or ↑ when `down` is false. In the list it selects the next link. In a link's
+    /// details it chooses the next control in the Comments section where that control's rows
+    /// are in view, so the text between two controls is read on the way, and scrolls the rest
+    /// of its rows in from that side. With none in view it scrolls a row, and the chosen
+    /// control stays chosen while any of its rows show. One that moved out of view as it acted
+    /// counts as none chosen.
+    pub fn step(&mut self, down: bool) {
+        let delta = if down { 1 } else { -1 };
+        if !self.viewing {
+            self.move_by(delta);
             return;
         }
-        let count = entries_of(self.list.as_ref()).len();
-        if count > 0 {
-            self.select(self.selected.saturating_add_signed(delta).min(count - 1));
+        let Some((view, targets)) = self.in_view() else {
+            self.scroll_rows(delta);
+            return;
+        };
+        let at = self
+            .pick
+            .and_then(|pick| targets.iter().position(|(_, control)| *control == pick))
+            .filter(|&at| shows(&targets[at].0, &view));
+        if at.is_none() {
+            self.pick = None;
+        }
+        let next = match (at, down) {
+            (Some(at), true) => targets.get(at + 1),
+            (Some(at), false) => at.checked_sub(1).and_then(|at| targets.get(at)),
+            (None, true) => targets.iter().find(|(rows, _)| shows(rows, &view)),
+            (None, false) => targets.iter().rev().find(|(rows, _)| shows(rows, &view)),
+        };
+        if let Some((rows, control)) = next
+            && shows(rows, &view)
+        {
+            self.pick = Some(*control);
+            let hidden = match down {
+                true => rows.end.saturating_sub(view.end) as isize,
+                false => -(view.start.saturating_sub(rows.start) as isize),
+            };
+            if hidden != 0 {
+                self.scroll_rows(hidden);
+            }
+            return;
+        }
+        let picked = at.map(|at| targets[at].0.clone());
+        self.scroll_rows(delta);
+        if let Some(rows) = picked
+            && let Some((view, _)) = self.in_view()
+            && !shows(&rows, &view)
+        {
+            self.pick = None;
+        }
+    }
+
+    /// The rows of the details in view, where the last frame drew them and the keys since
+    /// scrolled them, and the rows of each control. None until a frame drew these details.
+    fn in_view(&self) -> Option<(Range<usize>, Targets)> {
+        let last = self.last_row()?;
+        let shape = self.page.as_ref()?.shape;
+        let detail = self.detail.as_ref()?;
+        let top = match self.scroll {
+            Offset::Top(row) => row.min(last),
+            Offset::End(up) => last - up.min(last),
+        };
+        // The row back to the list comes first.
+        let rows = shape.height.saturating_sub(1);
+        Some((top..top + rows, detail.targets.clone()))
+    }
+
+    /// Enter: shows the selected link's details, or does what the chosen control in them does,
+    /// or else shows the list again.
+    pub fn enter(&mut self) {
+        match self.pick.filter(|_| self.viewing) {
+            Some(control) => self.act(control),
+            None => self.toggle(),
+        }
+    }
+
+    /// Does what `control` does to the conversation in the details, and chooses it. When it
+    /// goes because of that, the control that takes its place is chosen, if any. The details
+    /// keep their scroll, so what it shows comes in where the reader is, as in a browser, and
+    /// the control may move out of view.
+    fn act(&mut self, control: Control) {
+        let Some(read) = self.read.as_ref().filter(|read| self.reads_selected(read)) else {
+            return;
+        };
+        let Answer::Read(conversation) = &read.conversation else {
+            return;
+        };
+        if !conversation.has(control, &self.shown) {
+            return;
+        }
+        self.shown.act(control, conversation);
+        self.pick = Some(control)
+            .filter(|control| conversation.has(*control, &self.shown))
+            .or_else(|| control.partner())
+            .filter(|control| conversation.has(*control, &self.shown));
+        self.relay();
+    }
+
+    /// Whether `read` is of the selected link.
+    fn reads_selected(&self, read: &Read) -> bool {
+        entries_of(self.list.as_ref())
+            .get(self.selected)
+            .is_some_and(|entry| entry.key == read.key)
+    }
+
+    /// What Enter does with the chosen control, for the status line. None while none is.
+    pub fn action(&self) -> Option<String> {
+        let pick = self.pick.filter(|_| self.viewing)?;
+        let read = self
+            .read
+            .as_ref()
+            .filter(|read| self.reads_selected(read))?;
+        match &read.conversation {
+            Answer::Read(conversation) => Some(conversation.action(pick, &self.shown)),
+            _ => None,
         }
     }
 
     /// Selects the first link, or scrolls the details to their top.
     pub fn home(&mut self) {
         if self.viewing {
+            self.pick = None;
             self.scroll_to(Offset::Top(0));
         } else {
             self.move_by(isize::MIN);
@@ -910,6 +1262,7 @@ impl PullRequests {
     /// rows the next frame finds they take.
     pub fn end(&mut self) {
         if self.viewing {
+            self.pick = None;
             self.scroll_to(Offset::End(0));
         } else {
             self.move_by(isize::MAX);
@@ -966,7 +1319,132 @@ impl PullRequests {
             self.viewing = true;
             self.scroll = Offset::Top(0);
             self.current = false;
+            self.asking = true;
+            // What was opened starts over, so the rows laid out for it go too, even where the
+            // link, the width and the minute are the same.
+            self.shown = Shown::default();
+            self.pick = None;
+            self.relay();
         }
+    }
+
+    /// The read of the selected link's pull request that opening its details asks for. Opening
+    /// them wants a read, unless `enabled` is false because the environment doesn't read pull
+    /// requests or the thread names no project, or a read of the link is under way or one from
+    /// the last minute stands. The details show that the read is under way until `answer`
+    /// takes its answer. A read wanted while another is under way waits, and the caller calls
+    /// again once that one's answer comes. None while nothing waits.
+    pub fn take_ask(&mut self, enabled: bool, now: i64) -> Option<Ask> {
+        if std::mem::take(&mut self.asking) && enabled && self.viewing {
+            self.want(now);
+        }
+        if !enabled {
+            self.unqueue();
+            return None;
+        }
+        if self.running.is_some() {
+            return None;
+        }
+        let read = self.read.as_mut().filter(|read| read.ticket.is_none())?;
+        self.tickets += 1;
+        read.ticket = Some(self.tickets);
+        read.at = now;
+        self.running = read.ticket;
+        Some(Ask {
+            ticket: self.tickets,
+            host: read.host.clone(),
+            repository: read.repository.clone(),
+            number: read.number,
+        })
+    }
+
+    /// Wants a read of the selected link's pull request, unless one under way or from the last
+    /// minute stands.
+    fn want(&mut self, now: i64) {
+        let Some(entry) = entries_of(self.list.as_ref()).get(self.selected) else {
+            return;
+        };
+        let read = self.read.as_ref().filter(|read| read.key == entry.key);
+        if read.is_some_and(|read| read.stands(now)) {
+            return;
+        }
+        self.read = Some(Read {
+            key: entry.key.clone(),
+            host: entry.ask_host.clone(),
+            repository: entry.ask_repository.clone(),
+            number: entry.number,
+            ticket: None,
+            at: now,
+            answer: Answer::Reading,
+            conversation: Answer::Reading,
+        });
+        self.relay();
+    }
+
+    /// Notes whether the details show the pull requests' tab. Once they don't, as when the
+    /// pane closes or the Thread tab shows, a read that waits to be asked for is dropped, so no
+    /// host is asked for a link nobody looks at, and showing them again wants it again.
+    pub fn shown(&mut self, shown: bool) {
+        if !shown && self.unqueue() {
+            self.asking = true;
+        }
+    }
+
+    /// Drops a read that waits to be asked for, once nothing shows it or it can't be asked.
+    /// Says whether there was one.
+    fn unqueue(&mut self) -> bool {
+        if self.read.as_ref().is_some_and(|read| read.ticket.is_none()) {
+            self.read = None;
+            self.relay();
+            return true;
+        }
+        false
+    }
+
+    /// Takes part of the answer to read `ticket`, which came at `now`: the pull request's
+    /// detail or conversation, or why reading it failed. Says whether it is the read the
+    /// details wait for. An answer to an earlier read, or to a read of another thread's link,
+    /// is dropped. Once the read is done, another can be asked for.
+    pub fn answer(&mut self, ticket: u64, part: Part, now: i64) -> bool {
+        if let Part::Done = part {
+            if self.running == Some(ticket) {
+                self.running = None;
+            }
+            return false;
+        }
+        let Some(read) = self
+            .read
+            .as_mut()
+            .filter(|read| read.ticket == Some(ticket))
+        else {
+            return false;
+        };
+        match part {
+            Part::Detail(Ok(detail)) => {
+                read.at = now;
+                read.answer = Answer::Read(Box::new(Summary::of(&detail)));
+            }
+            Part::Detail(Err(failure)) => read.answer = Answer::Failed(bounded(&failure, FAILURE)),
+            Part::Activity(Ok(activity)) => {
+                read.conversation = Answer::Read(Box::new(Conversation::of(&activity)));
+            }
+            Part::Activity(Err(failure)) => {
+                read.conversation = Answer::Failed(bounded(&failure, FAILURE));
+            }
+            Part::Done => {}
+        }
+        // The rows move, so no control stays chosen.
+        self.pick = None;
+        self.relay();
+        true
+    }
+
+    /// Notes that the details' rows changed, so the next frame lays them out again and a click
+    /// before it lands on nothing.
+    fn relay(&mut self) {
+        self.detail = None;
+        self.page = None;
+        self.current = false;
     }
 
     /// Shows the list again in place of a link's details, with that link still selected. Says
@@ -978,6 +1456,8 @@ impl PullRequests {
         self.viewing = false;
         self.scroll = Offset::Top(0);
         self.current = false;
+        self.pick = None;
+        self.unqueue();
         true
     }
 
@@ -997,6 +1477,7 @@ impl PullRequests {
             Some(Spot::Back) => {
                 self.back();
             }
+            Some(Spot::Control(control)) => self.act(control),
             None => return false,
         }
         true
@@ -1022,10 +1503,28 @@ impl PullRequests {
         let cached = self.detail.as_ref().map(|detail| (detail.index, detail.at));
         if cached != Some((index, at)) {
             let lines = match entries_of(self.list.as_ref()).get(index) {
-                Some(entry) => detail_lines(entry, width, now, theme),
-                None => Vec::new(),
+                Some(entry) => {
+                    let read = self.read.as_mut().filter(|read| read.key == entry.key);
+                    if let Some(read) = read {
+                        if let Answer::Read(summary) = &mut read.answer {
+                            summary.lay_out(width, theme);
+                        }
+                        if let Answer::Read(conversation) = &mut read.conversation {
+                            conversation.lay_out(width, theme, &self.shown);
+                        }
+                    }
+                    let read = self.read.as_ref().filter(|read| read.key == entry.key);
+                    detail_lines(entry, read, &self.shown, width, now, theme)
+                }
+                None => (Vec::new(), Vec::new()),
             };
-            self.detail = Some(Detail { index, at, lines });
+            let (lines, targets) = lines;
+            self.detail = Some(Detail {
+                index,
+                at,
+                lines,
+                targets,
+            });
         }
         self.detail.as_ref().map_or(0, |detail| detail.lines.len())
     }
@@ -1034,7 +1533,14 @@ impl PullRequests {
     /// its shape changed: the list with the selected link on it, or the selected link's
     /// details, scrolled no further than their last row shows. Clicks land on it until the
     /// selection or the scroll moves.
-    pub fn page(&mut self, width: usize, height: usize, now: i64, theme: &Theme) -> &Page {
+    pub fn page(
+        &mut self,
+        width: usize,
+        height: usize,
+        now: i64,
+        focused: bool,
+        theme: &Theme,
+    ) -> &Page {
         let mut scroll = 0;
         if self.viewing {
             let total = self.prepare_detail(width, now, theme);
@@ -1054,6 +1560,8 @@ impl PullRequests {
             viewing: self.viewing,
             scroll,
             minute: now.div_euclid(60_000),
+            pick: self.pick.filter(|_| self.viewing),
+            focused,
         };
         if self.page.as_ref().map(|page| page.shape) != Some(shape) {
             #[cfg(test)]
@@ -1163,9 +1671,34 @@ fn view(list: Option<&List>, detail: Option<&Detail>, shape: Shape, theme: &Them
     page.lines.push(row(back, place, width));
     page.rows.push(Some(Spot::Back));
     let room = height - 1;
-    let shown = lines.iter().skip(shape.scroll).take(room);
-    page.lines.extend(shown.cloned());
-    page.rows.resize(page.lines.len(), None);
+    let targets: &[(Range<usize>, Control)] = match detail {
+        Some(detail) if detail.index == shape.selected => &detail.targets,
+        _ => &[],
+    };
+    // The controls from the first with a row in view.
+    let mut targets = targets[targets.partition_point(|(rows, _)| rows.end <= shape.scroll)..]
+        .iter()
+        .peekable();
+    for (at, line) in lines.iter().enumerate().skip(shape.scroll).take(room) {
+        while targets.next_if(|(rows, _)| rows.end <= at).is_some() {}
+        let control = targets
+            .peek()
+            .filter(|(rows, _)| rows.contains(&at))
+            .map(|(_, control)| *control);
+        // The chosen control shows highlighted across the row while the details have the
+        // keyboard.
+        if control.is_some() && control == shape.pick && shape.focused {
+            let mut spans = line.spans.clone();
+            let pad = shape.width.saturating_sub(line.width());
+            if pad > 0 {
+                spans.push(Span::raw(" ".repeat(pad)));
+            }
+            page.lines.push(Line::from(with_bg(spans, theme.highlight)));
+        } else {
+            page.lines.push(line.clone());
+        }
+        page.rows.push(control.map(Spot::Control));
+    }
     page.above = shape.scroll > 0;
     page.below = shape.scroll + room < lines.len();
     page.per_page = room.max(1);
@@ -1533,13 +2066,21 @@ fn branches(repository: &str, head: &str, base: &str, room: usize) -> String {
 }
 
 /// A link's details, which show in the list's place: its number and whole title, its status
-/// and the lines it changes, then each under its label its URL, whole as plain text to copy,
-/// its repository, its branches, its author, and who linked it and when it last changed and
-/// synced, then what watching it does and the stack it heads. Each value wraps to every row it
-/// takes, so the reader can scroll to all of it, and each was bounded when it was read.
-fn detail_lines(entry: &Entry, width: usize, now: i64, theme: &Theme) -> Vec<Line<'static>> {
+/// and the lines it changes, then what its host said of it when the details read it, then each
+/// under its label its URL, whole as plain text to copy, its repository, its branches, its
+/// author, and who linked it and when it last changed and synced, then what watching it does
+/// and the stack it heads. Each value wraps to every row it takes, so the reader can scroll to
+/// all of it, and each was bounded when it was read.
+fn detail_lines(
+    entry: &Entry,
+    read: Option<&Read>,
+    shown: &Shown,
+    width: usize,
+    now: i64,
+    theme: &Theme,
+) -> (Vec<Line<'static>>, Targets) {
     if width == 0 {
-        return Vec::new();
+        return (Vec::new(), Vec::new());
     }
     let muted = Style::new().fg(theme.muted);
     let value = Style::new().fg(theme.fg);
@@ -1549,6 +2090,14 @@ fn detail_lines(entry: &Entry, width: usize, now: i64, theme: &Theme) -> Vec<Lin
     let mut lines = whole(&heading, width, value.add_modifier(Modifier::BOLD));
     lines.extend(flowed(status_parts(entry, theme), " · ", width, theme));
     lines.extend(flowed(diff_parts(snapshot, theme), " ", width, theme));
+    let mut targets = Vec::new();
+    if let Some(read) = read {
+        let at = lines.len();
+        let (host, controls) = host_lines(entry, read, shown, width, now, theme);
+        lines.extend(host);
+        let moved = |rows: Range<usize>| rows.start + at..rows.end + at;
+        targets.extend(controls.into_iter().map(|(rows, c)| (moved(rows), c)));
+    }
 
     // Each section is a blank row, its label when it has one, then each value in its style,
     // wrapped to every row it takes.
@@ -1608,7 +2157,145 @@ fn detail_lines(entry: &Entry, width: usize, now: i64, theme: &Theme) -> Vec<Lin
         };
         section(None, &[(text, muted)]);
     }
-    lines
+    (lines, targets)
+}
+
+/// What the link's host said of its pull request, as the desktop's Summary tab shows it: that
+/// the read is under way, why it failed, or when it was read, then a warning while the branch
+/// is behind its base, the reviewers, the labels, the checks and the description. The checks
+/// come before the description, which the desktop folds away and these details can't.
+fn host_lines(
+    entry: &Entry,
+    read: &Read,
+    shown: &Shown,
+    width: usize,
+    now: i64,
+    theme: &Theme,
+) -> (Vec<Line<'static>>, Targets) {
+    let muted = Style::new().fg(theme.muted);
+    let value = Style::new().fg(theme.fg);
+    let warning = Style::new().fg(theme.warning_fg);
+    let mut lines = vec![Line::default()];
+    let summary = match &read.answer {
+        Answer::Reading => {
+            let reading = format!("Reading from {}…", entry.host);
+            lines.extend(whole(&reading, width, muted));
+            return (lines, Vec::new());
+        }
+        Answer::Failed(failure) => {
+            lines.extend(whole(failure, width, warning));
+            return (lines, Vec::new());
+        }
+        Answer::Read(summary) => summary,
+    };
+    let at = match age(read.at, now).as_str() {
+        "now" => "just now".to_string(),
+        ago => format!("{ago} ago"),
+    };
+    lines.extend(whole(
+        &format!("Read from {} {at}", entry.host),
+        width,
+        muted,
+    ));
+    if let Some(behind) = summary.behind {
+        let by = match behind {
+            Some(1) => " by 1 commit".to_string(),
+            Some(count) => format!(" by {} commits", grouped(count)),
+            None => String::new(),
+        };
+        let text = format!("This branch is out-of-date with {}{by}.", summary.base);
+        lines.extend(whole(&text, width, warning));
+    }
+    let mut section = |label: &str, rows: Vec<Line<'static>>| {
+        lines.push(Line::default());
+        lines.push(Line::styled(clip(label, width), muted));
+        lines.extend(rows);
+    };
+    let conversation = match &read.conversation {
+        Answer::Read(conversation) => Some(&**conversation),
+        _ => None,
+    };
+    let reviewers = conversation::reviewer_lines(&summary.reviewers, conversation, width, theme);
+    section("Reviewers", reviewers);
+    if let Some(labels) = summary.labels.as_ref() {
+        let labels = match labels.is_empty() {
+            true => whole("None", width, muted),
+            false => whole(&labels.join(", "), width, value),
+        };
+        section("Labels", labels);
+    }
+    let mut checks: Vec<Line<'static>> = match summary.checks.is_empty() {
+        true => whole("No checks reported.", width, muted),
+        false => summary
+            .checks
+            .iter()
+            .flat_map(|check| check_lines(check, width, theme))
+            .collect(),
+    };
+    if summary.cut {
+        let note = "T3 sent more reviewers, labels or checks than t3term keeps.";
+        checks.extend(whole(note, width, muted));
+    }
+    section("Checks", checks);
+    let mut body: Vec<Line<'static>> = match summary.laid_out.as_ref() {
+        Some((at, laid_out)) if *at == width => laid_out.clone(),
+        _ => Vec::new(),
+    };
+    if summary.body_cut {
+        let note = format!(
+            "Cut short: T3 sent a description longer than the {} bytes t3term keeps.",
+            grouped(pull_request::BODY as u64)
+        );
+        body.extend(whole(&note, width, muted));
+    }
+    section("Description", body);
+    // The Comments section's heading holds its order switch, so it lays its heading out.
+    let comments = conversation::section(&read.conversation, shown, width, now, theme);
+    lines.push(Line::default());
+    let at = lines.len();
+    lines.extend(comments.lines);
+    let targets = comments.targets.into_iter();
+    let targets = targets.map(|(rows, control)| (rows.start + at..rows.end + at, control));
+    (lines, targets.collect())
+}
+
+/// Whether any of `rows` is in `view`.
+fn shows(rows: &Range<usize>, view: &Range<usize>) -> bool {
+    rows.start < view.end && view.start < rows.end
+}
+
+/// A check's rows: its mark and name, wrapped, with its status at the end of the first row. A
+/// row too narrow for the status beside a few columns of the name has it on a row of its own.
+fn check_lines(check: &CheckRow, width: usize, theme: &Theme) -> Vec<Line<'static>> {
+    let (mark, status, color) = check.shown(theme);
+    let value = Style::new().fg(theme.fg);
+    let muted = Style::new().fg(theme.muted);
+    let room = width.saturating_sub(2 + status.width() + 1);
+    if room < 4 {
+        let mut lines = whole(&format!("{mark} {}", check.name), width, value);
+        lines.extend(whole(status, width, Style::new().fg(color)));
+        return lines;
+    }
+    let mut pieces = wrap(&check.name, room);
+    if pieces.is_empty() {
+        pieces.push(String::new());
+    }
+    pieces
+        .iter()
+        .enumerate()
+        .map(|(at, piece)| {
+            let lead = match at {
+                0 => Span::styled(mark, Style::new().fg(color)),
+                _ => Span::raw(" "),
+            };
+            let left = vec![lead, Span::raw(" "), Span::styled(clip(piece, room), value)];
+            let right = match at {
+                0 => vec![Span::styled(status, muted)],
+                _ => Vec::new(),
+            };
+            row(left, right, width)
+        })
+        .collect()
 }
 
 #[cfg(test)]
@@ -1735,7 +2422,7 @@ mod tests {
     fn page_rows(list: List, width: usize, height: usize) -> Vec<String> {
         let mut pulls = PullRequests::default();
         pulls.set(list);
-        rows_of(&pulls.page(width, height, now(), &theme()).lines)
+        rows_of(&pulls.page(width, height, now(), true, &theme()).lines)
     }
 
     /// The links whose rows `page` shows.
@@ -1771,7 +2458,7 @@ mod tests {
         let mut pulls = PullRequests::default();
         pulls.set(list_of(&thread(vec![pull])));
         pulls.toggle();
-        let rows = rows_of(&pulls.page(44, 30, now(), &theme()).lines);
+        let rows = rows_of(&pulls.page(44, 30, now(), true, &theme()).lines);
         assert_eq!(rows[0], format!("← List{}1 of 1", " ".repeat(32)));
         let expected = [
             "#31 Change 31",
@@ -2278,7 +2965,7 @@ mod tests {
         let mut pulls = PullRequests::default();
         pulls.set(list);
         let theme = theme();
-        let rows = rows_of(&pulls.page(40, 40, now(), &theme).lines);
+        let rows = rows_of(&pulls.page(40, 40, now(), true, &theme).lines);
         let start = "● #1 ]52;c;cHduZWQ=[2J👩\u{200d}💻e\u{301}名";
         assert!(rows[0].starts_with(start), "{rows:#?}");
         // The list and the link's details fit every width and height.
@@ -2288,7 +2975,7 @@ mod tests {
             }
             for width in [1, 2, 3, 7, 12, 20, 33, 52] {
                 for height in [1, 2, 5, 40] {
-                    let page = pulls.page(width, height, now(), &theme);
+                    let page = pulls.page(width, height, now(), true, &theme);
                     assert!(page.lines.len() <= height);
                     for line in &page.lines {
                         let text = line.to_string();
@@ -2301,7 +2988,7 @@ mod tests {
         }
         // Tall enough, the details show whole: every character of the URL t3term kept, wrapped
         // with nothing between, then the note that it was cut.
-        let page = pulls.page(40, 2_000, now(), &theme);
+        let page = pulls.page(40, 2_000, now(), true, &theme);
         assert!(!page.above && !page.below);
         let rows = rows_of(&page.lines);
         assert!(rows[0].starts_with("← List") && rows[0].ends_with("1 of 1"));
@@ -2324,7 +3011,7 @@ mod tests {
         let mut pulls = PullRequests::default();
         pulls.set(list);
         let theme = theme();
-        let page = pulls.page(36, 31, now(), &theme);
+        let page = pulls.page(36, 31, now(), true, &theme);
         // Thirty rows of links and the footer: ten links laid out of a thousand.
         let laid = links_on(page);
         assert_eq!(laid.len(), 10);
@@ -2334,14 +3021,14 @@ mod tests {
         assert_eq!(footer.as_deref(), Some(expected));
         // Frames of the same shape lay nothing out again.
         for _ in 0..5 {
-            pulls.page(36, 31, now(), &theme);
+            pulls.page(36, 31, now(), true, &theme);
         }
         assert_eq!((pulls.builds, pulls.pages), (1, 1));
         // The end of the list, a page at a time and then at once.
         pulls.page_by(true);
         assert_eq!(pulls.selected, 10);
         pulls.end();
-        let page = pulls.page(36, 31, now(), &theme);
+        let page = pulls.page(36, 31, now(), true, &theme);
         let laid = links_on(page);
         let last: HashSet<usize> = (990..1000).collect();
         assert_eq!(laid, last);
@@ -2349,10 +3036,10 @@ mod tests {
         assert_eq!(pulls.pages, 2);
         pulls.home();
         assert_eq!((pulls.selected, pulls.top), (0, 990));
-        pulls.page(36, 31, now(), &theme);
+        pulls.page(36, 31, now(), true, &theme);
         assert_eq!(pulls.top, 0);
         // Wider, the footer counts the links past the first thousand.
-        let page = pulls.page(80, 31, now(), &theme);
+        let page = pulls.page(80, 31, now(), true, &theme);
         let footer = page.lines.last().map(Line::to_string);
         let expected = "1000 open · 1000 linked · synced 1m ago · 500 not read";
         assert_eq!(footer.as_deref(), Some(expected));
@@ -2373,7 +3060,7 @@ mod tests {
         pulls.move_by(1);
         pulls.toggle();
         assert_eq!((pulls.selected, pulls.viewing), (1, true));
-        let rows = rows_of(&pulls.page(40, 10, now(), &theme).lines);
+        let rows = rows_of(&pulls.page(40, 10, now(), true, &theme).lines);
         assert_eq!(rows[0], format!("← List{}2 of 3", " ".repeat(28)));
         let url = "https://github.com/o/r/pull/2";
         assert!(rows.iter().any(|row| row == url), "{rows:#?}");
@@ -2384,7 +3071,7 @@ mod tests {
         pulls.set(list_of(&thread(four)));
         let after = (pulls.selected, pulls.viewing, pulls.scroll);
         assert_eq!(after, (2, true, Offset::Top(2)));
-        let rows = rows_of(&pulls.page(40, 10, now(), &theme).lines);
+        let rows = rows_of(&pulls.page(40, 10, now(), true, &theme).lines);
         assert!(rows[0].ends_with("3 of 4"), "{rows:#?}");
         assert_eq!(rows[4], url, "{rows:#?}");
         // #2 goes. The selection stays where it was, and the list shows again.
@@ -2394,10 +3081,10 @@ mod tests {
         assert_eq!(after, (2, false, Offset::Top(0)));
         assert_eq!(pulls.chosen.as_ref().map(|key| key.number), Some(1));
         // The same list again lays nothing out again.
-        pulls.page(40, 30, now(), &theme);
+        pulls.page(40, 30, now(), true, &theme);
         let pages = pulls.pages;
         pulls.set(list_of(&thread(without)));
-        pulls.page(40, 30, now(), &theme);
+        pulls.page(40, 30, now(), true, &theme);
         assert_eq!(pulls.pages, pages);
         // Only an event, another thread or another environment's support works them out again.
         assert!(!pulls.wants(Some("t"), true));
@@ -2437,7 +3124,7 @@ mod tests {
         assert_eq!(pulls.wanted(30, now(), &theme), 2 * ENTRY_ROWS + 1);
         // Enter on the stack's bottom layer shows its details from their top.
         pulls.toggle();
-        let page = pulls.page(30, 8, now(), &theme);
+        let page = pulls.page(30, 8, now(), true, &theme);
         assert!(!page.above && page.below);
         let rows = rows_of(&page.lines);
         assert_eq!(rows[0], format!("← List{}1 of 2", " ".repeat(18)));
@@ -2470,19 +3157,19 @@ mod tests {
 
         // ↓ scrolls a row and PageDown the seven rows a page shows.
         pulls.move_by(1);
-        pulls.page(30, 8, now(), &theme);
+        pulls.page(30, 8, now(), true, &theme);
         pulls.page_by(true);
         assert_eq!(pulls.scroll, Offset::Top(1 + 7));
         // End reaches the last row, and no further.
         pulls.end();
-        let page = pulls.page(30, 8, now(), &theme);
+        let page = pulls.page(30, 8, now(), true, &theme);
         assert!(page.above && !page.below);
         let rows = rows_of(&page.lines);
         assert!(rows[0].starts_with("← List"), "{rows:#?}");
         assert_eq!(rows[1..], all[total - 7..]);
         assert_eq!(pulls.scroll, Offset::Top(total - 7));
         pulls.move_by(1);
-        pulls.page(30, 8, now(), &theme);
+        pulls.page(30, 8, now(), true, &theme);
         assert_eq!(pulls.scroll, Offset::Top(total - 7));
         // ↑ and PageUp scroll back, and Home goes to the top.
         pulls.move_by(-1);
@@ -2497,7 +3184,7 @@ mod tests {
         assert!(!pulls.back());
         let after = (pulls.selected, pulls.viewing, pulls.scroll);
         assert_eq!(after, (0, false, Offset::Top(0)));
-        let page = pulls.page(30, 8, now(), &theme);
+        let page = pulls.page(30, 8, now(), true, &theme);
         assert_eq!(links_on(page), HashSet::from([0, 1]));
         assert!(rows_of(&page.lines)[0].starts_with("● #1"));
         pulls.toggle();
@@ -2515,12 +3202,12 @@ mod tests {
         pulls.set(list_of(&thread(vec![pull])));
         pulls.toggle();
         // A page shows the row back to the list and seven rows of the details.
-        pulls.page(30, 8, now(), &theme);
+        pulls.page(30, 8, now(), true, &theme);
         let last = detail_rows(&pulls).len() - 7;
         assert!(last > 3 * 7, "{last}");
         // Draws a frame and says how far it scrolled the details.
         let drawn = |pulls: &mut PullRequests| {
-            pulls.page(30, 8, now(), &theme);
+            pulls.page(30, 8, now(), true, &theme);
             pulls.scroll
         };
 
@@ -2570,14 +3257,14 @@ mod tests {
         // next frame.
         pulls.end();
         pulls.move_by(-1);
-        let page = pulls.page(20, 6, now(), &theme);
+        let page = pulls.page(20, 6, now(), true, &theme);
         assert!(page.above && page.below);
         let narrower = detail_rows(&pulls).len() - 5;
         assert_eq!(pulls.scroll, Offset::Top(narrower - 1));
         // Before a frame first draws a link's details, nothing knows how many rows they take,
         // and End and ↑ count from their end all the same.
         assert!(pulls.back());
-        pulls.page(30, 8, now(), &theme);
+        pulls.page(30, 8, now(), true, &theme);
         pulls.toggle();
         pulls.end();
         pulls.move_by(-1);
@@ -2592,11 +3279,11 @@ mod tests {
         pulls.set(list_of(&thread(links)));
         // Before a frame lays the list out, a click lands on nothing.
         assert!(!pulls.click(0));
-        pulls.page(40, 20, now(), &theme);
+        pulls.page(40, 20, now(), true, &theme);
         // The second link's rows are the page's fourth to sixth.
         assert!(pulls.click(4));
         assert_eq!((pulls.selected, pulls.viewing), (1, false));
-        pulls.page(40, 20, now(), &theme);
+        pulls.page(40, 20, now(), true, &theme);
         // The blank rows and the footer take no click.
         for offset in [6, 7, 18, 19, 20, 200] {
             assert!(!pulls.click(offset), "{offset}");
@@ -2604,7 +3291,7 @@ mod tests {
         // A second click on the link shows its details.
         assert!(pulls.click(3));
         assert!(pulls.viewing);
-        let rows = rows_of(&pulls.page(40, 20, now(), &theme).lines);
+        let rows = rows_of(&pulls.page(40, 20, now(), true, &theme).lines);
         assert_eq!(rows[1], "#2 Change 2");
         // Only the row above them takes a click, and it leads back to the list with the link
         // still selected.
@@ -2625,7 +3312,7 @@ mod tests {
             .collect();
         pulls.set(list_of(&thread(links)));
         // Three links fit above the footer.
-        pulls.page(40, 10, now(), &theme);
+        pulls.page(40, 10, now(), true, &theme);
         // The keys move the selection past them. Until a frame lays the list out again, a
         // click on its first row lands on nothing, rather than on the link that showed there.
         pulls.move_by(5);
@@ -2636,25 +3323,25 @@ mod tests {
         }
         assert_eq!((pulls.selected, pulls.viewing), (8, false));
         // After the frame, the click lands on the link that row shows now.
-        let page = pulls.page(40, 10, now(), &theme);
+        let page = pulls.page(40, 10, now(), true, &theme);
         assert_eq!(page.rows[0], Some(Spot::Link(6)));
         assert!(pulls.click(0));
         assert_eq!(pulls.selected, 6);
         // So with the details: until a frame draws them, no click shows the list again, and
         // after their scroll moves, none does until the next.
-        pulls.page(40, 10, now(), &theme);
+        pulls.page(40, 10, now(), true, &theme);
         assert!(pulls.click(0));
         assert!(pulls.viewing);
         assert!(!pulls.click(0));
-        pulls.page(40, 10, now(), &theme);
+        pulls.page(40, 10, now(), true, &theme);
         pulls.move_by(3);
         assert!(!pulls.click(0));
         assert!(pulls.viewing);
-        pulls.page(40, 10, now(), &theme);
+        pulls.page(40, 10, now(), true, &theme);
         assert!(pulls.click(0));
         assert!(!pulls.viewing);
         // A move that changes nothing keeps the page the reader sees.
-        pulls.page(40, 10, now(), &theme);
+        pulls.page(40, 10, now(), true, &theme);
         pulls.move_by(0);
         assert!(pulls.click(3));
         assert_eq!(pulls.selected, 7);
@@ -2681,5 +3368,700 @@ mod tests {
         assert_eq!(grouped(999), "999");
         assert_eq!(grouped(1_000), "1,000");
         assert_eq!(grouped(1_234_567), "1,234,567");
+    }
+
+    /// A pull request's detail as T3 sends it, with no reviewers, labels or checks and an
+    /// empty description, from a host that offers no labels.
+    fn bare_detail() -> Value {
+        json!({
+            "provider": "github",
+            "capabilities": {"diff": true, "comment": true, "actions": [], "mergeMethods": [],
+                "search": true, "review": {"inlineComment": false, "reply": false,
+                "resolve": false, "verdicts": []},
+                "reviewers": {"request": false, "listCandidates": false}},
+            "viewerPermissions": {"actions": [], "comment": false, "resolve": false,
+                "verdicts": [], "requestReviewers": false},
+            "projectId": "p", "projectTitle": "Demo", "workspaceRoot": "/repo",
+            "repository": "krishhgg/t3term", "number": 31, "title": "Change 31", "body": " ",
+            "url": "https://github.com/krishhgg/t3term/pull/31", "author": null,
+            "state": "open", "isDraft": false, "mergeability": "unknown", "additions": 0,
+            "deletions": 0, "changedFiles": 0, "headBranch": "feature", "baseBranch": "master",
+            "createdAt": "2026-10-13T08:00:00Z", "updatedAt": "2026-10-13T11:00:00Z",
+            "mergedAt": null, "closedAt": null, "reviewers": [], "labels": [], "checks": [],
+            "mergeCapabilities": {"merge": false, "squash": false, "rebase": false}
+        })
+    }
+
+    /// An activity as T3 sends it for a pull request nobody has said anything on.
+    fn bare_activity() -> Value {
+        json!({"comments": [], "commentCount": 0, "commentsTruncated": false,
+            "reviewThreads": [], "commits": []})
+    }
+
+    fn read_detail(detail: &Value) -> Box<pull_request::Detail> {
+        Box::new(pull_request::Detail::read(detail).unwrap())
+    }
+
+    /// The details of `link` once its host answered `answer`, `width` columns wide, from the
+    /// row after the lines it changes to the URL's label.
+    fn host_rows(
+        link: Value,
+        answer: Result<Box<pull_request::Detail>, String>,
+        width: usize,
+    ) -> Vec<String> {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![link])));
+        pulls.toggle();
+        let ask = pulls.take_ask(true, now()).expect("a read");
+        assert!(pulls.answer(ask.ticket, Part::Detail(answer), now()));
+        let activity = pull_request::Activity::read(&bare_activity()).unwrap();
+        let activity = Part::Activity(Ok(Box::new(activity)));
+        assert!(pulls.answer(ask.ticket, activity, now()));
+        pulls.page(width, 500, now(), true, &theme());
+        let rows = detail_rows(&pulls);
+        let from = rows
+            .iter()
+            .position(|row| row == "+821 -51")
+            .expect("the lines")
+            + 1;
+        let to = rows.iter().position(|row| row == "URL").expect("the URL");
+        rows[from..to].to_vec()
+    }
+
+    #[test]
+    fn opening_a_links_details_asks_for_its_pull_request_once() {
+        let mut pulls = PullRequests::default();
+        let mut pull = link("Krishhgg/T3term", 31, "feature", "master");
+        pull["host"] = json!(" GitHub.com ");
+        pulls.set(list_of(&thread(vec![
+            pull,
+            link("krishhgg/t3term", 32, "b", "c"),
+        ])));
+        // Nothing asks until the details open, and a disabled read asks for nothing.
+        assert_eq!(pulls.take_ask(true, now()), None);
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(false, now()), None);
+        assert_eq!(pulls.take_ask(true, now()), None);
+        // The read names the link as T3 sent it, trimmed, not as it compares.
+        pulls.back();
+        pulls.toggle();
+        let ask = pulls.take_ask(true, now()).expect("a read");
+        let named = ("GitHub.com", "Krishhgg/T3term", 31, 1);
+        assert_eq!(
+            (
+                ask.host.as_str(),
+                ask.repository.as_str(),
+                ask.number,
+                ask.ticket
+            ),
+            named
+        );
+        pulls.page(44, 30, now(), true, &theme());
+        assert!(detail_rows(&pulls).contains(&"Reading from GitHub.com…".to_string()));
+        // While it is under way, opening the details again asks for nothing.
+        pulls.back();
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(true, now()), None);
+        // An answer to another ticket is dropped. Another thread drops the read and its
+        // answer.
+        assert!(!pulls.answer(2, Part::Detail(Err("other".into())), now()));
+        pulls.follow();
+        assert!(!pulls.answer(1, Part::Detail(Err("late".into())), now()));
+        assert!(pulls.read.is_none());
+    }
+
+    #[test]
+    fn a_read_stands_until_both_answers_came_and_neither_failed() {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![link(
+            "krishhgg/t3term",
+            31,
+            "a",
+            "b",
+        )])));
+        let reopen = |pulls: &mut PullRequests, at: i64| {
+            pulls.back();
+            pulls.toggle();
+            pulls.take_ask(true, at).map(|ask| ask.ticket)
+        };
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(true, now()).map(|ask| ask.ticket), Some(1));
+        // The detail alone leaves the conversation reading, and the read stands.
+        assert!(pulls.answer(1, Part::Detail(Ok(read_detail(&bare_detail()))), now()));
+        pulls.page(44, 60, now(), true, &theme());
+        let rows = detail_rows(&pulls);
+        assert!(
+            rows.contains(&"Reading the conversation…".to_string()),
+            "{rows:#?}"
+        );
+        assert_eq!(reopen(&mut pulls, now()), None);
+        // A conversation that failed says so, and the next open asks again.
+        assert!(pulls.answer(1, Part::Activity(Err("timed out".into())), now()));
+        assert!(!pulls.answer(1, Part::Done, now()));
+        pulls.page(44, 60, now(), true, &theme());
+        let rows = detail_rows(&pulls);
+        let failed = [
+            "Comments",
+            "Could not load pull request activity",
+            "timed out",
+        ];
+        let at = rows
+            .iter()
+            .position(|row| row == "Comments")
+            .expect("the section");
+        assert_eq!(rows[at..at + 3], failed);
+        assert_eq!(reopen(&mut pulls, now()), Some(2));
+        // Both answers stand for a minute.
+        assert!(pulls.answer(2, Part::Detail(Ok(read_detail(&bare_detail()))), now()));
+        let activity = pull_request::Activity::read(&bare_activity()).unwrap();
+        assert!(pulls.answer(2, Part::Activity(Ok(Box::new(activity))), now()));
+        assert!(!pulls.answer(2, Part::Done, now()));
+        assert_eq!(reopen(&mut pulls, now() + FRESH - 1), None);
+        assert_eq!(reopen(&mut pulls, now() + FRESH), Some(3));
+    }
+
+    #[test]
+    fn a_link_opened_while_a_read_is_under_way_waits_for_it() {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![
+            link("krishhgg/t3term", 31, "feature", "master"),
+            link("krishhgg/t3term", 32, "b", "c"),
+        ])));
+        let numbers = |ask: Option<Ask>| ask.map(|ask| (ask.number, ask.ticket));
+        pulls.toggle();
+        assert_eq!(numbers(pulls.take_ask(true, now())), Some((31, 1)));
+        // #32 waits for #31's read, and shows that it reads meanwhile.
+        pulls.back();
+        pulls.move_by(1);
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(true, now()), None);
+        pulls.page(44, 30, now(), true, &theme());
+        assert!(detail_rows(&pulls).contains(&"Reading from github.com…".to_string()));
+        // Leaving its details drops it, and opening them again wants it again.
+        pulls.back();
+        assert!(pulls.read.is_none());
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(true, now()), None);
+        // #31's answers are dropped, and #32 is asked for once #31's read is done.
+        assert!(!pulls.answer(1, Part::Detail(Err("late".into())), now()));
+        assert_eq!(pulls.take_ask(true, now()), None);
+        assert!(!pulls.answer(1, Part::Done, now()));
+        assert_eq!(numbers(pulls.take_ask(true, now())), Some((32, 2)));
+        assert_eq!(pulls.take_ask(true, now()), None);
+
+        // Another thread's link waits for the read the last thread left under way.
+        pulls.follow();
+        let other = link("krishhgg/t3term", 40, "d", "e");
+        pulls.set(list_of(&thread(vec![other])));
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(true, now()), None);
+        // A read that can't be asked for any more is dropped.
+        assert_eq!(pulls.take_ask(false, now()), None);
+        assert!(pulls.read.is_none());
+        pulls.back();
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(true, now()), None);
+        assert!(!pulls.answer(2, Part::Done, now()));
+        assert_eq!(numbers(pulls.take_ask(true, now())), Some((40, 3)));
+    }
+
+    #[test]
+    fn a_read_that_waits_goes_while_the_tab_doesnt_show() {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![
+            link("krishhgg/t3term", 31, "feature", "master"),
+            link("krishhgg/t3term", 32, "b", "c"),
+        ])));
+        let numbers = |ask: Option<Ask>| ask.map(|ask| (ask.number, ask.ticket));
+        pulls.toggle();
+        assert_eq!(numbers(pulls.take_ask(true, now())), Some((31, 1)));
+        pulls.back();
+        pulls.move_by(1);
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(true, now()), None);
+        // The pane closes, or the Thread tab shows, while #32 waits, so it goes and #31's
+        // answer asks for nothing.
+        pulls.shown(false);
+        assert!(pulls.read.is_none());
+        assert!(!pulls.answer(1, Part::Detail(Err("late".into())), now()));
+        assert!(!pulls.answer(1, Part::Done, now()));
+        // Shown again, #32's details want it again.
+        pulls.shown(true);
+        assert_eq!(numbers(pulls.take_ask(true, now())), Some((32, 2)));
+        // A read under way stays, and so does an answer.
+        pulls.shown(false);
+        assert!(pulls.answer(2, Part::Detail(Ok(read_detail(&bare_detail()))), now()));
+        pulls.shown(false);
+        pulls.shown(true);
+        assert_eq!(pulls.take_ask(true, now()), None);
+        assert!(matches!(
+            pulls.read.as_ref().map(|read| &read.answer),
+            Some(Answer::Read(_))
+        ));
+    }
+
+    #[test]
+    fn an_answer_stands_for_a_minute_from_when_it_came() {
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![link(
+            "krishhgg/t3term",
+            31,
+            "a",
+            "b",
+        )])));
+        let reopen = |pulls: &mut PullRequests, at: i64| {
+            pulls.back();
+            pulls.toggle();
+            pulls.take_ask(true, at).map(|ask| ask.ticket)
+        };
+        pulls.toggle();
+        let asked = now() - 45_000;
+        assert_eq!(pulls.take_ask(true, asked).map(|ask| ask.ticket), Some(1));
+        // The host took 45 seconds, and the details say when the answer came.
+        assert!(pulls.answer(1, Part::Detail(Ok(read_detail(&bare_detail()))), now()));
+        let activity = pull_request::Activity::read(&bare_activity()).unwrap();
+        assert!(pulls.answer(1, Part::Activity(Ok(Box::new(activity))), now()));
+        assert!(!pulls.answer(1, Part::Done, now()));
+        pulls.page(44, 30, now(), true, &theme());
+        let rows = detail_rows(&pulls);
+        assert!(rows.contains(&"Read from github.com just now".to_string()));
+        // Twenty seconds on, the answer stands.
+        assert_eq!(reopen(&mut pulls, now() + 20_000), None);
+        assert_eq!(reopen(&mut pulls, now() + FRESH - 1), None);
+        assert_eq!(reopen(&mut pulls, now() + FRESH), Some(2));
+    }
+
+    #[test]
+    fn a_legacy_link_is_read_on_the_host_its_url_names() {
+        let legacy = json!({"repository": "krishhgg/t3term", "number": 7,
+            "url": "https://GitHub.com/krishhgg/t3term/pull/7"});
+        let thread = json!({"id": "t", "projectId": "p", "linkedPullRequest": legacy});
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread));
+        pulls.toggle();
+        let ask = pulls.take_ask(true, now()).expect("a read");
+        assert_eq!((ask.host.as_str(), ask.number), ("github.com", 7));
+    }
+
+    #[test]
+    fn a_hosts_answer_shows_as_the_desktops_summary_tab_does() {
+        let pull = link("krishhgg/t3term", 31, "feature", "master");
+        // An empty answer says so in each section, and leaves out the labels a host that
+        // offers none can't have.
+        let rows = host_rows(pull.clone(), Ok(read_detail(&bare_detail())), 44);
+        let expected = [
+            "",
+            "Read from github.com just now",
+            "",
+            "Reviewers",
+            "None",
+            "",
+            "Checks",
+            "No checks reported.",
+            "",
+            "Description",
+            "No description provided.",
+            "",
+            "Comments (0)",
+            "No comments yet.",
+            "",
+        ];
+        assert_eq!(rows, expected);
+
+        // A full one: a bot among the reviewers, the labels, each check status with its
+        // mark, a run waiting for approval, and the description as Markdown.
+        let mut detail = bare_detail();
+        detail["capabilities"]["labels"] = json!(true);
+        detail["mergeability"] = json!("mergeable");
+        detail["baseComparison"] = json!("behind");
+        detail["reviewers"] = json!([
+            {"login": "octocat", "name": "Mona", "isBot": false},
+            {"login": "greptile-apps[bot]", "name": null, "isBot": true}
+        ]);
+        let runs = "https://github.com/o/r/actions/runs/12/job/3";
+        let check = |name: &str, status: &str, url: Option<&str>| json!({"name": name, "status": status, "description": null, "url": url});
+        detail["checks"] = json!([
+            check("build", "success", None),
+            check("lint", "failure", None),
+            check("deploy", "cancelled", None),
+            check("docs", "skipped", None),
+            check("notes", "neutral", None),
+            check("tests", "pending", None),
+            check("first-time", "action-required", Some(runs)),
+            check("sign", "action-required", None)
+        ]);
+        detail["body"] = json!("## Why\n\nIt **reads** the host.\u{1b}[2J");
+        let rows = host_rows(pull.clone(), Ok(read_detail(&detail)), 44);
+        let status = |name: &str, mark: &str, label: &str| {
+            let gap = " ".repeat(44 - 2 - name.len() - label.chars().count());
+            format!("{mark} {name}{gap}{label}")
+        };
+        let expected = [
+            "".to_string(),
+            "Read from github.com just now".into(),
+            "This branch is out-of-date with master.".into(),
+            "".into(),
+            "Reviewers".into(),
+            "octocat".into(),
+            "greptile-apps[bot] (bot)".into(),
+            "".into(),
+            "Labels".into(),
+            "None".into(),
+            "".into(),
+            "Checks".into(),
+            status("build", "✓", "Passed"),
+            status("lint", "✗", "Failed"),
+            status("deploy", "✗", "Cancelled"),
+            status("docs", "–", "Skipped"),
+            status("notes", "–", "Neutral"),
+            status("tests", "○", "Running"),
+            status("first-time", "◉", "Awaiting approval"),
+            status("sign", "◉", "Awaiting action"),
+            "".into(),
+            "Description".into(),
+            "Why".into(),
+            "".into(),
+            "It reads the host.[2J".into(),
+            "".into(),
+            "Comments (0)".into(),
+            "No comments yet.".into(),
+            "".into(),
+        ];
+        assert_eq!(rows, expected);
+
+        // A count of commits behind shows, and an answer that left entries or text out says
+        // so. A closed pull request, or one that conflicts or may, isn't warned of.
+        detail["behindBy"] = json!(1_234);
+        let mut cut = detail.clone();
+        cut["body"] = json!("x".repeat(pull_request::BODY + 1));
+        cut["checks"] = json!(vec![check("a", "success", None); 1001]);
+        let rows = host_rows(pull.clone(), Ok(read_detail(&cut)), 44);
+        let behind = [
+            "This branch is out-of-date with master by",
+            "1,234 commits.",
+        ];
+        assert_eq!(rows[2..4], behind);
+        let note = "T3 sent more reviewers, labels or checks than t3term keeps.";
+        let joined = rows.join(" ");
+        assert!(joined.contains(note), "{joined}");
+        assert!(
+            joined.contains("Cut short: T3 sent a description longer than"),
+            "{joined}"
+        );
+        detail["behindBy"] = json!(1);
+        let rows = host_rows(pull.clone(), Ok(read_detail(&detail)), 60);
+        assert_eq!(
+            rows[2],
+            "This branch is out-of-date with master by 1 commit."
+        );
+        for (field, value) in [
+            ("state", "closed"),
+            ("mergeability", "conflicting"),
+            ("mergeability", "unknown"),
+        ] {
+            let mut quiet = detail.clone();
+            quiet[field] = json!(value);
+            let rows = host_rows(pull.clone(), Ok(read_detail(&quiet)), 60);
+            assert_eq!(rows[2], "", "{field} {value}");
+        }
+    }
+
+    #[test]
+    fn a_failed_read_says_why_cleaned_and_bounded() {
+        let pull = link("krishhgg/t3term", 31, "feature", "master");
+        let failure = format!(
+            "No GitHub credential\u{1b}]52;c;x\u{7} {}",
+            "y".repeat(5_000)
+        );
+        let rows = host_rows(pull, Err(failure), 44);
+        let text = rows.join(" ");
+        assert!(
+            text.trim().starts_with("No GitHub credential]52;c;x y"),
+            "{text}"
+        );
+        assert!(
+            !text.contains('\u{1b}') && !text.contains('\u{7}'),
+            "{text}"
+        );
+        assert!(text.trim_end().ends_with('…'), "{text}");
+        let kept = text.chars().filter(|c| !c.is_whitespace()).count();
+        assert!(kept <= FAILURE + 1, "{kept}");
+    }
+
+    #[test]
+    fn a_check_too_long_for_its_row_wraps_under_its_mark() {
+        let theme = theme();
+        let check = CheckRow {
+            name: "integration tests on macOS".into(),
+            status: CheckStatus::Success,
+            approval: false,
+        };
+        let rows = rows_of(&check_lines(&check, 22, &theme));
+        assert_eq!(rows, ["✓ integration   Passed", "  tests on", "  macOS"]);
+        // Too narrow for the status beside the name, each takes rows of its own.
+        let rows = rows_of(&check_lines(&check, 10, &theme));
+        assert_eq!(rows, ["✓", "integratio", "n tests on", "macOS", "Passed"]);
+    }
+
+    #[test]
+    fn only_a_github_actions_run_awaits_approval() {
+        for (url, run) in [
+            ("https://github.com/o/r/actions/runs/12", true),
+            ("https://github.com/o/r/actions/runs/12/job/3", true),
+            (
+                "https://github.com/o/r/actions/runs/x/actions/runs/9/",
+                true,
+            ),
+            ("https://github.com/o/r/actions/runs/", false),
+            ("https://github.com/o/r/actions/runs/12x", false),
+            ("https://github.com/o/r/checks/12", false),
+        ] {
+            assert_eq!(is_workflow_run(url), run, "{url}");
+        }
+    }
+
+    /// One link whose host answered with `bare_detail` and `activity`, its details open.
+    fn conversing(activity: Value) -> PullRequests {
+        let mut pulls = PullRequests::default();
+        let pull = link("krishhgg/t3term", 31, "a", "b");
+        pulls.set(list_of(&thread(vec![pull])));
+        pulls.toggle();
+        let ask = pulls.take_ask(true, now()).expect("a read");
+        let detail = Part::Detail(Ok(read_detail(&bare_detail())));
+        assert!(pulls.answer(ask.ticket, detail, now()));
+        let activity = pull_request::Activity::read(&activity).unwrap();
+        let activity = Part::Activity(Ok(Box::new(activity)));
+        assert!(pulls.answer(ask.ticket, activity, now()));
+        pulls
+    }
+
+    /// A conversation of `active` remarks by people, the newest last, and one by a bot. Each
+    /// came between 11 and 12 hours before `NOW`.
+    fn remarks(active: u32) -> Value {
+        let remark = |id: String, login: &str, minute: u32, body: String| {
+            json!({"id": id, "kind": "issue-comment", "author": {"login": login, "name": null},
+                "body": body, "createdAt": format!("2026-10-13T00:{minute:02}:00Z"),
+                "url": null, "path": null, "reviewState": null})
+        };
+        let mut comments: Vec<Value> = (0..active)
+            .map(|n| remark(format!("c{n}"), "mona", n, format!("Remark {n}")))
+            .collect();
+        comments.push(remark("b".into(), "ci[bot]", 59, "Bot".into()));
+        json!({"comments": comments, "commentCount": active + 1, "commentsTruncated": false,
+            "reviewThreads": [], "commits": []})
+    }
+
+    /// The rows of the page at `height` that `control` takes, and the rows that show
+    /// highlighted.
+    fn control_rows(
+        pulls: &mut PullRequests,
+        height: usize,
+        focused: bool,
+        control: Control,
+    ) -> (Vec<usize>, Vec<usize>) {
+        let theme = theme();
+        let page = pulls.page(40, height, now(), focused, &theme);
+        let rows = (0..page.rows.len())
+            .filter(|&at| page.rows[at] == Some(Spot::Control(control)))
+            .collect();
+        let lit = (0..page.lines.len())
+            .filter(|&at| {
+                let spans = &page.lines[at].spans;
+                spans
+                    .iter()
+                    .any(|span| span.style.bg == Some(theme.highlight))
+            })
+            .collect();
+        (rows, lit)
+    }
+
+    #[test]
+    fn arrows_choose_the_controls_in_view_and_enter_does_what_they_do() {
+        let mut pulls = conversing(remarks(12));
+        // At the top no control shows, so ↓ scrolls a row.
+        let theme = theme();
+        let page = pulls.page(40, 12, now(), true, &theme);
+        assert!(
+            !page
+                .rows
+                .iter()
+                .any(|s| matches!(s, Some(Spot::Control(_))))
+        );
+        pulls.step(true);
+        assert_eq!((pulls.pick, pulls.scroll), (None, Offset::Top(1)));
+
+        // From the end of a taller page, ↑ chooses the last control in view: the bots' group,
+        // both its rows, highlighted while the details have the keyboard.
+        pulls.end();
+        pulls.page(40, 24, now(), true, &theme);
+        pulls.step(false);
+        assert_eq!(pulls.pick, Some(Control::Bots));
+        let (bots, lit) = control_rows(&mut pulls, 24, true, Control::Bots);
+        assert_eq!(bots.len(), 2);
+        assert_eq!(lit, bots);
+        let page = pulls.page(40, 24, now(), true, &theme);
+        for &at in &bots {
+            assert_eq!(page.lines[at].width(), 40, "{:?}", page.lines[at]);
+        }
+        let (_, lit) = control_rows(&mut pulls, 24, false, Control::Bots);
+        assert!(lit.is_empty());
+        assert_eq!(pulls.action().as_deref(), Some("show bot comments"));
+
+        // Enter opens the group, whose remark comes in under it.
+        pulls.enter();
+        assert!(pulls.viewing);
+        assert_eq!(pulls.action().as_deref(), Some("hide bot comments"));
+        let (open, lit) = control_rows(&mut pulls, 24, true, Control::Bots);
+        assert_eq!((open, lit), (bots.clone(), bots.clone()));
+        let rows = rows_of(&pulls.page(40, 24, now(), true, &theme).lines);
+        assert_eq!(rows[bots[0]], "⌄ 1 bot comment");
+
+        // ↑ chooses Show older above it. The older remarks come in where it was, and Show only
+        // 10 recent takes its place under them.
+        pulls.step(false);
+        assert_eq!(pulls.pick, Some(Control::Older));
+        assert_eq!(pulls.action().as_deref(), Some("show 2 older"));
+        let (older, _) = control_rows(&mut pulls, 24, true, Control::Older);
+        let rows = rows_of(&pulls.page(40, 24, now(), true, &theme).lines);
+        assert_eq!(rows[older[0]], "+ Show 2 older comments (2 hidden)");
+        pulls.enter();
+        assert_eq!(pulls.pick, Some(Control::Recent));
+        assert_eq!(pulls.action().as_deref(), Some("show only 10 recent"));
+        let (recent, lit) = control_rows(&mut pulls, 24, true, Control::Recent);
+        // Two remarks of a header and a row of text, each after a blank row.
+        assert_eq!(recent, [older[0] + 6]);
+        assert_eq!(lit, recent);
+        let rows = rows_of(&pulls.page(40, 24, now(), true, &theme).lines);
+        assert_eq!(rows[recent[0]], "Show only 10 recent comments");
+        let all = detail_rows(&pulls);
+        let remarks = all.iter().filter(|row| row.starts_with("  Remark")).count();
+        assert_eq!(remarks, 12);
+
+        // Home leaves none chosen, and so does showing the list.
+        pulls.home();
+        assert_eq!((pulls.pick, pulls.action()), (None, None));
+        pulls.end();
+        pulls.page(40, 24, now(), true, &theme);
+        pulls.step(false);
+        assert!(pulls.pick.is_some());
+        pulls.back();
+        assert_eq!(pulls.pick, None);
+        // Opening the details again shows them as they first did.
+        pulls.toggle();
+        assert_eq!(pulls.shown, Shown::default());
+    }
+
+    #[test]
+    fn a_chosen_control_stays_in_view_and_each_shows_on_the_way_down_and_up() {
+        let mut pulls = conversing(remarks(12));
+        let theme = theme();
+        let mut picks = Vec::new();
+        for down in [true, false] {
+            for _ in 0..80 {
+                pulls.page(40, 12, now(), true, &theme);
+                pulls.step(down);
+                if let Some(pick) = pulls.pick {
+                    // The chosen control has a row in view whenever it is chosen, and all of
+                    // them once chosen, where they fit.
+                    let (view, targets) = pulls.in_view().expect("drawn");
+                    let (rows, _) = targets.iter().find(|(_, c)| *c == pick).unwrap();
+                    assert!(shows(rows, &view), "{pick:?} {rows:?} {view:?}");
+                    if picks.last() != Some(&pick) {
+                        picks.push(pick);
+                        let whole = view.start <= rows.start && rows.end <= view.end;
+                        assert!(whole, "{pick:?} {rows:?} {view:?}");
+                    }
+                }
+            }
+        }
+        let both = [
+            Control::Order,
+            Control::Older,
+            Control::Bots,
+            Control::Older,
+            Control::Order,
+        ];
+        assert_eq!(picks, both);
+        assert_eq!(pulls.scroll, Offset::Top(0));
+    }
+
+    #[test]
+    fn a_click_on_a_control_does_what_it_does_once_a_frame_drew_it() {
+        let mut pulls = conversing(remarks(12));
+        let theme = theme();
+        pulls.end();
+        let (bots, _) = control_rows(&mut pulls, 24, true, Control::Bots);
+        // Either of the group's rows opens it, and it is chosen.
+        assert!(pulls.click(bots[1]));
+        assert_eq!(pulls.pick, Some(Control::Bots));
+        assert_eq!(pulls.action().as_deref(), Some("hide bot comments"));
+        // The rows moved, so until a frame draws them a click lands on nothing.
+        assert!(!pulls.click(bots[0]));
+        let (open, _) = control_rows(&mut pulls, 24, true, Control::Bots);
+        assert_eq!(open, bots);
+        assert!(pulls.click(bots[0]));
+        assert_eq!(pulls.action().as_deref(), Some("show bot comments"));
+        // A row between two controls takes no click.
+        pulls.page(40, 24, now(), true, &theme);
+        assert!(!pulls.click(bots[0] - 1));
+        assert_eq!(pulls.action().as_deref(), Some("show bot comments"));
+    }
+
+    #[test]
+    fn details_opened_again_in_the_same_minute_start_over() {
+        let mut pulls = conversing(remarks(12));
+        let theme = theme();
+        pulls.page(40, 24, now(), true, &theme);
+        pulls.act(Control::Bots);
+        pulls.act(Control::Older);
+        pulls.page(40, 24, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(rows.iter().any(|row| row == "⌄ 1 bot comment"), "{rows:?}");
+
+        // Back to the list and in again, at the same width and minute, with the read standing.
+        pulls.toggle();
+        pulls.toggle();
+        assert_eq!(pulls.take_ask(true, now()), None);
+        pulls.page(40, 24, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(rows.iter().any(|row| row == "› 1 bot comment"), "{rows:?}");
+        let remarks = rows
+            .iter()
+            .filter(|row| row.starts_with("  Remark"))
+            .count();
+        assert_eq!(remarks, 10);
+        pulls.end();
+        pulls.page(40, 24, now(), true, &theme);
+        pulls.step(false);
+        assert_eq!(pulls.action().as_deref(), Some("show bot comments"));
+    }
+
+    #[test]
+    fn a_control_that_moved_out_of_view_as_it_acted_counts_as_none_chosen() {
+        let mut pulls = conversing(remarks(25));
+        let theme = theme();
+        pulls.page(40, 12, now(), true, &theme);
+        // ↓ chooses Show older two rows into the view.
+        let targets = &pulls.detail.as_ref().unwrap().targets;
+        let (rows, _) = targets.iter().find(|(_, c)| *c == Control::Older).unwrap();
+        pulls.scroll = Offset::Top(rows.start - 2);
+        pulls.page(40, 12, now(), true, &theme);
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::Older));
+        let (older, _) = control_rows(&mut pulls, 12, true, Control::Older);
+        // Enter brings 10 older remarks in where it was, and it moves down out of view. It
+        // stays chosen, as a button keeps the focus in a browser, and Enter acts on it again.
+        pulls.enter();
+        let (moved, lit) = control_rows(&mut pulls, 12, true, Control::Older);
+        assert!(moved.is_empty() && lit.is_empty(), "{moved:?}");
+        let rows = rows_of(&pulls.page(40, 12, now(), true, &theme).lines);
+        assert_eq!(older, [3]);
+        assert_eq!(rows[3], format!("mona{}11h ago", " ".repeat(29)));
+        assert_eq!(pulls.action().as_deref(), Some("show 5 older"));
+        // ↓ reads on from there, a row at a time, with none chosen.
+        let scroll = pulls.scroll;
+        pulls.step(true);
+        assert_eq!(pulls.pick, None);
+        assert_ne!(pulls.scroll, scroll);
     }
 }
