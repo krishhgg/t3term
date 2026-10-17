@@ -1,4 +1,5 @@
-//! Drives the RPC client, its bounded streams and the watcher against a fake Effect RPC server.
+//! Drives the RPC client, its bounded streams, the watcher and the terminal client against a
+//! fake Effect RPC server.
 
 use std::collections::HashMap;
 use std::future::Future;
@@ -12,10 +13,16 @@ use serde_json::{Value, json};
 use tokio::net::TcpListener;
 use tokio::sync::{mpsc, oneshot};
 use tokio_tungstenite::tungstenite::Message;
+use tokio_tungstenite::tungstenite::protocol::frame::Frame;
+use tokio_tungstenite::tungstenite::protocol::frame::coding::{Data, OpCode};
 
 use t3term::client::{WatchEvent, spawn_config_watch, spawn_watch, spawn_worktree_setup_watch};
 use t3term::projection::{Applied, ThreadState, apply_config};
 use t3term::rpc::{BoundedChunk, BoundedStream, RpcClient, RpcError, StreamLimits};
+use t3term::terminal::{
+    Launch, MetadataEvent, MetadataStream, Size, Terminal, TerminalBatch, TerminalError,
+    TerminalEvent, TerminalId, TerminalStream,
+};
 
 type Socket = tokio_tungstenite::WebSocketStream<tokio::net::TcpStream>;
 
@@ -876,8 +883,7 @@ async fn dropping_the_receiver_stops_a_setup_watch_that_waits_to_retry() {
 // ---- bounded streams ----
 
 /// The tag of each bounded stream, legacy stream and call below. rpc.rs reads a tag only to
-/// name a request in a failure, and nothing in t3term opens a bounded stream yet, so these
-/// are made up.
+/// name a request in a failure, so these are made up.
 const BOUNDED: &str = "example.bounded";
 const LEGACY: &str = "example.stream";
 const CALL: &str = "example.call";
@@ -1282,4 +1288,602 @@ async fn a_full_or_stopped_bounded_stream_holds_up_nothing_else_on_its_socket() 
     assert_eq!(accept_next(&mut bounded).await, [json!("held")]);
     let reason = stopped(&mut bounded).await;
     assert_eq!(reason, "a chunk would go over the limit of 1 chunk");
+}
+
+// ---- terminals ----
+
+/// T3's terminal methods, `WS_METHODS` in packages/contracts/src/rpc.ts.
+const TERMINAL_ATTACH: &str = "terminal.attach";
+const TERMINAL_OBSERVE: &str = "terminal.observe";
+const TERMINAL_WRITE: &str = "terminal.write";
+const TERMINAL_RESIZE: &str = "terminal.resize";
+const TERMINAL_CLOSE: &str = "terminal.close";
+const TERMINAL_METADATA: &str = "subscribeTerminalMetadata";
+
+const THREAD: &str = "thread-1";
+const TERM: &str = "term-1";
+
+/// Room for T3's attach window of 8 chunks and 64 KiB and more, for tests that don't test it.
+const ROOMY: StreamLimits = StreamLimits::new(16, 1 << 20).unwrap();
+
+fn terminal(rpc: &RpcClient) -> Terminal {
+    Terminal::new(rpc.clone(), TerminalId::new(THREAD, TERM).unwrap())
+}
+
+/// `{threadId, terminalId}`, T3's `TerminalSessionInput`.
+fn identity() -> Value {
+    json!({"threadId": THREAD, "terminalId": TERM})
+}
+
+/// `identity()` with `fields` added.
+fn identity_with(fields: Value) -> Value {
+    let mut payload = identity();
+    let fields = fields.as_object().unwrap().clone();
+    payload.as_object_mut().unwrap().extend(fields);
+    payload
+}
+
+/// Reads the next request, checks the whole of it, and returns its id.
+async fn request(socket: &mut Socket, tag: &str, payload: Value) -> Value {
+    let frame = within(recv(socket)).await;
+    let id = frame["id"].clone();
+    let expected =
+        json!({"_tag": "Request", "id": id, "tag": tag, "payload": payload, "headers": []});
+    assert_eq!(frame, expected);
+    id
+}
+
+/// A running shell's `TerminalSessionSnapshot`, with every field `snapshot` in T3's
+/// apps/server/src/terminal/Manager.ts writes.
+fn session(sequence: u64, history: &str) -> Value {
+    json!({"threadId": THREAD, "terminalId": TERM, "cwd": "/repo", "worktreePath": null,
+        "status": "running", "pid": 4242, "history": history, "exitCode": null,
+        "exitSignal": null, "label": "zsh", "updatedAt": "2026-10-07T12:00:00.000Z",
+        "sequence": sequence})
+}
+
+/// The `snapshot` event that opens every attach and observe.
+fn opening(sequence: u64, history: &str) -> Value {
+    json!({"type": "snapshot", "snapshot": session(sequence, history)})
+}
+
+/// An event of type `kind` with `fields` and the fields every type but `snapshot` carries.
+fn terminal_event(kind: &str, sequence: u64, fields: Value) -> Value {
+    let mut event =
+        json!({"type": kind, "threadId": THREAD, "terminalId": TERM, "sequence": sequence});
+    let fields = fields.as_object().unwrap().clone();
+    event.as_object_mut().unwrap().extend(fields);
+    event
+}
+
+/// The parts of `event` the tests check, to compare a batch with what the server sent.
+fn describe(event: TerminalEvent<'_>) -> Value {
+    match event {
+        TerminalEvent::Snapshot(snapshot) => {
+            json!([
+                "snapshot",
+                snapshot.sequence,
+                snapshot.history.as_str(),
+                snapshot.label
+            ])
+        }
+        TerminalEvent::Restarted { base, snapshot } => {
+            let history = snapshot.history.as_str();
+            json!(["restarted", base.sequence, snapshot.sequence, history])
+        }
+        TerminalEvent::Output { base, data } => json!(["output", base.sequence, data.as_str()]),
+        TerminalEvent::Cleared { base } => json!(["cleared", base.sequence]),
+        TerminalEvent::Exited {
+            base,
+            exit_code,
+            exit_signal,
+        } => json!(["exited", base.sequence, exit_code, exit_signal]),
+        TerminalEvent::Error { base, message } => json!(["error", base.sequence, message]),
+        TerminalEvent::Activity {
+            base,
+            has_running_subprocess,
+            label,
+        } => json!(["activity", base.sequence, has_running_subprocess, label]),
+        TerminalEvent::Closed { base } => json!(["closed", base.sequence]),
+        TerminalEvent::Unknown(unknown) => json!(["unknown", unknown.kind(), unknown.value()]),
+    }
+}
+
+fn described(batch: &TerminalBatch) -> Vec<Value> {
+    batch.events().map(describe).collect()
+}
+
+/// The stream's next batch. Fails the test on anything else, or after five seconds.
+async fn next_batch(stream: &mut TerminalStream) -> TerminalBatch {
+    match within(stream.next()).await {
+        Some(Ok(batch)) => batch,
+        Some(Err(error)) => panic!("expected a batch, got {error:?}"),
+        None => panic!("expected a batch, got the end"),
+    }
+}
+
+/// How the stream ended: its error, or `None` for a normal end. Fails the test on a batch.
+async fn terminal_end(stream: &mut TerminalStream) -> Option<RpcError> {
+    match within(stream.next()).await {
+        Some(Ok(batch)) => panic!("expected the end, got {batch:?}"),
+        Some(Err(error)) => Some(error),
+        None => None,
+    }
+}
+
+/// The message and tag of the failure that ended the stream.
+async fn failed_with(stream: &mut TerminalStream) -> (String, Option<String>) {
+    match terminal_end(stream).await {
+        Some(RpcError::Failed {
+            message, error_tag, ..
+        }) => (message, error_tag),
+        other => panic!("expected a failure, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn attach_and_observe_without_a_launch_name_the_terminal_and_nothing_else() {
+    let (rpc, mut socket) = connected().await;
+    let terminal = terminal(&rpc);
+    let bare = terminal.attach(None, None, ROOMY).await.unwrap();
+    let bare_id = request(&mut socket, TERMINAL_ATTACH, identity()).await;
+    // A size the caller asks for goes with it, and nothing else.
+    let size = Size::new(120, 30).unwrap();
+    let sized = terminal.attach(None, Some(size), ROOMY).await.unwrap();
+    let payload = identity_with(json!({"cols": 120, "rows": 30}));
+    let sized_id = request(&mut socket, TERMINAL_ATTACH, payload).await;
+    let observing = terminal.observe(ROOMY).await.unwrap();
+    let observe_id = request(&mut socket, TERMINAL_OBSERVE, identity()).await;
+
+    // Dropping each one interrupts that stream alone. Nothing closes, resizes or writes to
+    // the terminal.
+    drop((bare, sized, observing));
+    let interrupts = [
+        interrupt(&bare_id),
+        interrupt(&sized_id),
+        interrupt(&observe_id),
+    ];
+    assert_eq!(sent(&rpc, &mut socket).await, interrupts);
+}
+
+#[tokio::test]
+async fn an_attach_that_asks_for_a_shell_sends_the_desktops_launch() {
+    let (rpc, mut socket) = connected().await;
+    let terminal = terminal(&rpc);
+    let worktree = "/repo/.t3/worktrees/feature";
+    let launch = Launch::for_thread("/repo", Some(worktree)).unwrap();
+    let size = Size::new(80, 24).unwrap();
+    let mut stream = terminal
+        .attach(Some(&launch), Some(size), ROOMY)
+        .await
+        .unwrap();
+    // No restartIfNotRunning or providerInstanceId.
+    let env = json!({"T3CODE_PROJECT_ROOT": "/repo", "T3CODE_WORKTREE_PATH": worktree});
+    let payload = identity_with(json!({"cwd": worktree, "worktreePath": worktree,
+        "env": env, "cols": 80, "rows": 24}));
+    let id = request(&mut socket, TERMINAL_ATTACH, payload).await;
+    send(&mut socket, chunk(&id, json!([opening(0, "")]))).await;
+    let batch = next_batch(&mut stream).await;
+    assert_eq!(described(&batch), [json!(["snapshot", 0, "", "zsh"])]);
+    batch.accept();
+    assert_eq!(sent(&rpc, &mut socket).await, [ack(&id)]);
+}
+
+#[tokio::test]
+async fn a_chunk_of_every_event_reads_in_order_and_is_acked_once_when_accepted() {
+    let (rpc, mut socket) = connected().await;
+    let terminal = terminal(&rpc);
+    let mut stream = terminal.attach(None, None, ROOMY).await.unwrap();
+    let id = request(&mut socket, TERMINAL_ATTACH, identity()).await;
+    let output = "ls\r\n\u{1b}[1mbold\u{1b}[0m";
+    let events = json!([
+        opening(3, "$ "),
+        terminal_event("output", 4, json!({"data": output})),
+        terminal_event("activity", 5, json!({"hasRunningSubprocess": true, "label": "vim"})),
+        terminal_event("cleared", 6, json!({})),
+        terminal_event("exited", 7, json!({"exitCode": 0, "exitSignal": null})),
+        terminal_event("error", 8, json!({"message": "Failed to spawn"})),
+        terminal_event("restarted", 9, json!({"snapshot": session(0, "")})),
+        // A lower sequence and a type this t3term doesn't know pass through as sent.
+        terminal_event("closed", 1, json!({})),
+        {"type": "resized", "cols": 80},
+    ]);
+    // Two chunks in one frame, as Effect may batch. T3 keeps the stream open after closed.
+    let after = terminal_event("output", 2, json!({"data": "after"}));
+    let frame = json!([chunk(&id, events), chunk(&id, json!([after]))]);
+    send(&mut socket, frame).await;
+
+    let first = next_batch(&mut stream).await;
+    let second = next_batch(&mut stream).await;
+    let expected = [
+        json!(["snapshot", 3, "$ ", "zsh"]),
+        json!(["output", 4, output]),
+        json!(["activity", 5, true, "vim"]),
+        json!(["cleared", 6]),
+        json!(["exited", 7, 0, null]),
+        json!(["error", 8, "Failed to spawn"]),
+        json!(["restarted", 9, 0, ""]),
+        json!(["closed", 1]),
+        json!(["unknown", "resized", {"type": "resized", "cols": 80}]),
+    ];
+    assert_eq!(described(&first), expected);
+    assert_eq!(described(&second), [json!(["output", 2, "after"])]);
+    // Reading a batch acks nothing. Accepting each one sends its Ack.
+    nothing_sent(&rpc, &mut socket).await;
+    first.accept();
+    assert_eq!(sent(&rpc, &mut socket).await, [ack(&id)]);
+    second.accept();
+    assert_eq!(sent(&rpc, &mut socket).await, [ack(&id)]);
+}
+
+#[tokio::test]
+async fn a_bad_event_stops_the_stream_unacked_and_its_text_stays_out_of_the_error() {
+    let (rpc, mut socket) = connected().await;
+    let terminal = terminal(&rpc);
+    let mut stream = terminal.observe(ROOMY).await.unwrap();
+    let id = request(&mut socket, TERMINAL_OBSERVE, identity()).await;
+    // A good output and then one whose text is under the wrong name, in one chunk. Another
+    // chunk follows.
+    let secret = "\u{1b}]52;c;c2VjcmV0\u{7}";
+    let good = terminal_event("output", 1, json!({"data": secret}));
+    let bad = terminal_event("output", 2, json!({"text": secret}));
+    send(&mut socket, chunk(&id, json!([good, bad]))).await;
+    let next = terminal_event("output", 3, json!({"data": "next"}));
+    send(&mut socket, chunk(&id, json!([next]))).await;
+
+    match within(stream.next()).await {
+        Some(Err(RpcError::Protocol(message))) => {
+            let expected = "T3 sent a terminal output event whose `data` isn't a string";
+            assert_eq!(message, expected);
+        }
+        other => panic!("expected a protocol error, got {other:?}"),
+    }
+    // The chunk after it never comes.
+    assert!(terminal_end(&mut stream).await.is_none());
+    // t3term interrupted the stream and acked nothing, the late chunk included.
+    let late = terminal_event("output", 4, json!({"data": "late"}));
+    send(&mut socket, chunk(&id, json!([late]))).await;
+    assert_eq!(sent(&rpc, &mut socket).await, [interrupt(&id)]);
+}
+
+#[tokio::test]
+async fn a_lookup_or_scope_failure_ends_the_stream_in_words_and_nothing_asks_again() {
+    let (rpc, mut socket) = connected().await;
+    let terminal = terminal(&rpc);
+    let mut attach = terminal.attach(None, None, ROOMY).await.unwrap();
+    let attach_id = request(&mut socket, TERMINAL_ATTACH, identity()).await;
+    // T3's terminal errors carry their tag and fields but no message.
+    let error =
+        json!({"_tag": "TerminalSessionLookupError", "threadId": THREAD, "terminalId": TERM});
+    let lookup = json!({"_tag": "Fail", "error": error});
+    send(&mut socket, refusal(&attach_id, lookup)).await;
+    let (message, tag) = failed_with(&mut attach).await;
+    assert_eq!(message, "T3 has no such terminal on this thread.");
+    assert_eq!(tag.as_deref(), Some("TerminalSessionLookupError"));
+    assert!(terminal_end(&mut attach).await.is_none());
+
+    // A session without terminal:read, from apps/server/src/auth/RpcAuthorization.ts.
+    let mut observing = terminal.observe(ROOMY).await.unwrap();
+    let observe_id = request(&mut socket, TERMINAL_OBSERVE, identity()).await;
+    let scope = "The authenticated token is missing required scope: terminal:read.";
+    let error = json!({"_tag": "EnvironmentAuthorizationError", "message": scope,
+        "requiredScope": "terminal:read"});
+    let missing = json!({"_tag": "Fail", "error": error});
+    send(&mut socket, refusal(&observe_id, missing)).await;
+    let (message, tag) = failed_with(&mut observing).await;
+    assert_eq!(message, scope);
+    assert_eq!(tag.as_deref(), Some("EnvironmentAuthorizationError"));
+
+    // Neither stream asks again, and dropping streams T3 ended sends nothing.
+    drop((attach, observing));
+    nothing_sent(&rpc, &mut socket).await;
+}
+
+#[tokio::test]
+async fn a_history_over_the_byte_budget_stops_the_attach_and_the_socket_goes_on() {
+    let (rpc, mut socket) = connected().await;
+    let terminal = terminal(&rpc);
+    let budget = limits(16, 4096);
+    let mut stream = terminal.attach(None, None, budget).await.unwrap();
+    let id = request(&mut socket, TERMINAL_ATTACH, identity()).await;
+    let mut legacy = rpc.stream(LEGACY, json!({})).await.unwrap();
+    let legacy_id = within(recv(&mut socket)).await["id"].clone();
+    // ESC takes six bytes in JSON, so 1,000 of them take 6,000 and the chunk is over 4,096.
+    let history = "\u{1b}".repeat(1000);
+    send(&mut socket, chunk(&id, json!([opening(1, &history)]))).await;
+    send(&mut socket, chunk(&legacy_id, json!(["after"]))).await;
+    // t3term interrupts the attach. The other stream on the socket gets its item and Ack.
+    assert_eq!(within(recv(&mut socket)).await, interrupt(&id));
+    assert_eq!(within(recv(&mut socket)).await, ack(&legacy_id));
+    let after = within(legacy.next()).await.unwrap().unwrap();
+    assert_eq!(after, json!("after"));
+
+    match terminal_end(&mut stream).await {
+        Some(RpcError::Stopped(reason)) => {
+            assert_eq!(reason, "a chunk was over the 4096-byte limit by itself");
+        }
+        other => panic!("expected a stop, got {other:?}"),
+    }
+    assert!(terminal_end(&mut stream).await.is_none());
+    // Nothing attaches again, and a call still gets its answer.
+    nothing_sent(&rpc, &mut socket).await;
+}
+
+/// Sends `message` in one final WebSocket frame, as `ws` sends each message T3 writes.
+async fn send_one_frame(socket: &mut Socket, message: String) {
+    let frame = Frame::message(message, OpCode::Data(Data::Text), true);
+    socket.send(Message::Frame(frame)).await.unwrap();
+}
+
+/// The sequence and history of a batch that holds one snapshot. Fails the test on anything
+/// else.
+fn lone_snapshot(batch: &TerminalBatch) -> (Option<u64>, &str) {
+    let events: Vec<_> = batch.events().collect();
+    match events.as_slice() {
+        [TerminalEvent::Snapshot(snapshot)] => (snapshot.sequence, snapshot.history.as_str()),
+        _ => panic!("expected one snapshot, got {} events", events.len()),
+    }
+}
+
+#[tokio::test]
+async fn a_history_over_16_mib_as_json_arrives_whole_and_a_smaller_budget_stops_only_its_stream() {
+    let (rpc, mut socket) = connected().await;
+    let terminal = terminal(&rpc);
+    let mut whole = terminal
+        .attach(None, None, limits(8, 32 << 20))
+        .await
+        .unwrap();
+    let whole_id = request(&mut socket, TERMINAL_ATTACH, identity()).await;
+    let mut small = terminal.observe(limits(1, 16 << 20)).await.unwrap();
+    let small_id = request(&mut socket, TERMINAL_OBSERVE, identity()).await;
+    // 3 MiB of ESC is well inside the 8 MiB of history T3 keeps, and takes 18 MiB as JSON.
+    // That is past tungstenite's default of 16 MiB in one frame.
+    let history = "\u{1b}".repeat(3 << 20);
+    let snapshot = opening(1, &history).to_string();
+    let message =
+        |id: &Value| format!(r#"{{"_tag":"Chunk","requestId":{id},"values":[{snapshot}]}}"#);
+    let first = message(&whole_id);
+    let size = first.len();
+    assert!(size > 16 << 20, "a {size}-byte message fits in 16 MiB");
+
+    // Within a byte limit that has room for it, the whole history arrives as T3 sent it.
+    send_one_frame(&mut socket, first).await;
+    let batch = next_batch(&mut whole).await;
+    assert_eq!(batch.bytes(), size);
+    let (sequence, received) = lone_snapshot(&batch);
+    assert_eq!(sequence, Some(1));
+    // Not assert_eq!, which would print 3 MiB of ESC on a failure.
+    assert!(received == history, "the history changed on the way");
+    // Its arrival acks nothing, and accepting it sends one Ack.
+    nothing_sent(&rpc, &mut socket).await;
+    batch.accept();
+    assert_eq!(sent(&rpc, &mut socket).await, [ack(&whole_id)]);
+
+    // A 16 MiB byte limit stops the observe alone, with one Interrupt and no Ack.
+    send_one_frame(&mut socket, message(&small_id)).await;
+    assert_eq!(within(recv(&mut socket)).await, interrupt(&small_id));
+    match terminal_end(&mut small).await {
+        Some(RpcError::Stopped(reason)) => {
+            assert_eq!(reason, "a chunk was over the 16777216-byte limit by itself");
+        }
+        other => panic!("expected a stop, got {other:?}"),
+    }
+    assert!(terminal_end(&mut small).await.is_none());
+    // Nothing observes again, and a call still gets its answer.
+    nothing_sent(&rpc, &mut socket).await;
+
+    // The attach goes on.
+    let output = terminal_event("output", 2, json!({"data": "$ "}));
+    send(&mut socket, chunk(&whole_id, json!([output]))).await;
+    let batch = next_batch(&mut whole).await;
+    assert_eq!(described(&batch), [json!(["output", 2, "$ "])]);
+    batch.accept();
+    assert_eq!(sent(&rpc, &mut socket).await, [ack(&whole_id)]);
+}
+
+#[tokio::test]
+async fn a_cancelled_read_loses_no_batch_and_a_dropped_batch_closes_nothing() {
+    let (rpc, mut socket) = connected().await;
+    let terminal = terminal(&rpc);
+    let mut stream = terminal.observe(limits(1, 1 << 20)).await.unwrap();
+    let id = request(&mut socket, TERMINAL_OBSERVE, identity()).await;
+    // Reads polled once and then dropped, as a select! drops the branch that loses: one
+    // before the chunk comes, and one the chunk woke.
+    let mut read = Box::pin(stream.next());
+    assert!(poll!(&mut read).is_pending());
+    drop(read);
+    let mut read = Box::pin(stream.next());
+    assert!(poll!(&mut read).is_pending());
+    send(&mut socket, chunk(&id, json!([opening(1, "$ ")]))).await;
+    // Once nothing_sent returns, the reader has queued the chunk and woken the read.
+    nothing_sent(&rpc, &mut socket).await;
+    drop(read);
+    let batch = next_batch(&mut stream).await;
+    assert_eq!(described(&batch), [json!(["snapshot", 1, "$ ", "zsh"])]);
+    nothing_sent(&rpc, &mut socket).await;
+
+    // Dropping the batch unaccepted stops the stream with an Interrupt. It doesn't ack, and
+    // it never closes the terminal.
+    drop(batch);
+    assert_eq!(sent(&rpc, &mut socket).await, [interrupt(&id)]);
+    match terminal_end(&mut stream).await {
+        Some(RpcError::Stopped(reason)) => {
+            assert_eq!(reason, "a chunk was dropped before it was accepted");
+        }
+        other => panic!("expected a stop, got {other:?}"),
+    }
+}
+
+#[tokio::test]
+async fn a_long_write_goes_in_pieces_one_answer_at_a_time_and_writes_take_turns() {
+    let (rpc, mut socket) = connected().await;
+    let terminal = Arc::new(terminal(&rpc));
+    // 65,535 UTF-16 code units and then an emoji, which takes two. It would make 65,537, so it
+    // starts the second piece.
+    let head = "a".repeat(65_535);
+    let text = format!("{head}🙂tail");
+    let writing = tokio::spawn({
+        let terminal = terminal.clone();
+        async move { terminal.write(&text).await }
+    });
+    let payload = identity_with(json!({"data": head}));
+    let first = request(&mut socket, TERMINAL_WRITE, payload).await;
+    // A second write waits for the first to finish.
+    let typing = tokio::spawn({
+        let terminal = terminal.clone();
+        async move { terminal.write("ls\r").await }
+    });
+    // The second piece waits for T3's answer to the first.
+    nothing_sent(&rpc, &mut socket).await;
+    send(&mut socket, normal_end(&first)).await;
+    let payload = identity_with(json!({"data": "🙂tail"}));
+    let second = request(&mut socket, TERMINAL_WRITE, payload).await;
+    send(&mut socket, normal_end(&second)).await;
+    let payload = identity_with(json!({"data": "ls\r"}));
+    let third = request(&mut socket, TERMINAL_WRITE, payload).await;
+    send(&mut socket, normal_end(&third)).await;
+    within(writing).await.unwrap().unwrap();
+    within(typing).await.unwrap().unwrap();
+}
+
+#[tokio::test]
+async fn an_empty_or_failed_write_sends_nothing_more() {
+    let (rpc, mut socket) = connected().await;
+    let terminal = Arc::new(terminal(&rpc));
+    let empty = terminal.write("").await;
+    assert!(matches!(empty, Err(TerminalError::Invalid(_))), "{empty:?}");
+    nothing_sent(&rpc, &mut socket).await;
+
+    // T3 fails the first of two pieces, so the second never goes.
+    let writing = tokio::spawn({
+        let terminal = terminal.clone();
+        async move { terminal.write(&"b".repeat(65_537)).await }
+    });
+    let payload = identity_with(json!({"data": "b".repeat(65_536)}));
+    let first = request(&mut socket, TERMINAL_WRITE, payload).await;
+    let error = json!({"_tag": "TerminalNotRunningError", "threadId": THREAD, "terminalId": TERM});
+    send(
+        &mut socket,
+        refusal(&first, json!({"_tag": "Fail", "error": error})),
+    )
+    .await;
+    match within(writing).await.unwrap() {
+        Err(TerminalError::Rpc(RpcError::Failed { message, .. })) => {
+            assert_eq!(message, "The terminal's shell isn't running.");
+        }
+        other => panic!("expected the failure, got {other:?}"),
+    }
+    nothing_sent(&rpc, &mut socket).await;
+}
+
+#[tokio::test]
+async fn resize_and_close_always_name_the_terminal() {
+    let (rpc, mut socket) = connected().await;
+    let terminal = terminal(&rpc);
+    let resizing = terminal.resize(Size::new(100, 40).unwrap());
+    let answering = async {
+        let payload = identity_with(json!({"cols": 100, "rows": 40}));
+        let id = request(&mut socket, TERMINAL_RESIZE, payload).await;
+        send(&mut socket, normal_end(&id)).await;
+    };
+    let (resized, ()) = tokio::join!(resizing, answering);
+    resized.unwrap();
+
+    // Without a terminalId, T3 would close every terminal on the thread.
+    let closing = terminal.close(true);
+    let answering = async {
+        let payload = identity_with(json!({"deleteHistory": true}));
+        let id = request(&mut socket, TERMINAL_CLOSE, payload).await;
+        send(&mut socket, normal_end(&id)).await;
+    };
+    let (closed, ()) = tokio::join!(closing, answering);
+    closed.unwrap();
+}
+
+/// A `TerminalSummary` of an idle shell.
+fn summary(thread: &str, terminal: &str) -> Value {
+    json!({"threadId": thread, "terminalId": terminal, "cwd": "/repo", "worktreePath": null,
+        "status": "running", "pid": 4242, "exitCode": null, "exitSignal": null,
+        "hasRunningSubprocess": false, "label": "zsh", "updatedAt": "2026-10-07T12:00:00.000Z"})
+}
+
+fn describe_metadata(event: MetadataEvent<'_>) -> Value {
+    match event {
+        MetadataEvent::Snapshot(terminals) => {
+            let ids: Vec<_> = terminals
+                .iter()
+                .map(|terminal| json!([terminal.thread_id, terminal.terminal_id]))
+                .collect();
+            json!(["snapshot", ids])
+        }
+        MetadataEvent::Upsert(terminal) => {
+            json!(["upsert", terminal.thread_id, terminal.terminal_id])
+        }
+        MetadataEvent::Remove {
+            thread_id,
+            terminal_id,
+        } => json!(["remove", thread_id, terminal_id]),
+        MetadataEvent::Unknown(unknown) => json!(["unknown", unknown.kind()]),
+    }
+}
+
+async fn next_metadata(stream: &mut MetadataStream) -> Vec<Value> {
+    let batch = match within(stream.next()).await {
+        Some(Ok(batch)) => batch,
+        Some(Err(error)) => panic!("expected a batch, got {error:?}"),
+        None => panic!("expected a batch, got the end"),
+    };
+    let events = batch.events().map(describe_metadata).collect();
+    batch.accept();
+    events
+}
+
+#[tokio::test]
+async fn metadata_passes_every_threads_terminals_on_and_acks_each_accepted_batch() {
+    let (rpc, mut socket) = connected().await;
+    // T3 waits for each chunk's Ack, so one chunk at a time is enough.
+    let mut stream = MetadataStream::open(&rpc, limits(1, 1 << 20))
+        .await
+        .unwrap();
+    let id = request(&mut socket, TERMINAL_METADATA, json!({})).await;
+    let terminals = json!([summary("thread-2", TERM), summary(THREAD, TERM)]);
+    let snapshot = json!({"type": "snapshot", "terminals": terminals});
+    send(&mut socket, chunk(&id, json!([snapshot]))).await;
+    // Picking out one thread's terminals is up to the caller.
+    let expected = json!(["snapshot", [["thread-2", TERM], [THREAD, TERM]]]);
+    assert_eq!(next_metadata(&mut stream).await, [expected]);
+    assert_eq!(sent(&rpc, &mut socket).await, [ack(&id)]);
+
+    let changes = json!([
+        {"type": "upsert", "terminal": summary(THREAD, "term-2")},
+        {"type": "remove", "threadId": THREAD, "terminalId": TERM},
+        {"type": "renamed", "threadId": THREAD},
+    ]);
+    send(&mut socket, chunk(&id, changes)).await;
+    let expected = [
+        json!(["upsert", THREAD, "term-2"]),
+        json!(["remove", THREAD, TERM]),
+        json!(["unknown", "renamed"]),
+    ];
+    assert_eq!(next_metadata(&mut stream).await, expected);
+    assert_eq!(sent(&rpc, &mut socket).await, [ack(&id)]);
+
+    // A summary without hasRunningSubprocess stops the stream, unacked.
+    let mut broken = summary(THREAD, TERM);
+    broken
+        .as_object_mut()
+        .unwrap()
+        .remove("hasRunningSubprocess");
+    let upsert = json!({"type": "upsert", "terminal": broken});
+    send(&mut socket, chunk(&id, json!([upsert]))).await;
+    match within(stream.next()).await {
+        Some(Err(RpcError::Protocol(message))) => {
+            let expected = "T3 sent a terminal metadata upsert whose \
+                `terminal.hasRunningSubprocess` isn't true or false";
+            assert_eq!(message, expected);
+        }
+        other => panic!("expected a protocol error, got {other:?}"),
+    }
+    assert!(within(stream.next()).await.is_none());
+    assert_eq!(sent(&rpc, &mut socket).await, [interrupt(&id)]);
 }
