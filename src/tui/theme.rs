@@ -190,7 +190,8 @@ impl Theme {
     }
 
     /// This stock half with a built-in theme's `roles` in place of the colors the desktop lets
-    /// a theme set. Its status, provider and project colors stay, as the desktop keeps them.
+    /// a theme set. Its green, blue and violet, and its provider and project colors, stay, as
+    /// the desktop keeps them. Its warning, error and muted colors are the theme's.
     fn with(self, name: ThemeName, roles: &Roles) -> Theme {
         let depth = self.depth;
         let c = |color: Oklch| hex(depth, color.rgb());
