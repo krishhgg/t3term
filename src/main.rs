@@ -1734,9 +1734,9 @@ async fn environment_status(name: Option<&str>, json_mode: bool) -> Result<i32> 
         }
         body["default"] = json!(saved.default);
         body["environments"] = probes.iter().map(Probe::to_json).collect();
-        print_json(&body);
+        print_json(&body)?;
     } else {
-        println!("{}", status_text(&probes));
+        print_stdout(&format!("{}\n", status_text(&probes)))?;
     }
     Ok(failed.map_or(0, |probe| probe.exit_code))
 }

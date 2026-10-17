@@ -55,6 +55,7 @@ eval "$L models" | :                       # exit 1
 eval "$L requests thr-single" | :          # exit 1
 eval "$L settings thr-single" | :          # exit 1
 eval "$L environment list" | :             # exit 1
+eval "$L environment status" | :           # exit 1
 eval "$L wait thr-single --timeout 5" 2>"$RUN/wait.err" | :   # exit 1
 grep -F "The message was sent (msg-single-2), but t3term couldn't write to stdout" "$RUN/wait.err"
 grep -F "Do not resend it. [OUTPUT_FAILED]" "$RUN/wait.err"

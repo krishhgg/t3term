@@ -4078,3 +4078,28 @@ fn a_watch_whose_stderr_closed_reports_on_stdout_and_revokes_its_session_first()
         );
     }
 }
+
+#[test]
+fn environment_status_into_a_closed_stdout_fails_without_a_panic() {
+    // No environment is saved, so the command reads only the home and then prints, into a pipe
+    // whose reader is already gone.
+    let home = Home::new();
+    for json_mode in [true, false] {
+        let args: &[&str] = match json_mode {
+            true => &["--json", "environment", "status"],
+            false => &["environment", "status"],
+        };
+        let mut command = home.command(args, "false");
+        let child = {
+            let _alone = spawning();
+            let (reader, writer) = std::io::pipe().unwrap();
+            drop(reader);
+            command.stdout(writer).stderr(Stdio::piped());
+            command.spawn().expect("run t3term")
+        };
+        let finished = child.wait_with_output().unwrap();
+        assert_eq!(finished.status.code(), Some(1), "{args:?}");
+        let err = String::from_utf8(finished.stderr).unwrap();
+        assert_unprinted(json_mode, &err, "t3term: Couldn't write to stdout: ", ".");
+    }
+}
