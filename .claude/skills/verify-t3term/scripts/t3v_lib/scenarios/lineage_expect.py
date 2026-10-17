@@ -214,6 +214,13 @@ def lineage_of(current: str, threads: list, projection, closed: bool, paging: di
     own = projection.get('thread') if isinstance(projection, dict) else None
     if not isinstance(own, dict) or id_of(own.get('id')) != current:
         projection = None
+        own = None
+    # The projection's copy of the open thread links it to its parent once the shell no longer
+    # lists it, as after T3 archives it.
+    if current not in by_id and own is not None:
+        parent = parent_of(own)
+        if parent is not None:
+            add(parent, current, 'subagent' if relationship(own) == 'subagent' else 'fork', run_status(own))
 
     def listing(key: str) -> list:
         value = projection.get(key) if projection is not None else None
