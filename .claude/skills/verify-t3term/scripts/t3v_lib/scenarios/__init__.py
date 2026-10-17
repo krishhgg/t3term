@@ -11,6 +11,8 @@
 and may provide:
 
   print_threads      how `t3v threads` lists its threads, given the state and --all
+  run_fields         more of `t3v status`, from the server's numbers (live, or summary.json
+                     after stop) and the screen now
 """
 
 from __future__ import annotations
