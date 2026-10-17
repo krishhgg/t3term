@@ -6,6 +6,7 @@
 - **Reading the diff.** The first time the Code shows after the details open, t3term POSTs `/api/pull-requests/diff` with the link's project, host, repository and number and no cursor. `Loading pull request diff…` shows until the first slice comes. Once a frame shows the end of the files within two pages of the view, t3term reads the next slice with the cursor the last one gave. One slice is read at a time. Nothing reads the diff before the Code shows, and going to another tab and back within the minute reads nothing.
 - **The count and the note.** The count reads `5 files+` while more slices are left, with `Loading more files…` under the files while the next one is read, then `8 files`. `The host withheld part of this diff, such as a binary file or a change too large to show.` shows in yellow under it when a slice says the host left something out.
 - **Files.** Each file starts folded: `› M src/config/reader.rs +7 -5`, with `A` green, `D` red, `R` blue and `M` yellow, and the counts in green and red. A rename shows both paths, `› R src/config/source.rs → src/config/sources.rs`, with the counts on the next row where they don't fit. A file whose hunks the host left out takes the host's counts, as in `› M Cargo.lock +40 -12`.
+- **Order.** Each slice's files show in the desktop's reading order, not the patch's. Source files come first, each after the changed files it imports and otherwise by path. Tests come next, each after the source file whose name it has, then lockfiles, snapshots and files under `dist`, `build`, `vendor`, `__generated__` or `__snapshots__`, by path. A later slice never moves the files above it. So the first slice reads `assets/config-flow.png`, `src/config/reader.rs`, `src/config/schema.rs`, the rename and `tests/config_reload.rs`, and the second `docs/config.md`, `src/legacy/reader_v1.rs` and `Cargo.lock`.
 - **Unfolding.** Enter on the chosen file, or a click on it, turns `›` into `⌄` and shows its lines. Each line has its number in grey, the new one or the old for a removed line, then `-` and the line in red, `+` and the line in green, or a space and the line. `⋯ 14 unmodified lines` comes before a hunk that doesn't start at line 1. A line that wraps leaves the number and the mark blank on its later rows, and a tab stops every 4 columns. A binary file reads `A binary file, whose changes have no lines to show.` and a file the host withheld `The host withheld this file's changes.` Enter or a click again folds the file.
 - **Choosing.** Once a file or `↻ Retry` is in view, ↓ chooses the next one and ↑ the one before, and the status line leads with what Enter does: `Enter expand file`, `Enter collapse file` or `Enter retry`. Where none is in view, they scroll.
 - **Reading again.** A new refresh number, `r` and a detail whose `updatedAt` changed each read the first slice again. The files read before stay, each with its fold, until the new slice replaces them, and the count goes back to `5 files+` until the end of the files comes near again. After `r` the diff waits for the refresh number `pullRequests.invalidate` raises, or for the end of the read that sent it, so T3 has forgotten the diff it held.
@@ -17,7 +18,7 @@ Open a thread, open its details (Alt+B), press → for `Pull requests`, choose a
 
 ## Driving it with t3v
 
-Scenario `links` at 100x30. The diff route answers at once with two slices. The first holds `src/config/reader.rs`, `src/config/schema.rs`, the rename `src/config/source.rs → src/config/sources.rs`, the binary `assets/config-flow.png` and the new `tests/config_reload.rs`, with `truncated` and the cursor `s2`. The second holds `docs/config.md`, the deleted `src/legacy/reader_v1.rs` and a `Cargo.lock` with a header and no hunks, which the host counted at +40 -12. Files in the run directory change the reads: `diff-slow` holds each slice 4 s, `diff-fail` fails the first slice and `diff-fail-rest` the second with `GitHub took too long to answer.`, and `diff-off` makes the detail say the host gives no diff. The server logs each read of the diff in events.jsonl as `pr.diff` with its cursor, and `reads` lists those cursors, `null` for the first slice.
+Scenario `links` at 100x30. The diff route answers at once with two slices. The first holds `src/config/reader.rs`, `src/config/schema.rs`, the rename `src/config/source.rs → src/config/sources.rs`, the binary `assets/config-flow.png` and the new `tests/config_reload.rs`, with `truncated` and the cursor `s2`. The second holds `docs/config.md`, the deleted `src/legacy/reader_v1.rs` and a `Cargo.lock` with a header and no hunks, which the host counted at +40 -12. Files in the run directory change the reads: `diff-slow` holds each slice 4 s, `diff-fail` fails the first slice and `diff-fail-rest` the second with `GitHub took too long to answer.`, `diff-off` makes the detail say the host gives no diff, and `diff-ts` serves a TypeScript diff in one slice. Its patch has `src/settings/panel.tsx`, which imports `./store` and `../lib/format`, then `src/settings/panel.test.tsx`, `src/settings/store.ts`, which imports `../lib/format`, `pnpm-lock.yaml` and the new `src/lib/format.ts`. The server logs each read of the diff in events.jsonl as `pr.diff` with its cursor, and `reads` lists those cursors, `null` for the first slice.
 
 ```bash
 $T3V start --cols 100 --rows 30
@@ -41,23 +42,25 @@ $T3V capture more-100x30
 $T3V wait --text "8 files" --text "› M docs/config.md +2 -1" --text "› D src/legacy/reader_v1.rs +0 -4" --gone "Loading more files…" --idle 300
 rm "$RUN/diff-slow"
 [ "$(reads)" = '[null,"s2"]' ]
-S=$($T3V capture files-100x30 | grep 'ans$')
+C=$($T3V capture files-100x30); S=$(echo "$C" | grep 'ans$'); T=$(echo "$C" | grep 'txt$')
+# Each slice in reading order: source by path, as none imports another, then the test. Cargo.lock is below the view.
+[ "$(grep -o '› [AMDR] [^ ]*' "$T" | paste -sd' ' -)" = '› M assets/config-flow.png › M src/config/reader.rs › M src/config/schema.rs › R src/config/source.rs › A tests/config_reload.rs › M docs/config.md › D src/legacy/reader_v1.rs' ]
 grep -q '38;2;255;185;0mM.\[38;2;245;245;245m src/config/reader.rs .\[38;2;0;212;146m+7.\[38;2;245;245;245m .\[38;2;255;100;103m-5' "$S" && grep -q '38;2;43;127;255mR.\[38;2;245;245;245m src/config/source.rs → src/config/sources.rs' "$S" && grep -q '38;2;0;212;146mA.\[38;2;245;245;245m tests/config_reload.rs' "$S" && grep -q '38;2;255;100;103mD.\[38;2;245;245;245m src/legacy/reader_v1.rs' "$S" && grep -q '38;2;255;185;0mThe host withheld part' "$S"
 
-# ↓ chooses the first file and Enter unfolds it: numbers in grey, removed lines red, added green.
-$T3V keys Down && $T3V wait --text "Enter expand file"
-$T3V keys Enter && $T3V wait --text "⌄ M src/config/reader.rs +7 -5" --text " 4 - use crate::config::Source;" --text " 4 + use crate::config::schema::Schema;" --text "⋯ 14 unmodified lines" --text "Enter collapse file"
+# ↓ chooses the first file, the binary, and ↓ again the reader. Enter unfolds it: numbers in grey, removed lines red, added green.
+$T3V keys Down Down && $T3V wait --text "Enter expand file"
+$T3V keys Enter && $T3V wait --text "⌄ M src/config/reader.rs +7 -5" --text " 4 - use crate::config::Source;" --text " 4 + use crate::config::schema::Schema;" --text "Enter collapse file"
 S=$($T3V capture reader-100x30 | grep 'ans$')
 grep -q '38;2;129;129;129m 4 .\[38;2;255;100;103m- use crate::config::Source;' "$S" && grep -q '38;2;129;129;129m 4 .\[38;2;0;212;146m+ use crate::config::schema::Schema;' "$S" && grep -q '38;2;129;129;129m 1 .\[38;2;245;245;245m  use std::fs;' "$S"
-# Its tab stops at 4 columns, and a wrapped line leaves the number and the mark blank.
-$T3V keys PgDn && $T3V wait --text "28 -     Ok(config)" --text "33 +         // A reload reads and checks the file a" --text "     s a load does, so a file edited on disk since t"
-$T3V keys Home && $T3V keys Down && $T3V wait --text "Enter collapse file"
+# The unmodified lines before its second hunk, a tab stopping at 4 columns, and a wrapped line leaving the number and the mark blank.
+$T3V keys PgDn && $T3V wait --text "⋯ 14 unmodified lines" --text "28 -     Ok(config)" --text "33 +         // A reload reads and checks the file a" --text "     s a load does, so a file edited on disk since t"
+$T3V keys Home && $T3V keys Down Down && $T3V wait --text "Enter collapse file"
 $T3V keys Enter && $T3V wait --text "› M src/config/reader.rs +7 -5" --gone "⋯ 14 unmodified lines"
 
 # A click unfolds the others: the binary, the rename and the new file with its tabs.
 $T3V click --text "tests/config_reload.rs" && $T3V wait --text "⌄ A tests/config_reload.rs +8 -0" --text "4 + fn a_reload_checks_the_schema() {"
-$T3V click --text "assets/config-flow.png" && $T3V wait --text "⌄ M assets/config-flow.png" --text "A binary file, whose changes have no lines to show."
 $T3V click --text "src/config/source.rs" && $T3V wait --text "⌄ R src/config/source.rs → src/config/sources.rs" --text "1 - /// Where a config comes from." --text "1 + /// Where a config comes from: a file, the envir"
+$T3V click --text "assets/config-flow.png" && $T3V wait --text "⌄ M assets/config-flow.png" --text "A binary file, whose changes have no lines to show."
 $T3V capture kinds-100x30
 $T3V keys End && $T3V wait --text "› M Cargo.lock +40 -12" --text "5 +     let reader = Reader::new(\"tests/newer.toml\")"
 $T3V click --text "Cargo.lock" && $T3V wait --text "⌄ M Cargo.lock +40 -12"
@@ -115,6 +118,15 @@ $T3V refresh && $T3V wait --text "← List  Summary  Timeline  Code" --text "r r
 $T3V keys Right Right && $T3V wait --text "5 files+" --text "⌄ M src/config/reader.rs +7 -5"
 settle '[null]'
 
+# A TypeScript diff: format.ts, which the others import, then store.ts, which imports it, then panel.tsx, which imports both, then its test and the lockfile.
+touch "$RUN/diff-ts"
+mark
+$T3V refresh && settle '[null,null]'
+$T3V wait --text "› A src/lib/format.ts" --text "› M pnpm-lock.yaml" --gone "src/config/reader.rs" --idle 300
+rm "$RUN/diff-ts"
+T=$($T3V capture typescript-100x30 | grep 'txt$')
+[ "$(grep -o '› [AMDR] [^ ]*' "$T" | paste -sd' ' -)" = '› A src/lib/format.ts › M src/settings/store.ts › M src/settings/panel.tsx › M src/settings/panel.test.tsx › M pnpm-lock.yaml' ]
+
 # Another thread's link, whose first slice fails: the failure alone. Opening the details again reads it again.
 touch "$RUN/diff-fail"
 $T3V keys Escape && $T3V wait --gone "Thread details"
@@ -133,7 +145,7 @@ $T3V keys Right Right && $T3V wait --text "8 files" --text "› M src/config/rea
 
 # At 80x24 every row still fits the pane.
 $T3V resize 80 24 && $T3V wait --text "8 files" --idle 300
-$T3V keys Down Enter && $T3V wait --text "⌄ M src/config/reader.rs +7 -5" --text " 4 + use crate::config::schema::Schema;" --text "Enter collapse file"
+$T3V keys Down Down Enter && $T3V wait --text "⌄ M src/config/reader.rs +7 -5" --text " 4 + use crate::config::schema::Schema;" --text "Enter collapse file"
 $T3V capture reader-80x24
 $T3V status --json | jq -e '.scopeViolations == 0 and .unknownRpcs == 0 and .fixtureErrors == 0'
 ```
