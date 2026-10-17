@@ -92,6 +92,16 @@ def add_run_commands(commands):
     keys.add_argument('keys', nargs='+')
     keys.add_argument('--gap', type=float, default=0.2, metavar='S', help='seconds between two keys (default 0.2)')
     keys.add_argument('--literal', action='store_true', help='send each argument as literal text')
+    typed = command('type', c.cmd_type, 'type TEXT into t3term as keys, then Enter; the log keeps only its length')
+    typed.add_argument('text')
+    typed.add_argument('--no-enter', action='store_true', help='leave out the Enter')
+    paste = command('paste', c.cmd_paste, 'paste text through tmux as a terminal pastes it, bracketed when t3term '
+                                          'asked; the log keeps its counts and a hash')
+    body = paste.add_mutually_exclusive_group(required=True)
+    body.add_argument('--text', help='the text to paste')
+    body.add_argument('--bytes', type=int, metavar='N', help='N characters of ASCII rows that end in LF')
+    paste.add_argument('--escapes', action='store_true',
+                       help='with --text, turn \\xHH, \\uHHHH, \\e, \\a, \\r, \\n, \\t and \\\\ into what they name')
     click = command('click', c.cmd_click, 'send a left click or wheel notches as SGR mouse reports')
     where = click.add_mutually_exclusive_group(required=True)
     where.add_argument('--text', help='where this text first shows on screen now, or the --nth place')

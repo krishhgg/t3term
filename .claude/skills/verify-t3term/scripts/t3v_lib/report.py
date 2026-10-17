@@ -85,6 +85,10 @@ def build_report(root: Path, state: dict) -> dict:
         'labelServed': live.get('labelServed') if live else None,
     }
     report.update(scenario.status_fields(records, live))
+    run_fields = getattr(scenario, 'run_fields', None)
+    if run_fields is not None:
+        # The scenario's numbers from the server, live or from summary.json, and from the screen.
+        report.update(run_fields(server or {}, screen))
     report.update({
         'descriptorReads': by_event['descriptor.read'],
         'labelChanges': [r.get('preset') for r in records if r.get('event') == 'label.change'],
@@ -126,6 +130,7 @@ def build_report(root: Path, state: dict) -> dict:
         'scopeRefusals': prefixed(counts, 'scope.refused.'),
         'unknownRpcs': counts.get('unknownRpcs', 0),
         'unknownRpcTags': prefixed(counts, 'rpc.unknown.'),
+        'fixtureErrors': counts.get('fixtureErrors', 0),
         'openSockets': (server or {}).get('openSockets') if counts_from == 'the live server' else None,
         'openSocketsAtStop': (server or {}).get('openSocketsAtStop') if counts_from == 'summary.json' else None,
         'sessionsAtStop': (server or {}).get('sessions') if counts_from == 'summary.json' else None,

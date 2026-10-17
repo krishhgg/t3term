@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import sys
@@ -71,6 +72,22 @@ def encode(value) -> bytes:
         return json.dumps(value, separators=(',', ':'), ensure_ascii=False).encode('utf-8')
     except UnicodeEncodeError:
         return json.dumps(value, separators=(',', ':')).encode('ascii')
+
+
+def unescape(text: str) -> str:
+    """`text` with \\xHH, \\uHHHH, \\e, \\a, \\r, \\n, \\t and \\\\ turned into what they name."""
+    named = {'\\e': '\x1b', '\\a': '\x07', '\\r': '\r', '\\n': '\n', '\\t': '\t', '\\\\': '\\'}
+
+    def one(match) -> str:
+        found = match.group(0)
+        return chr(int(found[2:], 16)) if found[1] in 'xu' else named[found]
+
+    return re.sub(r'\\x[0-9a-fA-F]{2}|\\u[0-9a-fA-F]{4}|\\[earnt\\]', one, text)
+
+
+def sha(text: str) -> str:
+    """The SHA-256 of `text` in UTF-8, as hex. Logs keep it in place of what was typed."""
+    return hashlib.sha256(text.encode('utf-8', 'surrogatepass')).hexdigest()
 
 
 def without_controls(text: str) -> str:

@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import shlex
 import shutil
 import signal
@@ -21,7 +22,7 @@ from .runs import (CURRENT, RUN_PREFIX, SCRIPTS, SESSION, control_post, evidence
                    locate, make_evidence, make_run, mark, origin_of, owned, point_current, python_command,
                    read_log, run_argument, runs_command, save_state, server_needles, terminate)
 from .scenarios import SCENARIOS, scenario_of
-from .text import NAME, die, iso, now_ms, safe, text_places
+from .text import NAME, die, iso, now_ms, safe, sha, text_places, unescape
 from .tmux import (capture_screen, last_rows, launch, needs_pane, note_resize, own_t3term, pane, pane_size,
                    quit_t3term, respawn, send_mouse, sidebar_edge, t3term_command, tmux, wait_for_t3term,
                    wait_until)
@@ -311,6 +312,84 @@ def cmd_keys(args) -> int:
              literal=args.literal)
         if args.gap > 0 and i + 1 < len(args.keys):
             time.sleep(args.gap)
+    return 0
+
+
+def cmd_type(args) -> int:
+    """Types text into t3term as keys, then Enter. The log keeps only its length."""
+    root, state = locate(args.run)
+    needs_pane(state, 'type')
+    if args.text:
+        result = tmux(state, 'send-keys', '-t', state['session'], '-l', '--', args.text)
+        if result.returncode != 0:
+            die(f'tmux send-keys failed: {result.stderr.strip()}; `t3v doctor` checks the run')
+    if not args.no_enter:
+        time.sleep(0.05)
+        result = tmux(state, 'send-keys', '-t', state['session'], 'Enter')
+        if result.returncode != 0:
+            if args.text:
+                mark(state, 'fixture.type', length=len(args.text), enter=False)
+            die(f'tmux send-keys Enter failed: {result.stderr.strip()}; `t3v doctor` checks the run')
+    mark(state, 'fixture.type', length=len(args.text), enter=not args.no_enter)
+    return 0
+
+
+# The most t3term's terminal drawer sends of one paste, and the brackets it adds around a
+# bracketed one (src/tui/terminal.rs).
+PASTE_LIMIT = 256 << 10
+PASTE_BRACKETS = len('\x1b[200~') + len('\x1b[201~')
+
+
+def paste_body(size: int) -> str:
+    """`size` characters of printable ASCII in rows that end in LF."""
+    row = 'paste row {:06d} of the fixture body\n'
+    rows = size // len(row.format(0)) + 1
+    return ''.join(row.format(n) for n in range(rows))[:size]
+
+
+def cmd_paste(args) -> int:
+    """Pastes text into t3term through tmux as one paste from a terminal, bracketed when t3term
+    asked tmux for it. The log keeps the counts and a hash, never the text."""
+    root, state = locate(args.run)
+    needs_pane(state, 'paste')
+    if args.text is not None:
+        body = unescape(args.text) if args.escapes else args.text
+    else:
+        if not 1 <= args.bytes <= 4 << 20:
+            die('--bytes takes 1 to 4194304', 2)
+        body = paste_body(args.bytes)
+    if not body:
+        die('a paste needs text', 2)
+    try:
+        data = body.encode('utf-8')
+    except UnicodeEncodeError:
+        die('a paste must be valid UTF-8, so no lone surrogate', 2)
+    path = root / 'tmp' / f'paste-{secrets.token_hex(4)}.txt'
+    fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+    with os.fdopen(fd, 'wb') as handle:
+        handle.write(data)
+    try:
+        # -p brackets the paste when t3term turned bracketed paste on, which it does at start;
+        # -r keeps each LF as LF; -d drops the buffer after.
+        for step in (('load-buffer', '-b', 't3v', str(path)),
+                     ('paste-buffer', '-p', '-r', '-d', '-b', 't3v', '-t', state['session'])):
+            result = tmux(state, *step)
+            if result.returncode != 0:
+                die(f'tmux {step[0]} failed: {result.stderr.strip()}; `t3v doctor` checks the run')
+    finally:
+        path.unlink()
+    # The drawer drops Esc from a bracketed paste, so the paste can't end its own brackets.
+    kept = body.replace('\x1b', '')
+    digest = sha(kept)[:12]
+    lf, cr = body.count('\n'), body.count('\r')
+    mark(state, 'fixture.paste', chars=len(body), lf=lf, cr=cr, sha=digest)
+    print(f'pasted {len(body)} characters, LF {lf}, CR {cr}; the terminal scenario\'s fake shell reports '
+          f'sha256 {digest} for it')
+    bracketed = len(kept.encode('utf-8')) + PASTE_BRACKETS
+    plain = len(body.replace('\r\n', '\r').replace('\n', '\r').encode('utf-8'))
+    for mode, size in (('bracketed (the prompt asked)', bracketed), ('unbracketed (paste off)', plain)):
+        verdict = 'sends it whole' if size <= PASTE_LIMIT else 'refuses it whole and writes nothing'
+        print(f'  terminal drawer, {mode}: {size} bytes, so it {verdict} (it takes at most {PASTE_LIMIT})')
     return 0
 
 

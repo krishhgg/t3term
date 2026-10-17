@@ -20,8 +20,9 @@ Read the file for a feature before you drive it, and fix the file when a drive s
 
 ## Not mapped yet
 
-These exist on master but have no file yet, because no scenario serves what they need or nobody has driven them. Each line names the missing precondition.
+These have no file yet, because master doesn't have them, no scenario serves what they need or nobody has driven them. Each line names the missing precondition.
 
+- **The terminal drawer** isn't on master yet (#41). The `terminal` scenario serves it, and its docstring lists 27 cases to drive. Its feature file comes with the drawer, so smoke doesn't run it against a master without one.
 - **Sending a message, approvals, questions, interrupting and mode changes:** the fake server refuses every orchestration command (`message.dispatch`, `runtime-request.respond`, `run.interrupt`, `thread.runtime-mode.set`, `thread.interaction-mode.set`), so only t3term's refusal path is reachable.
 - **The tasks drawer:** needs a `todo_list` plan on the open thread's current run.
 - **The worktree setup card:** the fake server answers `subscribeWorktreeSetup` with null only.

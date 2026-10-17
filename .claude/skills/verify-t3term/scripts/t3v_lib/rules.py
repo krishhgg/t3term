@@ -134,6 +134,13 @@ def known_rpcs(report):
 
 
 @rule
+def fixture_held(report):
+    if report.get('fixtureErrors'):
+        yield (f'fixtureErrors {report["fixtureErrors"]}: the fake server hit a bug of its own, and fixture.error '
+               'in events.jsonl says where. Fix t3v before you trust this run')
+
+
+@rule
 def stopped_cleanly(report):
     if not report['stopped']:
         return
