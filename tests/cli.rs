@@ -45,20 +45,23 @@ fn output(command: &mut Command) -> Output {
     spawn(command).wait_with_output().expect("run t3term")
 }
 
-/// Every process these tests start holds `SPAWNING`, through `spawn` and `output`, or in the
-/// one test that holds `spawning()` itself until stdout's reader is gone. A test that calls
-/// `Command::output` or `Command::spawn` straight, as a merge from master can bring in, fails
-/// here rather than now and then on macOS.
+/// Every process these tests start holds `SPAWNING`: each call that starts one has a
+/// `spawning()` in the eight lines before it, as `spawn` and the tests that close a pipe do. A
+/// test that calls `Command::output` or `Command::spawn` straight, as a merge from master can
+/// bring in, fails here rather than now and then on macOS.
 #[test]
 fn every_process_starts_holding_the_spawn_lock() {
     let calls = ["output", "spawn", "status"].map(|name| format!(".{name}()"));
-    let starts: Vec<&str> = include_str!("cli.rs")
-        .lines()
-        .map(str::trim)
-        .filter(|line| calls.iter().any(|call| line.contains(call.as_str())))
+    let lines: Vec<&str> = include_str!("cli.rs").lines().map(str::trim).collect();
+    let unlocked: Vec<&str> = (0..lines.len())
+        .filter(|&at| calls.iter().any(|call| lines[at].contains(call.as_str())))
+        .filter(|&at| {
+            let before = &lines[at.saturating_sub(8)..at];
+            !before.iter().any(|line| line.contains("spawning()"))
+        })
+        .map(|at| lines[at])
         .collect();
-    // `spawn`'s own call, and `launch_into_closed_stdout`'s under `spawning()`.
-    assert_eq!(starts.len(), 2, "{starts:#?}");
+    assert!(unlocked.is_empty(), "{unlocked:#?}");
 }
 
 struct Home(TempDir);
