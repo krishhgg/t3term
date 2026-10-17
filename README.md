@@ -443,7 +443,7 @@ These come from the same fake T3 server, with `"theme": "grove"` in the settings
 
 Ctrl+Alt+A opens Change theme, the list the desktop's Cmd+Option+A opens. It lists T3 Code's own colors and then the five built-in themes, in the desktop's order, and marks the one that draws Current. Each row ends with a dot for each half, light then dark, in the half's focus color on its canvas. The desktop shows a ball lit by the half's accent there, which is the same color in every half but T3 Chat's dark one.
 
-The highlight starts on the first row, as the desktop's does. ↑ and ↓, Home and End or the mouse wheel move it. Enter, or a click on a row, draws that theme at once in the half that shows and saves it. Esc, Ctrl+Alt+A again or a click outside the list closes it. The list works from any pane, over a menu or a dialog too, and closes an open menu. Like Alt+A, it needs Option to send Meta on a Mac.
+The highlight starts on the first row, as the desktop's does. ↑ and ↓, Home and End or the mouse wheel move it. Enter, or a click on a row, draws that theme at once in the half that shows and saves it. Esc, Ctrl+Alt+A again or a click outside the list closes it. The list works from any pane, over a menu or a dialog too, and closes an open menu. While it is open every key goes to it but Alt+Shift+A and Ctrl+C or Ctrl+Q to quit, so Ctrl+X can't stop a run under it. Like Alt+A, it needs Option to send Meta on a Mac.
 
 | Change theme over T3 Code's dark colors, 120x48 | After Enter |
 |---|---|

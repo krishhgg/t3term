@@ -1834,6 +1834,28 @@ impl App {
                 self.quit = true;
                 return;
             }
+            // The color scheme, from any pane, an open menu, dialog or theme list included. The
+            // desktop's Cmd+Option+Shift+A. Terminals send Esc then `A` for it, which Alt+A
+            // below for an approval doesn't take.
+            KeyCode::Char('A') if alt => {
+                self.cycle_appearance();
+                return;
+            }
+            // The desktop's Change theme list, Cmd+Option+A, from any pane, over a menu or a
+            // dialog too. Terminals send Esc then Ctrl+A for Ctrl+Alt+A, which comes ahead of
+            // Alt+A for an approval and Ctrl+A in the composer. The same keys close it, as they
+            // close a menu.
+            KeyCode::Char('a') if ctrl && alt => {
+                self.toggle_theme_list();
+                return;
+            }
+            // The open list takes every other key but quitting, so nothing reaches what it
+            // covers: Ctrl+X doesn't stop a run under it, and the sidebar and the details stay
+            // as they are.
+            _ if self.theme_list.is_some() => {
+                self.on_theme_list_key(key);
+                return;
+            }
             KeyCode::Char('x') if ctrl => {
                 self.interrupt();
                 return;
@@ -1847,26 +1869,6 @@ impl App {
             // the composer.
             KeyCode::Char('b') if alt => {
                 self.toggle_details();
-                return;
-            }
-            // The color scheme, from any pane, an open menu or dialog included. The desktop's
-            // Cmd+Option+Shift+A. Terminals send Esc then `A` for it, which Alt+A below for an
-            // approval doesn't take.
-            KeyCode::Char('A') if alt => {
-                self.cycle_appearance();
-                return;
-            }
-            // The desktop's Change theme list, Cmd+Option+A, from any pane, over a menu or a
-            // dialog too. Terminals send Esc then Ctrl+A for Ctrl+Alt+A, which comes ahead of
-            // Alt+A for an approval and Ctrl+A in the composer. The same keys close it, as they
-            // close a menu.
-            KeyCode::Char('a') if ctrl && alt => {
-                self.toggle_theme_list();
-                return;
-            }
-            // The open list takes every other key, so nothing reaches what it covers.
-            _ if self.theme_list.is_some() => {
-                self.on_theme_list_key(key);
                 return;
             }
             // A dialog of the details takes every other key, so Esc closes it before it moves
@@ -14104,13 +14106,31 @@ mod tests {
         ctrl_alt_a(&mut app);
         assert!(app.theme_list.is_some());
         assert!(app.picker.is_none());
-        // Letters, Alt+A, a paste and Tab go nowhere.
+        // Letters, Alt+A, a paste and Tab go nowhere. Nor do the keys that work from any pane:
+        // Ctrl+X doesn't stop the run under the list, and Ctrl+B and Alt+B leave the sidebar
+        // and the details as they are.
+        let open = app.open.as_ref().unwrap();
+        assert!(open.state.as_ref().unwrap().active_run().is_some());
+        let sidebar_hidden = app.sidebar_hidden;
         press(&mut app, KeyCode::Char('x'));
         alt(&mut app, 'a');
         app.on_terminal_event(Event::Paste("pasted".into()));
         press(&mut app, KeyCode::Tab);
+        for c in ['x', 'b'] {
+            let key = KeyEvent::new(KeyCode::Char(c), KeyModifiers::CONTROL);
+            app.on_terminal_event(Event::Key(key));
+        }
+        alt(&mut app, 'b');
+        assert!(app.theme_list.is_some());
         assert_eq!(app.composer.text(), draft);
         assert_eq!(app.focus, Focus::Composer);
+        assert_eq!(app.sidebar_hidden, sidebar_hidden);
+        assert_eq!(
+            crate::settings::saved_in_test().sidebar_hidden,
+            Settings::default().sidebar_hidden
+        );
+        assert!(!app.details.open);
+        assert!(app.message.is_none());
         assert_eq!(
             runtime.metrics().num_alive_tasks(),
             tasks,
@@ -14125,6 +14145,8 @@ mod tests {
         cells(&mut app, 120, 40);
         assert!(app.details_modal());
         ctrl_alt_a(&mut app);
+        alt(&mut app, 'b');
+        assert!(app.details_modal());
         press(&mut app, KeyCode::Esc);
         assert!(app.theme_list.is_none());
         assert!(app.details_modal());
@@ -14190,6 +14212,11 @@ mod tests {
             tasks,
             "no answer went out"
         );
+
+        // Ctrl+C still quits.
+        let ctrl_c = KeyEvent::new(KeyCode::Char('c'), KeyModifiers::CONTROL);
+        app.on_terminal_event(Event::Key(ctrl_c));
+        assert!(app.quit);
     }
 
     #[test]
