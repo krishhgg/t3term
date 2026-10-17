@@ -14,7 +14,7 @@ use std::sync::{Arc, Mutex, MutexGuard, PoisonError};
 use serde_json::{Value, json};
 use tokio::sync::{Notify, mpsc};
 
-use super::RpcError;
+use super::{Owner, RpcError};
 
 /// The most a bounded stream may hold that its caller has not accepted.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -57,7 +57,9 @@ impl BoundedChunk {
     /// as compact UTF-8 JSON. T3's terminal output window measures a chunk the same way, as
     /// `Buffer.byteLength(JSON.stringify(response))` in apps/server/src/terminal/
     /// OutputProtocol.ts. serde_json writes strings and integers as JSON.stringify does, but
-    /// can write a float with an exponent differently, such as `1e21` for `1e+21`.
+    /// can write a float with an exponent differently, such as `1e21` for `1e+21`. Half a
+    /// surrogate pair counts differently too: T3 counts its 6-byte escape, and t3term counts the
+    /// 3 bytes of the U+FFFD it reads in its place.
     ///
     /// It isn't the memory the values take. A parsed `Value` takes more than its JSON.
     pub fn bytes(&self) -> usize {
@@ -98,8 +100,13 @@ impl fmt::Debug for BoundedChunk {
 
 /// A stream from `RpcClient::bounded_stream`. Dropping it interrupts the stream on the
 /// server if it is still open, and discards the chunks still queued in it.
+///
+/// The connection stays open while the stream lives, even after every client has dropped.
 pub struct BoundedStream {
     pub(super) shared: Arc<Shared>,
+    /// Kept here and not in `Shared`, which the connection's map of requests holds too. It
+    /// drops after `drop` has queued the `Interrupt`.
+    pub(super) _owner: Arc<Owner>,
 }
 
 impl BoundedStream {
@@ -148,7 +155,9 @@ impl Drop for BoundedStream {
     }
 }
 
-/// What a bounded stream shares with its chunks and with the connection's reader.
+/// What a bounded stream shares with its chunks and with the connection's reader. It holds no
+/// share in the connection, so neither the reader's map nor a chunk the caller keeps after
+/// dropping the stream holds the connection open.
 pub(super) struct Shared {
     request_id: String,
     limits: StreamLimits,
