@@ -7,6 +7,7 @@ import json
 import os
 import shlex
 import shutil
+import signal
 import subprocess
 import sys
 import tempfile
@@ -95,6 +96,9 @@ def cmd_start(args) -> int:
     deadline = time.monotonic() + 10
     while origin_of(root) is None:
         if server.poll() is not None or time.monotonic() > deadline:
+            if server.poll() is None:
+                os.kill(server.pid, signal.SIGUSR1)  # its stacks, into the log printed below
+                time.sleep(0.5)
             terminate(server.pid, server_needles(root), 'server')
             tail = (root / 'logs' / 'server.log').read_text(errors='replace')[-2000:]
             print(tail, file=sys.stderr)
@@ -476,9 +480,14 @@ def cmd_render(args) -> int:
 # -- internal --
 
 def cmd_serve(args) -> int:
+    import faulthandler
+
     from .scenarios import fixture_of
     from .server import serve
 
+    # `t3v start` sends SIGUSR1 to a server that hasn't listened in time, so the log it prints
+    # shows where every thread waits.
+    faulthandler.register(signal.SIGUSR1, all_threads=True)
     root, state, problem = inspect(args.run)
     if problem:
         die(problem, 2)
