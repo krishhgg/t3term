@@ -18,7 +18,7 @@ Read the file for a feature before you drive it, and fix the file when a drive s
 | Pull request page: what a link's details read from its host | [pull-request-page.md](pull-request-page.md) | `links` |
 | Lineage: related threads, forks and agents in the details | [lineage.md](lineage.md) | `lineage` |
 | CLI: commands, `--json` and exit codes against a fake server | [cli.md](cli.md) | `links` |
-| Saved environments: the `environment` commands, `environment status` and the descriptor cap | [environments.md](environments.md) | `links` |
+| Saved environments: the `environment` commands, `environment status`, the descriptor cap and the TUI's Environments dialog | [environments.md](environments.md) | `links` |
 | Transcript: how a thread's replies draw | [transcript.md](transcript.md) | `links` |
 | Appearance: Alt+Shift+A, System, Light and Dark, and the light colors | [appearance.md](appearance.md) | `links` |
 

@@ -8,6 +8,7 @@
 //! replaces the held one, nothing is merged, and nothing is kept for another thread or for
 //! later.
 
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
@@ -436,28 +437,30 @@ pub(super) struct Card {
 }
 
 impl Card {
-    /// The rows from `from` to `to` that a frame drew, starting `top` rows below the
-    /// transcript's first row on screen, which is screen row `y`. None when they are only the
-    /// blank row the card ends with, or none at all.
+    /// The rows from `from` to `to` that a frame drew, starting `top` rows below the first row
+    /// of the transcript's `area`. None when they are only the blank row the card ends with, or
+    /// none at all.
     pub(super) fn drawn(
         &self,
         from: usize,
         to: usize,
         top: isize,
-        y: u16,
+        area: Rect,
         scroll: usize,
     ) -> Option<Drawn> {
         if from >= to || from + 1 >= self.lines.len() {
             return None;
         }
+        let first = (top + from as isize).max(0) as u16;
         Some(Drawn {
             toggle: self.toggle.map(|toggle| top + toggle as isize),
             row: self
                 .toggle
                 .filter(|toggle| (from..to).contains(toggle))
-                .map(|toggle| y + (top + toggle as isize) as u16),
+                .map(|toggle| area.y + (top + toggle as isize) as u16),
             scroll,
             live: self.live,
+            rows: Rect::new(area.x, area.y + first, area.width, (to - from) as u16),
         })
     }
 }
@@ -472,8 +475,11 @@ pub(super) struct Drawn {
     pub row: Option<u16>,
     /// The scroll the frame drew.
     pub scroll: usize,
-    /// Whether the rows drawn had a moving clock or spinner.
+    /// Whether the rows drawn showed a moving clock or spinner. A banner, a menu or a dialog
+    /// over all of them leaves it false.
     pub live: bool,
+    /// The screen rows the card took, the transcript's width.
+    pub rows: Rect,
 }
 
 /// What an item from the subscription did.
@@ -668,6 +674,14 @@ impl Watch {
                 .as_ref()
                 .is_some_and(|held| held.phase == Phase::Running)
             && self.drawn.is_some_and(|drawn| drawn.live)
+    }
+
+    /// Notes that the frame drew `over` on top of the transcript. A card they cover all of
+    /// has no clock in view.
+    pub fn cover(&mut self, over: &[Rect]) {
+        if let Some(drawn) = self.drawn.as_mut() {
+            drawn.live &= !super::covered(drawn.rows, over);
+        }
     }
 }
 
@@ -1525,7 +1539,7 @@ mod tests {
             watch.lay_out(BEFORE, 60, now, &theme);
             watch.drawn = watch
                 .card()
-                .and_then(|card| card.drawn(0, card.lines.len(), 0, 0, 0));
+                .and_then(|card| card.drawn(0, card.lines.len(), 0, Rect::new(0, 0, 60, 40), 0));
         };
         let mut watch = Watch::default();
         watch.watch(mpsc::unbounded_channel().1);
@@ -1543,7 +1557,10 @@ mod tests {
         // The blank row the card ends with isn't the card.
         let card = watch.card().expect("a card");
         let last = card.lines.len();
-        assert_eq!(card.drawn(last - 1, last, 0, 0, 0), None);
+        assert_eq!(
+            card.drawn(last - 1, last, 0, Rect::new(0, 0, 60, 40), 0),
+            None
+        );
         // Out of view it doesn't tick.
         watch.drawn = None;
         assert!(!watch.ticks());
@@ -1592,6 +1609,7 @@ mod tests {
             row,
             scroll: 7,
             live: false,
+            rows: Rect::default(),
         };
         let mut watch = Watch::default();
         assert_eq!((watch.toggle(), watch.hint()), (None, None));

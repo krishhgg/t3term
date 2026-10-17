@@ -814,14 +814,21 @@ pub struct Sidebar {
     /// The screen rows each drawn card or slim row covers, top inclusive and bottom
     /// exclusive, with its thread.
     cards: Vec<(u16, u16, String)>,
-    /// Whether the last frame drew a card that reads Working or Goal.
+    /// Whether the last frame drew a card that reads Working or Goal where nothing drawn over
+    /// it covers its row.
     drew_working: bool,
+    /// The screen rows the last frame drew a card or slim row that reads Working or Goal on,
+    /// counting a card's first row, which has its spinner and clock.
+    working: Vec<u16>,
     /// The screen rows the last frame drew the headings of the shelves that fold on, with
     /// their shelves.
     headings: Vec<(u16, Shelf)>,
     /// Whether the last frame drew the feed's dot by the wordmark, with the environment
     /// under it. Without it the breadcrumb's row shows them.
     drew_environment: bool,
+    /// The row under the wordmark the last frame drew the environment in, which a click
+    /// opens the Environments dialog from.
+    pub environment: Rect,
 }
 
 impl Sidebar {
@@ -1000,10 +1007,20 @@ impl Sidebar {
 
     /// Whether the last frame drew a card that reads Working or Goal, whose spinner and clock
     /// need the event loop's tick. A card scrolled out of view, behind a closed shelf, left
-    /// out of the sidebar or in a hidden sidebar has nothing on screen to move, so it doesn't
-    /// count.
+    /// out of the sidebar, in a hidden sidebar or under a menu or a dialog has nothing on screen
+    /// to move, so it doesn't count.
     pub fn drew_working(&self) -> bool {
         self.drew_working
+    }
+
+    /// Notes that the frame drew `over` on top of the sidebar. A card that reads Working or
+    /// Goal counts only while they leave a cell of its row in view.
+    pub fn cover(&mut self, over: &[Rect]) {
+        let list = self.list;
+        self.drew_working = self
+            .working
+            .iter()
+            .any(|&y| !super::covered(Rect::new(list.x, y, list.width, 1), over));
     }
 
     /// Whether the last frame drew the feed's dot and the environment, which a hidden
@@ -1140,8 +1157,10 @@ impl Sidebar {
         self.border = Rect::default();
         self.cards.clear();
         self.drew_working = false;
+        self.working.clear();
         self.headings.clear();
         self.drew_environment = false;
+        self.environment = Rect::default();
     }
 
     /// Draws the wordmark, the environment and the shelves, keeping the highlight in view.
@@ -1197,10 +1216,8 @@ impl Sidebar {
             let identity = view
                 .environment
                 .spans(width, label, Style::new().fg(t.muted));
-            frame.render_widget(
-                Paragraph::new(Line::from(identity)),
-                Rect::new(inner.x, inner.y + inset + 1, inner.width, 1),
-            );
+            self.environment = Rect::new(inner.x, inner.y + inset + 1, inner.width, 1);
+            frame.render_widget(Paragraph::new(Line::from(identity)), self.environment);
         }
 
         let top = inner.y + 2 + 2 * inset;
@@ -1256,7 +1273,10 @@ impl Sidebar {
                     self.cards
                         .push((top, bottom.min(list.bottom()), id.clone()));
                     let thread = view.shell.and_then(|shell| find_thread(shell, id));
-                    self.drew_working |= thread.is_some_and(working);
+                    if thread.is_some_and(working) {
+                        self.drew_working = true;
+                        self.working.push(top);
+                    }
                     let is_open = view.open_id == Some(id.as_str());
                     let cursor = index == self.selected;
                     let bg = if is_open {

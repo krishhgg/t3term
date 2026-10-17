@@ -119,6 +119,10 @@ A name that isn't saved stops with `ENVIRONMENT_NOT_FOUND`, exit 3. A name that 
 
 A program that uses the t3term library gets the same checks from `Environments::probe` and `Environments::probe_all`.
 
+## In the TUI
+
+Alt+C, or a click on the environment under the sidebar's wordmark, opens the TUI's Environments dialog. It runs `Environments::probe_all` once when it opens and again when you press `r`, and shows each saved environment with its phase, as `environment status` would. It marks the environments whose servers report the id of the server the TUI is connected to, and shows the chosen one's label, address, version and T3 home, or its error's code and message. The README's [saved environments](../README.md#saved-environments) has the keys. It switches to none of them, so the TUI stays on the server the command chose.
+
 ## Redirects and proxies
 
 t3term sends each HTTP request straight to the server it chose. It follows no redirect. When a server answers the descriptor or any later request with a redirect, the saved login check included, the command stops with `T3_REDIRECTED`, and the request, its token and its body never reach the server the redirect names. At T3 f570bd21 no route t3term calls redirects. t3term uses no proxy either, so `HTTP_PROXY`, `HTTPS_PROXY` and `ALL_PROXY` don't apply, and a request for a server on this machine stays on it. The WebSocket already worked this way.
@@ -198,8 +202,8 @@ It holds names, paths and origins, and never a login or a token. A change follow
 - https. A local T3 server listens on plain http, and t3term is built without TLS, so it refuses an https origin on this machine when you add it, when a saved one loads and when a T3 home records one, all before it reaches a server. `T3TERM_ORIGIN` isn't checked this way: discovery passes an https origin over as one that didn't answer.
 - Remote environments. t3term refuses an origin off this machine, and a saved kind other than `local`, before it reaches any server. T3 pairs a remote client by exchanging a one-time `t3 pair` credential at the server's `/oauth/token` for a bearer token. t3term's HTTP client is built without TLS, and its saved logins don't hold a remote token yet.
 - T3 Connect. The next section says what T3's clients do and what t3term lacks.
-- A picker in the TUI. The TUI opens on the environment the command chose, and the sidebar names it as before.
-- Watching servers. `environment status` checks once per run. t3term doesn't keep a connection to each environment or poll them, and the TUI doesn't show their phases.
+- Switching in the TUI. The TUI stays on the environment the command chose. Its Environments dialog lists the saved environments and their phases, and switches to none of them.
+- Watching servers. `environment status` checks once per run, and the TUI's dialog once each time it opens or `r` asks. t3term doesn't keep a connection to each environment or poll them.
 - A dev server started with `--dev-url` and no base dir keeps its state in `~/.t3/dev`, which a saved environment doesn't read. Discovery still finds it.
 - `remove` doesn't revoke the environment's login. Run `t3term --environment NAME logout` first.
 
