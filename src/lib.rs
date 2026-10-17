@@ -7,6 +7,7 @@ pub mod http;
 pub mod keychain;
 pub mod models;
 pub mod projection;
+pub mod pull_request;
 pub mod rpc;
 pub mod settings;
 pub mod terminal;

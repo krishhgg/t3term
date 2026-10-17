@@ -2,7 +2,7 @@
 
 ## Sub-features
 
-- **The three choices.** System, Light and Dark. Light draws T3 Code's light colors and Dark its dark ones. System draws whichever macOS shows, read with `defaults read -g AppleInterfaceStyle` at start and again each time Alt+Shift+A comes back to System. Off macOS, or when the read fails, System draws dark at start and otherwise keeps what draws.
+- **The three choices.** System, Light and Dark. Light draws T3 Code's light colors and Dark its dark ones. System draws whichever macOS shows, read with `defaults read -g AppleInterfaceStyle` at start and again each time Alt+Shift+A comes back to System. Off macOS, or until a read works, System draws dark. When a later read fails, System keeps what the last read that worked found.
 - **The toast.** After each press the status line reads `Appearance: System`, `Appearance: Light` or `Appearance: Dark`. The next key clears it.
 - **Saving.** settings.json keeps the choice as `appearanceMode`: `system`, `light` or `dark`. A file without the key, or with a value t3term doesn't know, draws dark and keeps the rest of the file.
 - **T3 Code's light colors in truecolor.** The canvas is `#fcfcfc`, the sidebar `#fafafa`, text `#27272a`, borders and chips `#e4e4e7`, the composer and menus white, and the primary color `#1b4ed8`. Dark's canvas is `#0a0a0a` and its sidebar `#000000`.
