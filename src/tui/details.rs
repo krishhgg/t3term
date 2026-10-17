@@ -1003,6 +1003,16 @@ impl Details {
         }
     }
 
+    /// Reads the pull request whose details show from its host again, as `r` does. Says whether
+    /// it wants a read, which the caller asks for at `now`.
+    pub fn reload(&mut self, now: i64) -> bool {
+        let wants = self.tab == Tab::PullRequests && self.pulls.reload(now);
+        if wants {
+            self.moved = true;
+        }
+        wants
+    }
+
     /// Goes back a step: from a pull request's Timeline to its Summary, from its details to the
     /// list, or from the pull requests to the thread's tab.
     pub fn back(&mut self) {
@@ -1026,21 +1036,20 @@ impl Details {
             Tab::PullRequests => {
                 let action = self.pulls.action().filter(|_| self.pulls.viewing());
                 if let Some(action) = action {
-                    let plain = self.plain_keys(modal);
+                    let plain = self.plain(modal);
                     let mut keys: Vec<String> = plain
                         .iter()
                         .map(|keys| format!("Enter {action} · {keys}"))
                         .collect();
                     // Esc still shows where what Enter does has no room.
-                    keys.extend(plain.last().map(|keys| keys.to_string()));
+                    keys.extend(plain.last().cloned());
                     return keys;
                 }
                 None
             }
         };
         let Some(action) = lineage else {
-            let plain = self.plain_keys(modal);
-            return plain.iter().map(|keys| keys.to_string()).collect();
+            return self.plain(modal);
         };
         let shapes = if modal {
             [
@@ -1069,6 +1078,25 @@ impl Details {
         // Esc still shows where what Enter does has no room.
         keys.push(shapes[4].to_string());
         keys
+    }
+
+    /// The keys of `plain_keys`, with `r` before Esc in each while `r` reads the pull request
+    /// whose details show from its host again. Each shape follows itself with `r`, so a
+    /// narrower status line drops `r` before the other keys of that shape.
+    fn plain(&self, modal: bool) -> Vec<String> {
+        let shapes = self.plain_keys(modal);
+        if !(self.tab == Tab::PullRequests && self.pulls.reloads()) {
+            return shapes.iter().map(|keys| keys.to_string()).collect();
+        }
+        shapes
+            .iter()
+            .flat_map(|keys| {
+                [
+                    keys.replacen("Esc ", "r refresh · Esc ", 1),
+                    keys.to_string(),
+                ]
+            })
+            .collect()
     }
 
     /// The keys of `keys` for a tab with no Lineage rows to choose. A pull request's details
