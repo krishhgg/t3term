@@ -2,8 +2,9 @@
 //! number, title and state, and the checks, review and line counts the host reported, with
 //! the repository and its branches under them. Enter or a second click shows a link's details
 //! in the list's place, its whole URL among them as plain text, and they scroll. ←, Enter or
-//! a click on the row above them goes back to the list. t3term opens no browser and changes
-//! nothing: the list only reads.
+//! a click on the row above them goes back to the list. Once the host's detail of the pull
+//! request came, that row names two tabs, the Summary and the Timeline, which →, ← and clicks
+//! switch between. t3term opens no browser and changes nothing: the list only reads.
 //!
 //! The links come from the thread's record that the details already hold, as the desktop's
 //! `ThreadPullRequestsPanel` (apps/web/src/components/pullRequest/ThreadPullRequestsPanel.tsx
@@ -43,7 +44,7 @@ use crate::transcript::without_controls;
 
 mod conversation;
 
-use conversation::{Control, Conversation, Reviewer, Shown, Targets};
+use conversation::{Control, Conversation, Lifecycle, Reviewer, Shown, Targets};
 
 /// The most links read from a thread's record. The rest are counted and left unread.
 const MOST_LINKS: usize = 1000;
@@ -748,6 +749,28 @@ struct Shape {
     /// keyboard.
     pick: Option<Control>,
     focused: bool,
+    /// The tab of the details that shows, while they have tabs.
+    tabs: Option<Tab>,
+}
+
+/// A tab of a link's details, as the desktop's pull request panel has them once the host's
+/// detail of the pull request came. The desktop's third, Code, has no counterpart here.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub(super) enum Tab {
+    #[default]
+    Summary,
+    Timeline,
+}
+
+impl Tab {
+    const ALL: [Tab; 2] = [Tab::Summary, Tab::Timeline];
+
+    fn name(self) -> &'static str {
+        match self {
+            Tab::Summary => "Summary",
+            Tab::Timeline => "Timeline",
+        }
+    }
 }
 
 /// What a click on a row of a page reaches.
@@ -757,7 +780,7 @@ enum Spot {
     Link(usize),
     /// The row above a link's details, which leads back to the list.
     Back,
-    /// A row of a control in the details' Comments section.
+    /// A row of a control in the details' Comments section or Timeline.
     Control(Control),
 }
 
@@ -774,6 +797,9 @@ pub(super) struct Page {
     /// The links a page of the list holds, or the rows of details it shows, which PageUp and
     /// PageDown move by.
     per_page: usize,
+    /// The columns of each tab's name on the row above a link's details, with the gap before
+    /// it. A click on the rest of that row leads back to the list.
+    tabs: Vec<(Range<usize>, Tab)>,
 }
 
 /// The selected link's details at one width and minute.
@@ -892,6 +918,8 @@ struct Summary {
     cut: bool,
     /// The description laid out at one width, so a new minute doesn't lay it out again.
     laid_out: Option<(usize, Vec<Line<'static>>)>,
+    /// When the pull request opened and ended, for the Timeline.
+    lifecycle: Lifecycle,
 }
 
 /// One check on the pull request's head.
@@ -934,6 +962,7 @@ impl Summary {
             body_cut: detail.body.cut,
             cut: detail.cut,
             laid_out: None,
+            lifecycle: Lifecycle::of(detail),
         }
     }
 
@@ -1018,8 +1047,14 @@ pub(super) struct PullRequests {
     /// What the reader opened of the conversation, which starts over each time a link's
     /// details open.
     shown: Shown,
-    /// The control in the Comments section that ↑ and ↓ chose, which Enter acts on.
+    /// The control in the Comments section or the Timeline that ↑ and ↓ chose, which Enter
+    /// acts on.
     pick: Option<Control>,
+    /// The tab of a link's details that shows while they have tabs, which starts over at the
+    /// Summary each time they open.
+    tab: Tab,
+    /// The other tab's scroll, which it shows at again when the reader goes back to it.
+    other: Offset,
     /// How many times the links were worked out and a page laid out, so the tests can tell
     /// what a frame or an event did.
     #[cfg(test)]
@@ -1048,6 +1083,8 @@ impl PullRequests {
         self.asking = false;
         self.shown = Shown::default();
         self.pick = None;
+        self.tab = Tab::Summary;
+        self.other = Offset::Top(0);
     }
 
     /// Drops the page, the details and the host's answer laid out in the old colors, after the
@@ -1109,6 +1146,39 @@ impl PullRequests {
     /// Whether the selected link's details show in the list's place.
     pub fn viewing(&self) -> bool {
         self.viewing
+    }
+
+    /// The tab of the selected link's details that shows, while they show and have tabs: once
+    /// the host's detail of the pull request came, as the desktop shows its tabs only then.
+    /// Until it does, and after it failed, the details show as the Summary does.
+    pub fn tabs(&self) -> Option<Tab> {
+        let read = self
+            .read
+            .as_ref()
+            .filter(|read| self.reads_selected(read))?;
+        let read = matches!(read.answer, Answer::Read(_));
+        (self.viewing && read).then_some(self.tab)
+    }
+
+    /// → in a link's details: shows the Timeline in the Summary's place. Says whether it did.
+    pub fn forward(&mut self) -> bool {
+        if self.tabs() != Some(Tab::Summary) {
+            return false;
+        }
+        self.switch(Tab::Timeline);
+        true
+    }
+
+    /// Shows `tab` of the details, at the scroll it had when the reader left it, with no
+    /// control chosen. Each tab keeps its own scroll while the other shows.
+    fn switch(&mut self, tab: Tab) {
+        if self.tab == tab {
+            return;
+        }
+        self.tab = tab;
+        std::mem::swap(&mut self.scroll, &mut self.other);
+        self.pick = None;
+        self.relay();
     }
 
     /// Moves the selection `delta` links, down for a positive one, and stops at the ends.
@@ -1323,14 +1393,16 @@ impl PullRequests {
         }
     }
 
-    /// Shows the selected link's details in the list's place, from their top, or the list
-    /// again.
+    /// Shows the selected link's details in the list's place, from the top of their Summary,
+    /// or the list again.
     pub fn toggle(&mut self) {
         if self.viewing {
-            self.back();
+            self.show_list();
         } else if !entries_of(self.list.as_ref()).is_empty() {
             self.viewing = true;
             self.scroll = Offset::Top(0);
+            self.tab = Tab::Summary;
+            self.other = Offset::Top(0);
             self.current = false;
             self.asking = true;
             // What was opened starts over, so the rows laid out for it go too, even where the
@@ -1446,6 +1518,13 @@ impl PullRequests {
             }
             Part::Done => {}
         }
+        // The Timeline takes the pull request's opening and end from its detail, so it is made
+        // once both answers came, in either order.
+        if let (Answer::Read(summary), Answer::Read(conversation)) =
+            (&read.answer, &mut read.conversation)
+        {
+            conversation.follow(&summary.lifecycle);
+        }
         // The rows move, so no control stays chosen.
         self.pick = None;
         self.relay();
@@ -1460,9 +1539,19 @@ impl PullRequests {
         self.current = false;
     }
 
+    /// ← in a link's details: shows the Summary in the Timeline's place, or else the list
+    /// again. Says whether the details showed.
+    pub fn back(&mut self) -> bool {
+        if self.tabs() == Some(Tab::Timeline) {
+            self.switch(Tab::Summary);
+            return true;
+        }
+        self.show_list()
+    }
+
     /// Shows the list again in place of a link's details, with that link still selected. Says
     /// whether the details showed.
-    pub fn back(&mut self) -> bool {
+    fn show_list(&mut self) -> bool {
         if !self.viewing {
             return false;
         }
@@ -1474,21 +1563,29 @@ impl PullRequests {
         true
     }
 
-    /// A click on row `offset` of the page the last frame drew. On a link's rows it selects
-    /// the link, or shows its details when it is selected already, and on the row above the
-    /// details it shows the list again. Says whether it landed on one of those. Once the
-    /// selection or the scroll moved, a click lands on nothing until a frame draws the page.
-    pub fn click(&mut self, offset: usize) -> bool {
-        let hit = self
-            .page
-            .as_ref()
-            .filter(|_| self.current)
-            .and_then(|page| page.rows.get(offset).copied().flatten());
-        match hit {
+    /// A click at `column` of row `offset` of the page the last frame drew. On a link's rows
+    /// it selects the link, or shows its details when it is selected already. On the row above
+    /// the details it shows the tab whose name it is on, or else the list again. Says whether
+    /// it landed on one of those and changed what shows. Once the selection or the scroll
+    /// moved, a click lands on nothing until a frame draws the page.
+    pub fn click(&mut self, column: usize, offset: usize) -> bool {
+        let Some(page) = self.page.as_ref().filter(|_| self.current) else {
+            return false;
+        };
+        let tab = page
+            .tabs
+            .iter()
+            .find(|(columns, _)| offset == 0 && columns.contains(&column));
+        if let Some(&(_, tab)) = tab {
+            let changed = self.tab != tab;
+            self.switch(tab);
+            return changed;
+        }
+        match page.rows.get(offset).copied().flatten() {
             Some(Spot::Link(index)) if index == self.selected => self.toggle(),
             Some(Spot::Link(index)) => self.select(index),
             Some(Spot::Back) => {
-                self.back();
+                self.show_list();
             }
             Some(Spot::Control(control)) => self.act(control),
             None => return false,
@@ -1509,25 +1606,31 @@ impl PullRequests {
         count * ENTRY_ROWS + 1
     }
 
-    /// The rows of the selected link's details at `width`, worked out again only for another
-    /// link, width or minute.
+    /// The rows of the selected link's details at `width`, as the tab that shows has them,
+    /// worked out again only for another link, width or minute, or once what they show changed.
     fn prepare_detail(&mut self, width: usize, now: i64, theme: &Theme) -> usize {
         let (index, at) = (self.selected, (width, now.div_euclid(60_000)));
         let cached = self.detail.as_ref().map(|detail| (detail.index, detail.at));
         if cached != Some((index, at)) {
+            let tab = self.tabs().unwrap_or(Tab::Summary);
             let lines = match entries_of(self.list.as_ref()).get(index) {
                 Some(entry) => {
                     let read = self.read.as_mut().filter(|read| read.key == entry.key);
                     if let Some(read) = read {
-                        if let Answer::Read(summary) = &mut read.answer {
+                        if let (Tab::Summary, Answer::Read(summary)) = (tab, &mut read.answer) {
                             summary.lay_out(width, theme);
                         }
                         if let Answer::Read(conversation) = &mut read.conversation {
-                            conversation.lay_out(width, theme, &self.shown);
+                            match tab {
+                                Tab::Summary => conversation.lay_out(width, theme, &self.shown),
+                                Tab::Timeline => {
+                                    conversation.lay_out_timeline(width, theme, &self.shown);
+                                }
+                            }
                         }
                     }
                     let read = self.read.as_ref().filter(|read| read.key == entry.key);
-                    detail_lines(entry, read, &self.shown, width, now, theme)
+                    detail_lines(entry, read, &self.shown, tab, width, now, theme)
                 }
                 None => (Vec::new(), Vec::new()),
             };
@@ -1575,6 +1678,7 @@ impl PullRequests {
             minute: now.div_euclid(60_000),
             pick: self.pick.filter(|_| self.viewing),
             focused,
+            tabs: self.tabs(),
         };
         if self.page.as_ref().map(|page| page.shape) != Some(shape) {
             #[cfg(test)]
@@ -1605,6 +1709,7 @@ fn lay_out(list: Option<&List>, mut shape: Shape, now: i64, theme: &Theme) -> Pa
         above: false,
         below: false,
         per_page: 1,
+        tabs: Vec::new(),
     };
     let (width, height) = (shape.width, shape.height);
     if width == 0 || height == 0 {
@@ -1657,8 +1762,10 @@ fn lay_out(list: Option<&List>, mut shape: Shape, now: i64, theme: &Theme) -> Pa
     page
 }
 
-/// The page of the selected link's details for `shape`: the row back to the list, with where
-/// the link is in it, then as many rows of the details as fit from row `shape.scroll`.
+/// The page of the selected link's details for `shape`: the row back to the list, with the
+/// names of the tabs while they have them and where the link is in the list, then as many rows
+/// of the details as fit from row `shape.scroll`. Where the row is too narrow, where the link
+/// is goes first, and then the names are cut.
 fn view(list: Option<&List>, detail: Option<&Detail>, shape: Shape, theme: &Theme) -> Page {
     let mut page = Page {
         shape,
@@ -1667,6 +1774,7 @@ fn view(list: Option<&List>, detail: Option<&Detail>, shape: Shape, theme: &Them
         above: false,
         below: false,
         per_page: 1,
+        tabs: Vec::new(),
     };
     let (width, height) = (shape.width, shape.height);
     if width == 0 || height == 0 {
@@ -1677,10 +1785,30 @@ fn view(list: Option<&List>, detail: Option<&Detail>, shape: Shape, theme: &Them
         _ => &[],
     };
     let back = Style::new().fg(theme.focus).add_modifier(Modifier::BOLD);
-    let back = fitted(vec![Span::styled("← List", back)], width);
+    let mut left = vec![Span::styled("← List", back)];
+    if let Some(shown) = shape.tabs {
+        let active = back.add_modifier(Modifier::UNDERLINED);
+        let muted = Style::new().fg(theme.muted);
+        for tab in Tab::ALL {
+            let start = spans_width(&left);
+            let style = if tab == shown { active } else { muted };
+            left.push(Span::raw("  "));
+            left.push(Span::styled(tab.name(), style));
+            let end = spans_width(&left).min(width);
+            // A name of which no column shows can't be clicked.
+            if start + 2 < end {
+                page.tabs.push((start..end, tab));
+            }
+        }
+    }
+    let back = fitted(left, width);
     let count = entries_of(list).len();
     let place = format!("{} of {count}", shape.selected + 1);
-    let place = vec![Span::styled(place, Style::new().fg(theme.muted))];
+    // Where the link is shows only a gap of two columns away from the rest.
+    let place = match spans_width(&back) + 2 + place.width() <= width {
+        true => vec![Span::styled(place, Style::new().fg(theme.muted))],
+        false => Vec::new(),
+    };
     page.lines.push(row(back, place, width));
     page.rows.push(Some(Spot::Back));
     let room = height - 1;
@@ -2079,15 +2207,17 @@ fn branches(repository: &str, head: &str, base: &str, room: usize) -> String {
 }
 
 /// A link's details, which show in the list's place: its number and whole title, its status
-/// and the lines it changes, then what its host said of it when the details read it, then each
-/// under its label its URL, whole as plain text to copy, its repository, its branches, its
-/// author, and who linked it and when it last changed and synced, then what watching it does
-/// and the stack it heads. Each value wraps to every row it takes, so the reader can scroll to
-/// all of it, and each was bounded when it was read.
+/// and the lines it changes. On the Summary, what its host said of it when the details read
+/// it follows, then each under its label its URL, whole as plain text to copy, its repository,
+/// its branches, its author, and who linked it and when it last changed and synced, then what
+/// watching it does and the stack it heads. On the Timeline, the Timeline follows. Each value
+/// wraps to every row it takes, so the reader can scroll to all of it, and each was bounded
+/// when it was read.
 fn detail_lines(
     entry: &Entry,
     read: Option<&Read>,
     shown: &Shown,
+    tab: Tab,
     width: usize,
     now: i64,
     theme: &Theme,
@@ -2104,6 +2234,20 @@ fn detail_lines(
     lines.extend(flowed(status_parts(entry, theme), " · ", width, theme));
     lines.extend(flowed(diff_parts(snapshot, theme), " ", width, theme));
     let mut targets = Vec::new();
+    if let (Tab::Timeline, Some(read)) = (tab, read) {
+        lines.push(Line::default());
+        let at = lines.len();
+        let timeline = conversation::timeline_section(&read.conversation, shown, width, now, theme);
+        lines.extend(timeline.lines);
+        let moved = |rows: Range<usize>| rows.start + at..rows.end + at;
+        targets.extend(
+            timeline
+                .targets
+                .into_iter()
+                .map(|(rows, c)| (moved(rows), c)),
+        );
+        return (lines, targets);
+    }
     if let Some(read) = read {
         let at = lines.len();
         let (host, controls) = host_lines(entry, read, shown, width, now, theme);
@@ -3291,28 +3435,28 @@ mod tests {
         let links = vec![link("o/r", 1, "a", "m"), link("o/r", 2, "b", "m")];
         pulls.set(list_of(&thread(links)));
         // Before a frame lays the list out, a click lands on nothing.
-        assert!(!pulls.click(0));
+        assert!(!pulls.click(0, 0));
         pulls.page(40, 20, now(), true, &theme);
         // The second link's rows are the page's fourth to sixth.
-        assert!(pulls.click(4));
+        assert!(pulls.click(0, 4));
         assert_eq!((pulls.selected, pulls.viewing), (1, false));
         pulls.page(40, 20, now(), true, &theme);
         // The blank rows and the footer take no click.
         for offset in [6, 7, 18, 19, 20, 200] {
-            assert!(!pulls.click(offset), "{offset}");
+            assert!(!pulls.click(0, offset), "{offset}");
         }
         // A second click on the link shows its details.
-        assert!(pulls.click(3));
+        assert!(pulls.click(0, 3));
         assert!(pulls.viewing);
         let rows = rows_of(&pulls.page(40, 20, now(), true, &theme).lines);
         assert_eq!(rows[1], "#2 Change 2");
         // Only the row above them takes a click, and it leads back to the list with the link
         // still selected.
         for offset in 1..30 {
-            assert!(!pulls.click(offset), "{offset}");
+            assert!(!pulls.click(0, offset), "{offset}");
         }
         assert!(pulls.viewing);
-        assert!(pulls.click(0));
+        assert!(pulls.click(0, 0));
         assert_eq!((pulls.selected, pulls.viewing), (1, false));
     }
 
@@ -3332,31 +3476,31 @@ mod tests {
         pulls.page_by(true);
         assert_eq!(pulls.selected, 8);
         for offset in 0..10 {
-            assert!(!pulls.click(offset), "{offset}");
+            assert!(!pulls.click(0, offset), "{offset}");
         }
         assert_eq!((pulls.selected, pulls.viewing), (8, false));
         // After the frame, the click lands on the link that row shows now.
         let page = pulls.page(40, 10, now(), true, &theme);
         assert_eq!(page.rows[0], Some(Spot::Link(6)));
-        assert!(pulls.click(0));
+        assert!(pulls.click(0, 0));
         assert_eq!(pulls.selected, 6);
         // So with the details: until a frame draws them, no click shows the list again, and
         // after their scroll moves, none does until the next.
         pulls.page(40, 10, now(), true, &theme);
-        assert!(pulls.click(0));
+        assert!(pulls.click(0, 0));
         assert!(pulls.viewing);
-        assert!(!pulls.click(0));
+        assert!(!pulls.click(0, 0));
         pulls.page(40, 10, now(), true, &theme);
         pulls.move_by(3);
-        assert!(!pulls.click(0));
+        assert!(!pulls.click(0, 0));
         assert!(pulls.viewing);
         pulls.page(40, 10, now(), true, &theme);
-        assert!(pulls.click(0));
+        assert!(pulls.click(0, 0));
         assert!(!pulls.viewing);
         // A move that changes nothing keeps the page the reader sees.
         pulls.page(40, 10, now(), true, &theme);
         pulls.move_by(0);
-        assert!(pulls.click(3));
+        assert!(pulls.click(0, 3));
         assert_eq!(pulls.selected, 7);
     }
 
@@ -4005,18 +4149,18 @@ mod tests {
         pulls.end();
         let (bots, _) = control_rows(&mut pulls, 24, true, Control::Bots);
         // Either of the group's rows opens it, and it is chosen.
-        assert!(pulls.click(bots[1]));
+        assert!(pulls.click(0, bots[1]));
         assert_eq!(pulls.pick, Some(Control::Bots));
         assert_eq!(pulls.action().as_deref(), Some("hide bot comments"));
         // The rows moved, so until a frame draws them a click lands on nothing.
-        assert!(!pulls.click(bots[0]));
+        assert!(!pulls.click(0, bots[0]));
         let (open, _) = control_rows(&mut pulls, 24, true, Control::Bots);
         assert_eq!(open, bots);
-        assert!(pulls.click(bots[0]));
+        assert!(pulls.click(0, bots[0]));
         assert_eq!(pulls.action().as_deref(), Some("show bot comments"));
         // A row between two controls takes no click.
         pulls.page(40, 24, now(), true, &theme);
-        assert!(!pulls.click(bots[0] - 1));
+        assert!(!pulls.click(0, bots[0] - 1));
         assert_eq!(pulls.action().as_deref(), Some("show bot comments"));
     }
 
@@ -4076,5 +4220,157 @@ mod tests {
         pulls.step(true);
         assert_eq!(pulls.pick, None);
         assert_ne!(pulls.scroll, scroll);
+    }
+
+    #[test]
+    fn a_links_details_have_a_summary_and_a_timeline_each_at_its_own_scroll() {
+        let theme = theme();
+        let head = |pulls: &mut PullRequests, width| {
+            let page = pulls.page(width, 6, now(), true, &theme);
+            (rows_of(&page.lines[..1]).remove(0), page.tabs.clone())
+        };
+        // Until the host's detail came, the details have no tabs and → does nothing.
+        let mut pulls = PullRequests::default();
+        pulls.set(list_of(&thread(vec![link(
+            "krishhgg/t3term",
+            31,
+            "a",
+            "b",
+        )])));
+        pulls.toggle();
+        let ask = pulls.take_ask(true, now()).expect("a read");
+        assert_eq!(pulls.tabs(), None);
+        assert!(!pulls.forward());
+        let (row, tabs) = head(&mut pulls, 40);
+        assert_eq!(row, format!("← List{}1 of 1", " ".repeat(28)));
+        assert!(tabs.is_empty());
+        let detail = Part::Detail(Ok(read_detail(&bare_detail())));
+        assert!(pulls.answer(ask.ticket, detail, now()));
+        assert_eq!(pulls.tabs(), Some(Tab::Summary));
+        let (row, tabs) = head(&mut pulls, 40);
+        assert_eq!(
+            row,
+            format!("← List  Summary  Timeline{}1 of 1", " ".repeat(9))
+        );
+        assert_eq!(tabs, [(6..15, Tab::Summary), (15..25, Tab::Timeline)]);
+        let page = pulls.page(40, 6, now(), true, &theme);
+        let underlined = |name: &str| {
+            let span = page.lines[0].spans.iter().find(|span| span.content == name);
+            span.unwrap()
+                .style
+                .add_modifier
+                .contains(Modifier::UNDERLINED)
+        };
+        assert!(underlined("Summary") && !underlined("Timeline"));
+        // The Timeline waits for the conversation.
+        assert!(pulls.forward());
+        assert_eq!(pulls.tabs(), Some(Tab::Timeline));
+        head(&mut pulls, 40);
+        let rows = detail_rows(&pulls);
+        assert_eq!(rows[rows.len() - 2..], ["", "Reading the conversation…"]);
+        let activity = pull_request::Activity::read(&remarks(3)).unwrap();
+        let activity = Part::Activity(Ok(Box::new(activity)));
+        assert!(pulls.answer(ask.ticket, activity, now()));
+        head(&mut pulls, 40);
+        let rows = detail_rows(&pulls);
+        // The fixture's remarks came before it opened.
+        let timeline = [
+            "",
+            "4 comments · 0 commits      Newest first",
+            "",
+            "● Pull request opened",
+            "  4h ago",
+            "",
+            "› 4 comments",
+            "  2 authors · 11h ago",
+        ];
+        assert_eq!(rows[rows.len() - 8..], timeline);
+
+        // Each tab keeps its own scroll, and a switch chooses no control.
+        assert!(pulls.back());
+        head(&mut pulls, 40);
+        pulls.move_by(3);
+        assert!(pulls.forward());
+        assert_eq!(pulls.scroll, Offset::Top(0));
+        head(&mut pulls, 40);
+        pulls.move_by(2);
+        head(&mut pulls, 40);
+        assert!(pulls.back());
+        assert_eq!(pulls.scroll, Offset::Top(3));
+        head(&mut pulls, 40);
+        assert!(pulls.forward());
+        assert_eq!(pulls.scroll, Offset::Top(2));
+        assert!(!pulls.forward());
+
+        // A click on a tab's name shows it, and one on the rest of the row leads straight back
+        // to the list.
+        head(&mut pulls, 40);
+        assert!(!pulls.click(20, 0), "the tab that shows");
+        assert!(pulls.click(8, 0));
+        assert_eq!(pulls.tabs(), Some(Tab::Summary));
+        assert!(!pulls.click(20, 0), "before a frame drew the tab");
+        head(&mut pulls, 40);
+        assert!(pulls.click(20, 0));
+        assert_eq!(pulls.tabs(), Some(Tab::Timeline));
+        head(&mut pulls, 40);
+        assert!(pulls.click(36, 0));
+        assert!(!pulls.viewing());
+
+        // They open again on the Summary, from the top of each tab.
+        pulls.toggle();
+        assert_eq!(pulls.tabs(), Some(Tab::Summary));
+        assert_eq!(
+            (pulls.scroll, pulls.other),
+            (Offset::Top(0), Offset::Top(0))
+        );
+        assert!(pulls.forward());
+        assert_eq!(pulls.scroll, Offset::Top(0));
+
+        // ↓ chooses the Timeline's controls, and Enter does what they do.
+        pulls.page(40, 24, now(), true, &theme);
+        pulls.step(true);
+        assert_eq!(pulls.action().as_deref(), Some("oldest first"));
+        pulls.enter();
+        assert_eq!(pulls.action().as_deref(), Some("newest first"));
+        pulls.page(40, 24, now(), true, &theme);
+        pulls.step(true);
+        assert_eq!(pulls.action().as_deref(), Some("show comments"));
+        pulls.enter();
+        pulls.page(40, 24, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(rows.contains(&"⌄ 4 comments".to_string()), "{rows:?}");
+        assert!(
+            rows.contains(&"  ci[bot] commented".to_string()),
+            "{rows:?}"
+        );
+        // ← shows the Summary, with no control chosen, then the list.
+        assert!(pulls.back());
+        assert_eq!((pulls.tabs(), pulls.pick), (Some(Tab::Summary), None));
+        assert!(pulls.back());
+        assert!(!pulls.viewing());
+        assert!(!pulls.back());
+    }
+
+    #[test]
+    fn the_row_above_a_links_details_drops_where_it_is_then_cuts_the_tab_names() {
+        let mut pulls = conversing(remarks(1));
+        let theme = theme();
+        let both = vec![(6..15, Tab::Summary), (15..25, Tab::Timeline)];
+        let cases = [
+            (33, "← List  Summary  Timeline  1 of 1", both.clone()),
+            (32, "← List  Summary  Timeline", both),
+            (
+                20,
+                "← List  Summary  Ti…",
+                vec![(6..15, Tab::Summary), (15..20, Tab::Timeline)],
+            ),
+            (9, "← List  …", vec![(6..9, Tab::Summary)]),
+            (8, "← List", vec![]),
+        ];
+        for (width, row, tabs) in cases {
+            let page = pulls.page(width, 6, now(), true, &theme);
+            assert_eq!(rows_of(&page.lines[..1]), [row], "{width}");
+            assert_eq!(page.tabs, tabs, "{width}");
+        }
     }
 }
