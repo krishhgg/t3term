@@ -5,6 +5,10 @@ worktree, so a build never touches your checkout or its branch. Every build shar
 CARGO_TARGET_DIR=/tmp/t3v-target, so the second build of a nearby commit reuses the first's
 dependencies. The renderer is render.swift beside the t3v entry point, built once per version of
 its source into /tmp/t3v-bin/render-<12 hex of its sha256>.
+
+t3v runs what is in /tmp/t3v-bin and builds in /tmp/t3v-target, so it uses either only when this
+account owns it and no other can write to it (private_dir). Another account that made one first
+can't hand it a binary.
 """
 
 from __future__ import annotations
@@ -19,7 +23,7 @@ import sys
 import tempfile
 from pathlib import Path
 
-from .runs import BIN_ROOT, SCRIPTS, read_json, write_json
+from .runs import BIN_ROOT, SCRIPTS, private_dir, read_json, write_json
 from .text import die, iso, now_ms
 
 TARGET = Path('/tmp/t3v-target')
@@ -98,13 +102,12 @@ def build(rev: str, repo=None) -> Path:
     sha = git(repo, 'rev-parse', '--verify', '--end-of-options', f'{rev}^{{commit}}', check=False)
     if not SHA.match(sha):
         die(f'{rev} is not a commit in {repo}; `git -C {repo} fetch` it first', 2)
-    out = BIN_ROOT / sha / 't3term'
+    out = private_dir(BIN_ROOT) / sha / 't3term'
     if out.is_file():
         return out
     if not shutil.which('cargo'):
         die('cargo is not on PATH; install Rust 1.95.0 (rustup) to build', 2)
-    BIN_ROOT.mkdir(parents=True, exist_ok=True)
-    TARGET.mkdir(parents=True, exist_ok=True)
+    private_dir(TARGET)
     scratch = Path(os.path.realpath(tempfile.mkdtemp(prefix='t3v-build-', dir='/tmp')))
     tree = scratch / 'tree'
     print(f't3v: building {rev} ({sha[:12]}) in {tree}', file=sys.stderr)
@@ -144,14 +147,13 @@ def renderer() -> Path:
         digest = hashlib.sha256(source.read_bytes()).hexdigest()[:12]
     except OSError:
         die(f'{source} is missing; the renderer ships beside the t3v entry point', 1)
-    out = BIN_ROOT / f'render-{digest}'
+    out = private_dir(BIN_ROOT) / f'render-{digest}'
     if out.is_file():
         return out
     swiftc = shutil.which('swiftc')
     if swiftc is None:
         die('swiftc is not on PATH, so `t3v render` cannot build its renderer; install Xcode or its '
             'command line tools, or read the capture\'s .txt instead', 1)
-    BIN_ROOT.mkdir(parents=True, exist_ok=True)
     partial = out.with_name(f'{out.name}.partial-{os.getpid()}')
     print(f't3v: building the renderer into {out}', file=sys.stderr)
     # From /tmp/t3v-bin, so nothing swiftc leaves behind lands in the repository.

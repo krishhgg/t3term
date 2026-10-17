@@ -19,11 +19,12 @@ from .build import choose_binary, describe_binary, renderer, toplevel
 from .report import build_report, doctor, raw_bytes
 from .runs import (CURRENT, RUN_PREFIX, SCRIPTS, SESSION, control_post, evidence_of, forget_current, inspect,
                    locate, make_evidence, make_run, mark, origin_of, owned, point_current, python_command,
-                   read_log, run_argument, save_state, server_needles, terminate)
+                   read_log, run_argument, runs_command, save_state, server_needles, terminate)
 from .scenarios import SCENARIOS, scenario_of
 from .text import NAME, die, iso, now_ms, safe, text_places
-from .tmux import (capture_screen, last_rows, launch, needs_pane, pane, pane_size, quit_t3term, respawn,
-                   send_mouse, sidebar_edge, t3term_command, tmux, wait_for_t3term, wait_until)
+from .tmux import (capture_screen, last_rows, launch, needs_pane, note_resize, own_t3term, pane, pane_size,
+                   quit_t3term, respawn, send_mouse, sidebar_edge, t3term_command, tmux, wait_for_t3term,
+                   wait_until)
 
 
 def emit(args, value: dict, lines: list) -> None:
@@ -96,13 +97,14 @@ def cmd_start(args) -> int:
     deadline = time.monotonic() + 10
     while origin_of(root) is None:
         if server.poll() is not None or time.monotonic() > deadline:
-            if server.poll() is None:
-                os.kill(server.pid, signal.SIGUSR1)  # its stacks, into the log printed below
+            if server.poll() is None and runs_command(server.pid, server_needles(root)):
+                server.send_signal(signal.SIGUSR1)  # its stacks, into the log printed below
                 time.sleep(0.5)
             terminate(server.pid, server_needles(root), 'server')
             tail = (root / 'logs' / 'server.log').read_text(errors='replace')[-2000:]
             print(tail, file=sys.stderr)
-            die(f'the fake server did not start (its log is above); `t3v cleanup --run {root}` removes the run')
+            die(f'the fake server did not start (its log is above); `t3v cleanup --run {root}` removes the run',
+                run=str(root))
         time.sleep(0.05)
     origin = origin_of(root)
     summary = {'ok': True, 'run': str(root), 'evidence': str(evidence), 'scenario': scenario.NAME,
@@ -130,7 +132,7 @@ def cmd_start(args) -> int:
     if problems:
         tmux(state, 'kill-server')
         terminate(server.pid, server_needles(root), 'server')
-        die(f'{problems[0]}; `t3v cleanup --run {root}` removes the run')
+        die(f'{problems[0]}; `t3v cleanup --run {root}` removes the run', run=str(root))
     pid = wait_for_t3term(state)
     state['t3termPid'] = pid
     save_state(root, state)
@@ -168,9 +170,14 @@ def stop_run(root: Path, state: dict) -> list:
     if state.get('tmux'):
         info = quit_t3term(state, 'stop')
         if info and info[0]:
-            notes.append(f't3term: exited with status {info[1]}')
-            mark(state, 'fixture.t3term_exit', status=info[1])
-        notes.append(terminate(state.get('t3termPid'), [state['binary']['path']], 't3term'))
+            notes.append(f't3term: {info[1]}')
+            mark(state, 'fixture.t3term_exit', ending=info[1])
+        pid = own_t3term(state)
+        if pid:
+            notes.append(terminate(pid, [state['binary']['path']], 't3term',
+                                   ours=lambda: own_t3term(state) == pid))
+        elif not (info and info[0]):
+            notes.append("t3term: not running in the run's pane, so nothing to stop")
         killed = tmux(state, 'kill-server').returncode == 0
         notes.append("tmux: the run's own server stopped" if killed else "tmux: no server on the run's socket")
         # pipe-sink ends once tmux closes its pipe; wait for it so raw.ansi is whole.
@@ -191,7 +198,7 @@ def stop_run(root: Path, state: dict) -> list:
 def cmd_stop(args) -> int:
     root, state = locate(args.run)
     print('\n'.join(stop_run(root, state)))
-    print(f'evidence kept in {state["evidence"]}; `t3v check` now holds the run to the after-stop rules')
+    print(f'{kept(state)}; `t3v check` now holds the run to the after-stop rules')
     return 0
 
 
@@ -203,8 +210,13 @@ def cmd_cleanup(args) -> int:
         die(f'{root} no longer looks like this run, so t3v left it in place')
     forget_current(root)
     shutil.rmtree(root)
-    print(f'deleted {root}\nevidence kept in {state["evidence"]}')
+    print(f'deleted {root}\n{kept(state)}')
     return 0
+
+
+def kept(state: dict) -> str:
+    evidence = state['evidence']
+    return f'evidence kept in {evidence}' if os.path.isdir(evidence) else f'the evidence directory {evidence} is gone'
 
 
 # -- what a run is doing --
@@ -244,7 +256,7 @@ def cmd_doctor(args) -> int:
 
 def cmd_env(args) -> int:
     root, state = locate(args.run)
-    print(' '.join(shlex.quote(x) for x in t3term_command(root, state)))
+    print(' '.join(shlex.quote(x) for x in t3term_command(root, state, 'cli')))
     return 0
 
 
@@ -262,7 +274,9 @@ def cmd_wait(args) -> int:
     if result['ok']:
         print(f'held after {result["elapsed"]:.2f} s')
         return 0
-    print(f'timed out after {result["elapsed"]:.2f} s: ' + '; '.join(result['failed']))
+    # A dead pane ends the wait at once, so it is not a timeout.
+    why = 't3term ended' if result['exited'] else 'timed out'
+    print(f'{why} after {result["elapsed"]:.2f} s: ' + '; '.join(result['failed']))
     print('the last screen:')
     print(result['screen'] if result['screen'] is not None else '(no screen)')
     return 1
@@ -368,8 +382,11 @@ def cmd_resize(args) -> int:
     needs_pane(state, 'resize')
     if not (10 <= args.cols <= 500 and 5 <= args.rows <= 200):
         die('resize takes 10 to 500 columns and 5 to 200 rows', 2)
+    # Into the recording first, so the output drawn at the new size comes after it.
+    note_resize(root, state, args.cols, args.rows)
     result = tmux(state, 'resize-window', '-t', state['session'], '-x', str(args.cols), '-y', str(args.rows))
     if result.returncode != 0:
+        note_resize(root, state, state['cols'], state['rows'])
         die(f'tmux resize-window failed: {result.stderr.strip()}; `t3v doctor` checks the run')
     state.update(cols=args.cols, rows=args.rows)
     save_state(root, state)
@@ -397,7 +414,7 @@ def cmd_restart(args) -> int:
     info = quit_t3term(state, 'restart')
     if not info or not info[0]:
         die('t3term did not quit within 8 s; `t3v stop` stops it', 1)
-    mark(state, 'fixture.t3term_exit', status=info[1])
+    mark(state, 'fixture.t3term_exit', ending=info[1])
     count = state.get('restarts', 0) + 1
     problems = respawn(root, state, count)
     if problems:

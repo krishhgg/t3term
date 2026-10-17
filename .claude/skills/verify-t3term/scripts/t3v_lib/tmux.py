@@ -12,13 +12,18 @@ from __future__ import annotations
 import codecs
 import json
 import os
+import re
 import shlex
+import signal
 import subprocess
 import time
 from pathlib import Path
 
 from .runs import SESSION, command_of, evidence_of, mark, python_command, read_json
 from .text import cells, die
+
+# What `capture-pane -e` writes besides text: SGR, and OSC 8 for a link.
+ESCAPES = re.compile(r'\x1b\[[0-9;:]*m|\x1b\][^\x07\x1b]*(?:\x07|\x1b\\)')
 
 POLL = 0.05  # seconds between two looks at the pane
 
@@ -31,20 +36,35 @@ def tmux(state: dict, *args, check: bool = False):
 
 
 def pane(state: dict):
-    """(dead, dead_status, pid) for t3term's pane, or None when the session is gone."""
+    """(dead, ending, pid) for t3term's pane, or None when the session is gone. ENDING says how a
+    dead pane's process ended, such as 'exited with status 1' or 'was killed by SIGKILL (9)',
+    and is None while it runs."""
     if not state.get('tmux'):
         return None
     result = tmux(state, 'display-message', '-p', '-t', state['session'],
-                  '#{pane_dead} #{pane_dead_status} #{pane_pid}')
+                  '#{pane_dead}|#{pane_dead_status}|#{pane_dead_signal}|#{pane_pid}')
     if result.returncode != 0:
         return None
-    parts = result.stdout.split()
-    if not parts:
+    parts = result.stdout.strip().split('|')
+    if len(parts) != 4:
         return None
-    dead = parts[0] == '1'
-    status = parts[1] if dead and len(parts) > 2 else None
-    pid = int(parts[-1]) if parts[-1].isdigit() else None
-    return dead, status, pid
+    dead_flag, status, killer, pid = parts
+    dead = dead_flag == '1'
+    ending = None
+    if dead and killer and killer != '0':
+        ending = f'was killed by {signal_name(killer)}'
+    elif dead:
+        ending = f'exited with status {status}' if status.isdigit() else 'exited'
+    return dead, ending, int(pid) if pid.isdigit() else None
+
+
+def signal_name(killer: str) -> str:
+    """SIGKILL for tmux's 'kill' or '9'. tmux 3.6a gives the name, older ones the number."""
+    try:
+        found = signal.Signals(int(killer)) if killer.isdigit() else signal.Signals['SIG' + killer.upper()]
+    except (KeyError, ValueError):
+        return f'signal {killer}'
+    return f'{found.name} ({found.value})'
 
 
 def pane_size(state: dict):
@@ -61,13 +81,15 @@ def needs_pane(state: dict, what: str):
         die(f'{what} needs the tmux pane, and this run started with --no-tmux', 2)
 
 
-def t3term_env(root: Path, state: dict) -> dict:
+def t3term_env(root: Path, state: dict, client: str = 'tui') -> dict:
+    """t3term's whole environment. `client` 'cli' gives it the `t3` whose sessions the server
+    counts as a CLI line's, which leave what the TUI should show alone."""
     home = root / 'home'
     env = {
         'HOME': str(home),
         'T3CODE_HOME': str(home / '.t3'),
         'T3TERM_NO_SAVED_LOGIN': '1',
-        'T3TERM_T3_COMMAND': str(root / 'bin' / 't3-shim'),
+        'T3TERM_T3_COMMAND': str(root / 'bin' / ('t3-shim-cli' if client == 'cli' else 't3-shim')),
         'PATH': '/usr/bin:/bin:/usr/sbin:/sbin',
         'TERM': 'xterm-256color',
         'LANG': 'en_US.UTF-8',
@@ -83,8 +105,8 @@ def t3term_env(root: Path, state: dict) -> dict:
     return env
 
 
-def t3term_command(root: Path, state: dict) -> list:
-    env = t3term_env(root, state)
+def t3term_command(root: Path, state: dict, client: str = 'tui') -> list:
+    env = t3term_env(root, state, client)
     return ['/usr/bin/env', '-i', *[f'{k}={v}' for k, v in env.items()], state['binary']['path']]
 
 
@@ -135,6 +157,17 @@ def respawn(root: Path, state: dict, count: int) -> list:
     return []
 
 
+def own_t3term(state: dict):
+    """t3term's pid while this run's pane is alive and runs the pid the run recorded with the
+    run's binary, else None. The pane is on the run's own tmux socket, so a pid that another
+    process took after t3term exited, even another run of the same build, never passes."""
+    pid = state.get('t3termPid')
+    info = pane(state) if pid else None
+    if info is None or info[0] or info[2] != pid:
+        return None
+    return pid if state['binary']['path'] in command_of(pid) else None
+
+
 def wait_for_t3term(state: dict, seconds: float = 5):
     """t3term's pid once the pane's shell has become it, or None if it exited or took too long."""
     deadline = time.monotonic() + seconds
@@ -180,16 +213,24 @@ def last_rows(screen, count: int = 12) -> str:
 
 
 def capture_screen(state: dict, name: str):
-    """Saves the screen as NAME.txt (plain) and NAME.ans (ANSI) in the evidence directory."""
-    plain = tmux(state, 'capture-pane', '-p', '-t', state['session'])
+    """Saves the screen as NAME.txt (plain) and NAME.ans (ANSI) in the evidence directory, both
+    from one capture, so the text and its render show the same frame."""
     styled = tmux(state, 'capture-pane', '-p', '-e', '-t', state['session'])
-    if plain.returncode != 0 or styled.returncode != 0:
-        die(f'tmux capture-pane failed: {(plain.stderr or styled.stderr).strip()}; `t3v doctor` checks the run')
+    if styled.returncode != 0:
+        die(f'tmux capture-pane failed: {styled.stderr.strip()}; `t3v doctor` checks the run')
+    plain = plain_of(styled.stdout)
     evidence = evidence_of(state)
     text_path, ansi_path = evidence / f'{name}.txt', evidence / f'{name}.ans'
-    text_path.write_text(plain.stdout)
+    text_path.write_text(plain)
     ansi_path.write_text(styled.stdout)
-    return plain.stdout, text_path, ansi_path
+    return plain, text_path, ansi_path
+
+
+def plain_of(styled: str) -> str:
+    """What `capture-pane -p` gives for the frame `capture-pane -p -e` gave: the text without
+    its escape sequences, and each row without the spaces it ends with."""
+    text = ESCAPES.sub('', styled)
+    return '\n'.join(row.rstrip(' ') for row in text.split('\n'))
 
 
 def send_mouse(state: dict, report: str):
@@ -219,33 +260,60 @@ def wait_until(state: dict, texts=(), gone=(), idle_ms: int = 0, timeout: float 
     screen has not changed for `idle_ms`, all at once. Stops early when t3term exits.
 
     Returns {'ok', 'elapsed', 'failed': the conditions that didn't hold at the last look,
-    'screen': the last screen, 'exited': the pane's exit status or None}."""
+    'screen': the last screen, 'exited': how t3term ended, or None while it runs}."""
     started = time.monotonic()
     deadline = started + timeout
     last, changed = None, started
     while True:
         now = time.monotonic()
+        result = tmux(state, 'capture-pane', '-p', '-t', state['session'])
+        screen = result.stdout if result.returncode == 0 else None
+        # After the capture, so a screen that a dead t3term left never passes.
         info = pane(state)
         if info is None:
             return {'ok': False, 'elapsed': now - started, 'failed': ['the tmux session is gone'],
-                    'screen': last, 'exited': None}
-        result = tmux(state, 'capture-pane', '-p', '-t', state['session'])
-        screen = result.stdout if result.returncode == 0 else None
+                    'screen': screen if screen is not None else last, 'exited': None}
         if screen != last:
             last, changed = screen, now
-        failed = [f'--text {json.dumps(t)} is not on screen' for t in texts if screen is None or t not in screen]
+        failed = [] if screen is not None else [f'tmux capture-pane failed: {result.stderr.strip()}']
+        failed += [f'--text {json.dumps(t)} is not on screen' for t in texts if screen is not None and t not in screen]
         failed += [f'--gone {json.dumps(t)} is still on screen' for t in gone if screen is not None and t in screen]
         quiet = (now - changed) * 1000
         if idle_ms and quiet < idle_ms:
             failed.append(f'--idle {idle_ms}: the screen changed {quiet:.0f} ms ago')
+        if info[0]:
+            return {'ok': False, 'elapsed': now - started, 'failed': [f't3term {info[1]}'] + failed,
+                    'screen': screen, 'exited': info[1]}
         if not failed:
             return {'ok': True, 'elapsed': now - started, 'failed': [], 'screen': screen, 'exited': None}
-        if info[0]:
-            return {'ok': False, 'elapsed': now - started, 'failed': [f't3term exited with status {info[1]}'] + failed,
-                    'screen': screen, 'exited': info[1]}
         if now >= deadline:
             return {'ok': False, 'elapsed': now - started, 'failed': failed, 'screen': screen, 'exited': None}
         time.sleep(POLL)
+
+
+def cast_name(state: dict) -> str:
+    """The recording t3term writes to now: session.cast, then session-N.cast after restart N."""
+    count = state.get('restarts') or 0
+    return f'session-{count}.cast' if count else 'session.cast'
+
+
+def note_resize(root: Path, state: dict, cols: int, rows: int):
+    """Adds a resize event to the recording, so a player redraws at the new size from there.
+    pipe-sink appends output to the same file, one line per write."""
+    name = cast_name(state)
+    try:
+        t0 = float((root / 'run' / f'{name}.t0').read_text())
+    except (OSError, ValueError):
+        return
+    line = json.dumps([round(time.time() - t0, 6), 'r', f'{cols}x{rows}']) + '\n'
+    try:
+        fd = os.open(evidence_of(state) / name, os.O_WRONLY | os.O_APPEND)
+    except OSError:
+        return
+    try:
+        os.write(fd, line.encode())
+    finally:
+        os.close(fd)
 
 
 def pipe_sink(root: Path, cast_name: str) -> int:
@@ -254,6 +322,8 @@ def pipe_sink(root: Path, cast_name: str) -> int:
     state = read_json(root / 'run.json') or {}
     evidence = Path(state.get('evidence') or root / 'tmp')
     started = time.time()
+    # `t3v resize` reads this to time the resize it adds to the recording.
+    (root / 'run' / f'{cast_name}.t0').write_text(repr(started))
     decoder = codecs.getincrementaldecoder('utf-8')('replace')
     with open(evidence / 'raw.ansi', 'ab') as raw, open(evidence / cast_name, 'a', encoding='utf-8') as cast:
         cast.write(json.dumps({'version': 2, 'width': state.get('cols', 200), 'height': state.get('rows', 50),

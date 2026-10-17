@@ -11,10 +11,10 @@ from collections import Counter
 from pathlib import Path
 
 from . import rules
-from .runs import (CURRENT, alive, control_post, evidence_of, inspect, opener, origin_of, read_json, read_log,
+from .runs import (CURRENT, control_post, evidence_of, inspect, opener, origin_of, read_json, read_log,
                    runs_command, server_needles)
 from .scenarios import scenario_of
-from .tmux import pane, pane_size, screen_now
+from .tmux import own_t3term, pane, pane_size, screen_now
 
 
 def prefixed(counts: dict, prefix: str) -> dict:
@@ -58,6 +58,12 @@ def build_report(root: Path, state: dict) -> dict:
     tags = Counter(r.get('tag') for r in records if r.get('event') == 'rpc.request')
     running, live, server, counts_from = server_now(root, state)
     counts = (server or {}).get('counts') or {}
+    screen = screen_now(state)
+    if live is not None:
+        status, answer = control_post(root, '/__fixture/leaks', {'screen': screen}, quiet=True)
+        secret_leaks = answer.get('secretLeaks') if status == 200 else None
+    else:
+        secret_leaks = (server or {}).get('secretLeaks')
     shell_chunks = [r for r in records if r.get('event') == 'shell.chunk' and r.get('delivered')]
     marks = [r for r in records if r.get('event') == 'fixture.mark']
     last_mark = marks[-1] if marks else None
@@ -132,7 +138,8 @@ def build_report(root: Path, state: dict) -> dict:
         'lastMark': (f'{last_mark.get("name")} at byte {last_mark.get("rawOffset")}' if last_mark else None),
         'controlLeaksSinceMark': (rules.control_leaks(raw, leaks, last_mark.get('rawOffset') or 0)
                                   if last_mark else None),
-        'screenLeaks': rules.screen_leaks(screen_now(state), leaks, screen_names),
+        'screenLeaks': rules.screen_leaks(screen, leaks, screen_names),
+        'secretLeaks': secret_leaks,
         'settingsFile': settings_now(root),
     })
     return report
@@ -182,16 +189,16 @@ def doctor(path) -> dict:
     binary = state.get('binary') or {}
     if state.get('tmux'):
         pid = state.get('t3termPid')
-        running = bool(pid) and alive(pid) and runs_command(pid, [binary.get('path', '')])
-        check('t3term', running, f'pid {pid} runs {binary.get("path")}' if running
-              else f'pid {pid} is gone or runs something else; `t3v restart` starts it again')
+        running = own_t3term(state) is not None
+        check('t3term', running, f'pid {pid} runs {binary.get("path")} in the run\'s pane' if running
+              else f'pid {pid} is not running in the run\'s pane; `t3v restart` starts t3term again')
         info = pane(state)
         size = pane_size(state) if info is not None else None
         want_size = (state.get('cols'), state.get('rows'))
         if info is None:
             check('tmux', False, f'no session {state.get("session")} on {state.get("socket")}')
         elif info[0]:
-            check('tmux', False, f'the pane is dead: t3term exited with status {info[1]}')
+            check('tmux', False, f'the pane is dead: t3term {info[1]}')
         else:
             check('tmux', size == want_size, f'the pane is {size[0]}x{size[1]}' if size == want_size
                   else f'the pane is {size} but run.json records {want_size[0]}x{want_size[1]}')

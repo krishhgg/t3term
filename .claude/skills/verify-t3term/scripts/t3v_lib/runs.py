@@ -10,10 +10,15 @@ What a run proves goes to its evidence directory instead, /tmp/t3v-evidence/<run
 and summary.json. `cleanup` deletes the run directory and never the evidence directory. No
 token, ticket, session secret or control key reaches the evidence directory: the server writes
 `<redacted>` in their place.
+
+Every account on the machine can write to /tmp, so t3v trusts a directory there only when this
+account owns it and no other can write to it: a run directory, the evidence directory, and
+/tmp/t3v-bin and /tmp/t3v-target, whose files it runs (private_dir).
 """
 
 from __future__ import annotations
 
+import fcntl
 import hmac
 import json
 import os
@@ -21,12 +26,14 @@ import re
 import secrets
 import shlex
 import signal
+import stat
 import subprocess
 import sys
 import tempfile
 import time
 import urllib.error
 import urllib.request
+from contextlib import contextmanager
 from pathlib import Path
 
 from .text import die, iso, now_ms
@@ -38,6 +45,7 @@ RUN_PREFIX = 't3v-run-'
 MARKER = '.t3v-run'
 STATE = 'run.json'
 CURRENT = Path('/tmp/t3v-current')
+CURRENT_LOCK = Path('/tmp/t3v-current.lock')
 EVIDENCE_ROOT = Path('/tmp/t3v-evidence')
 BIN_ROOT = Path('/tmp/t3v-bin')
 SESSION = 't3v'
@@ -73,9 +81,63 @@ def run_shaped(root: Path) -> bool:
     return root.name.startswith(RUN_PREFIX) and root.parent == TMP
 
 
+def unsafe_dir(path: Path, mine: bool):
+    """What lets another account change what is in directory `path`, or None. A directory of
+    this account's (`mine`) must be its own and closed to others' writes. A directory on the way
+    to one may also be root's, and others may write to it only with the sticky bit, as /tmp has,
+    which keeps them from moving what this account put there."""
+    try:
+        info = os.lstat(path)
+    except OSError as error:
+        return f'{path}: {error.strerror}'
+    if not stat.S_ISDIR(info.st_mode):
+        return f'{path} is not a directory'
+    mode, uid = stat.S_IMODE(info.st_mode), info.st_uid
+    if uid != os.getuid() and (mine or uid != 0):
+        return f'{path} belongs to another account (uid {uid})'
+    if mine and mode & 0o022:
+        return f'other accounts can write to {path} (mode {mode:o})'
+    sticky = mode & stat.S_ISVTX
+    if not sticky and (mode & 0o002 or (mode & 0o020 and uid != 0)):
+        return f'other accounts can write to {path} (mode {mode:o})'
+    return None
+
+
+def private_problem(path: Path):
+    """Why another account could have put what is in directory `path`, or None when this account
+    owns it, no other can write to it, and the same holds on the way to it."""
+    problem = unsafe_dir(Path(path), mine=True)
+    if problem:
+        return problem
+    for ancestor in Path(os.path.realpath(path)).parents:
+        problem = unsafe_dir(ancestor, mine=False)
+        if problem:
+            return f'{problem}, and it holds {path}'
+    return None
+
+
+def private_dir(path: Path) -> Path:
+    """`path`, made if need be, or exits when another account could have put what is in it. t3v
+    runs the builds in /tmp/t3v-bin and builds in /tmp/t3v-target, so it must not take either from
+    an account that made it first."""
+    try:
+        os.mkdir(path, 0o700)
+    except FileExistsError:
+        pass
+    except OSError as error:
+        die(f'could not make {path}: {error.strerror}', 1)
+    problem = private_problem(path)
+    if problem:
+        die(f'{problem}, so t3v does not trust what is in it; remove it, or make it yours and '
+            f'`chmod go-w` it', 1)
+    return path
+
+
 def owned(root: Path, state) -> bool:
-    """Whether `root` is a run directory t3v made: its name, its parent, and a marker whose nonce
-    matches run.json's."""
+    """Whether `root` is a run directory t3v made for this account: its name, its parent, its
+    owner, and a marker whose nonce matches run.json's."""
+    if private_problem(root):
+        return False
     try:
         marker = (root / MARKER).read_text().strip()
     except OSError:
@@ -94,7 +156,9 @@ def inspect(path) -> tuple:
     if not run_shaped(root):
         return root, state, f'{root} is not a t3v run directory ({TMP}/{RUN_PREFIX}XXXXXXXX); pass --run with one'
     if not owned(root, state):
-        return root, state, f"{root}'s marker doesn't match its run.json, so t3v leaves it alone"
+        problem = private_problem(root)
+        return root, state, (f'{problem}, so t3v leaves it alone' if problem
+                             else f"{root}'s marker doesn't match its run.json, so t3v leaves it alone")
     return root, state, None
 
 
@@ -140,43 +204,94 @@ def make_run() -> tuple:
     fd = os.open(root / 'control.key', os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
     with os.fdopen(fd, 'w') as handle:
         handle.write(secrets.token_hex(32) + '\n')
-    shim_path = root / 'bin' / 't3-shim'
-    shim_path.write_text('#!/bin/sh\n' + ' '.join(shlex.quote(x) for x in (
-        'exec', *python_command(), 't3-shim', '--run', str(root))) + ' "$@"\n')
-    shim_path.chmod(0o700)
+    # One `t3` for the TUI and one for the CLI lines `t3v env` prints, so the server can tell
+    # whose session it issues.
+    for name, client in (('t3-shim', 'tui'), ('t3-shim-cli', 'cli')):
+        shim_path = root / 'bin' / name
+        shim_path.write_text('#!/bin/sh\n' + ' '.join(shlex.quote(x) for x in (
+            'exec', *python_command(), 't3-shim', '--run', str(root), '--client', client)) + ' "$@"\n')
+        shim_path.chmod(0o700)
     return root, nonce
 
 
 def make_evidence(path, root: Path) -> Path:
     """The evidence directory for run `root`, made if need be. It may exist, but not hold another
     run's evidence."""
-    evidence = Path(os.path.realpath(os.path.expanduser(str(path)))) if path else EVIDENCE_ROOT / root.name
+    if path:
+        evidence = Path(os.path.realpath(os.path.expanduser(str(path))))
+    else:
+        evidence = private_dir(EVIDENCE_ROOT) / root.name
     if evidence == root or root in evidence.parents:
         die('--evidence must be outside the run directory, which cleanup deletes', 2)
-    evidence.mkdir(parents=True, mode=0o700, exist_ok=True)
+    evidence.parent.mkdir(parents=True, exist_ok=True)
+    # The run writes raw.ansi and the rest by name, so a link another account left in the
+    # directory would aim those writes at a file of yours.
+    private_dir(evidence)
     held = [name for name in EVIDENCE_FILES if (evidence / name).exists()]
     if held:
         die(f'{evidence} already holds a run\'s evidence ({", ".join(held)}); pass another --evidence', 2)
     return evidence
 
 
+@contextmanager
+def current_lock(wait: float = 5):
+    """Holds /tmp/t3v-current.lock for up to WAIT seconds' worth of trying, so two starts or a
+    start and a cleanup change the link one at a time. Every account can make or hold that file,
+    so without it t3v goes on: each change is a single rename, and the worst a lost race does is
+    leave the link at another of this account's runs, or at none."""
+    try:
+        fd = os.open(CURRENT_LOCK, os.O_RDONLY | os.O_CREAT | os.O_NOFOLLOW, 0o644)
+    except OSError:
+        yield
+        return
+    try:
+        deadline = time.monotonic() + wait
+        while True:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    break
+                time.sleep(0.02)
+        yield
+    finally:
+        os.close(fd)
+
+
 def point_current(root: Path) -> str:
-    """Links /tmp/t3v-current to `root`. Only a link to a run directory gives way, so a start
-    never removes anything else. Returns a note when the link stays as it was."""
-    if CURRENT.is_symlink():
-        previous = Path(os.path.realpath(CURRENT))
-        if not run_shaped(previous):
-            return f'{CURRENT} links to {previous}, not to a run, so it stays; pass --run {root}'
-        CURRENT.unlink()
-    elif os.path.lexists(CURRENT):
-        return f'{CURRENT} is not a link, so it stays; pass --run {root}'
-    CURRENT.symlink_to(root)
+    """Links /tmp/t3v-current to `root`. Only this account's link to a run directory gives way,
+    so a start never removes anything else. Returns a note when the link stays as it was."""
+    with current_lock():
+        if CURRENT.is_symlink():
+            previous = Path(os.path.realpath(CURRENT))
+            if os.lstat(CURRENT).st_uid != os.getuid():
+                return f'{CURRENT} belongs to another account, so it stays; pass --run {root}'
+            if not run_shaped(previous):
+                return f'{CURRENT} links to {previous}, not to a run, so it stays; pass --run {root}'
+        elif os.path.lexists(CURRENT):
+            return f'{CURRENT} is not a link, so it stays; pass --run {root}'
+        # A new link under another name, renamed over the old one, so no moment lacks a link.
+        partial = CURRENT.with_name(f'.t3v-current-{os.getpid()}-{secrets.token_hex(4)}')
+        try:
+            partial.symlink_to(root)
+            os.replace(partial, CURRENT)
+        except OSError as error:
+            try:
+                partial.unlink()
+            except OSError:
+                pass
+            return f'{CURRENT} could not be changed ({error.strerror}); pass --run {root}'
     return ''
 
 
 def forget_current(root: Path):
-    if CURRENT.is_symlink() and os.path.realpath(CURRENT) == str(root):
-        CURRENT.unlink()
+    with current_lock():
+        if CURRENT.is_symlink() and os.path.realpath(CURRENT) == str(root):
+            try:
+                CURRENT.unlink()
+            except OSError:
+                pass
 
 
 def mark(state: dict, event: str, **fields):
@@ -187,7 +302,11 @@ def mark(state: dict, event: str, **fields):
     if world:
         record['sinceWorldMs'] = stamp - world['t0Ms']
     record.update({k: v for k, v in fields.items() if v is not None})
-    fd = os.open(evidence_of(state) / 'events.jsonl', os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    try:
+        fd = os.open(evidence_of(state) / 'events.jsonl', os.O_WRONLY | os.O_APPEND | os.O_CREAT, 0o600)
+    except FileNotFoundError:
+        # Someone deleted the evidence directory. Stop and cleanup still have to finish.
+        return
     try:
         os.write(fd, (json.dumps(record) + '\n').encode())
     finally:
@@ -235,20 +354,24 @@ def runs_command(pid, needles: list) -> bool:
     return bool(command) and all(n in command for n in needles)
 
 
-def terminate(pid, needles: list, label: str) -> str:
-    """SIGTERM, then SIGKILL, a pid this run recorded, if it still runs what it ran."""
+def terminate(pid, needles: list, label: str, ours=None) -> str:
+    """SIGTERM, then SIGKILL, a pid this run recorded, if it still runs what it ran. `ours`, when
+    given, must also say the pid is still this run's before each signal."""
     if not pid:
         return f'{label}: no pid recorded'
-    command = command_of(pid)
-    if not command:
+
+    def still_ours() -> bool:
+        return all(n in command_of(pid) for n in needles) and (ours is None or ours())
+
+    if not command_of(pid):
         return f'{label}: pid {pid} already gone'
-    if not all(n in command for n in needles):
-        return f'{label}: pid {pid} now runs something else, left alone'
+    if not still_ours():
+        return f'{label}: pid {pid} is not this run\'s any more, left alone'
     os.kill(pid, signal.SIGTERM)
     deadline = time.monotonic() + 6
     while time.monotonic() < deadline and alive(pid):
         time.sleep(0.05)
-    if alive(pid) and all(n in command_of(pid) for n in needles):
+    if alive(pid) and still_ours():
         os.kill(pid, signal.SIGKILL)
         return f'{label}: pid {pid} needed SIGKILL'
     return f'{label}: pid {pid} stopped'

@@ -35,10 +35,11 @@ def iso(ms: int) -> str:
     return f'{stamp}.{millis:03d}Z'
 
 
-def die(message: str, code: int = 1):
-    """Prints the error and exits. Under --json the error also goes to stdout as one object."""
+def die(message: str, code: int = 1, **fields):
+    """Prints the error and exits. Under --json the error also goes to stdout as one object,
+    with `fields`, such as the run a failed start left behind."""
     if JSON_ERRORS['on']:
-        print(json.dumps({'ok': False, 'error': message}))
+        print(json.dumps({'ok': False, 'error': message, **fields}))
     print(f't3v: {message}', file=sys.stderr)
     sys.exit(code)
 
@@ -109,10 +110,41 @@ def clusters(text: str) -> list:
     return out
 
 
+def regional(c: str) -> bool:
+    return 0x1F1E6 <= ord(c) <= 0x1F1FF
+
+
+def glyphs(text: str) -> list:
+    """`text` cut where tmux 3.6 and unicode-width 0.2 start a new glyph: not before a combining
+    or zero-width character, a skin tone, the character after a zero-width joiner, or the second
+    regional indicator of a flag."""
+    out, joined = [], False
+    for c in text:
+        flag = regional(c) and out and len(out[-1]) == 1 and regional(out[-1])
+        if out and (zero_width(c) or joined or 0x1F3FB <= ord(c) <= 0x1F3FF or flag):
+            out[-1] += c
+        else:
+            out.append(c)
+        joined = c == '\u200d'
+    return out
+
+
+def glyph_cells(glyph: str) -> int:
+    """Columns one glyph takes: two for a wide character, an emoji sequence (a joined one, a
+    skin tone, a flag) or one that VS16 or a keycap makes an emoji, none for a lone combining
+    character, else one."""
+    first = glyph[0]
+    width = 0 if zero_width(first) else 2 if unicodedata.east_asian_width(first) in ('W', 'F') else 1
+    if len(glyph) > 1 and (width == 2 or '\ufe0f' in glyph or '\u20e3' in glyph or regional(first)
+                           or any(unicodedata.east_asian_width(c) in ('W', 'F') for c in glyph[1:])):
+        return 2
+    return width
+
+
 def cells(text: str) -> int:
-    """Columns `text` takes, counting a wide character as two and a combining one as none."""
-    return sum(0 if zero_width(c) else 2 if unicodedata.east_asian_width(c) in ('W', 'F') else 1
-               for c in text)
+    """Columns `text` takes on screen, glyph by glyph, as tmux 3.6 lays it out and ratatui (with
+    unicode-width 0.2) draws it. `🧑‍💻`, `👩🏽`, `❤️` and a flag each take two."""
+    return sum(glyph_cells(glyph) for glyph in glyphs(text))
 
 
 def bounded(value: str, limit: int) -> str:

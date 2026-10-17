@@ -60,7 +60,7 @@ class Auth:
     `session_started` and `session_ended`."""
 
     def init_auth(self):
-        self.sessions = {}  # token -> {'id', 'scopes', 'kind', 'revoked'}
+        self.sessions = {}  # token -> {'id', 'scopes', 'kind', 'client', 'revoked'}
         self.tickets = {}  # ticket -> token, single use
         self.permissions = 'normal'
 
@@ -77,11 +77,12 @@ class Auth:
             session_id = f'sess-fixture-{len(self.sessions) + 1:02d}-{kind}'
             token = 'fixture-' + secrets.token_urlsafe(32)
             self.secret_values.add(token)
-            session = {'id': session_id, 'scopes': scopes, 'kind': kind, 'revoked': False}
+            client = 'cli' if request.get('client') == 'cli' else 'tui'
+            session = {'id': session_id, 'scopes': scopes, 'kind': kind, 'client': client, 'revoked': False}
             self.sessions[token] = session
             self.counts[f'auth.issue.{kind}'] += 1
-            self.log('auth.issue', sessionId=session_id, kind=kind, scopes=scopes, ttl=str(request.get('ttl')),
-                     label=str(request.get('label')), subject=str(request.get('subject')))
+            self.log('auth.issue', sessionId=session_id, kind=kind, client=client, scopes=scopes,
+                     ttl=str(request.get('ttl')), label=str(request.get('label')), subject=str(request.get('subject')))
             self.session_started(session)
             return {'sessionId': session_id, 'token': token}
 
@@ -158,6 +159,10 @@ def shim(argv: list) -> int:
         return fail('internal: --run missing')
     root = Path(os.path.realpath(argv[1]))
     rest = argv[2:]
+    # Which t3term asks: the TUI in the run's pane, or a CLI line from `t3v env`.
+    client = 'tui'
+    if rest[:1] == ['--client'] and len(rest) > 1:
+        client, rest = rest[1], rest[2:]
     if rest[:2] != ['auth', 'session'] or len(rest) < 3 or rest[2] not in ('issue', 'revoke'):
         return fail('only `auth session issue` and `auth session revoke` are supported')
     action, words = rest[2], rest[3:]
@@ -189,7 +194,8 @@ def shim(argv: list) -> int:
         return fail("this run's control key is missing")
     if action == 'issue':
         route, body = '/__fixture/auth/issue', {'scopes': scopes, 'ttl': flags.get('--ttl'),
-                                                 'label': flags.get('--label'), 'subject': flags.get('--subject')}
+                                                 'label': flags.get('--label'), 'subject': flags.get('--subject'),
+                                                 'client': client}
     else:
         if not positional:
             return fail('revoke needs a session id')

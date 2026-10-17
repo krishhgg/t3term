@@ -73,6 +73,7 @@ class FixtureBase(Auth):
         self.controls = {
             '/__fixture/auth/permissions': lambda request, _: self.set_permissions(request),
             '/__fixture/state': lambda request, _: (self.state(), None),
+            '/__fixture/leaks': lambda request, _: ({'secretLeaks': self.secret_leaks(request.get('screen'))}, None),
         }
 
     # -- log --
@@ -209,11 +210,37 @@ class FixtureBase(Auth):
         """What /__fixture/state answers: the scenario adds what t3term should show."""
         return {'server': self.report()}
 
+    def secret_leaks(self, screen=None) -> dict:
+        """How often a token or ticket this server issued, or the run's control key, shows in each
+        file of the evidence directory, and on `screen` when given, by file. The CLI output that
+        smoke keeps in smoke.log is one of those files. Counts only, never the values. A PNG is
+        pixels, so its own .txt and .ans speak for it."""
+        with self.lock:
+            values = [value.encode() for value in self.secret_values if value]
+        found = {}
+        for folder, _, names in os.walk(self.evidence):
+            for name in names:
+                path = Path(folder) / name
+                if name.endswith('.png') or path.is_symlink():
+                    continue
+                try:
+                    data = path.read_bytes()
+                except OSError:
+                    continue
+                count = sum(data.count(value) for value in values)
+                if count:
+                    found[str(path.relative_to(self.evidence))] = count
+        if isinstance(screen, str):
+            count = sum(screen.encode().count(value) for value in values)
+            if count:
+                found['the screen'] = count
+        return found
+
     def summary(self, open_at_stop: int) -> dict:
         with self.lock:
             return dict(self.report(), run=self.root.name, scenario=self.run.get('scenario'),
                         options=copy.deepcopy(self.options), t0=iso(self.t0) if self.t0 else None,
-                        stoppedAt=iso(now_ms()), openSocketsAtStop=open_at_stop)
+                        stoppedAt=iso(now_ms()), openSocketsAtStop=open_at_stop, secretLeaks=self.secret_leaks())
 
 
 def unmask(data: bytes, mask: bytes) -> bytes:

@@ -103,6 +103,16 @@ def control_leaks_held(report):
 
 
 @rule
+def secrets_held(report):
+    if report['secretLeaks'] is None and report['countsFrom'] is not None:
+        yield 'secretLeaks is missing: the server answered without it, so no evidence was searched for its tokens'
+    leaks = nonzero(report['secretLeaks'])
+    if leaks:
+        yield (f'secretLeaks {json.dumps(leaks)}: a token, ticket or control key the server issued is in '
+               'the evidence or on screen')
+
+
+@rule
 def screen_leaks_held(report):
     leaks = nonzero(report['screenLeaks'])
     if leaks:

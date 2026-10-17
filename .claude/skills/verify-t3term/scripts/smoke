@@ -92,6 +92,8 @@ def script(name, steps):
 
 def t3v(log, *args, timeout=STEP_TIMEOUT):
     """Runs t3v with ARGS, appends what it printed to LOG and returns the exit code and stdout."""
+    # What the recipe printed is then on disk, where `check` searches it for issued tokens.
+    log.flush()
     try:
         done = subprocess.run([sys.executable, '-I', T3V, *args], capture_output=True, text=True,
                               timeout=timeout)
@@ -114,13 +116,17 @@ def run_feature(name, binary, evidence):
             args += ['--binary', binary]
         code, out = t3v(log, *args)
         try:
-            run = json.loads(out)['run'] if code == 0 else None
-        except (ValueError, KeyError):
+            # A start that failed after making its run names it too, and the run may still be up.
+            run = json.loads(out).get('run')
+        except (ValueError, AttributeError):
             run = None
-        if run is None:
+        if code or not run:
             row['failed'] = 't3v start'
+        if not run:
             return finish(row, started)
         try:
+            if code:
+                return finish(row, started)
             env = dict(os.environ, T3V=T3V, T3V_RUN=run, RUN=run)
             code, _ = t3v(log, 'doctor', '--run', run)
             if code:

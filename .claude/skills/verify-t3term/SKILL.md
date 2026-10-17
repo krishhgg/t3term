@@ -61,7 +61,7 @@ Do one action, then wait for what it should change. Never `sleep`.
 - `t3v click --text "Pull requests"` clicks where the text shows now. `--nth N`, `--from-col` and `--from-row` pick among several places. `--at COL ROW` counts from 0. `--button wheel-up` or `wheel-down` sends wheel notches, and `--repeat N` sends more than one.
 - `t3v drag TO` drags the sidebar's edge and releases at column TO.
 - `t3v resize COLS ROWS`.
-- `t3v wait --text T --gone T --idle MS --timeout S` polls the pane every 50 ms until every condition holds at once. `--text` and `--gone` repeat. On a timeout it exits 1 and prints which condition failed and the screen.
+- `t3v wait --text T --gone T --idle MS --timeout S` polls the pane every 50 ms until every condition holds at once. `--text` and `--gone` repeat. On a timeout it exits 1 and prints which condition failed and the screen. If t3term exits, the wait fails at once and says how it ended, such as `t3term was killed by SIGKILL (9)`.
 - World controls change what the server sends, as T3 would: `t3v reconnect --hold 5` drops every socket for 5 s, `t3v shell fail` ends the sidebar's feed, `t3v run thr-single running` starts a run, `t3v links thr-single merged` changes a thread's links. `t3v --help` lists them all, and each feature file names the ones it uses.
 
 A click lands where the last frame drew. After a key, a wheel notch, a resize or a server event, wait for the frame that shows the change before you click. t3term ignores clicks on several widgets until that frame, on purpose, and a click sent too early does nothing.
@@ -86,7 +86,7 @@ What counts as proof:
 
 ## Check
 
-`t3v check` exits 1 with one line per broken rule. While the run is live: no request without its scope (`scopeViolations`), no RPC method the server doesn't know (`unknownRpcs`), and no text that must stay hidden on screen (`screenLeaks`) or in `raw.ansi` (`controlLeaks`). After `stop`: every session t3term issued was revoked and every socket closed. The server refuses every orchestration command and `status` counts them as `commandsRefused`, which doesn't fail `check`.
+`t3v check` exits 1 with one line per broken rule. While the run is live: no request without its scope (`scopeViolations`), no RPC method the server doesn't know (`unknownRpcs`), no text that must stay hidden on screen (`screenLeaks`) or in `raw.ansi` (`controlLeaks`), and no token, ticket or control key the server issued on screen or in any file of the evidence directory (`secretLeaks`, counts by file, never the values). After `stop`: every session t3term issued was revoked and every socket closed, and the server's last search for its secrets, in `summary.json`, found none. The server refuses every orchestration command and `status` counts them as `commandsRefused`, which doesn't fail `check`.
 
 ## Cleanup
 
@@ -98,7 +98,7 @@ Clean up failed attempts too. `ls -d /tmp/t3v-run-*` lists runs still on disk. R
 
 ## Helpers
 
-- `t3v env` prints the `env -i` line that runs t3term against the run. Add a subcommand to drive the CLI: `eval "$($T3V env) --json threads"`. Each CLI command issues and revokes its own session, and `check` covers them.
+- `t3v env` prints the `env -i` line that runs t3term against the run. Add a subcommand to drive the CLI: `eval "$($T3V env) --json threads"`. Each CLI command issues and revokes its own session, and `check` covers them. The line has its own `t3`, so the server knows those sessions are the CLI's and `t3v expect` keeps describing the TUI. `check` searches only the evidence directory for leaked tokens, so redirect CLI output into the evidence directory `start` printed to have it searched. smoke keeps every recipe's output in its `smoke.log` there.
 - `t3v build REV [--repo PATH]` prints the path of a cached build of any commit.
 - `t3v status` summarizes the event log, the live server and the screen.
 - `t3v mark NAME` notes where `raw.ansi` ends, and `status` then reports `controlLeaksSinceMark`.
@@ -114,9 +114,10 @@ Clean up failed attempts too. `ls -d /tmp/t3v-run-*` lists runs still on disk. R
 - The server refuses every orchestration command, so sending a message, answering an approval or a question, interrupting and changing a mode show t3term's refusal path. `features/README.md` lists what that leaves unreachable.
 - t3term can split a string across writes, so `controlLeaks` over `raw.ansi` may miss text that `screenLeaks` catches on screen.
 - PNGs differ slightly between machines in how fonts are smoothed. Compare `.txt` captures, not PNG bytes.
+- Every account can write to /tmp, so t3v uses a run directory, an evidence directory, /tmp/t3v-bin and /tmp/t3v-target only when this account owns it and no other account can write to it or to a directory on the way. If one belongs to another account, t3v stops and names it. Remove it, or pass `--evidence` somewhere of yours.
 
 ## Keeping this skill true
 
-The maintain-verify-t3term skill checks this file and `features/` against the app. When a drive shows the map is wrong, fix the feature file in the same pull request as the change that made it wrong.
+When a drive shows the map is wrong, fix the feature file in the same pull request as the change that made it wrong. smoke runs every recipe, so a recipe the app no longer matches fails there.
 
 Adapted from the create-verification-skill pattern in Cursor's pstack plugin (github.com/cursor/plugins, MIT) for this repo.

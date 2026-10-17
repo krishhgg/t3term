@@ -180,16 +180,17 @@ class Orchestration(FixtureBase):
         self.snapshots, self.synced, self.interrupted = set(), set(), []
 
     def session_started(self, session: dict):
-        # A new login session is a new t3term, which starts its feed over.
-        if session['kind'] != 'login':
+        # A new login session of the TUI's is a new t3term, which starts its feed over. A CLI
+        # line's session says nothing of what the TUI shows.
+        if session['kind'] != 'login' or session.get('client') == 'cli':
             return
         self.feed = 'connecting'
         self.forget_watches()
         self.log('feed.expected', state='connecting', why='a new t3term session')
 
     def session_ended(self, session: dict):
-        # t3term revokes its login session as it quits.
-        if session['kind'] != 'login':
+        # The TUI revokes its login session as it quits.
+        if session['kind'] != 'login' or session.get('client') == 'cli':
             return
         self.feed = NOT_RUNNING
         self.forget_watches()
