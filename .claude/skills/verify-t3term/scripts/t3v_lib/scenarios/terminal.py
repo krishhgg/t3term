@@ -26,7 +26,8 @@ apps/server/src/terminal/Manager.ts and OutputProtocol.ts, apps/server/src/auth/
 - terminal.write: a missing terminal fails with TerminalSessionLookupError, an exited one succeeds
   and does nothing, and any other that isn't running fails with TerminalNotRunningError. A write
   takes at most 65,536 UTF-16 units. terminal.resize does nothing for a missing terminal or one
-  that isn't running.
+  that isn't running. A write goes to the PTY the terminal has when the request comes, and a
+  resize and a restart take the thread's lock in turn, so a resize ends before a restart begins.
 - The label is "Terminal 1" while the shell is idle, and the running child's command while there
   is one, cut at 128 UTF-16 code units the way T3 cuts it.
 - closed takes the event count plus one and removes the terminal, and attach streams stay open.
@@ -115,7 +116,10 @@ for it, and a failed shell's last row. `--thread` defaults to thr-running.
     printed. `t3v paste --bytes 262132` goes whole, `--bytes 262133` is refused whole.
 16. Replies: `t3v type dsr` shows two replies. A shell started with `term start --starting 8`
     shows `starting` and refuses keys until it runs.
-17. Order: `term slow 800`, then `t3v keys a b c d e f --gap 0`: writesOverlapped stays 0.
+17. Order: `term slow 800`, then `t3v keys a b c d e f --gap 0`: writesOverlapped stays 0. A
+    write or resize that `term slow` holds over `term restart` belongs to the shell it came for.
+    The write reaches no shell (terminalWrites.toEndedShell), and the resize keeps its size with
+    no redraw in the new shell (terminalResizes.heldOverRestart), as T3's order would have it.
 18. Input failure: `term fail-writes on`, then a key: `input stopped` and a notice.
 19. Resize: `t3v resize 120 36` sends one terminal.resize with the size drawn; `t3v type size`
     says what the shell got. `term fail-resize on` and a resize: a notice.
@@ -540,22 +544,30 @@ class TerminalFixture(Orchestration):
                     'cause': {'name': 'Error', 'message': 'EIO: the fixture failed this write on purpose'}})
             elif self.slow_ms:
                 self.busy_writes[key] += 1
-                self.later(self.slow_ms / 1000, lambda: self.finish_write(connection, request_id, session, data, True))
+                shell = session.shell
+                self.later(self.slow_ms / 1000,
+                           lambda: self.finish_write(connection, request_id, session, shell, data, True))
             else:
-                self.finish_write(connection, request_id, session, data, False)
+                self.finish_write(connection, request_id, session, session.shell, data, False)
 
-    def finish_write(self, connection, request_id: str, session: Session, data: str, slow: bool):
+    def finish_write(self, connection, request_id: str, session: Session, shell: FakeShell, data: str,
+                     slow: bool):
+        """Feeds a write to `shell`, the one it came for. T3 writes to the PTY it has when the request
+        comes, so a write `term slow` held while a restart, a close or an exit ended that shell went
+        to a shell nothing reads."""
         with self.lock:
             if slow:
                 self.busy_writes[session.key] -= 1
-            if self.current(session) and session.status == 'running':
+            if self.current(session) and session.shell is shell and session.status == 'running':
                 session.held = []
                 try:
-                    session.shell.feed(data)
+                    shell.feed(data)
                 finally:
                     self.send_held(session)
                     session.held = None
                 self.counts['write.fed'] += 1
+            else:
+                self.counts['write.toEndedShell'] += 1
             connection.exit_success(request_id, None)
 
     def resize(self, connection, request_id: str, payload: dict):
@@ -587,12 +599,17 @@ class TerminalFixture(Orchestration):
                     'cause': {'name': 'Error', 'message': 'EBADF: the fixture failed this resize on purpose'}})
             elif self.slow_ms:
                 self.busy_resizes[key] += 1
+                shell = session.shell
                 self.later(self.slow_ms / 1000,
-                           lambda: self.finish_resize(connection, request_id, session, cols, rows, True))
+                           lambda: self.finish_resize(connection, request_id, session, shell, cols, rows, True))
             else:
-                self.finish_resize(connection, request_id, session, cols, rows, False)
+                self.finish_resize(connection, request_id, session, session.shell, cols, rows, False)
 
-    def finish_resize(self, connection, request_id: str, session: Session, cols: int, rows: int, slow: bool):
+    def finish_resize(self, connection, request_id: str, session: Session, shell: FakeShell, cols: int, rows: int,
+                      slow: bool):
+        """Applies a resize. T3 ends a resize before it begins a restart, which then starts the new
+        shell at that size, so a resize `term slow` held over a restart keeps its size, and only the
+        shell it came for redraws."""
         with self.lock:
             if slow:
                 self.busy_resizes[session.key] -= 1
@@ -600,7 +617,10 @@ class TerminalFixture(Orchestration):
                 session.cols, session.rows = cols, rows
                 session.sizes.append(f'{cols}x{rows}')
                 self.counts['resize.applied'] += 1
-                session.shell.resized()
+                if session.shell is shell:
+                    shell.resized()
+                else:
+                    self.counts['resize.heldOverRestart'] += 1
             connection.exit_success(request_id, None)
 
     # -- what t3term should show --
