@@ -41,11 +41,13 @@ $T3V build <head sha>
 
 A base that predates t3v, such as the commit before the pull request that adds it, can't drive itself. Use head's t3v and recipes against the base build, and say so in the verdict.
 
-Record the patch id. It identifies the change independent of the commits, and step 7 uses it to decide whether a verdict still holds:
+Record the patch id. It identifies the change independent of the commits and of the line numbers it lands on, and step 2 of Landing a stack uses it to decide whether a verdict still holds after a rebase:
 
 ```bash
-git diff <base sha> <head sha> | git patch-id --stable
+git diff <base sha> <head sha> | git patch-id --verbatim
 ```
+
+Use `--verbatim`. `--stable` ignores whitespace, so it gives `"two words"` and `"twowords"` the same id, and a verdict would carry over to code nobody drove.
 
 ## 3. Drive the claims on base, then on head
 
