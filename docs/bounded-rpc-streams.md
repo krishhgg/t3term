@@ -51,6 +51,8 @@ t3term forgets a request as soon as its stream ends, however it ends, so the req
 
 Dropping an open `BoundedStream` sends T3 an `Interrupt` and discards the chunks still queued in it. Chunks the caller holds keep their values. Accepting one after its stream has ended, stopped or been dropped returns the values, sends nothing and doesn't reopen the stream.
 
+A `BoundedStream` keeps its connection open while it lives, even after every client has dropped, so its chunks are still acked when the caller accepts them. A chunk doesn't keep the connection open. Once the stream and the last client have dropped, t3term closes the socket, even if the caller still holds a chunk. Before the WebSocket Close frame, it tries for up to a second to send the `Ack` of each chunk the caller accepted and then the stream's `Interrupt`. If the stream's request never went out, neither does its `Interrupt`.
+
 T3 may send more before it reads the `Interrupt`. t3term acks no `Chunk` for a request it no longer tracks, as Effect's own client does (`effect/src/rpc/RpcClient.ts`), and ignores the request's `Exit`. Before this change t3term acked every `Chunk`. A stream from `RpcClient::stream` still keeps its request until T3's `Exit`, so its chunks are acked as before.
 
 If the caller drops a stream as T3's `Exit` for it is on the way, the `Interrupt` reaches T3 after the request has finished. Effect answers it with another `Exit`, which t3term ignores.
