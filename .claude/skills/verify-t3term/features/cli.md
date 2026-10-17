@@ -7,6 +7,7 @@
 - **Exit codes.** 0 success, 1 failure, 2 usage, 3 not found, 4 rejected or unsupported protocol, 5 server unavailable or a launch t3term can't confirm, 6 timeout, 7 waiting for an approval or answer. A signal gives 130 (Ctrl+C), 129 (SIGHUP) or 143 (SIGTERM).
 - **Sessions.** Each command issues a temporary session through `t3 auth session issue` and revokes it before it exits, unless a saved login is in use.
 - **Plain output.** Control characters from the server are dropped from plain output and kept, escaped, in `--json`.
+- **Closed output.** When the program reading stdout or stderr exits first, every command stops with `OUTPUT_FAILED` and exit 1 instead of a panic, and still revokes its session. Plain output names the error on stderr, and `wait` adds the message's id and "Do not resend it." With `--json` the error goes to the closed stdout, so only the exit code shows.
 - **Launch.** `t3term launch PROJECT [PROMPT] --model M` starts a thread with its first message and returns once T3 accepts it, with the run in `preparing`. PROJECT is an id, an id prefix or an exact title. The prompt falls back to stdin and goes as typed. Without `--title`, the title is the start of the message. `--worktree REF` and `--branch B` ask for a new worktree. Plain output names the environment, project, model, mode and workspace. `--json` adds the ids t3term picked. A missing `--model` exits 2 (`MODEL_REQUIRED`), an unknown project 3 (`PROJECT_NOT_FOUND`), T3's launch error 4 (`THREAD_LAUNCH_REJECTED`) and a lost answer 5 (`THREAD_LAUNCH_UNCONFIRMED`, with a `read` command). t3term sends each launch once. When stdout's reader is gone after T3 accepts, it exits 1 with `OUTPUT_FAILED` on stderr and the thread's id.
 - **`watch` reconnects.** `watch THREAD` prints `snapshot at sequence N` and `live` on stderr and each event on stdout, or one JSON object a line with `--json`. When its socket ends it prints `connection lost (<reason>); retrying in 250ms` on stderr, with the wait doubling on each failed try up to 10 s, and `live` again once it is back. A frame t3term can't parse ends the socket with the reason `T3 protocol error: t3term couldn't parse a frame as JSON (...)` or `T3 protocol error: t3term couldn't read a binary frame as UTF-8 (...)`.
 
@@ -47,6 +48,21 @@ $T3V launches accept
 eval "$L launch 'Linked Desk' 'Printed nowhere' --model gpt-6" 2>"$RUN/launch.err" | :   # exit 1: stdout's reader is gone
 grep -F "[OUTPUT_FAILED]" "$RUN/launch.err"
 $T3V status --json | jq -e '.launches == {"accepted": 3, "resumed": 0, "refused": 1, "dropped": 1}'   # each launch went out once
+eval "$L threads" 2>"$RUN/threads.err" | :   # exit 1: stdout's reader is gone, and no panic
+grep -E "^t3term: Couldn't write to stdout: .*\[OUTPUT_FAILED\]$" "$RUN/threads.err"
+eval "$L --json read thr-single" | :       # exit 1: the error went to the closed stdout too
+eval "$L projects" | :                     # exit 1
+eval "$L doctor" | :                       # exit 1
+eval "$L models" | :                       # exit 1
+eval "$L requests thr-single" | :          # exit 1
+eval "$L settings thr-single" | :          # exit 1
+eval "$L environment list" | :             # exit 1
+eval "$L environment status" | :           # exit 1
+eval "$L wait thr-single --timeout 5" 2>"$RUN/wait.err" | :   # exit 1
+grep -F "The message was sent (msg-single-2), but t3term couldn't write to stdout" "$RUN/wait.err"
+grep -F "Do not resend it. [OUTPUT_FAILED]" "$RUN/wait.err"
+eval "$L watch thr-single" 2>&1 >"$RUN/watch.out" | :   # exit 1: stderr's reader is gone
+$T3V status --json | jq -e '.authIssued - .authRevoked == 1'   # every CLI session was revoked, and only the TUI's is open
 
 # watch in the background, its stderr in the evidence. A frame that isn't JSON ends its socket with
 # a protocol error, and it prints the reason, retries 250 ms later and is live again.
@@ -70,7 +86,9 @@ $T3V check                                 # every CLI session was issued and re
 - A launched thread stays in the run's world. The sidebar's Working shelf counts it, and `threads` lists it for the rest of the run. Its run stays `preparing`, because the fake prepares no workspace and starts no agent, until `t3v run THREAD STATUS` moves it.
 - `t3v launches refuse` and `t3v launches drop` last until `t3v launches accept`.
 - `links` has one project, so a shared prefix, a deleted project, a defect, an answer about another thread and the `--environment` a `read` command keeps come from `tests/cli.rs` and `src/launch.rs`, not from a run.
-- To close stdout's reader, pipe into `:`. `>&-` doesn't do it, because Rust opens /dev/null in place of a closed stdout, and macOS has no /dev/full. With `--json`, `OUTPUT_FAILED` goes to the stdout that failed, so read it from plain output on stderr.
+- To close stdout's reader, pipe into `:`. `>&-` doesn't do it, because Rust opens /dev/null in place of a closed stdout, and macOS has no /dev/full. With `--json`, `OUTPUT_FAILED` goes to the stdout that failed, so read it from plain output on stderr. To close stderr's reader instead, run `2>&1 >FILE | :` under bash, as smoke does. zsh, with its default `multios` option, gave exit 0 there.
+- Plain `watch` writes its first line to stderr and prints to stdout only when an event comes, so `watch | :` waits until one does. `--json watch` and a closed stderr fail at once.
+- `send`, `approve`, `interrupt` and `settings` changes need T3 to take a command, which the fake never does, so `tests/cli.rs` covers what they print when T3 accepted them and the output then fails.
 - The event log keeps a launch's ids, model and modes, and only the length and SHA-256 of the title, message, base ref and branch. Compare `printf '...' | shasum -a 256` with it to check what t3term sent.
 - `t3v status --json` counts CLI requests with the TUI's, since both reach the same server.
 - `frame --client cli` reaches only CLI sockets open when it runs, so start `watch` and wait for its `live` first. A command that just exited may leave its socket open for a moment, which is why the recipe's refusal comes before any command.

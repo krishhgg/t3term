@@ -505,8 +505,8 @@ fn report(error: &anyhow::Error, json_mode: bool) -> i32 {
     exit_code
 }
 
-fn print_json(value: &Value) {
-    println!("{}", json_text(value, true));
+fn print_json(value: &Value) -> Result<()> {
+    print_stdout(&(json_text(value, true) + "\n"))
 }
 
 /// `value` as JSON text that is safe to print. serde_json escapes the controls below 0x20 but
@@ -575,9 +575,9 @@ async fn run(cli: Cli) -> Result<i32> {
                 .filter(|p| all || models::enabled(p))
                 .collect();
             if json_mode {
-                print_json(&json!({"ok": true, "providers": providers}));
+                print_json(&json!({"ok": true, "providers": providers}))?;
             } else {
-                print!("{}", models_text(&providers));
+                print_stdout(&models_text(&providers))?;
             }
             Ok(0)
         }
@@ -590,28 +590,32 @@ async fn run(cli: Cli) -> Result<i32> {
             let config = client.server_config().await?;
             let plan = models::plan(&config, state.thread(), &choice)?;
             let applied = client.apply_settings(&state, &plan).await?;
-            if json_mode {
+            let output = if json_mode {
                 // Report the settings as they are now, not as the snapshot read before the change.
                 let state = match applied {
                     Some(sequence) => client.thread_after(&id, sequence).await?,
                     None => state,
                 };
-                print_json(&json!({
+                let body = json!({
                     "ok": true,
                     "threadId": id,
                     "settings": models::thread_settings(&config, state.thread()),
                     "changed": plan_json(&plan),
-                }));
+                });
+                json_text(&body, true) + "\n"
             } else if choice.is_empty() {
-                print!(
-                    "{}",
-                    settings_text(&models::thread_settings(&config, state.thread()))
-                );
+                settings_text(&models::thread_settings(&config, state.thread()))
             } else if plan == Plan::default() {
-                println!("Nothing to change.");
+                "Nothing to change.\n".to_string()
             } else {
-                print!("{}", changes_text(&plan));
-            }
+                changes_text(&plan)
+            };
+            write_stdout(&output).map_err(|error| match applied {
+                Some(_) => {
+                    unprinted_change(&format!("the change to thread {id}'s settings"), &error)
+                }
+                None => unprinted("stdout", &error),
+            })?;
             Ok(0)
         }
         Command::Logout => logout(environment, json_mode).await,
@@ -620,15 +624,15 @@ async fn run(cli: Cli) -> Result<i32> {
             let client = connect(environment, READ, "10m").await?;
             let shell = client.shell().await?;
             if json_mode {
-                print_json(&json!({"ok": true, "projects": shell.projects}));
+                print_json(&json!({"ok": true, "projects": shell.projects}))?;
             } else {
                 for project in &shell.projects {
-                    println!(
-                        "{}  {}  {}",
+                    print_stdout(&format!(
+                        "{}  {}  {}\n",
                         short(&project["id"]),
                         shown(&project["title"]),
                         shown(&project["workspaceRoot"])
-                    );
+                    ))?;
                 }
             }
             Ok(0)
@@ -677,20 +681,20 @@ async fn run(cli: Cli) -> Result<i32> {
             threads.sort_by(|a, b| text(&b["updatedAt"]).cmp(text(&a["updatedAt"])));
             threads.truncate(limit);
             if json_mode {
-                print_json(&json!({"ok": true, "threads": threads}));
+                print_json(&json!({"ok": true, "threads": threads}))?;
             } else {
                 for thread in threads {
                     let project = titles
                         .get(thread["projectId"].as_str().unwrap_or(""))
                         .copied()
                         .unwrap_or("");
-                    println!(
-                        "{}  {:<10} {:<20.20} {}",
+                    print_stdout(&format!(
+                        "{}  {:<10} {:<20.20} {}\n",
                         short(&thread["id"]),
                         shown(&thread["status"]),
                         plain(project),
                         shown(&thread["title"])
-                    );
+                    ))?;
                 }
             }
             Ok(0)
@@ -706,11 +710,11 @@ async fn run(cli: Cli) -> Result<i32> {
             if json_mode {
                 print_json(
                     &json!({"ok": true, "snapshotSequence": state.sequence, "projection": state.projection}),
-                );
+                )?;
             } else {
                 let title = shown(&state.thread()["title"]);
-                println!("# {title}  ({})", plain(&id));
-                print!("{}", transcript::plain_text(&state, last, reasoning));
+                print_stdout(&format!("# {title}  ({})\n", plain(&id)))?;
+                print_stdout(&transcript::plain_text(&state, last, reasoning))?;
             }
             Ok(0)
         }
@@ -724,27 +728,26 @@ async fn run(cli: Cli) -> Result<i32> {
                     WatchEvent::Item(item) => {
                         let applied = state.apply(&item);
                         if json_mode {
-                            println!("{}", json_text(&item, false));
+                            print_stdout(&(json_text(&item, false) + "\n"))?;
                         } else {
                             match applied {
-                                Applied::Snapshot => {
-                                    eprintln!("snapshot at sequence {}", state.sequence)
-                                }
-                                Applied::Synchronized => eprintln!("live"),
+                                Applied::Snapshot => print_stderr(&format!(
+                                    "snapshot at sequence {}\n",
+                                    state.sequence
+                                ))?,
+                                Applied::Synchronized => print_stderr("live\n")?,
                                 Applied::Event(kind) => {
-                                    println!("{} {}", state.sequence, plain(&kind))
+                                    print_stdout(&format!("{} {}\n", state.sequence, plain(&kind)))?
                                 }
                                 Applied::Duplicate | Applied::Ignored => {}
                             }
                         }
                     }
-                    WatchEvent::Reconnecting { reason, retry_in } => {
-                        eprintln!(
-                            "connection lost ({}); retrying in {}ms",
-                            plain(&reason),
-                            retry_in.as_millis()
-                        )
-                    }
+                    WatchEvent::Reconnecting { reason, retry_in } => print_stderr(&format!(
+                        "connection lost ({}); retrying in {}ms\n",
+                        plain(&reason),
+                        retry_in.as_millis()
+                    ))?,
                     WatchEvent::Failed(message) => return Err(err("WATCH_FAILED", message)),
                 }
             }
@@ -785,13 +788,14 @@ async fn run(cli: Cli) -> Result<i32> {
                 .send_message_with(&state, &prompt, if_busy, &plan)
                 .await?;
             if !wait {
-                if json_mode {
-                    print_json(
-                        &json!({"ok": true, "threadId": id, "messageId": receipt.message_id, "dispatchMode": receipt.dispatch_mode, "sequence": receipt.sequence, "changed": plan_json(&plan)}),
-                    );
+                let output = if json_mode {
+                    let body = json!({"ok": true, "threadId": id, "messageId": receipt.message_id, "dispatchMode": receipt.dispatch_mode, "sequence": receipt.sequence, "changed": plan_json(&plan)});
+                    json_text(&body, true) + "\n"
                 } else {
-                    println!("sent {} ({})", receipt.message_id, receipt.dispatch_mode);
-                }
+                    format!("sent {} ({})\n", receipt.message_id, receipt.dispatch_mode)
+                };
+                write_stdout(&output)
+                    .map_err(|error| unprinted_turn(&receipt.message_id, "stdout", &error))?;
                 return Ok(0);
             }
             wait_for_reply(
@@ -914,17 +918,17 @@ async fn run(cli: Cli) -> Result<i32> {
                 })
                 .collect();
             if json_mode {
-                print_json(&json!({"ok": true, "requests": requests}));
+                print_json(&json!({"ok": true, "requests": requests}))?;
             } else if requests.is_empty() {
-                println!("No pending requests.");
+                print_stdout("No pending requests.\n")?;
             } else {
                 for request in &requests {
-                    println!(
-                        "{}  {}  {}",
+                    print_stdout(&format!(
+                        "{}  {}  {}\n",
                         shown(&request["id"]),
                         shown(&request["kind"]),
                         shown(&request["prompt"])
-                    );
+                    ))?;
                 }
             }
             Ok(0)
@@ -963,13 +967,19 @@ async fn run(cli: Cli) -> Result<i32> {
                 },
             };
             let sequence = client.respond(&id, &request_id, decision.wire()).await?;
-            if json_mode {
-                print_json(
-                    &json!({"ok": true, "requestId": request_id, "decision": decision.wire(), "sequence": sequence}),
-                );
+            let output = if json_mode {
+                let body = json!({"ok": true, "requestId": request_id, "decision": decision.wire(), "sequence": sequence});
+                json_text(&body, true) + "\n"
             } else {
-                println!("{} {}", decision.wire(), plain(&request_id));
-            }
+                format!("{} {}\n", decision.wire(), plain(&request_id))
+            };
+            write_stdout(&output).map_err(|error| {
+                let decision = decision.wire();
+                unprinted_change(
+                    &format!("the answer {decision} to request {request_id}"),
+                    &error,
+                )
+            })?;
             Ok(0)
         }
         Command::Interrupt { thread } => {
@@ -985,11 +995,14 @@ async fn run(cli: Cli) -> Result<i32> {
             })?;
             let run_id = run["id"].as_str().unwrap_or_default().to_string();
             client.interrupt(&id, &run_id).await?;
-            if json_mode {
-                print_json(&json!({"ok": true, "runId": run_id}));
+            let output = if json_mode {
+                json_text(&json!({"ok": true, "runId": run_id}), true) + "\n"
             } else {
-                println!("interrupted {}", plain(&run_id));
-            }
+                format!("interrupted {}\n", plain(&run_id))
+            };
+            write_stdout(&output).map_err(|error| {
+                unprinted_change(&format!("the interrupt of run {run_id}"), &error)
+            })?;
             Ok(0)
         }
     }
@@ -1148,6 +1161,52 @@ fn write_stdout(text: &str) -> std::io::Result<()> {
     stdout.flush()
 }
 
+/// `write_stdout` for stderr, which `eprint!` panics on the same way.
+fn write_stderr(text: &str) -> std::io::Result<()> {
+    let mut stderr = std::io::stderr().lock();
+    stderr.write_all(text.as_bytes())?;
+    stderr.flush()
+}
+
+/// Writes `text` to stdout, or returns `OUTPUT_FAILED` for `report` to show.
+fn print_stdout(text: &str) -> Result<()> {
+    write_stdout(text).map_err(|error| unprinted("stdout", &error))
+}
+
+/// Writes `text` to stderr, or returns `OUTPUT_FAILED` for `report` to show.
+fn print_stderr(text: &str) -> Result<()> {
+    write_stderr(text).map_err(|error| unprinted("stderr", &error))
+}
+
+/// The error for output t3term couldn't write to `stream`, usually because the program reading
+/// it exited. The command stops there, so nothing more is written after it.
+fn unprinted(stream: &str, error: &std::io::Error) -> anyhow::Error {
+    err(
+        "OUTPUT_FAILED",
+        format!("Couldn't write to {stream}: {error}."),
+    )
+}
+
+/// The error for a command T3 accepted whose result t3term couldn't write. It says what T3
+/// accepted, so the failure isn't read as T3 refusing it.
+fn unprinted_change(accepted: &str, error: &std::io::Error) -> anyhow::Error {
+    err(
+        "OUTPUT_FAILED",
+        format!("T3 accepted {accepted}, but t3term couldn't print it: {error}."),
+    )
+}
+
+/// The error for output about message `message_id` that t3term couldn't write. T3 has the
+/// message, so the error names it and says not to send it again, as the wait's timeout does.
+fn unprinted_turn(message_id: &str, stream: &str, error: &std::io::Error) -> anyhow::Error {
+    err(
+        "OUTPUT_FAILED",
+        format!(
+            "The message was sent ({message_id}), but t3term couldn't write to {stream}: {error}. Do not resend it."
+        ),
+    )
+}
+
 /// The error for a launch T3 accepted whose result t3term couldn't write. It names the thread,
 /// because launching again would start a second one.
 fn unprinted_launch(
@@ -1289,7 +1348,12 @@ async fn wait_for_reply(
     let mut events = client.watch_thread(thread_id, Some(state.sequence));
     let mut printed: HashMap<String, usize> = HashMap::new();
     let mut announced: std::collections::HashSet<String> = Default::default();
-    let mut stdout = std::io::stdout();
+    let out = |text: &str| {
+        write_stdout(text).map_err(|error| unprinted_turn(message_id, "stdout", &error))
+    };
+    let note = |text: &str| {
+        write_stderr(text).map_err(|error| unprinted_turn(message_id, "stderr", &error))
+    };
     loop {
         if let Some(run) = state.run_for_message(message_id).cloned() {
             let run_id = run["id"].as_str().unwrap_or_default();
@@ -1307,13 +1371,12 @@ async fn wait_for_reply(
                         let done = printed.entry(item_id).or_insert(0);
                         if body.len() > *done && body.is_char_boundary(*done) {
                             if *done == 0 && !announced.is_empty() {
-                                println!();
+                                out("\n")?;
                             }
                             // `done` counts the bytes of the reply as T3 sent it, and
                             // `plain_from` cleans from there to print what cleaning the whole
                             // reply would add.
-                            print!("{}", transcript::plain_from(body, *done));
-                            stdout.flush().ok();
+                            out(&transcript::plain_from(body, *done))?;
                             *done = body.len();
                             announced.insert("assistant".into());
                         }
@@ -1326,12 +1389,12 @@ async fn wait_for_reply(
                         )
                     {
                         announced.insert(item_id);
-                        eprintln!("\n· {}", plain(&block.header));
+                        note(&format!("\n· {}\n", plain(&block.header)))?;
                         // A handoff says where the context went, as `t3term read` does.
                         // `describe_plain` has cleaned and bounded its endpoints.
                         if block.item_type == "handoff" {
                             for line in block.body.lines() {
-                                eprintln!("  {line}");
+                                note(&format!("  {line}\n"))?;
                             }
                         }
                     }
@@ -1361,18 +1424,17 @@ async fn wait_for_reply(
                     .collect::<Vec<_>>()
                     .join("\n\n");
                 if json_mode {
-                    print_json(
-                        &json!({"ok": true, "threadId": thread_id, "messageId": message_id, "runId": run_id, "outcome": outcome, "reply": reply}),
-                    );
+                    let body = json!({"ok": true, "threadId": thread_id, "messageId": message_id, "runId": run_id, "outcome": outcome, "reply": reply});
+                    out(&(json_text(&body, true) + "\n"))?;
                 } else {
-                    println!();
+                    out("\n")?;
                     if needs_person {
-                        eprintln!(
-                            "The turn is waiting for approval. Run `t3term requests {}`.",
+                        note(&format!(
+                            "The turn is waiting for approval. Run `t3term requests {}`.\n",
                             plain(thread_id)
-                        );
+                        ))?;
                     } else if outcome != "completed" {
-                        eprintln!("The turn ended: {outcome}");
+                        note(&format!("The turn ended: {outcome}\n"))?;
                     }
                 }
                 return Ok(match outcome {
@@ -1399,7 +1461,10 @@ async fn wait_for_reply(
             }
             Ok(Some(WatchEvent::Reconnecting { reason, .. })) => {
                 if !json_mode {
-                    eprintln!("\n(connection lost: {}; resuming)", plain(&reason));
+                    note(&format!(
+                        "\n(connection lost: {}; resuming)\n",
+                        plain(&reason)
+                    ))?;
                 }
             }
             Ok(Some(WatchEvent::Failed(message))) => return Err(err("WATCH_FAILED", message)),
@@ -1515,9 +1580,9 @@ async fn logout(environment: Option<&str>, json_mode: bool) -> Result<i32> {
         },
     };
     if json_mode {
-        print_json(&json!({"ok": true, "message": message}));
+        print_json(&json!({"ok": true, "message": message}))?;
     } else {
-        println!("{}", plain(&message));
+        print_stdout(&format!("{}\n", plain(&message)))?;
     }
     Ok(0)
 }
@@ -1609,9 +1674,9 @@ async fn manage_environments(command: EnvironmentCommand, json_mode: bool) -> Re
         }
     };
     if json_mode {
-        print_json(&body);
+        print_json(&body)?;
     } else {
-        println!("{}", plain(&message));
+        print_stdout(&format!("{}\n", plain(&message)))?;
     }
     Ok(0)
 }
@@ -1669,9 +1734,9 @@ async fn environment_status(name: Option<&str>, json_mode: bool) -> Result<i32> 
         }
         body["default"] = json!(saved.default);
         body["environments"] = probes.iter().map(Probe::to_json).collect();
-        print_json(&body);
+        print_json(&body)?;
     } else {
-        println!("{}", status_text(&probes));
+        print_stdout(&format!("{}\n", status_text(&probes)))?;
     }
     Ok(failed.map_or(0, |probe| probe.exit_code))
 }
@@ -1714,7 +1779,7 @@ fn status_text(probes: &[Probe]) -> String {
 
 fn finish_doctor(checks: serde_json::Map<String, Value>, ok: bool, json_mode: bool) -> Result<i32> {
     if json_mode {
-        print_json(&json!({"ok": ok, "checks": checks}));
+        print_json(&json!({"ok": ok, "checks": checks}))?;
     } else {
         for (name, check) in &checks {
             let mark = if check["ok"] == true { "ok  " } else { "FAIL" };
@@ -1724,7 +1789,10 @@ fn finish_doctor(checks: serde_json::Map<String, Value>, ok: bool, json_mode: bo
             }
             // A detail can quote T3, such as its version or an error, so it prints as `--json`
             // writes it, with every control escaped.
-            println!("{mark} {name:<22} {}", json_text(&detail, false));
+            print_stdout(&format!(
+                "{mark} {name:<22} {}\n",
+                json_text(&detail, false)
+            ))?;
         }
     }
     Ok(if ok { 0 } else { exit::UNAVAILABLE })
