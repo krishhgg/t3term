@@ -1,0 +1,194 @@
+#!/usr/bin/env python3
+"""smoke: runs the recipe of every file in ../features against a build of t3term, one run each.
+
+A recipe is the bash block under "## Driving it with t3v". Its first command is `$T3V start`, and
+smoke starts that run itself with the same options, the binary it was given and an evidence
+directory of its own, then runs the other lines with T3V, T3V_RUN and RUN set. A line whose comment
+starts with `exit N` must exit N. Every other line must exit 0. After the last line smoke runs
+`t3v check`, `t3v stop`, `t3v check` again and `t3v cleanup`, whatever happened, so the evidence
+stays and the run doesn't.
+
+    smoke [--binary PATH] [--evidence DIR] [FEATURE...]
+
+It exits 0 when every recipe and every check passed, 1 when one failed and 2 on bad usage.
+"""
+
+import argparse
+import json
+import os
+import re
+import shlex
+import subprocess
+import sys
+import time
+
+HERE = os.path.dirname(os.path.realpath(__file__))
+T3V = os.path.join(HERE, 't3v')
+FEATURES = os.path.join(os.path.dirname(HERE), 'features')
+BLOCK = re.compile(r'^## Driving it with t3v\n.*?^```bash\n(.*?)^```', re.S | re.M)
+EXIT = re.compile(r'exit (\d+)\b')
+STEP_TIMEOUT = 300
+
+
+def comment_start(line):
+    """Where bash would start a comment in LINE: a # outside quotes after a blank or at the start."""
+    quote = None
+    i = 0
+    while i < len(line):
+        c = line[i]
+        if quote:
+            if c == '\\' and quote == '"':
+                i += 1
+            elif c == quote:
+                quote = None
+        elif c in '\'"':
+            quote = c
+        elif c == '\\':
+            i += 1
+        elif c == '#' and (i == 0 or line[i - 1] in ' \t'):
+            return i
+        i += 1
+    return None
+
+
+def recipe(name):
+    """The start options and the other (line number, command, wanted exit) of a feature's recipe."""
+    with open(os.path.join(FEATURES, name + '.md'), encoding='utf-8') as f:
+        found = BLOCK.search(f.read())
+    if not found:
+        raise SystemExit(f'smoke: features/{name}.md has no bash block under "## Driving it with t3v"')
+    start, steps = None, []
+    for number, line in enumerate(found.group(1).splitlines(), 1):
+        at = comment_start(line)
+        command = (line if at is None else line[:at]).strip()
+        note = '' if at is None else line[at + 1:].strip()
+        if not command:
+            continue
+        if command.endswith('\\'):
+            raise SystemExit(f'smoke: features/{name}.md recipe line {number} continues on the next line')
+        if start is None:
+            words = shlex.split(command)
+            if words[:2] != ['$T3V', 'start']:
+                raise SystemExit(f'smoke: features/{name}.md recipe must begin with $T3V start')
+            start = words[2:]
+            continue
+        wanted = EXIT.match(note)
+        steps.append((number, command, int(wanted.group(1)) if wanted else 0))
+    if start is None:
+        raise SystemExit(f'smoke: features/{name}.md recipe is empty')
+    return start, steps
+
+
+def script(name, steps):
+    """A bash script that runs STEPS in order and stops at the first one that exits wrongly."""
+    out = ['set -u -o pipefail']
+    for number, command, wanted in steps:
+        where = shlex.quote(f'features/{name}.md recipe line {number}')
+        out.append(command)
+        out.append(f'rc=$?; if [ "$rc" -ne {wanted} ]; then '
+                   f'echo "smoke: "{where}" exited $rc, wanted {wanted}" >&2; exit 1; fi')
+    return '\n'.join(out) + '\n'
+
+
+def t3v(log, *args, timeout=STEP_TIMEOUT):
+    """Runs t3v with ARGS, appends what it printed to LOG and returns the exit code and stdout."""
+    # What the recipe printed is then on disk, where `check` searches it for issued tokens.
+    log.flush()
+    try:
+        done = subprocess.run([sys.executable, '-I', T3V, *args], capture_output=True, text=True,
+                              timeout=timeout)
+    except subprocess.TimeoutExpired:
+        log.write(f'$ t3v {shlex.join(args)}\ntimed out after {timeout} s\n')
+        return 124, ''
+    log.write(f'$ t3v {shlex.join(args)}\n{done.stdout}{done.stderr}exit {done.returncode}\n')
+    return done.returncode, done.stdout
+
+
+def run_feature(name, binary, evidence):
+    """Runs one recipe. Returns a result row for smoke.json."""
+    started = time.monotonic()
+    start, steps = recipe(name)
+    os.makedirs(evidence, exist_ok=True)
+    row = {'feature': name, 'evidence': evidence, 'ok': False, 'failed': None}
+    with open(os.path.join(evidence, 'smoke.log'), 'w', encoding='utf-8') as log:
+        args = ['start', '--json', '--evidence', evidence, *start]
+        if binary:
+            args += ['--binary', binary]
+        code, out = t3v(log, *args)
+        try:
+            # A start that failed after making its run names it too, and the run may still be up.
+            run = json.loads(out).get('run')
+        except (ValueError, AttributeError):
+            run = None
+        if code or not run:
+            row['failed'] = 't3v start'
+        if not run:
+            return finish(row, started)
+        try:
+            if code:
+                return finish(row, started)
+            env = dict(os.environ, T3V=T3V, T3V_RUN=run, RUN=run)
+            code, _ = t3v(log, 'doctor', '--run', run)
+            if code:
+                row['failed'] = 't3v doctor'
+                return finish(row, started)
+            log.write(f'$ features/{name}.md recipe\n')
+            log.flush()
+            try:
+                done = subprocess.run(['bash', '-c', script(name, steps)], env=env, cwd=os.getcwd(),
+                                      stdout=log, stderr=subprocess.STDOUT, timeout=STEP_TIMEOUT * 2)
+                code = done.returncode
+            except subprocess.TimeoutExpired:
+                log.write(f'the recipe timed out after {STEP_TIMEOUT * 2} s\n')
+                code = 124
+            if code:
+                row['failed'] = 'the recipe'
+                return finish(row, started)
+            code, _ = t3v(log, 'check', '--run', run)
+            if code:
+                row['failed'] = 't3v check while live'
+        finally:
+            t3v(log, 'stop', '--run', run)
+            code, _ = t3v(log, 'check', '--run', run)
+            if code and not row['failed']:
+                row['failed'] = 't3v check after stop'
+            t3v(log, 'cleanup', '--run', run)
+    row['ok'] = not row['failed']
+    return finish(row, started)
+
+
+def finish(row, started):
+    row['seconds'] = round(time.monotonic() - started, 1)
+    return row
+
+
+def main():
+    parser = argparse.ArgumentParser(prog='smoke', description=__doc__.split('\n\n')[0])
+    parser.add_argument('--binary', help='the t3term to run (default: t3v start\'s, target/debug/t3term)')
+    parser.add_argument('--evidence', default=f'/tmp/t3v-evidence/smoke-{os.getpid()}',
+                        help='where each feature\'s evidence goes, one directory each')
+    parser.add_argument('features', nargs='*', help='feature file names without .md (default: all)')
+    args = parser.parse_args()
+    names = args.features or sorted(f[:-3] for f in os.listdir(FEATURES)
+                                    if f.endswith('.md') and f != 'README.md')
+    missing = [n for n in names if not os.path.exists(os.path.join(FEATURES, n + '.md'))]
+    if missing:
+        parser.error('no feature file named ' + ', '.join(missing))
+    binary = os.path.abspath(args.binary) if args.binary else None
+    rows = []
+    for name in names:
+        row = run_feature(name, binary, os.path.join(args.evidence, name))
+        rows.append(row)
+        print(f"{'pass' if row['ok'] else 'FAIL'}  {name}  {row['seconds']} s"
+              + ('' if row['ok'] else f"  ({row['failed']} failed)"), flush=True)
+        if not row['ok']:
+            with open(os.path.join(row['evidence'], 'smoke.log'), encoding='utf-8') as f:
+                print(''.join(f.readlines()[-60:]), flush=True)
+    with open(os.path.join(args.evidence, 'smoke.json'), 'w', encoding='utf-8') as f:
+        json.dump({'ok': all(r['ok'] for r in rows), 'features': rows}, f, indent=2)
+    print(f"{sum(r['ok'] for r in rows)} of {len(rows)} recipes passed. Evidence: {args.evidence}")
+    return 0 if all(r['ok'] for r in rows) else 1
+
+
+if __name__ == '__main__':
+    sys.exit(main())
