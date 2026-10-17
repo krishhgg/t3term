@@ -3386,6 +3386,8 @@ fn run_into_closed(
     let t3 = held_revoke_t3(&home);
     let mut command = home.command(args, &t3);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
+    // No other test starts a process until the reader is gone, so none holds it open.
+    let alone = spawning();
     let mut running = Running {
         child: command.spawn().expect("run t3term"),
         release: home.0.path().join("release"),
@@ -3400,6 +3402,7 @@ fn run_into_closed(
         Closed::Stdout => drop(running.child.stdout.take()),
         Closed::Stderr => drop(running.child.stderr.take()),
     }
+    drop(alone);
     keeper.open.send(()).unwrap();
 
     // t3term starts the revoke and is still running while the revoke is held.
