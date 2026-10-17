@@ -111,7 +111,8 @@ type PendingMap = Arc<Mutex<HashMap<String, Pending>>>;
 /// to how many were waiting. The task looks at the clock before each queued frame, so however
 /// many are queued, it goes past the second by one frame's work at most: taking the frame from
 /// the queue and passing over it, or handing it to a sink that takes it at once. It drops the
-/// socket before it frees the frames left in the queue.
+/// socket before it frees the frames left in the queue and the ids of the requests it passed
+/// over.
 ///
 /// A [`BoundedChunk`] doesn't keep the connection: it acks only while its stream is open, and
 /// an open stream does.
@@ -344,15 +345,12 @@ impl RpcClient {
             for (_, entry) in reader_pending.lock().await.drain() {
                 fail(entry, RpcError::Disconnected(reason.clone()));
             }
-            // `leave` looks at the clock before each frame, and the timeout cuts short a write
-            // T3 doesn't read.
-            let deadline = tokio::time::Instant::now() + CLOSE_LIMIT;
-            let expired = || tokio::time::Instant::now() >= deadline;
-            let leaving = leave(&mut sink, &mut outgoing_rx, unsent, abandoned, expired);
-            let _ = tokio::time::timeout_at(deadline, leaving).await;
-            // The socket drops here, whether the frames went or not, and before the task frees
-            // the frames still queued, which may be many.
-            drop((sink, source));
+            let mut finished = HashSet::new();
+            let socket = (sink, source);
+            end_socket(socket, &mut outgoing_rx, &mut finished, unsent, abandoned).await;
+            // The socket is gone. Only now does the task free the frames still queued and the
+            // ids of the requests `leave` passed over, which may be many.
+            drop((outgoing_rx, finished));
         });
 
         let rpc = RpcClient {
@@ -496,12 +494,37 @@ async fn forget_bounded(pending: &PendingMap, interrupt: &Value) {
     }
 }
 
+/// Gives [`leave`] until `CLOSE_LIMIT` from now, then drops the socket, whether the frames
+/// went out or not. `leave` looks at the clock before each frame, and the timeout cuts short a
+/// write T3 doesn't read.
+///
+/// What `leave` works through stays with the caller: the frames left in `queue` and the ids of
+/// the requests it passed over, in `finished`. Both grow with the queue, and a timeout that
+/// cuts `leave` short frees neither, so the caller can free them once the socket has dropped
+/// rather than within the second.
+async fn end_socket<S, R>(
+    socket: (S, R),
+    queue: &mut mpsc::UnboundedReceiver<Value>,
+    finished: &mut HashSet<String>,
+    held: Option<Value>,
+    abandoned: bool,
+) where
+    S: Sink<Message> + Unpin,
+{
+    let (mut sink, source) = socket;
+    let deadline = tokio::time::Instant::now() + CLOSE_LIMIT;
+    let expired = || tokio::time::Instant::now() >= deadline;
+    let leaving = leave(&mut sink, queue, finished, held, abandoned, expired);
+    let _ = tokio::time::timeout_at(deadline, leaving).await;
+    drop((sink, source));
+}
+
 /// What a connection's task sends last, once it has ended every call and stream still
 /// waiting. After a close, or once the socket was lost, that is only the WebSocket Close
 /// frame. After the last handle dropped, the frames those handles queued come first, in
 /// order, starting with `held`, the one the task had taken from the queue. Of those, only the
-/// ones [`sent_after_abandon`] allows go out. The sink finishes a frame that had started to go
-/// out before any of them, if T3 reads it.
+/// ones [`sent_after_abandon`] allows go out, and `finished` collects the ids it needs. The
+/// sink finishes a frame that had started to go out before any of them, if T3 reads it.
 ///
 /// `expired` says whether the task's second is up, and `leave` asks before each frame. So a
 /// long run of requests it passes over, which never waits on the sink, can't keep the socket
@@ -510,6 +533,7 @@ async fn forget_bounded(pending: &PendingMap, interrupt: &Value) {
 async fn leave<S>(
     sink: &mut S,
     queue: &mut mpsc::UnboundedReceiver<Value>,
+    finished: &mut HashSet<String>,
     mut held: Option<Value>,
     abandoned: bool,
     expired: impl Fn() -> bool,
@@ -517,7 +541,6 @@ async fn leave<S>(
     S: Sink<Message> + Unpin,
 {
     if abandoned {
-        let mut finished = HashSet::new();
         loop {
             if expired() {
                 return;
@@ -525,7 +548,7 @@ async fn leave<S>(
             let Some(message) = held.take().or_else(|| queue.try_recv().ok()) else {
                 break;
             };
-            if !sent_after_abandon(&message, &mut finished) {
+            if !sent_after_abandon(&message, finished) {
                 // Passing over a frame never waits, so once the task's budget runs out it
                 // gives the runtime its turn here, as a send would.
                 tokio::task::coop::consume_budget().await;
@@ -1158,13 +1181,59 @@ mod tests {
             looks.set(looks.get() + 1);
             looks.get() > TAKEN
         };
-        within(leave(&mut sink, &mut queue, None, true, expired)).await;
+        let mut finished = HashSet::new();
+        let leaving = leave(&mut sink, &mut queue, &mut finished, None, true, expired);
+        within(leaving).await;
         assert_eq!(queue.len(), REQUESTS + 1 - TAKEN);
+        assert_eq!(finished.len(), TAKEN);
 
-        within(leave(&mut sink, &mut queue, None, true, || false)).await;
+        let leaving = leave(&mut sink, &mut queue, &mut finished, None, true, || false);
+        within(leaving).await;
         assert!(queue.is_empty());
         drop((sink, source));
         let mut server = WebSocketStream::from_raw_socket(server, Role::Server, None).await;
         assert_eq!(before_close(&mut server).await, [interrupt]);
+    }
+
+    /// After the last handle drops, the task passes over a long run of requests and starts
+    /// an `Interrupt` too large for the pipe, which T3 never reads. The timeout cuts it short
+    /// at `CLOSE_LIMIT` and the socket drops. The ids `leave` collected, one for each request
+    /// it passed over and one for the `Interrupt`, are all still held then, so the task frees
+    /// them after the socket drops, not within its second.
+    #[tokio::test]
+    async fn the_socket_drops_before_the_ids_of_requests_passed_over_are_freed() {
+        const REQUESTS: usize = 1000;
+        let (client, mut server) = tokio::io::duplex(PIPE);
+        let socket = WebSocketStream::from_raw_socket(client, Role::Client, None).await;
+        let (outgoing, mut queue) = mpsc::unbounded_channel();
+        for id in 1..=REQUESTS {
+            let write = json!({"threadId": "thread-1", "terminalId": "term-1", "data": "ls\r"});
+            let request = json!({
+                "_tag": "Request",
+                "id": id.to_string(),
+                "tag": "terminal.write",
+                "payload": write,
+                "headers": []
+            });
+            outgoing.send(request).unwrap();
+        }
+        // The Interrupt of a stream whose request T3 got before the run, padded past `PIPE`.
+        let padding = "x".repeat(WRITE);
+        let interrupt = json!({"_tag": "Interrupt", "requestId": "0", "interruptors": [padding]});
+        outgoing.send(interrupt).unwrap();
+
+        let mut finished = HashSet::new();
+        let started = tokio::time::Instant::now();
+        let ending = end_socket(socket.split(), &mut queue, &mut finished, None, true);
+        within(ending).await;
+        assert!(started.elapsed() >= CLOSE_LIMIT, "{:?}", started.elapsed());
+        assert!(queue.is_empty());
+        // T3 reads what the pipe held and then the end, so the socket has dropped.
+        let mut received = Vec::new();
+        within(server.read_to_end(&mut received)).await.unwrap();
+        assert!(received.len() < WRITE, "T3 got {} bytes", received.len());
+        // Each request passed over, and the Interrupt that started to go out.
+        assert_eq!(finished.len(), REQUESTS + 1);
+        assert!((0..=REQUESTS).all(|id| finished.contains(&id.to_string())));
     }
 }
