@@ -418,11 +418,43 @@ fn recorded_servers(home: &Path) -> Vec<(PathBuf, RuntimeState)> {
     servers
 }
 
+/// The origin `T3TERM_ORIGIN` names, when it is set, and the T3 home whose records
+/// `discover_any` reads.
+fn discover_from() -> (Option<String>, PathBuf) {
+    #[cfg(test)]
+    {
+        if let Some(given) = fake::DISCOVER_FROM.with_borrow(Clone::clone) {
+            return given;
+        }
+    }
+    (std::env::var("T3TERM_ORIGIN").ok(), t3_home())
+}
+
+/// What a unit test gives `Target::Discover` in place of `T3TERM_ORIGIN` and the T3 home. A
+/// test can't set those without changing them for the tests on other threads. Each thread has
+/// its own, and a thread that sets none reads the process environment.
+#[cfg(test)]
+pub(crate) mod fake {
+    use std::cell::RefCell;
+    use std::path::{Path, PathBuf};
+
+    thread_local! {
+        pub(super) static DISCOVER_FROM: RefCell<Option<(Option<String>, PathBuf)>> =
+            const { RefCell::new(None) };
+    }
+
+    /// Makes `Target::Discover` on this thread try `origin` first, then the servers `home`
+    /// records.
+    pub(crate) fn discover_from(origin: Option<&str>, home: &Path) {
+        DISCOVER_FROM.set(Some((origin.map(str::to_string), home.to_path_buf())));
+    }
+}
+
 /// Tries `T3TERM_ORIGIN` first, then the servers recorded under `~/.t3/userdata` and `~/.t3/dev`.
 async fn discover_any() -> Result<Runtime> {
-    let home = t3_home();
+    let (named, home) = discover_from();
     let mut candidates = Vec::new();
-    if let Ok(origin) = std::env::var("T3TERM_ORIGIN") {
+    if let Some(origin) = named {
         candidates.push(Candidate {
             origin,
             state_dir: None,
