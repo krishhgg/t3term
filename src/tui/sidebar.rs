@@ -815,11 +815,11 @@ pub struct Sidebar {
     /// exclusive, with its thread.
     cards: Vec<(u16, u16, String)>,
     /// Whether the last frame drew a card that reads Working or Goal where nothing drawn over
-    /// it covers its row.
+    /// it covers its status.
     drew_working: bool,
-    /// The screen rows the last frame drew a card or slim row that reads Working or Goal on,
-    /// counting a card's first row, which has its spinner and clock.
-    working: Vec<u16>,
+    /// Where the last frame drew the status of each card or slim row that reads Working or
+    /// Goal: the right end of a card's first row, with its spinner, word and clock.
+    working: Vec<Rect>,
     /// The screen rows the last frame drew the headings of the shelves that fold on, with
     /// their shelves.
     headings: Vec<(u16, Shelf)>,
@@ -1007,20 +1007,20 @@ impl Sidebar {
 
     /// Whether the last frame drew a card that reads Working or Goal, whose spinner and clock
     /// need the event loop's tick. A card scrolled out of view, behind a closed shelf, left
-    /// out of the sidebar, in a hidden sidebar or under a menu or a dialog has nothing on screen
-    /// to move, so it doesn't count.
+    /// out of the sidebar or in a hidden sidebar has nothing on screen to move, so it doesn't
+    /// count, nor does one whose status a menu or a dialog covers.
     pub fn drew_working(&self) -> bool {
         self.drew_working
     }
 
     /// Notes that the frame drew `over` on top of the sidebar. A card that reads Working or
-    /// Goal counts only while they leave a cell of its row in view.
+    /// Goal counts only while they leave a cell of its status in view. The rest of the card
+    /// doesn't move.
     pub fn cover(&mut self, over: &[Rect]) {
-        let list = self.list;
         self.drew_working = self
             .working
             .iter()
-            .any(|&y| !super::covered(Rect::new(list.x, y, list.width, 1), over));
+            .any(|&status| !super::covered(status, over));
     }
 
     /// Whether the last frame drew the feed's dot and the environment, which a hidden
@@ -1273,10 +1273,6 @@ impl Sidebar {
                     self.cards
                         .push((top, bottom.min(list.bottom()), id.clone()));
                     let thread = view.shell.and_then(|shell| find_thread(shell, id));
-                    if thread.is_some_and(working) {
-                        self.drew_working = true;
-                        self.working.push(top);
-                    }
                     let is_open = view.open_id == Some(id.as_str());
                     let cursor = index == self.selected;
                     let bg = if is_open {
@@ -1286,11 +1282,21 @@ impl Sidebar {
                     } else {
                         None
                     };
-                    if slim {
-                        lines.push(view.slim_row(thread, width, bg, cursor, is_open));
+                    let status = if slim {
+                        let (line, status) = view.slim_row(thread, width, bg, cursor, is_open);
+                        lines.push(line);
+                        status
                     } else {
-                        lines.extend(view.thread_card(thread, width, bg, cursor, is_open));
+                        let (card, status) = view.thread_card(thread, width, bg, cursor, is_open);
+                        lines.extend(card);
                         lines.push(Line::default());
+                        status
+                    };
+                    // The status ends before the row's blank last column.
+                    if thread.is_some_and(working) && status > 0 {
+                        self.drew_working = true;
+                        let right = list.x + list.width - 1;
+                        self.working.push(Rect::new(right - status, top, status, 1));
                     }
                 }
             }
@@ -1479,6 +1485,8 @@ pub struct View<'a> {
 impl View<'_> {
     /// Three lines like the GUI's thread card: project and status, title, branch and provider.
     /// The open thread's title is bold, so it shows without its background's color too.
+    /// A thread's card in three rows, and how many columns its status takes at the right end
+    /// of the first, before the blank last column.
     fn thread_card(
         &self,
         thread: Option<&Value>,
@@ -1486,7 +1494,7 @@ impl View<'_> {
         bg: Option<Color>,
         cursor: bool,
         open: bool,
-    ) -> Vec<Line<'static>> {
+    ) -> (Vec<Line<'static>>, u16) {
         let t = self.theme;
         // The card borrows the titles and the branch as T3 sent them and reads only what it has
         // room for.
@@ -1517,6 +1525,7 @@ impl View<'_> {
                 .unwrap_or(""),
         );
         let muted = Style::new().fg(t.sidebar_muted);
+        let status = status_label.width() as u16;
         let project_room = inner.saturating_sub(badge.letters.width() + status_label.width() + 2);
         let line1 = row(
             vec![
@@ -1544,15 +1553,17 @@ impl View<'_> {
             vec![Span::styled(glyph, Style::new().fg(glyph_color))],
             inner,
         );
-        [line1, line2, line3]
+        let lines = [line1, line2, line3]
             .into_iter()
             .map(|line| self.framed(line, cursor, bg))
-            .collect()
+            .collect();
+        (lines, status)
     }
 
     /// One line for a settled thread, after the GUI's slim row: the badge in the muted tone,
     /// the title, and at the right the card's word, or else how long ago the thread settled,
-    /// which is what the shelf sorts by.
+    /// which is what the shelf sorts by. Also how many columns that status takes, before the
+    /// blank last column.
     fn slim_row(
         &self,
         thread: Option<&Value>,
@@ -1560,7 +1571,7 @@ impl View<'_> {
         bg: Option<Color>,
         cursor: bool,
         open: bool,
-    ) -> Line<'static> {
+    ) -> (Line<'static>, u16) {
         let t = self.theme;
         let muted = Style::new().fg(t.sidebar_muted);
         let title = thread
@@ -1588,6 +1599,7 @@ impl View<'_> {
         };
         let title_room = inner.saturating_sub(letters.width() + status.width() + 2);
         let style = if open { title_style(t, true) } else { muted };
+        let columns = status.width() as u16;
         let line = row(
             vec![
                 Span::styled(format!("{letters} "), muted),
@@ -1596,7 +1608,7 @@ impl View<'_> {
             vec![Span::styled(status, Style::new().fg(color))],
             inner,
         );
-        self.framed(line, cursor, bg)
+        (self.framed(line, cursor, bg), columns)
     }
 
     /// `line` as a row of the list: the highlight's bar before it, a blank column after it,
@@ -3444,6 +3456,67 @@ mod tests {
         assert_eq!(sidebar.selected_thread_id(), Some("a8"));
         let lines = text(&render(&mut sidebar, Some(&listed), None, size));
         assert!(lines[row_of(&lines, "Thread a8") as usize - 1].contains("Working"));
+        assert!(sidebar.drew_working());
+    }
+
+    #[test]
+    fn a_working_card_needs_the_tick_while_a_cell_of_its_status_shows() {
+        let listed = shell(vec![with(thread("t"), running()), thread("s")]);
+        let mut sidebar = Sidebar::with_choices(ShelfChoices {
+            working_enabled: false,
+            ..ShelfChoices::default()
+        });
+        sidebar.rebuild(&listed.threads, ALL, None, now());
+        let lines = text(&render(&mut sidebar, Some(&listed), None, (30, 12)));
+        // The card's first row ends in its status, from the spinner to the clock, then the
+        // row's blank last column.
+        let y = row_of(&lines, "Thread t") - 1;
+        let first = &lines[y as usize];
+        let spinner = spinner_frame(now());
+        let from = first.find(spinner).expect("a spinner");
+        let start = first[..from].width() as u16;
+        let end = first.trim_end().width() as u16;
+        assert_eq!(&first[from..].trim_end(), &format!("{spinner} Working 3m"));
+        assert!(sidebar.drew_working());
+
+        // Over the status alone, what shows of the card doesn't move.
+        sidebar.cover(&[Rect::new(start, y, end - start, 1)]);
+        assert!(!sidebar.drew_working());
+        // The clock's last column, or the spinner, is enough to keep it.
+        sidebar.cover(&[Rect::new(start, y, end - start - 1, 1)]);
+        assert!(sidebar.drew_working());
+        sidebar.cover(&[Rect::new(start + 1, y, end - start - 1, 1)]);
+        assert!(sidebar.drew_working());
+        // Over everything but the status, it moves in view.
+        sidebar.cover(&[Rect::new(0, 0, start, 12), Rect::new(0, y + 1, 30, 11)]);
+        assert!(sidebar.drew_working());
+
+        // A slim row's status is the same.
+        let settled = with(
+            thread("t"),
+            json!({
+                "latestRunId": "r",
+                "status": "completed",
+                "activityRunStatus": "waiting",
+                "settledOverride": "settled",
+            }),
+        );
+        let listed = shell(vec![thread("a"), settled]);
+        let mut sidebar = Sidebar::with_choices(ShelfChoices {
+            settled_open: true,
+            ..ShelfChoices::default()
+        });
+        sidebar.rebuild(&listed.threads, ALL, None, now());
+        let lines = text(&render(&mut sidebar, Some(&listed), None, (30, 12)));
+        let y = row_of(&lines, "Thread t");
+        let row = &lines[y as usize];
+        let from = row.find(spinner).expect("a spinner");
+        let start = row[..from].width() as u16;
+        let end = row.trim_end().width() as u16;
+        assert!(sidebar.drew_working());
+        sidebar.cover(&[Rect::new(start, y, end - start, 1)]);
+        assert!(!sidebar.drew_working());
+        sidebar.cover(&[Rect::new(start, y, end - start - 1, 1)]);
         assert!(sidebar.drew_working());
     }
 

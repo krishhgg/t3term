@@ -15633,6 +15633,36 @@ mod tests {
     }
 
     #[test]
+    fn a_working_card_whose_status_a_dialog_covers_needs_no_tick() {
+        // At 63 by 24 the details open as a dialog over the right of the sidebar. It hides the
+        // Working card's status, the spinner, the word and the clock, and leaves its badge and
+        // project in view, which don't move.
+        let mut app = tui(&Settings::default());
+        let mut busy = bound("w", "p", Value::Null, Value::Null);
+        busy["status"] = json!("running");
+        app.on_shell_event(details_shell(vec![feature_thread(), busy]));
+        app.on_shell_event(caught_up());
+        app.open_thread(open_bound(feature_thread()));
+        let rows = screen(&mut app, 63, 24);
+        let spinning = format!("{} Working", spinner_frame(app.now));
+        assert!(shows(&rows, &spinning), "{rows:#?}");
+        assert!(app.sidebar.drew_working());
+        alt(&mut app, 'b');
+        let rows = screen(&mut app, 63, 24);
+        assert_eq!(app.details.drawn.unwrap().layout, details::Layout::Dialog);
+        assert!(
+            shows(&rows, "Thread w") && !shows(&rows, &spinning),
+            "{rows:#?}"
+        );
+        assert!(!app.sidebar.drew_working());
+        // Closed, the status shows and moves again.
+        alt(&mut app, 'b');
+        let rows = screen(&mut app, 63, 24);
+        assert!(shows(&rows, &spinning), "{rows:#?}");
+        assert!(app.sidebar.drew_working());
+    }
+
+    #[test]
     fn the_running_prompts_clock_under_a_dialog_needs_no_tick() {
         let (mut app, _subscriptions) = setup_tui();
         app.check_environments = Box::new(|_, _| None);
