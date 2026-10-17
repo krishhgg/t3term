@@ -8,6 +8,7 @@ pub mod keychain;
 pub mod launch;
 pub mod models;
 pub mod projection;
+pub mod pull_request;
 pub mod rpc;
 pub mod settings;
 pub mod terminal;
