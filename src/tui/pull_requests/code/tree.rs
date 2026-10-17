@@ -7,8 +7,10 @@
 //! it again, it shows as modified. Each folder on the way to a file has a row above it, and a
 //! folder takes the place of its first file, so the rows keep the order the files show in, as
 //! `diffFileTreePositions` and `compareDiffFileTreeEntries` order them. A folder whose only child
-//! is a folder shares its row with it, as `flattenEmptyDirectories` joins them, and the row opens
-//! and closes the last of them, as pierre's `getFlattenedTerminalDirectoryId` says. Every folder
+//! is a folder shares its row with it, as `flattenEmptyDirectories` joins them, and the row closes
+//! the last of them, as pierre's `getFlattenedTerminalDirectoryId` says. The row shows closed while
+//! any folder it joins is, so a folder closed before a read again joined it to the one in it stays
+//! closed, where pierre's row asks only the last. Opening the row opens them all. Every folder
 //! starts open, as `initialExpansion: "open"` has it.
 //!
 //! The folders are kept side by side rather than inside each other, and the rows are listed
@@ -62,7 +64,8 @@ pub(super) struct Row {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub(super) enum Kind {
     /// A folder's row: the path of the last folder it joins, the number of parts in that path,
-    /// the place among the files of its first file, and whether it is open.
+    /// the place among the files of its first file, and whether it is open, as none of the
+    /// folders it joins is closed.
     Folder {
         path: String,
         parts: usize,
@@ -169,6 +172,7 @@ impl Tree {
             let mut names = name.clone();
             let mut path = joined(&listing.path, name);
             let mut parts = listing.parts + 1;
+            let mut open = !folded.contains(&path);
             // A folder whose only child is a folder shares its row.
             while let [Child::Folder(name, _, inner)] = self.folders[folder].children.as_slice() {
                 names.push('/');
@@ -177,8 +181,8 @@ impl Tree {
                 path.push_str(name);
                 parts += 1;
                 folder = *inner;
+                open &= !folded.contains(&path);
             }
-            let open = !folded.contains(&path);
             rows.push(Row {
                 depth,
                 name: names,
@@ -210,6 +214,12 @@ impl Tree {
         })
         .collect()
     }
+}
+
+/// The path of each folder on the way to the one at `path`, the outermost first, then `path`.
+pub(super) fn ancestors(path: &str) -> impl Iterator<Item = &str> {
+    let outer = path.match_indices('/').map(|(end, _)| &path[..end]);
+    outer.chain([path])
 }
 
 /// `name` in the folder at `path`, or at the root where `path` is empty.

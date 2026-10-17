@@ -4339,6 +4339,51 @@ diff --git a/src/b.rs b/src/b.rs
 }
 
 #[test]
+fn a_folder_closed_before_a_read_again_joins_it_to_another_stays_closed() {
+    let inner = "diff --git a/a/b/g.rs b/a/b/g.rs
+--- a/a/b/g.rs
++++ b/a/b/g.rs
+@@ -1 +1 @@
+-a
++b
+";
+    let both = format!(
+        "{inner}diff --git a/a/f.rs b/a/f.rs
+--- a/a/f.rs
++++ b/a/f.rs
+@@ -1 +1 @@
+-a
++b
+"
+    );
+    let mut code = read(slice(&both, None), 0);
+    code.act(Control::Tree, &[]);
+    assert_eq!(
+        tree_of(&code)[2..],
+        ["⌄ a", "  ⌄ b", "    M g.rs", "  M f.rs"]
+    );
+    code.act(Control::Folder(0, 1), &[]);
+    // A read again whose `a` holds only `b` joins them on one row, which stays closed.
+    code.again();
+    assert_eq!(code.ask(2), Some(None));
+    assert_eq!(code.take(2, Ok(slice(inner, None)), 0), Some(true));
+    assert_eq!(tree_of(&code)[1..], [FOLDERS_FOLDED, "› a/b"]);
+    assert_eq!(code.action(Control::Folder(0, 2), &[]), "expand folder");
+    // The row opens both folders.
+    code.act(Control::Folder(0, 2), &[]);
+    assert_eq!(tree_of(&code)[1..], [FOLDERS_OPEN, "⌄ a/b", "  M g.rs"]);
+    // Closing it closes `b`, which stays closed once `a` has a file of its own again.
+    code.act(Control::Folder(0, 2), &[]);
+    code.again();
+    assert_eq!(code.ask(3), Some(None));
+    assert_eq!(code.take(3, Ok(slice(&both, None)), 0), Some(true));
+    assert_eq!(
+        tree_of(&code)[1..],
+        [FOLDERS_FOLDED, "⌄ a", "  › b", "  M f.rs"]
+    );
+}
+
+#[test]
 fn the_tree_fits_every_width_and_cleans_hostile_paths() {
     let patch = "diff --git a/src/\u{1b}]8;;evil\u{7}very/long/path/漢字漢字/name.rs b/src/\u{1b}]8;;evil\u{7}very/long/path/漢字漢字/name.rs
 --- a/src/\u{1b}]8;;evil\u{7}very/long/path/漢字漢字/name.rs

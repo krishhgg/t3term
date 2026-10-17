@@ -841,19 +841,27 @@ impl Code {
                 }
             }
             Control::Folder(first, parts) => {
-                let path = self.tree_rows().into_iter().find_map(|row| match row.kind {
+                let row = self.tree_rows().into_iter().find_map(|row| match row.kind {
                     tree::Kind::Folder {
                         path,
                         first: f,
                         parts: p,
-                        ..
-                    } if (f, p) == (first, parts) => Some(path),
+                        open,
+                    } if (f, p) == (first, parts) => Some((path, open)),
                     _ => None,
                 });
-                if let Some(path) = path
-                    && !self.folded.remove(&path)
-                {
-                    self.folded.insert(path);
+                match row {
+                    Some((path, true)) => {
+                        self.folded.insert(path);
+                    }
+                    // A row shows closed while any folder it joins is, and the folders above
+                    // it are open, as it shows.
+                    Some((path, false)) => {
+                        for path in tree::ancestors(&path) {
+                            self.folded.remove(path);
+                        }
+                    }
+                    None => {}
                 }
             }
             // A file folded unfolds, and one unfolded stays so.
@@ -1145,10 +1153,12 @@ impl Code {
     }
 
     /// Whether every folder of the file tree is open, so its row offers to close them all, as
-    /// the desktop's `areAllDirectoriesExpanded` says. Only a tree with folders has the row.
+    /// the desktop's `areAllDirectoriesExpanded` says. Only a tree with folders has the row. The
+    /// outermost folder closed shows, as those above it are open, so the rows that show say.
     fn folders_open(&self) -> bool {
-        let folders = self.tree().folders();
-        folders.iter().all(|path| !self.folded.contains(path))
+        let rows = self.tree().rows(&self.folded);
+        let closed = |row: &tree::Row| matches!(row.kind, tree::Kind::Folder { open: false, .. });
+        !rows.iter().any(closed)
     }
 
     /// Whether the end of the file tree offers to read the next slice: there is one, and no

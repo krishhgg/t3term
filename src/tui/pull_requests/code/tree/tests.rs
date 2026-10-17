@@ -83,9 +83,10 @@ fn a_folder_closed_hides_what_is_in_it() {
     assert!(matches!(rows[0].kind, Kind::Folder { open: true, .. }));
     let rows = tree.rows(&closed(&["src"]));
     assert_eq!(outline(&rows), [(0, "src", 0), (0, "README.md", 2)]);
-    // A folder inside a row it shares has no row of its own to close.
+    // A folder closed inside a row it shares closes the row, as a read again can join it to the
+    // folder in it.
     let rows = tree.rows(&closed(&["src/a"]));
-    assert_eq!(rows, tree.rows(&HashSet::new()));
+    assert_eq!(rows, tree.rows(&closed(&["src/a/b"])));
     // The folders closed don't change which folders there are.
     assert_eq!(tree.folders(), ["src", "src/a/b"]);
 }
