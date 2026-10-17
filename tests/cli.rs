@@ -33,10 +33,18 @@ fn spawning() -> MutexGuard<'static, ()> {
     SPAWNING.lock().unwrap_or_else(PoisonError::into_inner)
 }
 
-/// Starts `command` while no other test starts a process, so it inherits no other test's pipe.
+/// Starts `command` while no other test starts a process, so it inherits no other test's pipe,
+/// and gives back the lock with it. A test that closes its end of a pipe keeps the lock until
+/// that end is closed. This is the one place in this file that starts a process.
+fn spawn_alone(command: &mut Command) -> (Child, MutexGuard<'static, ()>) {
+    let alone = spawning();
+    let child = command.spawn().expect("run t3term");
+    (child, alone)
+}
+
+/// Starts `command` as `spawn_alone` does, and lets the lock go once it has started.
 fn spawn(command: &mut Command) -> Child {
-    let _alone = spawning();
-    command.spawn().expect("run t3term")
+    spawn_alone(command).0
 }
 
 /// What `Command::output` gives, with the process started through `spawn`.
@@ -45,23 +53,45 @@ fn output(command: &mut Command) -> Output {
     spawn(command).wait_with_output().expect("run t3term")
 }
 
-/// Every process these tests start holds `SPAWNING`: each call that starts one has a
-/// `spawning()` in the eight lines before it, as `spawn` and the tests that close a pipe do. A
-/// test that calls `Command::output` or `Command::spawn` straight, as a merge from master can
-/// bring in, fails here rather than now and then on macOS.
+/// Every process these tests start goes through `spawn_alone`: no other function in this file
+/// calls `Command::output`, `Command::spawn` or `Command::status`. A test that calls one of them
+/// straight, as a merge from master can bring in, fails here rather than now and then on macOS.
 #[test]
-fn every_process_starts_holding_the_spawn_lock() {
+fn every_process_starts_through_spawn_alone() {
     let calls = ["output", "spawn", "status"].map(|name| format!(".{name}()"));
     let lines: Vec<&str> = include_str!("cli.rs").lines().map(str::trim).collect();
-    let unlocked: Vec<&str> = (0..lines.len())
-        .filter(|&at| calls.iter().any(|call| lines[at].contains(call.as_str())))
-        .filter(|&at| {
-            let before = &lines[at.saturating_sub(8)..at];
-            !before.iter().any(|line| line.contains("spawning()"))
-        })
-        .map(|at| lines[at])
-        .collect();
-    assert!(unlocked.is_empty(), "{unlocked:#?}");
+    let mut within = "";
+    let mut elsewhere = Vec::new();
+    for line in &lines {
+        if let Some(name) = line.strip_prefix("fn ") {
+            within = name.split('(').next().unwrap_or(name);
+        }
+        let starts = calls.iter().any(|call| line.contains(call.as_str()));
+        if starts && within != "spawn_alone" {
+            elsewhere.push((within, *line));
+        }
+    }
+    assert!(elsewhere.is_empty(), "{elsewhere:#?}");
+}
+
+/// `spawn_alone` starts nothing while another test holds `SPAWNING`, and starts its process once
+/// the lock is let go.
+#[test]
+fn no_process_starts_while_another_holds_the_spawn_lock() {
+    let dir = TempDir::new().unwrap();
+    let started = dir.path().join("started");
+    let mut touch = Command::new("touch");
+    touch.arg(&started);
+    let held = spawning();
+    let starting = std::thread::spawn(move || spawn(&mut touch).wait().unwrap());
+    std::thread::sleep(Duration::from_millis(500));
+    assert!(
+        !started.exists(),
+        "a process started while the lock was held"
+    );
+    drop(held);
+    assert!(starting.join().unwrap().success());
+    assert!(started.exists());
 }
 
 struct Home(TempDir);
@@ -3265,9 +3295,9 @@ fn launch_into_closed_stdout(json_mode: bool) {
     let mut command = home.command(&args, &t3);
     command.stdout(Stdio::piped()).stderr(Stdio::piped());
     // No other test starts a process until stdout's reader is gone, so none holds it open.
-    let alone = spawning();
+    let (child, alone) = spawn_alone(&mut command);
     let mut running = Running {
-        child: command.spawn().expect("run t3term"),
+        child,
         release: home.0.path().join("release"),
     };
 
