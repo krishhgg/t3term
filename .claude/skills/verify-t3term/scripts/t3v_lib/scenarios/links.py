@@ -22,8 +22,8 @@ POST /api/pull-requests/diff at once, in two slices. `refresh` raises the refres
 read gets without one. `pullRequests.invalidate` raises it too, then answers at once, and the event
 log keeps the link its reference names as `pr.invalidate`. A file of these names in the run directory changes the reads: stack-fail,
 stack-slow (8 s), comments-fail, contents-fail, viewed-fail, viewed-short, diff-slow (4 s a slice),
-diff-fail, diff-fail-rest, diff-ts (a TypeScript diff) and diff-threads (review threads on the
-diff's lines).
+diff-fail, diff-fail-rest, diff-off (a detail whose `capabilities.diff` is false), diff-ts (a
+TypeScript diff) and diff-threads (review threads on the diff's lines).
 
 The project:
 
@@ -418,6 +418,8 @@ class LinksFixture(Orchestration):
                 return
             detail = detail_of(found, payload)
             detail['updatedAt'] = f'2026-10-14T08:{min(self.refresh_number + self.revision, 59):02d}:00Z'
+            if self.flag('diff-off'):
+                detail['capabilities']['diff'] = False
             connection.exit_success(request_id, detail)
 
         self.later(1.5, answer)
