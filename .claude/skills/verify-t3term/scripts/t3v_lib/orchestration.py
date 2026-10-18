@@ -57,7 +57,8 @@ class Orchestration(FixtureBase):
         self.projects = self.threads = self.order = None
         self.removed = set()  # threads the shell leaves out after `gone`
         self.label_preset = self.options.get('label', 'normal')
-        self.label_read = None  # the preset the last descriptor read served, which t3term shows
+        self.label_pending = None  # the preset the last descriptor read served, any client's
+        self.label_read = None  # the preset the read before the TUI's last login served, which t3term shows
         self.watch_refusing = False
         self.pulses = Counter()  # thread id -> bumped by each pulse, so a new one stops the last
         # What t3term should show, worked out from what reached it.
@@ -181,8 +182,11 @@ class Orchestration(FixtureBase):
             self.feed = state
 
     def note_descriptor_read(self):
+        # The read is unauthenticated, so it could be the TUI's, a CLI line's or a dialog's
+        # check. t3term reads the descriptor just before it logs in, so `session_started` keeps
+        # the read a TUI login follows.
         with self.lock:
-            self.label_read = self.label_preset
+            self.label_pending = self.label_preset
             self.counts['descriptor.read'] += 1
             self.log('descriptor.read', **self.world_fields())
 
@@ -196,9 +200,14 @@ class Orchestration(FixtureBase):
         # line's session says nothing of what the TUI shows.
         if session['kind'] != 'login' or session.get('client') == 'cli':
             return
+        self.keep_descriptor_read()
         self.feed = 'connecting'
         self.forget_watches()
         self.log('feed.expected', state='connecting', why='a new t3term session')
+
+    def keep_descriptor_read(self):
+        """The TUI logged in after the last descriptor read, so that read is the one it shows."""
+        self.label_read = self.label_pending
 
     def session_ended(self, session: dict):
         # The TUI revokes its login session as it quits.
