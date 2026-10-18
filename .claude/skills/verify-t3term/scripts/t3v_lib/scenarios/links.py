@@ -139,7 +139,8 @@ class LinksFixture(Launches, Orchestration):
         # Changes on the host that T3 heard nothing of, which only a read again sees.
         self.revision = 0
         self.capability = self.options.get('capability', 'on')  # what the descriptor and configs serve
-        self.capability_read = None  # what the last descriptor read served
+        self.capability_pending = None  # what the last descriptor read served, any client's
+        self.capability_read = None  # what the read before the TUI's last login served
         self.capability_config = None  # what the last config t3term got served, None before any
         self.rpc.update({
             'pullRequests.detail': self.read_detail,
@@ -175,8 +176,12 @@ class LinksFixture(Launches, Orchestration):
 
     def note_descriptor_read(self):
         with self.lock:
-            self.capability_read = self.capability
+            self.capability_pending = self.capability
             super().note_descriptor_read()
+
+    def keep_descriptor_read(self):
+        super().keep_descriptor_read()
+        self.capability_read = self.capability_pending
 
     def config_delivered(self):
         self.capability_config = self.capability
