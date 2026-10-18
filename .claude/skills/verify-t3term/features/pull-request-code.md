@@ -60,6 +60,12 @@ $T3V wait --text "› M docs/config.md +2 -1" --gone "Loading more files…" --i
 $T3V click --text "src/config/reader.rs" --button wheel-up --repeat $TB && $T3V wait --text "› All commits" --text "8 files · 3 / 8 viewed" --idle 300
 rm "$RUN/diff-slow"
 [ "$(reads)" = '[null,"s2"]' ]
+# The marks came once, a second after the Code first showed. Back from the Timeline within 15 s of their coming reads nothing.
+[ "$(viewed)" = '[7]' ]
+mark
+$T3V keys Left && $T3V wait --text "→ code · ← summary"
+$T3V keys Right && $T3V wait --text "8 files · 3 / 8 viewed" --text "← timeline" --idle 300
+[ "$(viewed)" = '[7]' ] && [ "$(since)" = '[]' ]
 # Changes to whitespace start hidden. reader.rs's reindented Ok(config) and the let it removed and added again show unchanged, and so does schema.rs's respaced line.
 $T3V wait --text "› M src/config/reader.rs +5 -3 · ✓ Viewed" --text "› M src/config/schema.rs +7 -0"
 $T3V click --text "src/config/reader.rs" && $T3V wait --text "⌄ M src/config/reader.rs +5 -3" --text " 4 - use crate::config::Source;"
@@ -74,12 +80,7 @@ $T3V click --text "src/config/reader.rs" --button wheel-down --repeat $((12 + TB
 [ "$(since)" = '[]' ]
 $T3V keys Home && $T3V wait --text "⌄ M src/config/reader.rs +7 -5" --idle 300
 $T3V click --text "src/config/reader.rs" && $T3V wait --text "› M src/config/reader.rs +7 -5"
-# The marks came once, a second after the Code first showed. Back from the Timeline within 15 s of their coming reads nothing. 16 s later, showing the Code reads them again, but not the diff, whose first slice came less than a minute ago.
-[ "$(viewed)" = '[7]' ]
-mark
-$T3V keys Left && $T3V wait --text "→ code · ← summary"
-$T3V keys Right && $T3V wait --text "8 files · 3 / 8 viewed" --text "← timeline" --idle 300
-[ "$(viewed)" = '[7]' ]
+# More than 15 s after the marks came, showing the Code reads them again, but not the diff, whose first slice came less than a minute ago.
 sleep 16
 $T3V keys Left && $T3V wait --text "→ code · ← summary"
 $T3V keys Right && vsettle '[7,7]'
@@ -423,5 +424,6 @@ $T3V status --json | jq -e '.scopeViolations == 0 and .unknownRpcs == 0 and .fix
 - The reason a read of the text failed wraps at 100 columns. Wait for a prefix of it, such as `This host cannot expand unchanged pull request`.
 - A read of the marks takes a second, and showing the Code while one is under way asks for none. After a read that fails, let its answer come before showing the Code again, or nothing is read.
 - `r` and `t3v refresh` read the marks twice, as they read the diff twice.
+- The trip to the Timeline that reads no marks has to come back to the Code within 15 s of their first read, or showing the Code reads them again. Keep new steps out of the span between the Code first showing and that trip. With the whitespace steps inside it, a macOS runner on CI took 19 s.
 - The fixture's detail always says the host keeps the marks, so `viewed in T3 Code`, a detail without `viewedFiles` and more marks than the 1,000 t3term reads aren't driven. The unit tests cover them.
 - Clicks land on the rows the last frame drew. Click the lowest file first when unfolding several, so the rows above don't move.
