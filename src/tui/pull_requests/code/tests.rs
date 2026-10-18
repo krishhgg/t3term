@@ -218,7 +218,7 @@ fn a_hunk_that_removes_nothing_after_the_highest_line_unfolds() {
 +added
 ";
     let mut code = read(slice(patch, None), 0);
-    code.act(Control::File(0));
+    code.act(Control::File(0), &[]);
     let rows = rows(&code, 60);
     assert_eq!(
         rows[2..4],
