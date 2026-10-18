@@ -21,12 +21,29 @@ fn rows_of(lines: &[Line]) -> Vec<String> {
 
 /// The tab's rows and targets at `width`, with no review threads.
 fn laid(code: &Code, width: usize) -> (Vec<Line<'static>>, Targets) {
-    code.lay_out(&[], &[], &Shown::default(), width, 0, &theme())
+    code.lay_out(Reads::default(), &Shown::default(), width, 0, &theme())
 }
 
 /// The tab's rows at `width`.
 fn rows(code: &Code, width: usize) -> Vec<String> {
     rows_of(&laid(code, width).0)
+}
+
+/// What the other reads give the tab: `threads`, and no commits or marks.
+fn threads_of(threads: &[Thread]) -> Reads<'_> {
+    Reads {
+        threads,
+        ..Reads::default()
+    }
+}
+
+/// What the other reads give the tab: `threads` and `commits`, and no marks.
+fn both<'a>(threads: &'a [Thread], commits: &'a [&'a Commit]) -> Reads<'a> {
+    Reads {
+        threads,
+        commits,
+        viewed: None,
+    }
 }
 
 /// A slice of a diff as T3 sends it, with the cursor of the next where `next` says.
@@ -724,7 +741,13 @@ fn with_threads(
 ) -> (Vec<String>, Targets) {
     let showing = code.threads_shown(conversation.threads(), shown);
     conversation.lay_out_threads(&showing, width, &theme());
-    let (lines, targets) = code.lay_out(conversation.threads(), &[], shown, width, NOW, &theme());
+    let (lines, targets) = code.lay_out(
+        threads_of(conversation.threads()),
+        shown,
+        width,
+        NOW,
+        &theme(),
+    );
     (rows_of(&lines), targets)
 }
 
@@ -1286,7 +1309,7 @@ fn a_new_theme_restyles_the_threads() {
     let color = |conversation: &mut Conversation, theme: &Theme, text: &str| {
         let showing = code.threads_shown(conversation.threads(), &shown);
         conversation.lay_out_threads(&showing, 40, theme);
-        let (lines, _) = code.lay_out(conversation.threads(), &[], &shown, 40, NOW, theme);
+        let (lines, _) = code.lay_out(threads_of(conversation.threads()), &shown, 40, NOW, theme);
         lines.iter().find_map(|line| {
             let span = line.spans.iter().find(|span| span.content.contains(text))?;
             line.style.patch(span.style).fg
@@ -1356,8 +1379,13 @@ fn threads_fit_every_width_and_hostile_text_is_cleaned() {
         let showing = code.threads_shown(conversation.threads(), &shown);
         assert_eq!(showing, [0, 1]);
         conversation.lay_out_threads(&showing, width, &theme());
-        let (lines, targets) =
-            code.lay_out(conversation.threads(), &[], &shown, width, NOW, &theme());
+        let (lines, targets) = code.lay_out(
+            threads_of(conversation.threads()),
+            &shown,
+            width,
+            NOW,
+            &theme(),
+        );
         for line in &lines {
             let text = line.to_string();
             // The Markdown renderer keeps 8 columns for text beside the bar's 2, and the
@@ -1439,7 +1467,7 @@ fn scoped(
 ) -> (Vec<String>, Targets) {
     let commits = conversation.commits();
     let threads = conversation.threads();
-    let (lines, targets) = code.lay_out(threads, &commits, shown, width, NOW, &theme());
+    let (lines, targets) = code.lay_out(both(threads, &commits), shown, width, NOW, &theme());
     (rows_of(&lines), targets)
 }
 
@@ -1708,7 +1736,7 @@ fn the_list_of_commits_fits_every_width_and_cleans_its_headlines() {
     );
     for width in 1..=80 {
         let threads = conversation.threads();
-        let (lines, targets) = code.lay_out(threads, &commits, &shown, width, NOW, &theme());
+        let (lines, targets) = code.lay_out(both(threads, &commits), &shown, width, NOW, &theme());
         for line in &lines {
             let text = line.to_string();
             assert!(text.width() <= width, "{width}: {text:?}");
@@ -2442,4 +2470,321 @@ fn unchanged_lines_fit_every_width_and_hostile_text_is_cleaned() {
     }
     let rows_now = rows(&code, 80);
     assert!(rows_now.contains(&"100   ]0;title    [31mred[0m 漢字漢字漢字".to_string()));
+}
+
+/// The marks on files viewed as T3 sends them.
+fn marks(
+    files: &[(&str, ViewedState)],
+    truncated: bool,
+    cut: bool,
+) -> Result<Box<FilesViewed>, String> {
+    let files = files
+        .iter()
+        .map(|&(path, state)| pull_request::FileViewed {
+            path: path.to_string(),
+            state,
+        })
+        .collect();
+    Ok(Box::new(FilesViewed {
+        files,
+        truncated,
+        cut,
+    }))
+}
+
+/// The tab's rows at `width` where `store` keeps the marks.
+fn kept(code: &Code, store: Option<ViewedFilesStore>, width: usize) -> Vec<String> {
+    rows_of(&kept_lines(code, store, width))
+}
+
+fn kept_lines(code: &Code, store: Option<ViewedFilesStore>, width: usize) -> Vec<Line<'static>> {
+    let reads = Reads {
+        viewed: store,
+        ..Reads::default()
+    };
+    code.lay_out(reads, &Shown::default(), width, 0, &theme()).0
+}
+
+/// The color of the span of `lines` that reads `text`.
+fn color_of(lines: &[Line], text: &str) -> Option<Color> {
+    let span = lines.iter().flat_map(|line| &line.spans);
+    span.clone()
+        .find(|span| span.content == text)
+        .and_then(|span| span.style.fg)
+}
+
+#[test]
+fn the_count_and_each_header_say_which_files_are_viewed() {
+    use ViewedState::{Dismissed, Unviewed, Viewed};
+    let host = Some(ViewedFilesStore::Host);
+    let mut code = read(slice(PATCH, None), 0);
+    // Nothing says how many are viewed before the marks came, as none may be wrong.
+    assert_eq!(kept(&code, host, 60)[0], "5 files");
+    assert!(code.ask_viewed(2));
+    // A deleted file has its path before the change, and a renamed one its path after. A path
+    // named twice has the state named last, and one the diff doesn't have counts for nothing.
+    let answer = marks(
+        &[
+            ("src/lib.rs", Viewed),
+            ("old.txt", Dismissed),
+            ("docs/new.md", Viewed),
+            ("docs/new.md", Unviewed),
+            ("from.rs", Viewed),
+            ("logo.png", Viewed),
+            ("elsewhere.rs", Viewed),
+        ],
+        false,
+        false,
+    );
+    assert!(code.take_viewed(2, answer, 1_000));
+    let marked = [
+        "",
+        "› A docs/new.md +2 -0",
+        "",
+        "› M logo.png ✓ Viewed",
+        "",
+        "› D old.txt +0 -1 · Changed since viewed",
+        "",
+        "› M src/lib.rs +2 -1 · ✓ Viewed",
+        "",
+        "› R from.rs → to.rs",
+    ];
+    let rows = kept(&code, host, 60);
+    assert_eq!(rows[0], "5 files · 2 / 5 viewed");
+    assert_eq!(rows[1..], marked);
+    let lines = kept_lines(&code, host, 60);
+    let theme = theme();
+    assert_eq!(color_of(&lines, "✓ Viewed"), Some(theme.muted));
+    assert_eq!(
+        color_of(&lines, "Changed since viewed"),
+        Some(theme.warning_fg)
+    );
+    // Marks T3 keeps say so, as the host's own pages won't show them.
+    let environment = kept(&code, Some(ViewedFilesStore::Environment), 60);
+    assert_eq!(environment[0], "5 files · 2 / 5 viewed in T3 Code");
+    assert_eq!(environment[1..], marked);
+    // A detail that says nobody keeps them hides them.
+    assert_eq!(kept(&code, None, 60), rows_of(&laid(&code, 60).0));
+    assert_eq!(kept(&code, None, 60)[0], "5 files");
+    assert!(
+        !kept(&code, None, 60)
+            .iter()
+            .any(|row| row.contains("iewed"))
+    );
+
+    // An unfolded file keeps its mark, and the count counts the slices read so far.
+    code.act(Control::File(3), &[]);
+    assert_eq!(kept(&code, host, 60)[8], "⌄ M src/lib.rs +2 -1 · ✓ Viewed");
+    let mut more = read(slice(PATCH, Some("2")), 0);
+    assert!(more.ask_viewed(2));
+    assert!(more.take_viewed(2, marks(&[("old.txt", Viewed)], false, false), 0));
+    assert_eq!(kept(&more, host, 60)[0], "5 files+ · 1 / 5 viewed");
+
+    // A diff with no files says nothing of marks, whether they came or failed.
+    let mut empty = read(slice("", None), 0);
+    let none = ["0 files", "", "This pull request has no file changes."];
+    assert!(empty.ask_viewed(2));
+    assert!(empty.take_viewed(2, marks(&[("a.rs", Viewed)], true, true), 0));
+    assert_eq!(kept(&empty, host, 60), none);
+    empty.view_again();
+    assert!(empty.ask_viewed(3));
+    assert!(empty.take_viewed(3, Err("Down.".into()), 0));
+    assert_eq!(kept(&empty, host, 60), none);
+}
+
+#[test]
+fn the_marks_keep_through_a_commits_diff_and_a_failure() {
+    use ViewedState::Viewed;
+    let host = Some(ViewedFilesStore::Host);
+    let mut code = read(slice(PATCH, None), 0);
+    // A failure before any marks came says so, with the reason, and the count has none.
+    assert!(code.ask_viewed(2));
+    assert!(code.take_viewed(2, Err("This host does not track it.".into()), 0));
+    assert_eq!(
+        kept(&code, host, 60)[..3],
+        [
+            "5 files",
+            "t3term couldn't read which files you viewed.",
+            "This host does not track it.",
+        ]
+    );
+    let lines = kept_lines(&code, host, 60);
+    let theme = theme();
+    assert_eq!(color_of(&lines, VIEWED_FAILED), Some(theme.warning_fg));
+    let reason = color_of(&lines, "This host does not track it.");
+    assert_eq!(reason, Some(theme.muted));
+    // A detail that says nobody keeps them hides the failure too.
+    let hidden = kept(&code, None, 60);
+    assert!(
+        !hidden.iter().any(|row| row.contains("couldn't")),
+        "{hidden:#?}"
+    );
+    assert!(code.viewed_stale(0));
+    code.view_again();
+    assert!(code.ask_viewed(3));
+    let answer = marks(&[("src/lib.rs", Viewed)], false, false);
+    assert!(code.take_viewed(3, answer, 0));
+    assert_eq!(kept(&code, host, 60)[..2], ["5 files · 1 / 5 viewed", ""]);
+    // A failure after keeps the marks read and says they may be out of date.
+    code.again();
+    assert!(code.ask_viewed(4));
+    assert!(code.take_viewed(4, Err("Down.".into()), 0));
+    let rows = kept(&code, host, 60);
+    assert_eq!(
+        rows[..4],
+        [
+            "5 files · 1 / 5 viewed",
+            "The viewed marks may be out of date: t3term couldn't read",
+            "them again.",
+            "Down.",
+        ]
+    );
+    assert!(rows.contains(&"› M src/lib.rs +2 -1 · ✓ Viewed".to_string()));
+
+    // A commit's diff keeps them, as they are the reader's whatever diff shows, and reads
+    // none again.
+    code.view_again();
+    assert!(code.ask_viewed(5));
+    assert!(code.take_viewed(5, marks(&[("src/lib.rs", Viewed)], false, false), 0));
+    assert!(code.show("abc1234".into()));
+    assert!(!code.ask_viewed(6));
+    assert_eq!(code.ask(7), Some(None));
+    assert_eq!(code.take(7, Ok(slice(PATCH, None)), 0), Some(true));
+    assert_eq!(kept(&code, host, 60)[0], "5 files · 1 / 5 viewed");
+
+    // A reason past 1,024 characters is cut.
+    code.view_again();
+    assert!(code.ask_viewed(8));
+    assert!(code.take_viewed(8, Err("q".repeat(2_000)), 0));
+    let rows = kept(&code, host, 60);
+    let shown: usize = rows.iter().map(|row| row.matches('q').count()).sum();
+    assert_eq!(shown, 1_024);
+}
+
+#[test]
+fn a_short_read_of_the_marks_says_the_count_is_short() {
+    let host = Some(ViewedFilesStore::Host);
+    let mut code = read(slice(PATCH, None), 0);
+    assert!(code.ask_viewed(2));
+    assert!(code.take_viewed(2, marks(&[], true, false), 0));
+    assert_eq!(
+        kept(&code, host, 60)[..4],
+        [
+            "5 files · 0 / 5 viewed",
+            "This change has more files than the host reports viewed",
+            "marks for in one read, so the count is short.",
+            "",
+        ]
+    );
+    let lines = kept_lines(&code, host, 60);
+    let short = color_of(&lines, "marks for in one read, so the count is short.");
+    assert_eq!(short, Some(theme().warning_fg));
+    code.view_again();
+    assert!(code.ask_viewed(3));
+    assert!(code.take_viewed(3, marks(&[], false, true), 0));
+    assert_eq!(
+        kept(&code, host, 80)[..3],
+        [
+            "5 files · 0 / 5 viewed",
+            "T3 sent more viewed marks than the 1,000 t3term reads, so the count may be",
+            "short.",
+        ]
+    );
+    // A read that is whole says neither.
+    code.view_again();
+    assert!(code.ask_viewed(4));
+    assert!(code.take_viewed(4, marks(&[], false, false), 0));
+    assert_eq!(kept(&code, host, 80)[..2], ["5 files · 0 / 5 viewed", ""]);
+}
+
+#[test]
+fn the_marks_are_read_once_at_a_time_and_again_when_stale() {
+    let mut code = Code::new();
+    // Wanted from the first, one read at a time.
+    assert!(!code.viewed_stale(0));
+    assert!(code.ask_viewed(1));
+    assert!(!code.ask_viewed(2));
+    assert!(!code.viewed_stale(0));
+    // An answer to another read is dropped and leaves this one under way.
+    assert!(!code.take_viewed(9, marks(&[], false, false), 0));
+    assert!(!code.ask_viewed(2));
+    assert!(code.take_viewed(1, marks(&[], false, false), 1_000));
+    assert!(!code.ask_viewed(2));
+    // They go stale 15 seconds after they came, though not while they are wanted or a read
+    // of them is under way.
+    assert!(!code.viewed_stale(15_999));
+    assert!(code.viewed_stale(16_000));
+    code.view_again();
+    assert!(!code.viewed_stale(16_000));
+    assert!(code.ask_viewed(2));
+    assert!(!code.viewed_stale(16_000));
+    assert!(code.take_viewed(2, marks(&[], false, false), 16_000));
+    assert!(!code.viewed_stale(30_999));
+    // A read of the diff again reads them again. One under way then is dropped, and the next
+    // waits for it.
+    code.again();
+    assert!(!code.viewed_stale(60_000));
+    assert!(code.ask_viewed(3));
+    code.again();
+    assert!(!code.ask_viewed(4));
+    assert!(!code.take_viewed(3, marks(&[], false, false), 0));
+    assert!(code.ask_viewed(4));
+    assert!(code.take_viewed(4, marks(&[], false, false), 0));
+    // A failure is stale at once.
+    code.view_again();
+    assert!(code.ask_viewed(5));
+    assert!(code.take_viewed(5, Err("Down.".into()), 0));
+    assert!(code.viewed_stale(0));
+}
+
+#[test]
+fn a_header_with_a_mark_fits_every_width() {
+    use ViewedState::{Dismissed, Viewed};
+    let host = Some(ViewedFilesStore::Host);
+    let patch =
+        "diff --git a/src/a/rather/long/path/to/a/file.rs b/src/a/rather/long/path/to/a/file.rs
+--- a/src/a/rather/long/path/to/a/file.rs
++++ b/src/a/rather/long/path/to/a/file.rs
+@@ -1 +1 @@
+-old
++new
+diff --git a/b.rs b/b.rs
+--- a/b.rs
++++ b/b.rs
+@@ -1 +1 @@
+-old
++new
+";
+    let mut code = read(slice(patch, None), 0);
+    assert!(code.ask_viewed(2));
+    let answer = marks(
+        &[
+            ("src/a/rather/long/path/to/a/file.rs", Dismissed),
+            ("b.rs", Viewed),
+        ],
+        false,
+        false,
+    );
+    assert!(code.take_viewed(2, answer, 0));
+    for width in 1..=80 {
+        for row in kept(&code, host, width) {
+            assert!(row.width() <= width, "{width}: {row:?}");
+        }
+    }
+    // Where the counts and the mark don't fit after the path, each takes a row of its own,
+    // and a mark too long for one is cut.
+    assert_eq!(
+        kept(&code, host, 24)[5..9],
+        [
+            "› M src/a/rather/long/pa",
+            "    th/to/a/file.rs",
+            "    +1 -1",
+            "    Changed since viewed",
+        ]
+    );
+    assert!(kept(&code, host, 16).contains(&"    Changed sin…".to_string()));
+    assert!(kept(&code, host, 25).contains(&"› M b.rs +1 -1 · ✓ Viewed".to_string()));
+    assert!(kept(&code, host, 24).contains(&"    ✓ Viewed".to_string()));
+    assert!(kept(&code, host, 16).contains(&"› M b.rs +1 -1".to_string()));
+    assert!(kept(&code, host, 16).contains(&"    ✓ Viewed".to_string()));
 }

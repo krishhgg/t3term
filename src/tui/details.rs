@@ -988,6 +988,19 @@ impl Details {
         }
     }
 
+    /// Takes the reader's marks on files viewed, or why reading them failed, which came at
+    /// `now`, for the Code tab of the details that asked for them with `ticket`.
+    pub fn answer_viewed(
+        &mut self,
+        ticket: u64,
+        answer: Result<Box<crate::pull_request::FilesViewed>, String>,
+        now: i64,
+    ) {
+        if self.pulls.answer_viewed(ticket, answer, now) {
+            self.moved = true;
+        }
+    }
+
     /// Takes a file's whole text, or why reading it failed, for the run of unchanged lines on
     /// the Code tab of the details that asked for it with `ticket`.
     pub fn answer_text(

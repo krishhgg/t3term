@@ -8,6 +8,7 @@
 - **Commits.** Where the change has commits, `› All commits` sits above the count. Enter or a click opens the list under it: `✓ All commits`, then each commit's headline with the first seven characters of its id at the end, newest first, and `Show more (13 left)` while more than 10 are left. ✓ marks the diff shown. Picking a commit closes the list, reads that commit's own diff from its first slice with every file folded, and the row reads `› Reuse the parsed config on reload · 9dc565a`. Under a commit's diff every review thread goes to the list off the diff. `All commits` reads the whole change again. A read of the conversation that no longer lists the commit goes back to the whole change.
 - **From the Timeline.** Where the host gives a diff, a commit's two rows on the Timeline are a control: ↑ and ↓ choose it, the status line reads `Enter view commit 9dc565a`, and Enter or a click shows the Code with that commit picked. The same commit again shows the Code as the reader left it and reads nothing. Another commit reads its first slice and starts the Code at its top, with the list off the diff closed. Without a diff the rows are plain text.
 - **Files.** Each file starts folded: `› M src/config/reader.rs +7 -5`, with `A` green, `D` red, `R` blue and `M` yellow, and the counts in green and red. A rename shows both paths, `› R src/config/source.rs → src/config/sources.rs`, with the counts on the next row where they don't fit. A file whose hunks the host left out takes the host's counts, as in `› M Cargo.lock +40 -12`.
+- **Viewed files.** Where the detail's `capabilities.viewedFiles` says who keeps the reader's marks, the Code reads them through `pullRequests.filesViewed` the first time it shows. Once they come the count reads `8 files · 3 / 8 viewed`, counting the files read so far, and a viewed file reads `› M src/config/reader.rs +7 -5 · ✓ Viewed`, with the mark in grey. A file pushed to since its mark reads `Changed since viewed` in yellow, on the row under its header where it doesn't fit, and a file not viewed shows nothing. Showing the Code again 15 s or more after the marks came, or after their read failed, reads them again, and so does each read of the diff again. A commit's diff keeps the marks and reads none. A first read that fails shows `t3term couldn't read which files you viewed.` in yellow and the reason, with no marks in the count. A later one keeps the marks under `The viewed marks may be out of date: t3term couldn't read them again.` A read that says the host had more files than it covered shows `This change has more files than the host reports viewed marks for in one read, so the count is short.` in yellow.
 - **Order.** Each slice's files show in the desktop's reading order, not the patch's. Source files come first, each after the changed files it imports and otherwise by path. Tests come next, each after the source file whose name it has, then lockfiles, snapshots and files under `dist`, `build`, `vendor`, `__generated__` or `__snapshots__`, by path. A later slice never moves the files above it. So the first slice reads `assets/config-flow.png`, `src/config/reader.rs`, `src/config/schema.rs`, the rename and `tests/config_reload.rs`, and the second `docs/config.md`, `src/legacy/reader_v1.rs` and `Cargo.lock`.
 - **Unfolding.** Enter on the chosen file, or a click on it, turns `›` into `⌄` and shows its lines. Each line has its number in grey, the new one or the old for a removed line, then `-` and the line in red, `+` and the line in green, or a space and the line. `⋯ 14 unmodified lines` comes before a hunk that doesn't start at line 1. A line that wraps leaves the number and the mark blank on its later rows, and a tab stops every 4 columns. A binary file reads `A binary file, whose changes have no lines to show.` and a file the host withheld `The host withheld this file's changes.` Enter or a click again folds the file.
 - **Unchanged lines.** Each run of unchanged lines around a file's hunks is a control. Before a hunk it reads `⋯ 14 unmodified lines`. After the last hunk of a file changed in place or renamed and changed it reads `⋯ More unchanged context may be available` until the file's text comes, then counts what is left, as `⋯ 7 unmodified lines`. The first Enter or click on a run reads the file's text through `pullRequests.diffFileContents`, and the run reads `· Reading…` until it comes. Then the run shows up to 100 more lines at each end that touches a hunk, and each Enter after shows 100 more, until the run shows whole and its row goes. Each Enter while the text is read counts once it comes, and each run pressed reads `· Reading…`. A failed read drops those presses and shows its reason under the run pressed last, and Enter reads again. The file keeps its text and the lines it showed while a read of the diff again leaves its hunks as they were.
@@ -23,7 +24,7 @@ Open a thread, open its details (Alt+B), press → for `Pull requests`, choose a
 
 ## Driving it with t3v
 
-Scenario `links` at 100x30. The diff route answers at once with two slices. The first holds `src/config/reader.rs`, `src/config/schema.rs`, the rename `src/config/source.rs → src/config/sources.rs`, the binary `assets/config-flow.png` and the new `tests/config_reload.rs`, with `truncated` and the cursor `s2`. The second holds `docs/config.md`, the deleted `src/legacy/reader_v1.rs` and a `Cargo.lock` with a header and no hunks, which the host counted at +40 -12. Files in the run directory change the reads: `diff-slow` holds each slice 4 s, `diff-fail` fails the first slice and `diff-fail-rest` the second with `GitHub took too long to answer.`, `diff-off` makes the detail say the host gives no diff, `diff-ts` serves a TypeScript diff in one slice, and `diff-threads` gives #7's conversation four review threads: a resolved one on removed line 26 of `src/config/reader.rs`, an open one on added line 28 whose host counts 4 comments where T3 sent 2 and has one more page, an outdated one on added line 45 of `src/config/schema.rs`, and one on line 12 of `src/config/watch.rs`, which the diff doesn't touch. The page comes 1.5 s late with the last of the 2 comments again and 2 more, and `comments-fail` fails it. The TypeScript diff's patch has `src/settings/panel.tsx`, which imports `./store` and `../lib/format`, then `src/settings/panel.test.tsx`, `src/settings/store.ts`, which imports `../lib/format`, `pnpm-lock.yaml` and the new `src/lib/format.ts`. #7 has two commits, `Split the config reader` (1f3e2a90) and `Reuse the parsed config on reload` (9dc565a0) an hour old, and the route answers each with its own one slice: schema.rs for the first, reader.rs and the new test for the second. `pullRequests.diffFileContents` answers 1.5 s late with the text of `src/config/reader.rs` (43 lines), `src/config/schema.rs` (235 lines), `src/config/sources.rs` and `docs/config.md`, and fails any other file, or every file while `contents-fail` is there, with `This host cannot expand unchanged pull request lines.` It logs each read as `pr.diffFileContents` with its `newPath`, which `contents` lists. The server logs each read of the diff in events.jsonl as `pr.diff` with its cursor and commit, and `reads` lists those cursors, `null` for the first slice.
+Scenario `links` at 100x30. The diff route answers at once with two slices. The first holds `src/config/reader.rs`, `src/config/schema.rs`, the rename `src/config/source.rs → src/config/sources.rs`, the binary `assets/config-flow.png` and the new `tests/config_reload.rs`, with `truncated` and the cursor `s2`. The second holds `docs/config.md`, the deleted `src/legacy/reader_v1.rs` and a `Cargo.lock` with a header and no hunks, which the host counted at +40 -12. Files in the run directory change the reads: `diff-slow` holds each slice 4 s, `diff-fail` fails the first slice and `diff-fail-rest` the second with `GitHub took too long to answer.`, `diff-off` makes the detail say the host gives no diff, `diff-ts` serves a TypeScript diff in one slice, and `diff-threads` gives #7's conversation four review threads: a resolved one on removed line 26 of `src/config/reader.rs`, an open one on added line 28 whose host counts 4 comments where T3 sent 2 and has one more page, an outdated one on added line 45 of `src/config/schema.rs`, and one on line 12 of `src/config/watch.rs`, which the diff doesn't touch. The page comes 1.5 s late with the last of the 2 comments again and 2 more, and `comments-fail` fails it. The TypeScript diff's patch has `src/settings/panel.tsx`, which imports `./store` and `../lib/format`, then `src/settings/panel.test.tsx`, `src/settings/store.ts`, which imports `../lib/format`, `pnpm-lock.yaml` and the new `src/lib/format.ts`. #7 has two commits, `Split the config reader` (1f3e2a90) and `Reuse the parsed config on reload` (9dc565a0) an hour old, and the route answers each with its own one slice: schema.rs for the first, reader.rs and the new test for the second. `pullRequests.diffFileContents` answers 1.5 s late with the text of `src/config/reader.rs` (43 lines), `src/config/schema.rs` (235 lines), `src/config/sources.rs` and `docs/config.md`, and fails any other file, or every file while `contents-fail` is there, with `This host cannot expand unchanged pull request lines.` It logs each read as `pr.diffFileContents` with its `newPath`, which `contents` lists. `pullRequests.filesViewed` answers 1 s late with #7's marks: `src/config/reader.rs`, `tests/config_reload.rs` and `Cargo.lock` viewed, `src/config/schema.rs` dismissed, `docs/config.md` unviewed, and `src/config/old_reader.rs`, which the diff doesn't have, viewed. Other numbers have none. `viewed-fail` fails the read with `GitHub took too long to answer.` and `viewed-short` says the host had more files than it read. The server logs each read as `pr.filesViewed` with its number, which `viewed` lists, and `vcount` waits for a count of them. The server logs each read of the diff in events.jsonl as `pr.diff` with its cursor and commit, and `reads` lists those cursors, `null` for the first slice.
 
 ```bash
 $T3V start --cols 100 --rows 30
@@ -32,25 +33,43 @@ reads() { jq -s -c '[.[] | select(.event == "pr.diff") | .cursor]' "$E/events.js
 mark() { M=$(reads | jq length); }
 since() { reads | jq -c ".[$M:]"; }
 settle() { local i; for i in $(seq 50); do [ "$(since)" = "$1" ] && return 0; sleep 0.2; done; since; return 1; }
+viewed() { jq -s -c '[.[] | select(.event == "pr.filesViewed") | .number]' "$E/events.jsonl"; }
+vsettle() { local i; for i in $(seq 50); do [ "$(viewed)" = "$1" ] && return 0; sleep 0.2; done; viewed; return 1; }
+vcount() { local i; for i in $(seq 50); do [ "$(viewed | jq length)" = "$1" ] && return 0; sleep 0.2; done; viewed; return 1; }
 $T3V click --text "Single: one open link" && $T3V wait --text "/  Single: one open link"
 $T3V keys M-b && $T3V wait --text "Thread details" && $T3V keys Right && $T3V wait --text "#7 Open: ready to merge" --idle 300
 $T3V keys Enter && $T3V wait --text "← List  Summary  Timeline  Code" --text "Read from github.com just now" --text "r refresh" --idle 300
 [ "$(reads)" = '[]' ]   # nothing reads the diff before the Code shows
+[ "$(viewed)" = '[]' ]   # nor the marks on files viewed
 
 # The first slice, then the second once the end of the files is in view, each held 4 s.
 touch "$RUN/diff-slow"
 $T3V keys Right && $T3V wait --text "→ code · ← summary"
 $T3V keys Right && $T3V wait --text "Loading pull request diff…" --text "← timeline"
 $T3V capture loading-100x30
-$T3V wait --text "5 files+" --text "The host withheld part of this diff, such as a" --text "› A tests/config_reload.rs +8 -0" --text "Loading more files…"
+$T3V wait --text "5 files+ · 2 / 5 viewed" --text "The host withheld part of this diff, such as a" --text "› A tests/config_reload.rs +8 -0" --text "Loading more files…"
 $T3V capture more-100x30
-$T3V wait --text "› All commits" --text "8 files" --text "› M docs/config.md +2 -1" --gone "Loading more files…" --idle 300
+$T3V wait --text "› All commits" --text "8 files · 3 / 8 viewed" --text "› M docs/config.md +2 -1" --gone "Loading more files…" --idle 300
 rm "$RUN/diff-slow"
 [ "$(reads)" = '[null,"s2"]' ]
+# The marks came once, a second after the Code first showed. Back from the Timeline within 15 s of their coming reads nothing. 16 s later, showing the Code reads them again, but not the diff, whose first slice came less than a minute ago.
+[ "$(viewed)" = '[7]' ]
+mark
+$T3V keys Left && $T3V wait --text "→ code · ← summary"
+$T3V keys Right && $T3V wait --text "8 files · 3 / 8 viewed" --text "← timeline" --idle 300
+[ "$(viewed)" = '[7]' ]
+sleep 16
+$T3V keys Left && $T3V wait --text "→ code · ← summary"
+$T3V keys Right && vsettle '[7,7]'
+$T3V wait --text "8 files · 3 / 8 viewed" --text "← timeline" --idle 1500
+[ "$(viewed)" = '[7,7]' ] && [ "$(since)" = '[]' ]
 C=$($T3V capture files-100x30); S=$(echo "$C" | grep 'ans$'); T=$(echo "$C" | grep 'txt$')
 # Each slice in reading order: source by path, as none imports another, then the test, then the second slice.
 [ "$(grep -o '› [AMDR] [^ ]*' "$T" | head -6 | paste -sd' ' -)" = '› M assets/config-flow.png › M src/config/reader.rs › M src/config/schema.rs › R src/config/source.rs › A tests/config_reload.rs › M docs/config.md' ]
-grep -q '38;2;255;185;0mM.\[38;2;245;245;245m src/config/reader.rs .\[38;2;0;212;146m+7.\[38;2;245;245;245m .\[38;2;255;100;103m-5' "$S" && grep -q '38;2;43;127;255mR.\[38;2;245;245;245m src/config/source.rs → src/config/sources.rs' "$S" && grep -q '38;2;0;212;146mA.\[38;2;245;245;245m tests/config_reload.rs' "$S" && grep -q '38;2;255;185;0mThe host withheld part' "$S"
+grep -q '38;2;255;185;0mM.\[38;2;245;245;245m src/config/reader.rs.\[38;2;129;129;129m .\[38;2;0;212;146m+7.\[38;2;245;245;245m .\[38;2;255;100;103m-5' "$S" && grep -q '38;2;43;127;255mR.\[38;2;245;245;245m src/config/source.rs → src/config/sources.rs' "$S" && grep -q '38;2;0;212;146mA.\[38;2;245;245;245m tests/config_reload.rs' "$S" && grep -q '38;2;255;185;0mThe host withheld part' "$S"
+# A viewed file says so after its counts in grey. schema.rs, pushed to since its mark, says so in yellow on the row under it, and docs/config.md, not viewed, says nothing.
+grep -q 'src/config/reader.rs.*-5.\[38;2;129;129;129m · ✓ Viewed' "$S" && grep -q 'tests/config_reload.rs.*-0.\[38;2;129;129;129m · ✓ Viewed' "$S" && grep -q '38;2;255;185;0mChanged since viewed' "$S" && grep -q '38;2;129;129;129m8 files · 3 / 8 viewed' "$S"
+grep -q '› M src/config/schema.rs +8 -1 *│' "$T" && grep -q '│     Changed since viewed' "$T" && grep -q '› M docs/config.md +2 -1 *│' "$T"
 
 # ↓ chooses the commits row, ↓ again the first file, the binary, and ↓ once more the reader. Enter unfolds it: numbers in grey, removed lines red, added green.
 $T3V keys Down Down Down && $T3V wait --text "Enter expand file"
@@ -63,15 +82,43 @@ $T3V keys Home && $T3V keys Down Down Down && $T3V wait --text "Enter collapse f
 $T3V keys Enter && $T3V wait --text "› M src/config/reader.rs +7 -5" --gone "⋯ 14 unmodified lines"
 
 # A click unfolds the others: the binary, the rename and the new file with its tabs.
-$T3V click --text "tests/config_reload.rs" && $T3V wait --text "⌄ A tests/config_reload.rs +8 -0" --text "3 + #[test]"
+$T3V click --text "tests/config_reload.rs" && $T3V wait --text "⌄ A tests/config_reload.rs +8 -0" --text "1 + use fixture_config::Reader;"
 $T3V click --text "src/config/source.rs" && $T3V wait --text "⌄ R src/config/source.rs → src/config/sources.rs" --text "1 - /// Where a config comes from." --text "1 + /// Where a config comes from: a file, the envir"
 $T3V click --text "assets/config-flow.png" && $T3V wait --text "⌄ M assets/config-flow.png" --text "A binary file, whose changes have no lines to show."
 $T3V capture kinds-100x30
 $T3V keys End && $T3V wait --text "› M Cargo.lock +40 -12" --text "› D src/legacy/reader_v1.rs +0 -4" --text "5 +     let reader = Reader::new(\"tests/newer.toml\")"
 S=$($T3V capture end-100x30 | grep 'ans$')
 grep -q '38;2;255;100;103mD.\[38;2;245;245;245m src/legacy/reader_v1.rs' "$S"
-$T3V click --text "Cargo.lock" && $T3V wait --text "⌄ M Cargo.lock +40 -12"
+$T3V click --text "Cargo.lock" && $T3V wait --text "⌄ M Cargo.lock +40 -12 · ✓ Viewed"
 $T3V keys End && $T3V wait --text "The host withheld this file's changes."
+
+# A read of the marks again that fails keeps them under a yellow note and the reason. Showing the Code again reads them again at once, and once a read works the note goes. r reads the marks again with the diff, twice as it reads the diff twice.
+touch "$RUN/viewed-fail"
+$T3V wait --text "r refresh"
+V=$(viewed | jq length)
+$T3V keys r && $T3V keys Home && $T3V wait --text "The viewed marks may be out of date: t3term" --text "GitHub took too long to answer." --text "› M src/config/reader.rs +7 -5 · ✓ Viewed" --idle 300
+$T3V wait --text "r refresh" && vcount $((V + 2)) && $T3V wait --text "r refresh" --idle 1500
+S=$($T3V capture viewed-stale-100x30 | grep 'ans$')
+grep -q '38;2;255;185;0mThe viewed marks may be out of date' "$S" && grep -q '38;2;129;129;129m8 files · 3 / 8 viewed' "$S"
+$T3V keys Left && $T3V wait --text "→ code · ← summary"
+V=$(viewed | jq length)
+$T3V keys Right && vcount $((V + 1))
+$T3V wait --text "The viewed marks may be out of date: t3term" --idle 1500
+rm "$RUN/viewed-fail"
+$T3V keys Left && $T3V wait --text "→ code · ← summary"
+$T3V keys Right && $T3V wait --gone "The viewed marks may be out of date" --text "8 files · 3 / 8 viewed" --idle 300
+# A read that says the host has more files than it covered says the count is short.
+touch "$RUN/viewed-short"
+$T3V wait --text "r refresh"
+$T3V keys r && $T3V wait --text "This change has more files than the host reports" --text "8 files · 3 / 8 viewed" --idle 300
+S=$($T3V capture viewed-short-100x30 | grep 'ans$')
+grep -q '38;2;255;185;0mThis change has more files than the host reports' "$S"
+rm "$RUN/viewed-short"
+$T3V wait --text "r refresh"
+mark
+$T3V keys r && settle '[null,"s2",null,"s2"]'
+$T3V wait --gone "This change has more files than the host" --text "r refresh" --idle 1500
+$T3V keys End && $T3V wait --text "⌄ M Cargo.lock +40 -12 · ✓ Viewed" --text "The host withheld this file's changes." --idle 300
 
 # The Timeline and back within the minute reads nothing.
 mark
@@ -233,8 +280,10 @@ C=$($T3V capture commits-100x30); T=$(echo "$C" | grep 'txt$')
 [ "$(grep -o -e '✓ All commits' -e 'Reuse the parsed config on reload *9dc565a' -e 'Split the config reader *1f3e2a9' "$T" | sed 's/  */ /g' | paste -sd'|' -)" = '✓ All commits|Reuse the parsed config on reload 9dc565a|Split the config reader 1f3e2a9' ]
 $T3V keys Down && $T3V wait --text "Enter show all commits"
 $T3V keys Down && $T3V wait --text "Enter show commit 9dc565a"
-mark
+mark; V=$(viewed | jq length)
 $T3V keys Enter && $T3V wait --text "› Reuse the parsed config on reload · 9dc565a" --text "› M src/config/reader.rs" --text "› A tests/config_reload.rs" --text "› 4 conversations not on the current diff" --gone "Split the config reader" --gone "src/config/schema.rs" --idle 300
+# The commit's files keep their marks, and picking it reads none.
+$T3V wait --text "2 files · 2 / 2 viewed" && [ "$(viewed | jq length)" = "$V" ]
 [ "$(jq -s -c '[.[] | select(.event == "pr.diff") | [.cursor, .commit]] | .['"$M"':]' "$E/events.jsonl")" = '[[null,"9dc565a0"]]' ]
 $T3V capture commit-100x30
 $T3V click --text "Reuse the parsed config on reload" && $T3V wait --text "⌄ Reuse the parsed config on reload · 9dc565a" --text "Split the config reader"
@@ -267,8 +316,8 @@ $T3V keys Enter && $T3V wait --text "› Split the config reader · 1f3e2a9" --t
 [ "$(jq -s -c '[.[] | select(.event == "pr.diff") | [.cursor, .commit]] | .['"$M"':]' "$E/events.jsonl")" = '[[null,"1f3e2a90"]]' ]
 rm "$RUN/diff-threads"
 
-# Another thread's link, whose first slice fails: the failure alone. Showing the Code again reads it again, and so does opening the details again.
-touch "$RUN/diff-fail"
+# Another thread's link, whose first slice fails: the failure alone. Showing the Code again reads it again, and so does opening the details again. Its marks fail to read from here on, so the details never hold any for it, and their notes show only with the files.
+touch "$RUN/diff-fail" "$RUN/viewed-fail"
 $T3V keys Escape && $T3V wait --gone "Thread details"
 $T3V click --text "Mixed: every state" && $T3V wait --text "/  Mixed: every state"
 $T3V keys M-b && $T3V wait --text "Pull requests 11" --idle 300
@@ -282,8 +331,15 @@ $T3V keys Right && settle '[null,null]'
 $T3V wait --text "Couldn't read this diff: GitHub took too long to" --text "← timeline" --idle 300
 rm "$RUN/diff-fail"
 $T3V keys Left Left Left && $T3V wait --gone "← List"
+# Opening #70 again, its marks fail to read once more: the note and the reason, and no marks in the count. Showing the Code again reads them, and #70 has none viewed.
 $T3V keys Enter && $T3V wait --text "#70 Watched: checks running" --text "← List  Summary  Timeline  Code" --idle 300
-$T3V keys Right Right && $T3V wait --text "8 files" --text "› M src/config/reader.rs +7 -5"
+$T3V keys Right Right && $T3V wait --text "8 files" --text "› M src/config/reader.rs +7 -5" --text "t3term couldn't read which files you viewed." --text "GitHub took too long to answer." --gone "/ 8 viewed" --idle 1500
+[ "$(since)" = '[null,null,null,"s2"]' ]
+S=$($T3V capture viewed-failed-100x30 | grep 'ans$')
+grep -q "38;2;255;185;0mt3term couldn't read which files you viewed." "$S"
+rm "$RUN/viewed-fail"
+$T3V keys Left && $T3V wait --text "→ code"
+$T3V keys Right && $T3V wait --text "8 files · 0 / 8 viewed" --gone "t3term couldn't read which files you viewed." --gone "✓ Viewed" --idle 300
 [ "$(since)" = '[null,null,null,"s2"]' ]
 
 # At 80x24 every row still fits the pane.
@@ -309,4 +365,7 @@ $T3V status --json | jq -e '.scopeViolations == 0 and .unknownRpcs == 0 and .fix
 - A wheel notch on the Code scrolls one row. The recipe uses 13 notches to bring reader.rs's first line to the top, so ↓ picks the run before its second hunk rather than the file.
 - Line numbers widen to three digits past line 99, which moves every column of schema.rs's later lines one to the right. Wait for ` 52   #[cfg(test)]` with its leading space.
 - The reason a read of the text failed wraps at 100 columns. Wait for a prefix of it, such as `This host cannot expand unchanged pull request`.
+- A read of the marks takes a second, and showing the Code while one is under way asks for none. After a read that fails, let its answer come before showing the Code again, or nothing is read.
+- `r` and `t3v refresh` read the marks twice, as they read the diff twice.
+- The fixture's detail always says the host keeps the marks, so `viewed in T3 Code`, a detail without `viewedFiles` and more marks than the 1,000 t3term reads aren't driven. The unit tests cover them.
 - Clicks land on the rows the last frame drew. Click the lowest file first when unfolding several, so the rows above don't move.
