@@ -500,7 +500,7 @@ fn bounded(path: &str) -> String {
 }
 
 /// A hunk header after `@@ `: `-a[,b] +c[,d] @@` and the section after it. A count left out is
-/// 1, as in unified diffs.
+/// 1, as in unified diffs. A range whose lines would be numbered past `u64::MAX` isn't one.
 #[allow(clippy::type_complexity)]
 fn hunk_header(header: &str) -> Option<((u64, u64), (u64, u64), &str)> {
     let (ranges, section) = header.split_once(" @@")?;
@@ -516,7 +516,11 @@ fn hunk_header(header: &str) -> Option<((u64, u64), (u64, u64), &str)> {
                 .then(|| text.parse::<u64>().ok())
                 .flatten()
         };
-        Some((digits(start)?, digits(count)?))
+        let (start, count) = (digits(start)?, digits(count)?);
+        // Each line on the side moves the number on by one, so the last one moves it to
+        // `start + count`.
+        start.checked_add(count)?;
+        Some((start, count))
     };
     let section = section.strip_prefix(' ').unwrap_or(section);
     Some((range(old, '-')?, range(new, '+')?, section))
