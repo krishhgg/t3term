@@ -33,11 +33,23 @@
 //! commit's own diff, where a line's number may mean other code than the thread's, every thread
 //! shows in that list (PullRequestCodeTab.tsx:454-458).
 //!
+//! The unchanged lines before each hunk of a file changed in place or renamed and changed, and
+//! after its last, can show, as the desktop's diff viewer expands them (@pierre/diffs 1.5.2).
+//! Enter or a click on the row that counts them reads the file's whole text once, through
+//! `pullRequests.diffFileContents`, then shows up to `EXPANSION` more of them at each end
+//! between two hunks, before the first hunk at the end nearest it, and after the last at the
+//! end nearest it. A run of one line shows whole once the text came. The row after the last
+//! hunk says only that there may be more until the text says how many. The text read stays
+//! while a read of the diff again leaves the file's hunks as they were, and goes with another
+//! commit's diff.
+//!
 //! Only the files unfolded are laid out, each once for each width. Each line of them is cleaned
 //! of control characters, its tabs set every `TAB` columns, and cut at `LINE` characters as it
 //! is.
 
 use std::collections::{HashMap, HashSet};
+use std::hash::{DefaultHasher, Hash, Hasher};
+use std::ops::Range;
 
 use ratatui::style::{Color, Style};
 use ratatui::text::{Line, Span};
@@ -48,7 +60,7 @@ use super::super::theme::Theme;
 use super::super::{clip, row};
 use super::conversation::{Commit, Control, Shown, Targets, Thread};
 use super::{FAILURE, FRESH, flowed, grouped, whole};
-use crate::pull_request::{self, Side, patch};
+use crate::pull_request::{self, ChangeType, FileContents, Side, patch};
 use crate::transcript::clusters;
 
 /// The columns between two tab stops in a line of the diff.
@@ -58,6 +70,11 @@ const TAB: usize = 4;
 const LINE: usize = 2000;
 /// The longest path shown, in characters.
 const PATH: usize = 1024;
+/// The most unchanged lines one Enter shows at each end of a run of them, as the desktop's
+/// `expansionLineCount` (@pierre/diffs 1.5.2, DiffHunksRenderer.js:381).
+const EXPANSION: u64 = 100;
+/// The most files whose text the tab keeps. Reading one more forgets the first read.
+const MOST_TEXTS: usize = 64;
 
 const LOADING: &str = "Loading pull request diff…";
 const LOADING_MORE: &str = "Loading more files…";
@@ -70,6 +87,10 @@ const WITHHELD: &str =
 const REST_FAILED: &str = "t3term couldn't read the rest of this diff.";
 const STALE: &str = "May be out of date: t3term couldn't read the diff again.";
 const UNREAD: &str = "t3term couldn't split this patch into files.";
+const MORE_CONTEXT: &str = "More unchanged context may be available";
+const READING: &str = "Reading…";
+const UNMATCHED: &str =
+    "This file's text doesn't match the diff, which may be out of date. r reads it again.";
 
 /// What the Code tab read of a pull request's diff.
 pub(super) struct Code {
@@ -104,6 +125,8 @@ pub(super) struct Code {
     commits_open: bool,
     /// How many commits the list shows.
     commits_shown: usize,
+    /// What the tab read of files' unchanged lines, in the order each was first wanted.
+    contexts: Vec<Context>,
     /// How many times a file's rows were laid out for `bodies`.
     #[cfg(test)]
     pub(super) builds: usize,
@@ -116,6 +139,70 @@ struct Body {
     withheld: bool,
     lines: Vec<Line<'static>>,
     marks: Vec<Mark>,
+    /// The rows that count each run of unchanged lines Enter shows more of, with the run's
+    /// place among the file's.
+    stretches: Vec<(Range<usize>, usize)>,
+}
+
+/// What the tab read of one file's text after the change, which fills the runs of unchanged
+/// lines around its hunks, and how much of each run shows.
+struct Context {
+    /// The file's path, as `File::path` gives it.
+    path: String,
+    /// The fingerprint of the file's paths and hunks it was read for, as `fingerprint` gives
+    /// it.
+    print: u64,
+    change: ChangeType,
+    old_path: String,
+    new_path: String,
+    text: Text,
+    /// The run Enter was last pressed on, under which a failed read says why.
+    pressed: usize,
+    /// How many lines of each run show from its start and from its end, by its place. Each
+    /// press of Enter counts at once, as each click does in the desktop's diff library
+    /// (@pierre/diffs 1.5.2, DiffHunksRenderer.js:185), so every run pressed while the text is
+    /// read shows more once it comes.
+    shown: HashMap<usize, (u64, u64)>,
+}
+
+/// A file's text after the change, as far as the tab read it.
+enum Text {
+    /// Enter asked for it, and no read is under way.
+    Wanted,
+    /// The read with this ticket is under way.
+    Asked(u64),
+    /// Why the read failed, cleaned and bounded.
+    Failed(String),
+    /// The text, with its number of lines.
+    Read { text: String, count: u64 },
+}
+
+/// A run of unchanged lines around a file's hunks: before a hunk, or after the last.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Stretch {
+    /// The number after the change of its first line.
+    first: u64,
+    /// How many lines it has, or None after the last hunk until the file's text says.
+    size: Option<u64>,
+}
+
+/// How a run of unchanged lines shows: the lines from its start and at its end, and the row
+/// between them that counts the rest.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Showing {
+    head: u64,
+    tail: u64,
+    rest: Rest,
+}
+
+/// The row that counts the lines of a run that don't show.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum Rest {
+    /// None, as every line shows.
+    None,
+    Count(u64),
+    /// Some may be left, after the last hunk while the file's text isn't read.
+    Unknown,
 }
 
 /// Where a line of the diff ends among its file's rows, with its numbers before and after the
@@ -150,6 +237,8 @@ struct Slice {
     patch: patch::Patch,
     /// The places of its files in reading order, as `order::reading_order` says.
     order: Vec<usize>,
+    /// Each file's fingerprint, by its place, as `fingerprint` gives it.
+    prints: Vec<u64>,
 }
 
 impl Code {
@@ -169,6 +258,7 @@ impl Code {
             commit: None,
             commits_open: false,
             commits_shown: COMMIT_PAGE,
+            contexts: Vec::new(),
             #[cfg(test)]
             builds: 0,
         }
@@ -240,10 +330,16 @@ impl Code {
                 }
                 let patch = patch::Patch::read(&diff.patch);
                 let order = order::reading_order(&diff.patch, &patch);
+                let prints = patch
+                    .files
+                    .iter()
+                    .map(|file| fingerprint(&diff.patch, file))
+                    .collect();
                 self.slices.push(Slice {
                     diff: *diff,
                     patch,
                     order,
+                    prints,
                 });
                 self.failed = None;
                 self.index();
@@ -265,6 +361,24 @@ impl Code {
                 self.omitted.insert(omitted.path.clone(), counts);
             }
         }
+        // The text read of a file whose hunks changed is read again, and that of a file the
+        // diff no longer has goes once every slice came.
+        let whole = self.next_cursor().is_none();
+        let mut contexts = std::mem::take(&mut self.contexts);
+        contexts.retain(|context| {
+            let mut prints = self
+                .files
+                .iter()
+                .map(|&(slice, place)| (&self.slices[slice], place))
+                .filter(|(slice, place)| slice.patch.files[*place].path() == context.path)
+                .map(|(slice, place)| slice.prints[place])
+                .peekable();
+            match prints.peek() {
+                None => !whole,
+                Some(_) => prints.any(|print| print == context.print),
+            }
+        });
+        self.contexts = contexts;
     }
 
     /// The cursor of the slice after those read, while there is one.
@@ -307,8 +421,25 @@ impl Code {
             Control::AllCommits => open,
             Control::Commit(at) => open && at < self.listed(commits),
             Control::MoreCommits => open && commits.len() > self.listed(commits),
+            Control::Stretch(at, place) => {
+                self.rest(at, place).is_some_and(|rest| rest != Rest::None)
+            }
             _ => false,
         }
+    }
+
+    /// The row that counts the lines left of the run at `place` around the hunks of the file
+    /// at `at` among those shown, where the file is unfolded and its text can fill the run.
+    fn rest(&self, at: usize, place: usize) -> Option<Rest> {
+        let &(slice, index) = self.files.get(at)?;
+        let slice = &self.slices[slice];
+        let file = &slice.patch.files[index];
+        if !self.open.contains(file.path()) {
+            return None;
+        }
+        let stretch = *stretches(file)?.get(place)?;
+        let context = find(&self.contexts, file.path(), slice.prints[index]);
+        Some(showing(stretch, context, place).rest)
     }
 
     /// How many of `commits` the list shows while it is open.
@@ -351,9 +482,125 @@ impl Code {
                     self.due = !first;
                 }
             }
+            Control::Stretch(at, place) => self.widen(at, place),
             _ => {}
         }
         false
+    }
+
+    /// Shows more of the run of unchanged lines at `place` around the hunks of the file at
+    /// `at` among those shown, at once or once the file's text is read. While a read is under
+    /// way, each run pressed notes that it is.
+    fn widen(&mut self, at: usize, place: usize) {
+        let offered = self.rest(at, place).is_some_and(|rest| rest != Rest::None);
+        let Some(&(slice, index)) = self.files.get(at).filter(|_| offered) else {
+            return;
+        };
+        let slice = &self.slices[slice];
+        let (file, print) = (&slice.patch.files[index], slice.prints[index]);
+        let Some(change) = change_type(file) else {
+            return;
+        };
+        let last = file.hunks.len();
+        let path = file.path().to_string();
+        let found = self
+            .contexts
+            .iter_mut()
+            .find(|context| context.path == path && context.print == print);
+        match found {
+            Some(context) => {
+                context.pressed = place;
+                if let Text::Failed(_) = context.text {
+                    context.text = Text::Wanted;
+                }
+                context.widen(place, last);
+            }
+            None => {
+                let mut context = Context {
+                    path: path.clone(),
+                    print,
+                    change,
+                    old_path: file.old_path.clone().unwrap_or_default(),
+                    new_path: file.new_path.clone().unwrap_or_default(),
+                    text: Text::Wanted,
+                    pressed: place,
+                    shown: HashMap::new(),
+                };
+                context.widen(place, last);
+                if self.contexts.len() >= MOST_TEXTS {
+                    let first = self.contexts.remove(0);
+                    self.unlay(&first.path);
+                }
+                self.contexts.push(context);
+            }
+        }
+        self.unlay(&path);
+    }
+
+    /// Forgets the rows laid out for the files at `path`, so they are laid out again.
+    fn unlay(&mut self, path: &str) {
+        let slices = &self.slices;
+        self.bodies
+            .retain(|&(slice, place), _| slices[slice].patch.files[place].path() != path);
+    }
+
+    /// The read of a file's text that Enter on one of its runs of unchanged lines wants, with
+    /// `ticket`: how the file changed and its paths before and after the change.
+    pub(super) fn ask_text(&mut self, ticket: u64) -> Option<(ChangeType, String, String)> {
+        let context = self
+            .contexts
+            .iter_mut()
+            .find(|context| matches!(context.text, Text::Wanted))?;
+        context.text = Text::Asked(ticket);
+        let paths = (context.old_path.clone(), context.new_path.clone());
+        Some((context.change, paths.0, paths.1))
+    }
+
+    /// Takes the answer to read `ticket` of a file's text, or why it failed. Text that matches
+    /// the file's hunks shows more of each run Enter was pressed on while it was read, and a
+    /// failed read drops those presses. Says whether what the tab shows changed. An answer to a
+    /// read the tab no longer wants, as for a file the diff no longer shows, is dropped.
+    pub(super) fn take_text(
+        &mut self,
+        ticket: u64,
+        answer: Result<Box<FileContents>, String>,
+    ) -> bool {
+        let Some(found) = self
+            .contexts
+            .iter()
+            .position(|context| matches!(context.text, Text::Asked(asked) if asked == ticket))
+        else {
+            return false;
+        };
+        let context = &self.contexts[found];
+        let shown = self.files.iter().find_map(|&(slice, place)| {
+            let slice = &self.slices[slice];
+            let file = &slice.patch.files[place];
+            let same = file.path() == context.path && slice.prints[place] == context.print;
+            same.then_some((slice.diff.patch.as_str(), file))
+        });
+        let Some((patch, file)) = shown else {
+            self.contexts.remove(found);
+            return false;
+        };
+        let text = match answer {
+            Ok(contents) => match fits(&contents.new, patch, file) {
+                Some(count) => Text::Read {
+                    text: contents.new,
+                    count,
+                },
+                None => Text::Failed(UNMATCHED.to_string()),
+            },
+            Err(failure) => Text::Failed(bounded(&failure, FAILURE)),
+        };
+        let context = &mut self.contexts[found];
+        if let Text::Failed(_) = text {
+            context.shown.clear();
+        }
+        context.text = text;
+        let path = context.path.clone();
+        self.unlay(&path);
+        true
     }
 
     /// Shows the diff of the commit `commit` names, or of the whole change, and closes the list
@@ -372,6 +619,7 @@ impl Code {
         self.omitted.clear();
         self.bodies.clear();
         self.open.clear();
+        self.contexts.clear();
         self.asked = None;
         self.failed = None;
         self.again = true;
@@ -415,6 +663,16 @@ impl Code {
                 None => "show commit".to_string(),
             },
             Control::MoreCommits => "show more commits".to_string(),
+            Control::Stretch(at, place) => match self.rest(at, place) {
+                Some(Rest::Count(rest)) => {
+                    let last = self.file(at).map_or(0, |(_, file)| file.hunks.len());
+                    let ends = if place == 0 || place == last { 1 } else { 2 };
+                    let count = rest.min(ends * EXPANSION);
+                    let noun = if count == 1 { "line" } else { "lines" };
+                    format!("show {} unmodified {noun}", grouped(count))
+                }
+                _ => "show unmodified lines".to_string(),
+            },
             _ => "retry".to_string(),
         }
     }
@@ -540,13 +798,8 @@ impl Code {
                     {
                         self.builds += 1;
                     }
-                    let (lines, marks) = body(&slice.diff.patch, file, withheld, width, theme);
-                    Body {
-                        width,
-                        withheld,
-                        lines,
-                        marks,
-                    }
+                    let context = find(&self.contexts, file.path(), slice.prints[place]);
+                    body(&slice.diff.patch, file, withheld, context, width, theme)
                 }
             };
             bodies.insert((at, place), laid);
@@ -700,15 +953,17 @@ impl Code {
             if open {
                 let withheld = self.omitted.contains_key(file.path());
                 let fresh;
-                let (rows, marks) = match self.bodies.get(&self.files[at]) {
-                    Some(laid) if laid.width == width && laid.withheld == withheld => {
-                        (&laid.lines, &laid.marks)
-                    }
+                let laid = match self.bodies.get(&self.files[at]) {
+                    Some(laid) if laid.width == width && laid.withheld == withheld => laid,
                     _ => {
-                        fresh = body(text, file, withheld, width, theme);
-                        (&fresh.0, &fresh.1)
+                        let (slice, place) = self.files[at];
+                        let print = self.slices[slice].prints[place];
+                        let context = find(&self.contexts, file.path(), print);
+                        fresh = body(text, file, withheld, context, width, theme);
+                        &fresh
                     }
                 };
+                let (rows, marks) = (&laid.lines, &laid.marks);
                 // The threads on each line, those on its number before the change first, as
                 // the desktop's stacked view puts them, then in the order T3 sent them.
                 let mut on: HashMap<(Side, u64), Vec<usize>> = HashMap::new();
@@ -717,6 +972,19 @@ impl Code {
                     let line = thread.line.expect("a thread on a line");
                     on.entry((thread.side, line)).or_default().push(index);
                 }
+                // The rows that count unchanged lines, each where it lands among the threads, in
+                // order with their targets.
+                let base = lines.len();
+                let mut added = 0;
+                let mut stretches = laid.stretches.iter().peekable();
+                let mut counted = |targets: &mut Targets, before: usize, added: usize| {
+                    while let Some((rows, place)) =
+                        stretches.next_if(|(rows, _)| rows.start < before)
+                    {
+                        let rows = base + added + rows.start..base + added + rows.end;
+                        targets.push((rows, Control::Stretch(at, *place)));
+                    }
+                };
                 let mut from = 0;
                 for mark in marks.iter().filter(|_| !on.is_empty()) {
                     let left = mark.old.and_then(|line| on.get(&(Side::Left, line)));
@@ -726,8 +994,10 @@ impl Code {
                     if here.is_empty() {
                         continue;
                     }
+                    counted(&mut targets, mark.end, added);
                     lines.extend(rows[from..mark.end].iter().cloned());
                     from = mark.end;
+                    let before = lines.len();
                     // A blank row keeps two threads on one line apart.
                     for (place, index) in here.into_iter().enumerate() {
                         if place > 0 {
@@ -735,7 +1005,9 @@ impl Code {
                         }
                         card(&mut lines, &mut targets, index);
                     }
+                    added += lines.len() - before;
                 }
+                counted(&mut targets, usize::MAX, added);
                 lines.extend(rows[from..].iter().cloned());
             }
         }
@@ -933,17 +1205,20 @@ fn status(status: patch::Status, theme: &Theme) -> (&'static str, Color) {
 /// An unfolded file's rows: its hunks, each after a row that counts the unchanged lines before
 /// it, and a note for each part t3term couldn't show. A file without hunks says why: it is
 /// binary, the host withheld its changes, or the change touched no line, as a rename or a mode
-/// change does.
+/// change does. Where `context` holds the file's text, the unchanged lines it shows go around
+/// those rows, and a row after the last hunk counts the lines after it.
 fn body(
     text: &str,
     file: &patch::File,
     withheld: bool,
+    context: Option<&Context>,
     width: usize,
     theme: &Theme,
-) -> (Vec<Line<'static>>, Vec<Mark>) {
+) -> Body {
     let muted = Style::new().fg(theme.muted);
     let mut lines = Vec::new();
     let mut marks: Vec<Mark> = Vec::new();
+    let mut counted = Vec::new();
     // A file past the bound or with a broken hunk header can have no hunks, and its notes
     // below say why.
     if file.hunks.is_empty() && !file.lines_cut && !file.unreadable {
@@ -954,8 +1229,33 @@ fn body(
         } else {
             "No lines changed."
         };
-        return (whole(note, width, muted), marks);
+        return Body {
+            width,
+            withheld,
+            lines: whole(note, width, muted),
+            marks,
+            stretches: counted,
+        };
     }
+    // The runs of unchanged lines the file's text can fill, how each shows, and the lines of
+    // the text that show, in order.
+    let stretches = stretches(file).unwrap_or_default();
+    let showings: Vec<Showing> = stretches
+        .iter()
+        .enumerate()
+        .map(|(place, &stretch)| showing(stretch, context, place))
+        .collect();
+    let contents = match context.map(|context| &context.text) {
+        Some(Text::Read { text, .. }) => text.as_str(),
+        _ => "",
+    };
+    let mut wanted = Vec::new();
+    for (stretch, showing) in stretches.iter().zip(&showings) {
+        let end = stretch.first + showing.head + showing.tail + rest(showing.rest);
+        wanted.extend(stretch.first..stretch.first + showing.head);
+        wanted.extend(end - showing.tail..end);
+    }
+    let mut found = lines_at(contents, &wanted).into_iter();
     let last = file
         .hunks
         .iter()
@@ -963,6 +1263,7 @@ fn body(
             let old = hunk.old_start + hunk.old_count.saturating_sub(1);
             old.max(hunk.new_start + hunk.new_count.saturating_sub(1))
         })
+        .chain(wanted.last().copied())
         .max()
         .unwrap_or_default();
     let digits = last.max(1).ilog10() as usize + 1;
@@ -972,20 +1273,68 @@ fn body(
     } else {
         None
     };
+    // A run of unchanged lines: those from its start, the row that counts the rest, then those
+    // at its end.
+    let mut stretch = |lines: &mut Vec<Line<'static>>, place: usize| {
+        let (Some(stretch), Some(showing)) = (stretches.get(place), showings.get(place)) else {
+            return;
+        };
+        let mut unchanged = |lines: &mut Vec<Line<'static>>, numbers: Range<u64>| {
+            for number in numbers {
+                let Some(text) = found.next() else {
+                    return;
+                };
+                let line = patch::Line {
+                    kind: patch::Kind::Context,
+                    old: None,
+                    new: Some(number),
+                    text,
+                };
+                lines.extend(line_rows(contents, &line, gutter, width, theme));
+            }
+        };
+        let end = stretch.first + showing.head + showing.tail + rest(showing.rest);
+        unchanged(lines, stretch.first..stretch.first + showing.head);
+        let mut note = match showing.rest {
+            Rest::None => None,
+            Rest::Count(count) => {
+                let noun = if count == 1 { "line" } else { "lines" };
+                Some(format!("⋯ {} unmodified {noun}", grouped(count)))
+            }
+            Rest::Unknown => Some(format!("⋯ {MORE_CONTEXT}")),
+        };
+        if let Some(note) = &mut note {
+            let reading = context.is_some_and(|context| {
+                matches!(context.text, Text::Wanted | Text::Asked(_))
+                    && context.shown.contains_key(&place)
+            });
+            if reading {
+                note.push_str(&format!(" · {READING}"));
+            }
+            let start = lines.len();
+            lines.extend(whole(note, width, muted));
+            counted.push((start..lines.len(), place));
+            let pressed = context.filter(|context| context.pressed == place);
+            if let Some(Text::Failed(failure)) = pressed.map(|context| &context.text) {
+                lines.extend(whole(failure, width, muted));
+            }
+        }
+        unchanged(lines, end - showing.tail..end);
+    };
     // Where the line after the last hunk is in the file before the change.
     let mut after = 1;
-    for hunk in &file.hunks {
-        // A hunk that removes nothing names the line before it, as git writes `-5,0`. The
-        // parser lets that line be u64::MAX, where the count of the lines above stops.
-        let first = match hunk.old_count {
-            0 => hunk.old_start.saturating_add(1),
-            _ => hunk.old_start,
-        };
-        let gap = first.saturating_sub(after);
-        if gap > 0 {
-            let noun = if gap == 1 { "line" } else { "lines" };
-            let note = format!("⋯ {} unmodified {noun}", grouped(gap));
-            lines.extend(whole(&note, width, muted));
+    for (place, hunk) in file.hunks.iter().enumerate() {
+        // A hunk that removes nothing names the line before it, as git writes `-5,0`.
+        let first = side_first(hunk.old_start, hunk.old_count);
+        if stretches.is_empty() {
+            let gap = first.saturating_sub(after);
+            if gap > 0 {
+                let noun = if gap == 1 { "line" } else { "lines" };
+                let note = format!("⋯ {} unmodified {noun}", grouped(gap));
+                lines.extend(whole(&note, width, muted));
+            }
+        } else {
+            stretch(&mut lines, place);
         }
         after = first + hunk.old_count;
         for line in &hunk.lines {
@@ -1002,6 +1351,7 @@ fn body(
             }
         }
     }
+    stretch(&mut lines, file.hunks.len());
     if file.lines_cut {
         let note = format!(
             "t3term reads at most {} lines of a slice, so the rest of this file doesn't show.",
@@ -1016,7 +1366,211 @@ fn body(
             muted,
         ));
     }
-    (lines, marks)
+    Body {
+        width,
+        withheld,
+        lines,
+        marks,
+        stretches: counted,
+    }
+}
+
+/// The lines a row counts as left.
+fn rest(rest: Rest) -> u64 {
+    match rest {
+        Rest::Count(count) => count,
+        Rest::None | Rest::Unknown => 0,
+    }
+}
+
+/// The number of the first line a hunk's side covers, from its header's `start` and `count`.
+/// A side with no lines names the line before it, as git writes `-5,0`.
+fn side_first(start: u64, count: u64) -> u64 {
+    match count {
+        0 => start.saturating_add(1),
+        _ => start,
+    }
+}
+
+/// How `file` changed, as T3 names it for a read of its text, where that text can fill the
+/// runs of unchanged lines around its hunks: a file changed in place, or renamed and changed,
+/// as the desktop's `canHydrateCollapsedContext` asks, whose hunks t3term read whole.
+fn change_type(file: &patch::File) -> Option<ChangeType> {
+    let readable = !file.hunks.is_empty() && !file.binary && !file.lines_cut && !file.unreadable;
+    if !readable || file.old_path.is_none() || file.new_path.is_none() {
+        return None;
+    }
+    match file.status {
+        patch::Status::Modified => Some(ChangeType::Change),
+        patch::Status::Renamed => Some(ChangeType::RenameChanged),
+        patch::Status::Added | patch::Status::Deleted => None,
+    }
+}
+
+/// The runs of unchanged lines around `file`'s hunks that its text can fill, by place: one
+/// before each hunk, empty where the hunk follows the last at once, then one after the last.
+/// None where `change_type` says the text can't fill them, or where the hunks' headers don't
+/// leave as many lines between them on both sides, which unchanged lines would.
+fn stretches(file: &patch::File) -> Option<Vec<Stretch>> {
+    change_type(file)?;
+    let mut stretches = Vec::with_capacity(file.hunks.len() + 1);
+    let (mut old_after, mut new_after) = (1u64, 1u64);
+    for hunk in &file.hunks {
+        let old_first = side_first(hunk.old_start, hunk.old_count);
+        let new_first = side_first(hunk.new_start, hunk.new_count);
+        let size = new_first.checked_sub(new_after)?;
+        if old_first.checked_sub(old_after)? != size {
+            return None;
+        }
+        stretches.push(Stretch {
+            first: new_after,
+            size: Some(size),
+        });
+        old_after = old_first.saturating_add(hunk.old_count);
+        new_after = new_first.saturating_add(hunk.new_count);
+    }
+    stretches.push(Stretch {
+        first: new_after,
+        size: None,
+    });
+    Some(stretches)
+}
+
+/// How the run `stretch` at `place` shows with what `context` read of its file. Until the
+/// text came, no line of it shows. After, a run of one line shows whole, as the desktop's
+/// `collapsedContextThreshold` of 1 has it, and the rest shows as far as Enter widened it.
+fn showing(stretch: Stretch, context: Option<&Context>, place: usize) -> Showing {
+    let read = context.and_then(|context| match context.text {
+        Text::Read { count, .. } => Some((context, count)),
+        _ => None,
+    });
+    let Some((context, count)) = read else {
+        let rest = match stretch.size {
+            Some(0) => Rest::None,
+            Some(size) => Rest::Count(size),
+            None => Rest::Unknown,
+        };
+        return Showing {
+            head: 0,
+            tail: 0,
+            rest,
+        };
+    };
+    let size = stretch
+        .size
+        .unwrap_or_else(|| count.saturating_add(1).saturating_sub(stretch.first));
+    if size <= 1 {
+        return Showing {
+            head: size,
+            tail: 0,
+            rest: Rest::None,
+        };
+    }
+    let (from_start, from_end) = context.shown.get(&place).copied().unwrap_or_default();
+    let head = from_start.min(size);
+    let tail = from_end.min(size - head);
+    let rest = match size - head - tail {
+        0 => Rest::None,
+        rest => Rest::Count(rest),
+    };
+    Showing { head, tail, rest }
+}
+
+impl Context {
+    /// Shows up to `EXPANSION` more lines of the run at `place` at each end that touches a
+    /// hunk, as the desktop's buttons do: at its end before the first hunk, at its start after
+    /// the last at `last`, and at both between two.
+    fn widen(&mut self, place: usize, last: usize) {
+        let (from_start, from_end) = self.shown.entry(place).or_default();
+        if place != 0 {
+            *from_start = from_start.saturating_add(EXPANSION);
+        }
+        if place != last {
+            *from_end = from_end.saturating_add(EXPANSION);
+        }
+    }
+}
+
+/// What `contexts` read of the file at `path` whose fingerprint is `print`.
+fn find<'a>(contexts: &'a [Context], path: &str, print: u64) -> Option<&'a Context> {
+    contexts
+        .iter()
+        .find(|context| context.path == path && context.print == print)
+}
+
+/// A fingerprint of `file`'s paths and of its hunks in `patch`, so the text read for it stays
+/// only while a read of the diff again leaves them as they were.
+fn fingerprint(patch: &str, file: &patch::File) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    (&file.old_path, &file.new_path).hash(&mut hasher);
+    for hunk in &file.hunks {
+        let header = (
+            hunk.old_start,
+            hunk.old_count,
+            hunk.new_start,
+            hunk.new_count,
+        );
+        header.hash(&mut hasher);
+        for line in &hunk.lines {
+            (line.kind, patch.get(line.text.clone())).hash(&mut hasher);
+        }
+    }
+    hasher.finish()
+}
+
+/// How many lines `text`, a file's text after the change, has, where each line `file`'s hunks
+/// in `patch` have after the change is in it with its number, as when both come from one
+/// revision. None where one isn't.
+fn fits(text: &str, patch: &str, file: &patch::File) -> Option<u64> {
+    let mut lines = file
+        .hunks
+        .iter()
+        .flat_map(|hunk| &hunk.lines)
+        .filter(|line| matches!(line.kind, patch::Kind::Context | patch::Kind::Added))
+        .filter_map(|line| Some((line.new?, patch.get(line.text.clone())?)))
+        .peekable();
+    let mut count = 0;
+    for (number, line) in (1u64..).zip(text.split_inclusive('\n')) {
+        count = number;
+        if let Some((_, expected)) = lines.next_if(|&(at, _)| at == number)
+            && without_end(line) != expected
+        {
+            return None;
+        }
+    }
+    // A text too short for a hunk's lines ends before the line after the last hunk.
+    let reach = file
+        .hunks
+        .iter()
+        .map(|hunk| side_first(hunk.new_start, hunk.new_count).saturating_add(hunk.new_count))
+        .max()
+        .unwrap_or(1);
+    (reach.saturating_sub(1) <= count).then_some(count)
+}
+
+/// The ranges in `text` of its lines numbered `wanted`, from 1 and in increasing order,
+/// without their ends.
+fn lines_at(text: &str, wanted: &[u64]) -> Vec<Range<usize>> {
+    let mut found = Vec::with_capacity(wanted.len());
+    let mut wanted = wanted.iter().peekable();
+    let mut at = 0;
+    for (number, line) in (1u64..).zip(text.split_inclusive('\n')) {
+        if wanted.peek().is_none() {
+            break;
+        }
+        if wanted.next_if(|&&wanted| wanted == number).is_some() {
+            found.push(at..at + without_end(line).len());
+        }
+        at += line.len();
+    }
+    found
+}
+
+/// A line of a file without its end, as the patch's lines are read: `\n`, then a `\r`
+/// before it.
+fn without_end(line: &str) -> &str {
+    let line = line.strip_suffix('\n').unwrap_or(line);
+    line.strip_suffix('\r').unwrap_or(line)
 }
 
 /// Whether a line of `file`'s hunks has the number `line` on `side`. The desktop's

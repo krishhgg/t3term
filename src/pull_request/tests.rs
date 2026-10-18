@@ -1143,6 +1143,45 @@ fn other_failures_keep_t3s_message() {
     assert_eq!(lost.to_string(), "T3 connection lost: socket ended");
 }
 
+#[test]
+fn a_files_text_keeps_the_side_after_the_change_up_to_its_bound() {
+    let read = FileContents::read(json!({"oldContents": "a\n", "newContents": "a\nb\n"}));
+    assert_eq!(read.unwrap().new, "a\nb\n");
+    let at_bound = "x".repeat(MOST_CONTENTS);
+    let read = FileContents::read(json!({"oldContents": "", "newContents": at_bound}));
+    assert_eq!(read.unwrap().new.len(), MOST_CONTENTS);
+    // Only the side kept counts toward the bound.
+    let old_long = "x".repeat(MOST_CONTENTS + 1);
+    let read = FileContents::read(json!({"oldContents": old_long, "newContents": ""}));
+    assert_eq!(read.unwrap().new, "");
+    let long = "x".repeat(MOST_CONTENTS + 1);
+    let error = FileContents::read(json!({"oldContents": "", "newContents": long}));
+    assert_eq!(
+        error.unwrap_err().to_string(),
+        "The file is longer than the 2 MiB t3term reads."
+    );
+    let broken = [
+        json!({"newContents": "a"}),
+        json!({"oldContents": null, "newContents": "a"}),
+        json!({"oldContents": "a"}),
+        json!({"oldContents": "a", "newContents": 1}),
+        json!(null),
+    ];
+    for value in broken {
+        let error = FileContents::read(value.clone());
+        assert!(
+            matches!(error, Err(PullRequestError::Malformed(_))),
+            "{value}"
+        );
+    }
+}
+
+#[test]
+fn a_change_type_is_named_as_t3s_contract_names_it() {
+    assert_eq!(ChangeType::Change.name(), "change");
+    assert_eq!(ChangeType::RenameChanged.name(), "rename-changed");
+}
+
 mod diff {
     use super::*;
     use crate::http::fake;

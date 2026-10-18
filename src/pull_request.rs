@@ -3,8 +3,9 @@
 //! `pullRequests.activity` and `pullRequests.stack`. `pullRequests.invalidate` makes T3's next
 //! read of it ask the host again. Each is one RPC call, which T3 answers through the host's CLI or API or from a cache
 //! of its own. The diff comes over HTTP instead, from `POST /api/pull-requests/diff`, as the
-//! desktop reads it, and `patch` splits it into files and hunks. Nothing here writes to the
-//! host, and nothing keeps what it read.
+//! desktop reads it, and `patch` splits it into files and hunks. `pullRequests.diffFileContents`
+//! reads a file's whole text, for the unchanged lines between its hunks. Nothing here writes
+//! to the host, and nothing keeps what it read.
 //! `pullRequests.subscribeRefreshes` is a stream of numbers that says when T3's reads may have
 //! changed, which `client::spawn_pull_request_refresh_watch` follows.
 //!
@@ -39,6 +40,7 @@ pub const CHECKS: &str = "pullRequests.checks";
 pub const ACTIVITY: &str = "pullRequests.activity";
 pub const STACK: &str = "pullRequests.stack";
 pub const THREAD_COMMENTS: &str = "pullRequests.threadComments";
+pub const DIFF_FILE_CONTENTS: &str = "pullRequests.diffFileContents";
 pub const INVALIDATE: &str = "pullRequests.invalidate";
 pub const SUBSCRIBE_REFRESHES: &str = "pullRequests.subscribeRefreshes";
 /// The HTTP route of a pull request's diff (packages/contracts/src/environmentHttp.ts:650-663).
@@ -56,6 +58,10 @@ const DIFF_TIMEOUT: Duration = Duration::from_secs(60);
 pub const MOST_DIFF: usize = 16 * 1024 * 1024;
 /// The most files the host left out of a diff kept.
 const MOST_OMITTED: usize = 3000;
+/// The longest text of a file read for the unchanged lines its hunks leave out, in bytes. T3
+/// reads at most 1 MiB of each side from GitHub and GitLab (GitHubPullRequestCli.ts:345,
+/// GitLabPullRequestCli.ts:202).
+pub const MOST_CONTENTS: usize = 2 * 1024 * 1024;
 
 /// The longest project id, host or repository a `Reference` sends, in bytes.
 const KEY: usize = 1024;
@@ -107,6 +113,8 @@ pub enum PullRequestError {
     Rpc(RpcError),
     /// A read over HTTP failed before T3 answered, or T3 refused it. The message is t3term's.
     Http(String),
+    /// T3's answer is longer than t3term reads. The message is t3term's.
+    TooLong(&'static str),
 }
 
 /// Why T3 can't read a host's pull requests, as `PullRequestUnavailableReason` says it.
@@ -133,6 +141,7 @@ impl fmt::Display for PullRequestError {
             }
             PullRequestError::Rpc(error) => error.fmt(f),
             PullRequestError::Http(message) => f.write_str(message),
+            PullRequestError::TooLong(message) => f.write_str(message),
         }
     }
 }
@@ -372,6 +381,40 @@ pub async fn thread_comments(
     payload["cursor"] = json!(cursor);
     let answer = rpc.call(THREAD_COMMENTS, payload, CALL_TIMEOUT).await?;
     CommentPage::read(&answer)
+}
+
+/// The whole text after the change of the file at `new_path`, `old_path` before it, as the
+/// desktop's Code tab reads it to show the unchanged lines its hunks leave out
+/// (apps/web/src/lib/diffFileContents.ts at f570bd2), of the whole change or of the commit
+/// `commit` names alone. T3 fails where the host can't read a file's text
+/// (PullRequestService.ts:1901-1922), and GitHub fails for a side past 1 MiB or binary
+/// (GitHubPullRequestCli.ts:1454-1478). T3 trims both paths, so t3term sends nothing for a
+/// path that is blank or starts or ends with whitespace, which would name another file.
+pub async fn diff_file_contents(
+    rpc: &RpcClient,
+    reference: &Reference,
+    commit: Option<&str>,
+    change: ChangeType,
+    old_path: &str,
+    new_path: &str,
+) -> Result<FileContents, PullRequestError> {
+    if [old_path, new_path]
+        .iter()
+        .any(|path| path.is_empty() || path.trim() != *path)
+    {
+        return Err(PullRequestError::Invalid(
+            "T3 can't read a file whose path is blank or starts or ends with a space.",
+        ));
+    }
+    let mut payload = reference.payload();
+    if let Some(commit) = commit {
+        payload["commit"] = json!(commit);
+    }
+    payload["changeType"] = json!(change.name());
+    payload["oldPath"] = json!(old_path);
+    payload["newPath"] = json!(new_path);
+    let answer = rpc.call(DIFF_FILE_CONTENTS, payload, CALL_TIMEOUT).await?;
+    FileContents::read(answer)
 }
 
 /// One slice of the pull request's diff, from the slice `cursor` names or from the first, of
@@ -1063,6 +1106,52 @@ pub struct Diff {
     pub omitted: Vec<Omitted>,
     /// Whether T3 named more such files than t3term keeps.
     pub omitted_cut: bool,
+}
+
+/// How a file whose unchanged lines are read changed, as `PullRequestDiffFileContentsInput`
+/// names it. The desktop reads them only for a file changed in place or renamed and changed
+/// (`canHydrateCollapsedContext` in @pierre/diffs 1.5.2), so t3term names only those.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ChangeType {
+    Change,
+    RenameChanged,
+}
+
+impl ChangeType {
+    fn name(self) -> &'static str {
+        match self {
+            ChangeType::Change => "change",
+            ChangeType::RenameChanged => "rename-changed",
+        }
+    }
+}
+
+/// A file's whole text after the change. `PullRequestDiffFileContentsResult` also has its text
+/// before the change, which t3term doesn't keep: the lines its hunks leave out are the same
+/// on both sides.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileContents {
+    /// At most `MOST_CONTENTS` bytes.
+    pub new: String,
+}
+
+impl FileContents {
+    /// Reads T3's answer, taking the text after the change without copying it.
+    pub fn read(mut value: Value) -> Result<FileContents, PullRequestError> {
+        if !value.get("oldContents").is_some_and(Value::is_string) {
+            return Err(malformed("a file's text has no valid oldContents".into()));
+        }
+        let new = match value.get_mut("newContents").map(Value::take) {
+            Some(Value::String(new)) => new,
+            _ => return Err(malformed("a file's text has no valid newContents".into())),
+        };
+        if new.len() > MOST_CONTENTS {
+            return Err(PullRequestError::TooLong(
+                "The file is longer than the 2 MiB t3term reads.",
+            ));
+        }
+        Ok(FileContents { new })
+    }
 }
 
 /// A file whose changes the host left out of the diff. `PullRequestOmittedFileStat`.

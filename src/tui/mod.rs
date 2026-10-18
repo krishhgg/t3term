@@ -62,7 +62,7 @@ use details::Details;
 use environment::{Feed, Identity};
 use markdown::Styles;
 use picker::{Item, Kind, Pick};
-use pull_requests::{Ask, CommentsAsk, DiffAsk, Part};
+use pull_requests::{Ask, CommentsAsk, DiffAsk, Part, TextAsk};
 use scroll::{Pin, Scroll};
 use sidebar::{Badges, Capabilities, Shelf, ShelfChoices, Sidebar, View};
 use theme::{
@@ -110,6 +110,9 @@ type ReadDiff = Box<dyn Fn(Reference, DiffAsk)>;
 /// Reads the next page of a review thread's remarks in the background as `CommentsAsk` says,
 /// and sends the answer as an action with the ask's ticket.
 type ReadComments = Box<dyn Fn(Reference, CommentsAsk)>;
+/// Reads a file's whole text in the background as `TextAsk` says, and sends the answer as an
+/// action with the ask's ticket.
+type ReadText = Box<dyn Fn(Reference, TextAsk)>;
 /// Opens T3's `pullRequests.subscribeRefreshes`: `Client::watch_pull_request_refreshes`, or a
 /// test's stand-in.
 type WatchRefreshes = Box<dyn Fn() -> mpsc::UnboundedReceiver<WatchEvent>>;
@@ -377,6 +380,11 @@ enum ActionResult {
         ticket: u64,
         answer: Result<Box<pull_request::CommentPage>, String>,
     },
+    /// A file's whole text, or why reading it failed, for the read with this ticket.
+    PullRequestText {
+        ticket: u64,
+        answer: Result<Box<pull_request::FileContents>, String>,
+    },
     /// A send that failed. The composer gets its text back.
     SendFailed {
         thread_id: String,
@@ -627,6 +635,8 @@ struct App {
     read_diff: ReadDiff,
     /// Reads the next page of the remarks of a review thread on that Code tab.
     read_comments: ReadComments,
+    /// Reads a file's whole text for the unchanged lines around its hunks on that Code tab.
+    read_text: ReadText,
     /// Opens T3's refresh numbers for pull requests.
     watch_refreshes: WatchRefreshes,
     /// T3's refresh numbers, open while the details hold a read of a link's pull request.
@@ -801,6 +811,26 @@ async fn read_comments(
     let rpc = client.rpc().await.map_err(|e| e.to_string())?;
     match pull_request::thread_comments(&rpc, reference, thread, cursor).await {
         Ok(page) => Ok(Box::new(page)),
+        Err(e) => Err(e.to_string()),
+    }
+}
+
+/// Reads the whole text of a file of the pull request `reference` names, through
+/// `pullRequests.diffFileContents`, as the desktop's diff viewer does to show the unchanged
+/// lines around its hunks. The reason shows under the run of lines Enter was pressed on, so it
+/// is the error alone, and a sentence of T3's own reads as T3 wrote it.
+async fn read_text(
+    client: &Client,
+    reference: &Reference,
+    ask: &TextAsk,
+) -> Result<Box<pull_request::FileContents>, String> {
+    let rpc = client.rpc().await.map_err(|e| e.to_string())?;
+    let (old_path, new_path) = (ask.old_path.as_str(), ask.new_path.as_str());
+    let commit = ask.commit.as_deref();
+    let read =
+        pull_request::diff_file_contents(&rpc, reference, commit, ask.change, old_path, new_path);
+    match read.await {
+        Ok(contents) => Ok(Box::new(contents)),
         Err(e) => Err(e.to_string()),
     }
 }
@@ -1069,6 +1099,7 @@ impl App {
         let (reader, answers) = (client.clone(), actions.clone());
         let (differ, diffs) = (client.clone(), actions.clone());
         let (pager, pages) = (client.clone(), actions.clone());
+        let (texter, texts) = (client.clone(), actions.clone());
         let environment = Identity::new(client.runtime.label.as_deref(), &client.runtime.origin);
         let current = client.runtime.environment_id.clone();
         App {
@@ -1181,6 +1212,14 @@ impl App {
                     let answer = read_comments(&client, &reference, &ask.thread, &ask.cursor).await;
                     let ticket = ask.ticket;
                     let _ = answers.send(ActionResult::PullRequestComments { ticket, answer });
+                });
+            }),
+            read_text: Box::new(move |reference, ask: TextAsk| {
+                let (client, answers) = (texter.clone(), texts.clone());
+                tokio::spawn(async move {
+                    let answer = read_text(&client, &reference, &ask).await;
+                    let ticket = ask.ticket;
+                    let _ = answers.send(ActionResult::PullRequestText { ticket, answer });
                 });
             }),
             watch_refreshes: Box::new(move || refresher.watch_pull_request_refreshes()),
@@ -1483,9 +1522,17 @@ impl App {
         {
             comments.push(ask);
         }
+        // So does each file's text that Enter on a run of unchanged lines wants.
+        let mut texts = Vec::new();
+        while let Some(ask) = shown
+            .then(|| self.details.pulls.take_text_ask(enabled))
+            .flatten()
+        {
+            texts.push(ask);
+        }
         self.follow_refreshes(enabled);
         let project = project.unwrap_or_default();
-        let asked = ask.is_some() || diff.is_some() || !comments.is_empty();
+        let asked = ask.is_some() || diff.is_some() || !comments.is_empty() || !texts.is_empty();
         if let Some(ask) = ask {
             match Reference::new(&project, Some(&ask.host), &ask.repository, ask.number) {
                 Ok(reference) => (self.read_pull)(reference, ask),
@@ -1511,6 +1558,15 @@ impl App {
                 Err(failure) => {
                     let failure = Err(failure.to_string());
                     self.details.answer_comments(ask.ticket, failure);
+                }
+            }
+        }
+        for ask in texts {
+            match Reference::new(&project, Some(&ask.host), &ask.repository, ask.number) {
+                Ok(reference) => (self.read_text)(reference, ask),
+                Err(failure) => {
+                    let failure = Err(failure.to_string());
+                    self.details.answer_text(ask.ticket, failure);
                 }
             }
         }
@@ -2864,6 +2920,9 @@ impl App {
             }
             ActionResult::PullRequestComments { ticket, answer } => {
                 self.details.answer_comments(ticket, answer);
+            }
+            ActionResult::PullRequestText { ticket, answer } => {
+                self.details.answer_text(ticket, answer);
             }
             ActionResult::PullRequestDiff { ticket, answer } => {
                 let now = now_ms().max(self.now);
@@ -14043,6 +14102,40 @@ mod tests {
         asked
     }
 
+    /// What a read of a file's text named: the project, the host, the repository, the number,
+    /// the ticket, the commit, how the file changed and its paths before and after.
+    type NotedText = (
+        String,
+        String,
+        String,
+        u64,
+        u64,
+        Option<String>,
+        pull_request::ChangeType,
+        String,
+        String,
+    );
+
+    /// Replaces how `app` reads a file's text, so a read only notes what it named.
+    fn note_texts(app: &mut App) -> std::rc::Rc<std::cell::RefCell<Vec<NotedText>>> {
+        let asked = std::rc::Rc::new(std::cell::RefCell::new(Vec::new()));
+        let noted = asked.clone();
+        app.read_text = Box::new(move |reference: Reference, ask: TextAsk| {
+            noted.borrow_mut().push((
+                reference.project_id().to_string(),
+                reference.host().unwrap_or_default().to_string(),
+                reference.repository().to_string(),
+                reference.number(),
+                ask.ticket,
+                ask.commit,
+                ask.change,
+                ask.old_path,
+                ask.new_path,
+            ));
+        });
+        asked
+    }
+
     /// Replaces how `app` opens T3's refresh numbers, so each subscription only notes its
     /// sender, which a test sends numbers on.
     fn note_refreshes(
@@ -14591,6 +14684,162 @@ mod tests {
             ]
         );
         assert_eq!(rows[at - 4], "│ Loading more comments…");
+    }
+
+    #[test]
+    fn a_run_of_unchanged_lines_reads_its_files_text_through_the_links_project() {
+        use pull_request::ChangeType;
+
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        let _asked = note_reads(&mut app);
+        let _diffs = note_diffs(&mut app);
+        let texts = note_texts(&mut app);
+        press(&mut app, KeyCode::Enter);
+        let activity = pull_request::Activity::read(&host_activity_sent()).unwrap();
+        let parts = vec![
+            Part::Detail(Ok(Box::new(host_detail()))),
+            Part::Activity(Ok(Box::new(activity))),
+            Part::Done,
+        ];
+        hear(&mut app, 1, parts);
+        press(&mut app, KeyCode::Right);
+        press(&mut app, KeyCode::Right);
+        let diff = pull_request::Diff {
+            patch: "diff --git a/a b/a\n--- a/a\n+++ b/a\n@@ -3 +3 @@\n-o3\n+l3\n\
+                    diff --git a/b b/c\nsimilarity index 90%\nrename from b\nrename to c\n\
+                    --- a/b\n+++ b/c\n@@ -2 +2 @@\n-o2\n+l2\n"
+                .into(),
+            truncated: false,
+            next_cursor: None,
+            omitted: Vec::new(),
+            omitted_cut: false,
+        };
+        let answer = Ok(Box::new(diff));
+        app.on_action_result(ActionResult::PullRequestDiff { ticket: 2, answer });
+        let down_to = |app: &mut App, action: &str| {
+            for _ in 0..10 {
+                cells(app, 200, 50);
+                if app.details.pulls.action().as_deref() == Some(action) {
+                    return;
+                }
+                press(app, KeyCode::Down);
+            }
+            panic!("no {action:?}: {:?}", app.details.pulls.action());
+        };
+        let text = |count: u64| {
+            let new = (1..=count).map(|n| format!("l{n}\n")).collect();
+            Ok(Box::new(pull_request::FileContents { new }))
+        };
+        down_to(&mut app, "expand file");
+        press(&mut app, KeyCode::Enter);
+        down_to(&mut app, "show 2 unmodified lines");
+        let status = text_in(&cells(&mut app, 200, 50), Rect::new(0, 49, 200, 1));
+        assert!(status.contains("Enter show 2 unmodified lines"), "{status}");
+        assert!(texts.borrow().is_empty());
+
+        // Enter reads the file's text through the link's project and host.
+        press(&mut app, KeyCode::Enter);
+        let named = |ticket, change, old: &str, new: &str| {
+            let host = ("p", "github.com", "krishhgg/t3term", 31);
+            let (project, host, repository, number) = host;
+            let (project, host) = (project.to_string(), host.to_string());
+            let (old, new) = (old.to_string(), new.to_string());
+            let repository = repository.to_string();
+            (
+                project, host, repository, number, ticket, None, change, old, new,
+            )
+        };
+        assert_eq!(*texts.borrow(), [named(3, ChangeType::Change, "a", "a")]);
+        let rows = body_after(&mut app, 200, 50);
+        let reading = rows.iter().filter(|row| row.contains("Reading…"));
+        assert_eq!(reading.count(), 1, "{rows:#?}");
+
+        // A failure says why under the run, in T3's words, laid out for the narrow pane.
+        let answer = Err("This host cannot expand unchanged pull request lines.".to_string());
+        assert!(!app.details.moved);
+        app.on_action_result(ActionResult::PullRequestText { ticket: 3, answer });
+        assert!(app.details.moved);
+        let rows = body_after(&mut app, 200, 50);
+        let at = rows
+            .iter()
+            .position(|row| row.trim() == "⋯ 2 unmodified lines")
+            .unwrap_or_else(|| panic!("{rows:#?}"));
+        let reason: Vec<&str> = rows[at + 1..at + 3].iter().map(|row| row.trim()).collect();
+        assert_eq!(
+            reason.join(" "),
+            "This host cannot expand unchanged pull request lines."
+        );
+        // An answer to no read changes nothing.
+        app.on_action_result(ActionResult::PullRequestText {
+            ticket: 9,
+            answer: text(3),
+        });
+        assert!(!app.details.moved);
+
+        // Reads asked for before t3term next reads go out together, each with its ticket.
+        // The panel enters here without the keys, which would send each read.
+        let enter_on = |app: &mut App, action: &str| {
+            app.details.pulls.home();
+            for _ in 0..10 {
+                cells(app, 200, 50);
+                if app.details.pulls.action().as_deref() == Some(action) {
+                    app.details.pulls.enter();
+                    return;
+                }
+                app.details.pulls.step(true);
+            }
+            panic!("no {action:?}: {:?}", app.details.pulls.action());
+        };
+        enter_on(&mut app, "expand file");
+        enter_on(&mut app, "show 2 unmodified lines");
+        enter_on(&mut app, "show 1 unmodified line");
+        assert_eq!(texts.borrow().len(), 1);
+        assert!(app.read_opened_pull());
+        assert_eq!(
+            texts.borrow()[1..],
+            [
+                named(4, ChangeType::Change, "a", "a"),
+                named(5, ChangeType::RenameChanged, "b", "c")
+            ]
+        );
+        assert!(!app.read_opened_pull());
+
+        // Each text shows the lines of the run Enter was pressed on.
+        app.on_action_result(ActionResult::PullRequestText {
+            ticket: 4,
+            answer: text(5),
+        });
+        app.on_action_result(ActionResult::PullRequestText {
+            ticket: 5,
+            answer: text(2),
+        });
+        let rows = body_after(&mut app, 200, 50);
+        let rows: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
+        let at = rows
+            .iter()
+            .position(|row| *row == "1   l1")
+            .unwrap_or_else(|| panic!("{rows:#?}"));
+        assert_eq!(
+            rows[at + 1..at + 5],
+            ["2   l2", "3 - o3", "3 + l3", "⋯ 2 unmodified lines"]
+        );
+        let renamed = at
+            + 1
+            + rows[at + 1..]
+                .iter()
+                .position(|row| *row == "1   l1")
+                .unwrap_or_else(|| panic!("{rows:#?}"));
+        assert_eq!(rows[renamed + 1], "2 - o2");
+        assert!(!rows.iter().any(|row| row.contains("Reading…")));
+
+        // A click on a run shows its lines from the text read, and reads nothing more.
+        let body = app.details.drawn.expect("the pane").body;
+        let row = u16::try_from(at + 4).unwrap();
+        assert!(mouse(&mut app, CLICK, body.x + 2, body.y + row));
+        let rows = body_after(&mut app, 200, 50);
+        let rows: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
+        assert_eq!(rows[at + 3..at + 6], ["3 + l3", "4   l4", "5   l5"]);
+        assert_eq!(texts.borrow().len(), 3);
     }
 
     #[test]
@@ -16081,6 +16330,90 @@ mod tests {
         assert!(results.try_recv().is_err());
         let sent: Value = serde_json::from_str(&t3.bodies()[1]).unwrap();
         assert_eq!(sent["commit"], "2222222bbbb");
+    }
+
+    /// The app's reader sends T3 how a file changed, its paths and the commit a read of its
+    /// text names, over the socket, and the text or T3's reason comes back with the ticket.
+    #[tokio::test]
+    async fn the_app_reads_a_files_text_from_t3() {
+        use futures_util::SinkExt;
+        use tokio_tungstenite::tungstenite::Message;
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = format!("ws://{}", listener.local_addr().unwrap());
+        let accepting = async {
+            let (stream, _) = listener.accept().await.unwrap();
+            tokio_tungstenite::accept_async(stream).await.unwrap()
+        };
+        let (rpc, mut socket) = tokio::join!(crate::rpc::RpcClient::connect_url(&url), accepting);
+        let (sender, mut results) = mpsc::unbounded_channel();
+        let app = App::new(
+            Arc::new(Client::over(rpc.unwrap())),
+            Theme::new(Depth::TrueColor),
+            &Settings::default(),
+            sender,
+        );
+        let reference = Reference::new("p", Some("github.com"), "krishhgg/t3term", 31).unwrap();
+        let ask = |ticket| TextAsk {
+            ticket,
+            host: "github.com".into(),
+            repository: "krishhgg/t3term".into(),
+            number: 31,
+            commit: Some("abc1234def".into()),
+            change: pull_request::ChangeType::RenameChanged,
+            old_path: "old.rs".into(),
+            new_path: "new.rs".into(),
+        };
+        let unexpandable = "This host cannot expand unchanged pull request lines.";
+        let answers = [
+            (
+                json!({"_tag": "Success", "value": {"oldContents": "a\n", "newContents": "b\n"}}),
+                Ok("b\n".to_string()),
+            ),
+            (
+                json!({"_tag": "Failure", "cause": [{"_tag": "Fail", "error": {
+                    "_tag": "PullRequestOperationError", "operation": "diffFileContents",
+                    "detail": unexpandable}}]}),
+                Err(unexpandable.to_string()),
+            ),
+        ];
+        let soon = Duration::from_secs(5);
+        for (ticket, (exit, read)) in (7..).zip(answers) {
+            (app.read_text)(reference.clone(), ask(ticket));
+            let request = async {
+                loop {
+                    let frame = socket.next().await.expect("an open socket").unwrap();
+                    if let Message::Text(text) = frame {
+                        let frame: Value = serde_json::from_str(&text).unwrap();
+                        if frame["_tag"] == "Request" {
+                            return frame;
+                        }
+                    }
+                }
+            };
+            let request = tokio::time::timeout(soon, request)
+                .await
+                .expect("a request within five seconds");
+            assert_eq!(request["tag"], "pullRequests.diffFileContents");
+            assert_eq!(
+                request["payload"],
+                json!({"projectId": "p", "host": "github.com", "repository": "krishhgg/t3term",
+                    "number": 31, "commit": "abc1234def", "changeType": "rename-changed",
+                    "oldPath": "old.rs", "newPath": "new.rs"})
+            );
+            let reply = json!({"_tag": "Exit", "requestId": request["id"], "exit": exit});
+            let reply = Message::Text(reply.to_string().into());
+            socket.send(reply).await.unwrap();
+            let result = tokio::time::timeout(soon, results.recv())
+                .await
+                .expect("an answer within five seconds")
+                .expect("the answer");
+            let ActionResult::PullRequestText { ticket: of, answer } = result else {
+                panic!("an answer of another kind");
+            };
+            assert_eq!(of, ticket);
+            assert_eq!(answer.map(|text| text.new), read);
+        }
     }
 
     // ---- the Environments dialog ----

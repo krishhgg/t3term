@@ -151,6 +151,8 @@ fn files_show_folded_and_each_unfolds_into_its_hunks() {
             "10   fn a() {}",
             "11 + fn b() {}",
             "12   fn c() {}",
+            "⋯ More unchanged context may be",
+            "available",
             "",
             "⌄ R from.rs → to.rs",
             "No lines changed.",
@@ -393,8 +395,15 @@ diff --git a/two b/two
     assert_eq!(code.ask(4), Some(None));
     assert_eq!(code.take(4, Ok(slice(again, None)), 7), Some(true));
     assert_eq!(
-        rows(&code, 40),
-        ["1 file", "", "⌄ M two +1 -1", "1 - c", "1 + e"]
+        rows(&code, 80),
+        [
+            "1 file",
+            "",
+            "⌄ M two +1 -1",
+            "1 - c",
+            "1 + e",
+            "⋯ More unchanged context may be available"
+        ]
     );
 
     // The first slice's time says when showing the tab again reads it again.
@@ -1005,7 +1014,8 @@ fn a_thread_reads_its_remarks_a_page_at_a_time() {
         .position(|row| row == "│ ⌄ Open · 5 comments")
         .unwrap();
     assert_eq!(rows[at + 2..at + 4], ["│   First.", "│ Load more comments"]);
-    assert_eq!(rows.len(), at + 4, "{rows:#?}");
+    let trailing = ["⋯ More unchanged context may be", "available"];
+    assert_eq!(rows[at + 4..], trailing, "{rows:#?}");
     assert_eq!(more_rows(&targets, 0), Some(at + 3..at + 4));
     assert!(code.shows(Control::More(0), conversation.threads(), &shown));
     assert_eq!(conversation.take_wanted(1), None);
@@ -1741,4 +1751,695 @@ fn the_list_of_commits_fits_every_width_and_cleans_its_headlines() {
     code.act(Control::Commits, &commits);
     assert!(code.has(Control::AllCommits, &commits));
     assert!(!code.has(Control::AllCommits, &[]));
+}
+
+/// A file changed in three places of its 400 lines: 2 unchanged lines before the first hunk,
+/// 250 between it and the second, 1 between the second and the third, and 144 after it.
+const STRETCHED: &str = "diff --git a/f.rs b/f.rs
+--- a/f.rs
++++ b/f.rs
+@@ -3 +3 @@
+-o3
++l3
+@@ -254 +254 @@
+-o254
++l254
+@@ -256 +256 @@
+-o256
++l256
+";
+
+/// A file's text whose line `n` is `l{n}`, for lines 1 to `count`.
+fn numbered(count: u64) -> String {
+    (1..=count).map(|n| format!("l{n}\n")).collect()
+}
+
+/// A file's text, as T3 sends it.
+fn text(new: String) -> Result<Box<FileContents>, String> {
+    Ok(Box::new(FileContents { new }))
+}
+
+/// The rows of unchanged lines `numbers` with a gutter of `digits`.
+fn unchanged(numbers: std::ops::RangeInclusive<u64>, digits: usize) -> Vec<String> {
+    numbers.map(|n| format!("{n:>digits$}   l{n}")).collect()
+}
+
+/// The runs of unchanged lines each target offers more of, with the text of its first row.
+fn stretch_targets(code: &Code, width: usize) -> Vec<(usize, usize, String)> {
+    let (lines, targets) = laid(code, width);
+    let rows = rows_of(&lines);
+    targets
+        .into_iter()
+        .filter_map(|(at, control)| match control {
+            Control::Stretch(file, place) => {
+                assert_eq!(file, 0);
+                Some((place, at.start, rows[at.start].clone()))
+            }
+            _ => None,
+        })
+        .collect()
+}
+
+#[test]
+fn the_unchanged_lines_around_hunks_show_a_run_at_a_time() {
+    let mut code = read(slice(STRETCHED, None), 0);
+    assert!(!code.has(Control::Stretch(0, 1), &[]), "folded");
+    code.act(Control::File(0), &[]);
+    let header = ["1 file", "", "⌄ M f.rs +3 -3"].map(String::from).to_vec();
+    let mut rows_before = header.clone();
+    rows_before.extend(
+        [
+            "⋯ 2 unmodified lines",
+            "  3 - o3",
+            "  3 + l3",
+            "⋯ 250 unmodified lines",
+            "254 - o254",
+            "254 + l254",
+            "⋯ 1 unmodified line",
+            "256 - o256",
+            "256 + l256",
+            "⋯ More unchanged context may be available",
+        ]
+        .map(String::from),
+    );
+    assert_eq!(rows(&code, 80), rows_before);
+    let counted: Vec<_> = stretch_targets(&code, 80)
+        .into_iter()
+        .map(|(place, row, _)| (place, row))
+        .collect();
+    assert_eq!(counted, [(0, 3), (1, 6), (2, 9), (3, 12)]);
+    for place in 0..4 {
+        assert!(code.has(Control::Stretch(0, place), &[]), "{place}");
+    }
+    assert!(!code.has(Control::Stretch(0, 4), &[]));
+    assert!(!code.has(Control::Stretch(1, 0), &[]));
+    let action = |code: &Code, place| code.action(Control::Stretch(0, place), &[]);
+    assert_eq!(action(&code, 0), "show 2 unmodified lines");
+    assert_eq!(action(&code, 1), "show 200 unmodified lines");
+    assert_eq!(action(&code, 2), "show 1 unmodified line");
+    assert_eq!(action(&code, 3), "show unmodified lines");
+
+    // The first Enter wants the file's text, once, and its run says so until it comes. The
+    // rows laid out before go.
+    code.prepare(80, &theme());
+    assert!(!code.act(Control::Stretch(0, 1), &[]));
+    assert_eq!(rows(&code, 80)[6], "⋯ 250 unmodified lines · Reading…");
+    assert_eq!(rows(&code, 80)[3], "⋯ 2 unmodified lines");
+    let asked = code.ask_text(5);
+    assert_eq!(
+        asked,
+        Some((ChangeType::Change, "f.rs".into(), "f.rs".into()))
+    );
+    assert_eq!(code.ask_text(6), None);
+    assert!(!code.take_text(4, text(numbered(400))));
+
+    // Once it came, the run shows 100 lines at each end, and a run of one line shows whole.
+    code.prepare(80, &theme());
+    assert!(code.take_text(5, text(numbered(400))));
+    assert!(!code.take_text(5, text(numbered(400))), "taken");
+    let mut after = header.clone();
+    after.extend(["⋯ 2 unmodified lines", "  3 - o3", "  3 + l3"].map(String::from));
+    after.extend(unchanged(4..=103, 3));
+    after.push("⋯ 50 unmodified lines".into());
+    after.extend(unchanged(154..=253, 3));
+    after.extend(["254 - o254", "254 + l254", "255   l255"].map(String::from));
+    after.extend(["256 - o256", "256 + l256", "⋯ 144 unmodified lines"].map(String::from));
+    assert_eq!(rows(&code, 80), after);
+    assert!(!code.has(Control::Stretch(0, 2), &[]));
+    assert_eq!(action(&code, 1), "show 50 unmodified lines");
+    assert_eq!(action(&code, 3), "show 100 unmodified lines");
+    let counted: Vec<_> = stretch_targets(&code, 80)
+        .into_iter()
+        .map(|(place, row, _)| (place, row))
+        .collect();
+    assert_eq!(counted, [(0, 3), (1, 106), (3, 212)]);
+
+    // Before the first hunk, the lines nearest it show, and after the last, those nearest it.
+    // With the text read, Enter shows them at once.
+    code.prepare(80, &theme());
+    code.act(Control::Stretch(0, 0), &[]);
+    assert_eq!(code.ask_text(7), None);
+    let rows_now = rows(&code, 80);
+    assert_eq!(rows_now[3..6], ["  1   l1", "  2   l2", "  3 - o3"]);
+    assert!(!code.has(Control::Stretch(0, 0), &[]));
+    code.prepare(80, &theme());
+    code.act(Control::Stretch(0, 3), &[]);
+    let rows_now = rows(&code, 80);
+    let end = rows_now.len();
+    assert_eq!(rows_now[end - 102..end - 100], ["256 + l256", "257   l257"]);
+    assert_eq!(rows_now[end - 2..], ["356   l356", "⋯ 44 unmodified lines"]);
+    code.act(Control::Stretch(0, 3), &[]);
+    let rows_now = rows(&code, 80);
+    assert_eq!(rows_now.last().unwrap(), "400   l400");
+    assert!(!code.has(Control::Stretch(0, 3), &[]));
+
+    // The run between two hunks shows whole after another 100 at each end, and its row goes.
+    code.act(Control::Stretch(0, 1), &[]);
+    assert!(!code.has(Control::Stretch(0, 1), &[]));
+    let mut whole_file = header;
+    for n in 1..=400 {
+        match n {
+            3 | 254 | 256 => {
+                whole_file.push(format!("{n:>3} - o{n}"));
+                whole_file.push(format!("{n:>3} + l{n}"));
+            }
+            n => whole_file.push(format!("{n:>3}   l{n}")),
+        }
+    }
+    assert_eq!(rows(&code, 80), whole_file);
+    assert!(stretch_targets(&code, 80).is_empty());
+
+    // Folded, the file offers none of its runs, and unfolded again it shows them as they were.
+    code.act(Control::File(0), &[]);
+    assert!(!code.has(Control::Stretch(0, 1), &[]));
+    code.act(Control::File(0), &[]);
+    assert_eq!(rows(&code, 80).len(), 3 + 403);
+}
+
+#[test]
+fn each_press_while_the_text_is_read_counts_once_it_comes() {
+    let mut code = read(slice(STRETCHED, None), 0);
+    code.act(Control::File(0), &[]);
+    code.act(Control::Stretch(0, 1), &[]);
+    code.act(Control::Stretch(0, 3), &[]);
+    // Both runs say the read is under way, and the second press asks for nothing more.
+    let rows_now = rows(&code, 80);
+    assert!(rows_now.contains(&"⋯ 250 unmodified lines · Reading…".to_string()));
+    assert_eq!(
+        rows_now.last().unwrap(),
+        "⋯ More unchanged context may be available · Reading…"
+    );
+    assert!(code.ask_text(2).is_some());
+    assert_eq!(code.ask_text(3), None);
+    code.act(Control::Stretch(0, 3), &[]);
+    assert_eq!(code.ask_text(4), None, "one read at a time");
+
+    // As on the desktop, each press shows 100 more lines: the run after the last hunk twice.
+    assert!(code.take_text(2, text(numbered(400))));
+    let rows_now = rows(&code, 80);
+    assert!(rows_now.contains(&"⋯ 50 unmodified lines".to_string()));
+    assert_eq!(rows_now.last().unwrap(), "400   l400");
+    assert!(!code.has(Control::Stretch(0, 3), &[]));
+}
+
+#[test]
+fn a_failed_read_says_why_and_enter_reads_again() {
+    let mut code = read(slice(STRETCHED, None), 0);
+    code.act(Control::File(0), &[]);
+    code.act(Control::Stretch(0, 3), &[]);
+    assert!(code.ask_text(2).is_some());
+    let failure = Err("This host cannot expand unchanged pull request lines.\u{1b}[2J".into());
+    assert!(code.take_text(2, failure));
+    let rows_now = rows(&code, 80);
+    assert_eq!(
+        rows_now[rows_now.len() - 2..],
+        [
+            "⋯ More unchanged context may be available",
+            "This host cannot expand unchanged pull request lines.[2J",
+        ]
+    );
+    // The reason shows under the run Enter was pressed on, and the target is its row alone.
+    let counted = stretch_targets(&code, 80);
+    assert_eq!(counted.last().unwrap().1, rows_now.len() - 2);
+    assert!(code.has(Control::Stretch(0, 3), &[]));
+    assert_eq!(code.ask_text(3), None);
+
+    // Enter on another run reads the text again, and the reason goes.
+    code.act(Control::Stretch(0, 1), &[]);
+    let rows_now = rows(&code, 80);
+    assert_eq!(
+        rows_now.last().unwrap(),
+        "⋯ More unchanged context may be available"
+    );
+    assert_eq!(rows_now[6], "⋯ 250 unmodified lines · Reading…");
+    assert!(code.ask_text(3).is_some());
+    assert!(code.take_text(3, text(numbered(400))));
+    assert_eq!(rows(&code, 80)[106], "⋯ 50 unmodified lines");
+}
+
+#[test]
+fn text_that_doesnt_match_the_diff_shows_nothing_of_it() {
+    let fails = |new: String| {
+        let mut code = read(slice(STRETCHED, None), 0);
+        code.act(Control::File(0), &[]);
+        code.act(Control::Stretch(0, 1), &[]);
+        assert!(code.ask_text(2).is_some());
+        assert!(code.take_text(2, text(new)));
+        let rows_now = rows(&code, 80);
+        let failed = rows_now[7].starts_with("This file's text doesn't match");
+        if failed {
+            assert_eq!(rows_now[6], "⋯ 250 unmodified lines");
+        }
+        failed
+    };
+    assert!(!fails(numbered(400)));
+    // A line of a hunk differs, as after a push since the diff was read.
+    assert!(fails(numbered(400).replace("l254\n", "l254 changed\n")));
+    // The text ends before the last hunk's lines, or before a hunk that only removes.
+    assert!(fails(numbered(255)));
+    assert!(!fails(numbered(256)));
+    // Windows line ends and a last line without one read as the patch's lines do.
+    assert!(!fails(numbered(400).replace('\n', "\r\n")));
+    assert!(!fails(numbered(256).trim_end().to_string()));
+    assert!(fails(String::new()));
+
+    let removal = "diff --git a/g b/g
+--- a/g
++++ b/g
+@@ -3,2 +2,0 @@
+-x
+-y
+";
+    let mut code = read(slice(removal, None), 0);
+    code.act(Control::File(0), &[]);
+    // The two lines before a removal at the end of the file show, then nothing is left.
+    assert_eq!(
+        rows(&code, 80),
+        [
+            "1 file",
+            "",
+            "⌄ M g +0 -2",
+            "⋯ 2 unmodified lines",
+            "3 - x",
+            "4 - y",
+            "⋯ More unchanged context may be available"
+        ]
+    );
+    code.act(Control::Stretch(0, 1), &[]);
+    assert!(code.ask_text(2).is_some());
+    assert!(code.take_text(2, text("a\nb\n".into())));
+    assert_eq!(
+        rows(&code, 80)[3..],
+        ["⋯ 2 unmodified lines", "3 - x", "4 - y"]
+    );
+    code.act(Control::Stretch(0, 0), &[]);
+    assert_eq!(rows(&code, 80)[3..5], ["1   a", "2   b"]);
+    assert!(fits("a\n", removal, &patch::Patch::read(removal).files[0]).is_none());
+}
+
+#[test]
+fn only_a_file_changed_in_place_or_renamed_and_changed_offers_its_lines() {
+    let patch = "diff --git a/added b/added
+new file mode 100644
+--- /dev/null
++++ b/added
+@@ -0,0 +1 @@
++a
+diff --git a/deleted b/deleted
+deleted file mode 100644
+--- a/deleted
++++ /dev/null
+@@ -1 +0,0 @@
+-a
+diff --git a/moved b/moved
+similarity index 100%
+rename from moved
+rename to there
+diff --git a/old b/new
+similarity index 90%
+rename from old
+rename to new
+--- a/old
++++ b/new
+@@ -5 +5 @@
+-x
++y
+diff --git a/skewed b/skewed
+--- a/skewed
++++ b/skewed
+@@ -5 +7 @@
+-x
++y
+";
+    let mut code = read(slice(patch, None), 0);
+    for at in 0..5 {
+        code.act(Control::File(at), &[]);
+    }
+    let files = (0..5)
+        .map(|at| code.file(at).unwrap().1.path().to_string())
+        .collect::<Vec<_>>();
+    let offered: Vec<_> = (0..5)
+        .filter(|&at| (0..2).any(|place| code.has(Control::Stretch(at, place), &[])))
+        .map(|at| files[at].as_str())
+        .collect();
+    assert_eq!(offered, ["new"]);
+    let new = files.iter().position(|path| path == "new").unwrap();
+    code.act(Control::Stretch(new, 0), &[]);
+    let asked = code.ask_text(2);
+    assert_eq!(
+        asked,
+        Some((ChangeType::RenameChanged, "old".into(), "new".into()))
+    );
+    // A file whose hunk headers leave more lines before a hunk on one side than the other
+    // counts them as before, offers nothing, and wants no text.
+    let skewed = files.iter().position(|path| path == "skewed").unwrap();
+    code.act(Control::Stretch(skewed, 0), &[]);
+    assert_eq!(code.ask_text(3), None);
+    let (lines, targets) = laid(&code, 80);
+    let rows_now = rows_of(&lines);
+    assert!(rows_now.contains(&"⋯ 4 unmodified lines".to_string()));
+    assert_eq!(
+        rows_now
+            .iter()
+            .filter(|row| row.starts_with("⋯ More"))
+            .count(),
+        1
+    );
+    for (rows, control) in &targets {
+        if let Control::Stretch(at, _) = control {
+            assert_eq!(*at, new);
+            assert!(rows_now[rows.start].starts_with('⋯'));
+        }
+    }
+
+    // A binary file, one past t3term's bound and one with a broken hunk offer nothing either.
+    let mut file = patch::Patch::read(STRETCHED).files.remove(0);
+    assert_eq!(change_type(&file), Some(ChangeType::Change));
+    for broken in 0..3 {
+        let mut file = file.clone();
+        match broken {
+            0 => file.binary = true,
+            1 => file.lines_cut = true,
+            _ => file.unreadable = true,
+        }
+        assert_eq!(change_type(&file), None, "{broken}");
+        assert_eq!(stretches(&file), None, "{broken}");
+    }
+    file.old_path = None;
+    assert_eq!(change_type(&file), None);
+
+    // Nor does a file added or deleted whose header names both paths.
+    let named = "diff --git a/fresh b/fresh\nnew file mode 100644\n--- a/fresh\n+++ b/fresh\n\
+                 @@ -0,0 +1 @@\n+a\ndiff --git a/gone b/gone\ndeleted file mode 100644\n\
+                 --- a/gone\n+++ b/gone\n@@ -1 +0,0 @@\n-a\n";
+    for file in patch::Patch::read(named).files {
+        assert!(
+            file.old_path.is_some() && file.new_path.is_some(),
+            "{file:?}"
+        );
+        assert_eq!(change_type(&file), None, "{file:?}");
+    }
+}
+
+#[test]
+fn the_text_stays_while_the_hunks_do_and_goes_with_another_diff() {
+    let shown_after_read = |code: &mut Code, ticket| {
+        code.act(Control::Stretch(0, 1), &[]);
+        assert!(code.ask_text(ticket).is_some());
+        assert!(code.take_text(ticket, text(numbered(400))));
+        assert_eq!(rows(code, 80)[106], "⋯ 50 unmodified lines");
+    };
+    let mut code = read(slice(STRETCHED, None), 0);
+    code.act(Control::File(0), &[]);
+    shown_after_read(&mut code, 2);
+
+    // A read of the diff again with the same hunks keeps the lines shown.
+    code.again();
+    assert_eq!(code.ask(3), Some(None));
+    assert_eq!(code.take(3, Ok(slice(STRETCHED, None)), 1), Some(true));
+    assert_eq!(rows(&code, 80)[106], "⋯ 50 unmodified lines");
+
+    // A change to a hunk takes the file back to its rows before the text came.
+    let changed = STRETCHED.replace("-o256", "-p256");
+    code.again();
+    assert_eq!(code.ask(4), Some(None));
+    assert_eq!(code.take(4, Ok(slice(&changed, None)), 2), Some(true));
+    assert_eq!(rows(&code, 80)[6], "⋯ 250 unmodified lines");
+    shown_after_read(&mut code, 5);
+
+    // A file the first slice of a read again doesn't have keeps its text while slices are
+    // left to read, and loses it once none are.
+    let other = "diff --git a/z b/z
+--- a/z
++++ b/z
+@@ -1 +1 @@
+-a
++b
+";
+    code.again();
+    assert_eq!(code.ask(6), Some(None));
+    assert_eq!(code.take(6, Ok(slice(other, Some("2"))), 3), Some(true));
+    code.near_end();
+    assert_eq!(code.ask(7), Some(Some("2".into())));
+    assert_eq!(code.take(7, Ok(slice(&changed, None)), 3), Some(false));
+    let rows_now = rows(&code, 80);
+    assert!(rows_now.contains(&"⋯ 50 unmodified lines".to_string()));
+    code.again();
+    assert_eq!(code.ask(8), Some(None));
+    assert_eq!(code.take(8, Ok(slice(other, None)), 4), Some(true));
+    assert_eq!(code.take(8, Ok(slice(&changed, None)), 4), None);
+    code.again();
+    assert_eq!(code.ask(9), Some(None));
+    assert_eq!(code.take(9, Ok(slice(&changed, None)), 5), Some(true));
+    assert_eq!(rows(&code, 80)[6], "⋯ 250 unmodified lines");
+
+    // An answer for a file the diff no longer shows is dropped.
+    code.act(Control::Stretch(0, 1), &[]);
+    assert!(code.ask_text(10).is_some());
+    code.again();
+    assert_eq!(code.ask(11), Some(None));
+    assert_eq!(code.take(11, Ok(slice(other, None)), 6), Some(true));
+    assert!(!code.take_text(10, text(numbered(400))));
+
+    // Another commit's diff starts with no text read.
+    let mut code = read(slice(STRETCHED, None), 0);
+    code.act(Control::File(0), &[]);
+    shown_after_read(&mut code, 2);
+    let conversation = committed(Vec::new(), &[("abc1234def", "One", "2026-10-15T08:00:00Z")]);
+    assert!(code.act(Control::Commit(0), &conversation.commits()));
+    assert_eq!(code.ask(3), Some(None));
+    assert_eq!(code.take(3, Ok(slice(STRETCHED, None)), 1), Some(true));
+    code.act(Control::File(0), &[]);
+    assert_eq!(rows(&code, 80)[6], "⋯ 250 unmodified lines");
+}
+
+#[test]
+fn a_files_text_goes_when_its_hunks_or_paths_change() {
+    let read_text = |code: &mut Code, ticket| {
+        code.act(Control::Stretch(0, 1), &[]);
+        assert!(code.ask_text(ticket).is_some());
+        assert!(code.take_text(ticket, text(numbered(400))));
+        assert!(rows(code, 80).contains(&"⋯ 50 unmodified lines".to_string()));
+    };
+    let read_again = |code: &mut Code, ticket, patch: &str| {
+        code.again();
+        assert_eq!(code.ask(ticket), Some(None));
+        assert_eq!(code.take(ticket, Ok(slice(patch, None)), 1), Some(true));
+    };
+    let unread = |code: &Code, before: &str, between: &str| {
+        let rows_now = rows(code, 80);
+        assert_eq!(rows_now[3], before, "{rows_now:#?}");
+        assert!(rows_now.contains(&between.to_string()), "{rows_now:#?}");
+        assert!(
+            !rows_now.iter().any(|row| row.ends_with("   l4")),
+            "{rows_now:#?}"
+        );
+    };
+    let mut code = read(slice(STRETCHED, None), 0);
+    code.act(Control::File(0), &[]);
+    read_text(&mut code, 2);
+
+    // Hunks that change and change back don't bring back the text read before.
+    read_again(&mut code, 3, &STRETCHED.replace("-o256", "-p256"));
+    read_again(&mut code, 4, STRETCHED);
+    unread(&code, "⋯ 2 unmodified lines", "⋯ 250 unmodified lines");
+
+    // Nor does a hunk that moves with the same lines, as after the base gained a line.
+    read_text(&mut code, 5);
+    let moved = STRETCHED.replace("@@ -3 +3 @@", "@@ -4 +4 @@");
+    read_again(&mut code, 6, &moved);
+    unread(&code, "⋯ 3 unmodified lines", "⋯ 249 unmodified lines");
+
+    // Nor a file renamed before and changed in place now, which T3 reads by other paths.
+    let renamed = STRETCHED.replace(
+        "diff --git a/f.rs b/f.rs\n--- a/f.rs",
+        "diff --git a/e.rs b/f.rs\nsimilarity index 90%\nrename from e.rs\nrename to f.rs\n--- a/e.rs",
+    );
+    read_again(&mut code, 7, &renamed);
+    code.act(Control::Stretch(0, 1), &[]);
+    assert_eq!(
+        code.ask_text(8),
+        Some((ChangeType::RenameChanged, "e.rs".into(), "f.rs".into()))
+    );
+    assert!(code.take_text(8, text(numbered(400))));
+    read_again(&mut code, 9, STRETCHED);
+    unread(&code, "⋯ 2 unmodified lines", "⋯ 250 unmodified lines");
+    code.act(Control::Stretch(0, 1), &[]);
+    assert_eq!(
+        code.ask_text(10),
+        Some((ChangeType::Change, "f.rs".into(), "f.rs".into()))
+    );
+
+    // An answer that comes while the file waits for a later slice is dropped, and the file
+    // reads its text again once it's back.
+    let other = "diff --git a/z b/z\n--- a/z\n+++ b/z\n@@ -1 +1 @@\n-a\n+b\n";
+    code.again();
+    assert_eq!(code.ask(11), Some(None));
+    assert_eq!(code.take(11, Ok(slice(other, Some("2"))), 2), Some(true));
+    assert!(!code.take_text(10, text(numbered(400))));
+    code.near_end();
+    assert_eq!(code.ask(12), Some(Some("2".into())));
+    assert!(code.take(12, Ok(slice(STRETCHED, None)), 2).is_some());
+    let rows_now = rows(&code, 80);
+    assert!(
+        rows_now.contains(&"⋯ 250 unmodified lines".to_string()),
+        "{rows_now:#?}"
+    );
+    assert_eq!(code.file(1).unwrap().1.path(), "f.rs");
+    code.act(Control::Stretch(1, 1), &[]);
+    assert!(code.ask_text(13).is_some());
+}
+
+#[test]
+fn a_run_shows_the_lines_nearest_its_hunk_and_widens_the_numbers() {
+    // Before the first hunk, the 100 lines nearest it show first.
+    let late = "diff --git a/h.rs b/h.rs\n--- a/h.rs\n+++ b/h.rs\n@@ -251 +251 @@\n-o251\n+l251\n";
+    let mut code = read(slice(late, None), 0);
+    code.act(Control::File(0), &[]);
+    assert_eq!(
+        code.action(Control::Stretch(0, 0), &[]),
+        "show 100 unmodified lines"
+    );
+    code.act(Control::Stretch(0, 0), &[]);
+    assert!(code.ask_text(2).is_some());
+    assert!(code.take_text(2, text(numbered(260))));
+    let rows_now = rows(&code, 80);
+    assert_eq!(rows_now[3], "⋯ 150 unmodified lines");
+    assert_eq!(rows_now[4..104], unchanged(151..=250, 3));
+    assert_eq!(
+        rows_now[104..],
+        ["251 - o251", "251 + l251", "⋯ 9 unmodified lines"]
+    );
+
+    // Lines past the hunks' numbers widen the column the numbers take.
+    let early = "diff --git a/g.rs b/g.rs\n--- a/g.rs\n+++ b/g.rs\n@@ -98 +98 @@\n-o98\n+l98\n";
+    let mut code = read(slice(early, None), 0);
+    code.act(Control::File(0), &[]);
+    assert_eq!(rows(&code, 80)[4..6], ["98 - o98", "98 + l98"]);
+    code.act(Control::Stretch(0, 1), &[]);
+    assert!(code.ask_text(2).is_some());
+    assert!(code.take_text(2, text(numbered(150))));
+    let rows_now = rows(&code, 80);
+    assert_eq!(
+        rows_now[3..6],
+        ["⋯ 97 unmodified lines", " 98 - o98", " 98 + l98"]
+    );
+    assert_eq!(rows_now[6..], unchanged(99..=150, 3));
+}
+
+#[test]
+fn rows_that_count_lines_keep_their_targets_among_threads() {
+    let mut conversation = conversation(vec![
+        thread(
+            "a",
+            "f.rs",
+            Some(3),
+            "right",
+            false,
+            &["On the first hunk."],
+        ),
+        thread("b", "f.rs", Some(254), "left", false, &["On the second."]),
+        thread("c", "f.rs", Some(254), "right", false, &["Twice on it."]),
+    ]);
+    let mut code = read(slice(STRETCHED, None), 0);
+    code.act(Control::File(0), &[]);
+    code.act(Control::Stretch(0, 1), &[]);
+    assert!(code.ask_text(2).is_some());
+    assert!(code.take_text(2, text(numbered(400))));
+    let shown = Shown::default();
+    code.prepare(80, &theme());
+    let (rows, targets) = with_threads(&code, &mut conversation, &shown, 80);
+    // Every target is in row order, and each run's is the row that counts it.
+    let starts: Vec<_> = targets.iter().map(|(rows, _)| rows.start).collect();
+    assert!(
+        starts.windows(2).all(|pair| pair[0] < pair[1]),
+        "{targets:?}"
+    );
+    let counted: Vec<_> = targets
+        .iter()
+        .filter_map(|(at, control)| match control {
+            Control::Stretch(_, place) => Some((*place, rows[at.start].as_str())),
+            _ => None,
+        })
+        .collect();
+    assert_eq!(
+        counted,
+        [
+            (0, "⋯ 2 unmodified lines"),
+            (1, "⋯ 50 unmodified lines"),
+            (3, "⋯ 144 unmodified lines")
+        ]
+    );
+    let card = rows
+        .iter()
+        .position(|row| row.contains("On the first hunk"));
+    let fifty = rows.iter().position(|row| row == "⋯ 50 unmodified lines");
+    assert!(card.unwrap() < fifty.unwrap());
+}
+
+#[test]
+fn a_file_read_past_what_the_tab_keeps_forgets_the_first_read() {
+    let patch: String = (0..=MOST_TEXTS)
+        .map(|n| format!("diff --git a/f{n:02} b/f{n:02}\n--- a/f{n:02}\n+++ b/f{n:02}\n@@ -3 +3 @@\n-o3\n+l3\n"))
+        .collect();
+    let mut code = read(slice(&patch, None), 0);
+    for at in 0..=MOST_TEXTS {
+        code.act(Control::File(at), &[]);
+    }
+    for at in 0..MOST_TEXTS {
+        code.act(Control::Stretch(at, 0), &[]);
+        let ticket = at as u64 + 10;
+        assert!(code.ask_text(ticket).is_some());
+        assert!(code.take_text(ticket, text(numbered(4))));
+    }
+    let shows_first = |code: &Code| {
+        let rows = rows(code, 80);
+        let header = rows.iter().position(|row| row == "⌄ M f00 +1 -1").unwrap();
+        rows[header + 1] == "1   l1"
+    };
+    assert!(shows_first(&code));
+    code.prepare(80, &theme());
+    code.act(Control::Stretch(MOST_TEXTS, 0), &[]);
+    assert_eq!(code.contexts.len(), MOST_TEXTS);
+    assert!(
+        !shows_first(&code),
+        "the first file's text went, and its rows with it"
+    );
+    assert_eq!(code.contexts[0].path, "f01");
+}
+
+#[test]
+fn unchanged_lines_fit_every_width_and_hostile_text_is_cleaned() {
+    let hostile: String = (1..=400)
+        .map(|n| match n {
+            3 | 254 | 256 => format!("l{n}\n"),
+            100 => "\u{1b}]0;title\u{7}\t\u{1b}[31mred\u{1b}[0m 漢字漢字漢字\n".to_string(),
+            n => format!("line {n} {}\n", "x".repeat(n as usize % 90)),
+        })
+        .collect();
+    let mut code = read(slice(STRETCHED, None), 0);
+    code.act(Control::File(0), &[]);
+    code.act(Control::Stretch(0, 1), &[]);
+    assert!(code.ask_text(2).is_some());
+    assert!(code.take_text(2, text(hostile)));
+    code.act(Control::Stretch(0, 3), &[]);
+    for width in 1..=80 {
+        let (lines, targets) = laid(&code, width);
+        for line in &lines {
+            assert!(line.width() <= width, "{width}: {line:?}");
+            let text = line.to_string();
+            assert!(
+                !text.contains(|c: char| c.is_control()),
+                "{width}: {text:?}"
+            );
+        }
+        assert!(targets.iter().all(|(rows, _)| rows.end <= lines.len()));
+        let counted = targets
+            .iter()
+            .filter(|(_, control)| matches!(control, Control::Stretch(..)))
+            .count();
+        assert_eq!(counted, 3, "{width}");
+    }
+    let rows_now = rows(&code, 80);
+    assert!(rows_now.contains(&"100   ]0;title    [31mred[0m 漢字漢字漢字".to_string()));
 }

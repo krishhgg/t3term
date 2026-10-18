@@ -951,6 +951,22 @@ pub(super) struct CommentsAsk {
     pub cursor: String,
 }
 
+/// What reading a file's whole text after the change names, for the unchanged lines around its
+/// hunks: the link's host, repository and number as T3 sent them, the commit whose own diff the
+/// Code tab shows, or None for the whole change's, how the file changed, its paths before and
+/// after the change, and the ticket its answer comes back with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct TextAsk {
+    pub ticket: u64,
+    pub host: String,
+    pub repository: String,
+    pub number: u64,
+    pub commit: Option<String>,
+    pub change: pull_request::ChangeType,
+    pub old_path: String,
+    pub new_path: String,
+}
+
 /// Part of what a host said of a pull request. A read sends its detail, its conversation and,
 /// where the host keeps stacks, its stack, as each arrives, then `Done`.
 pub(super) enum Part {
@@ -2325,6 +2341,55 @@ impl PullRequests {
             thread,
             cursor,
         })
+    }
+
+    /// The read of a file's text that Enter on a run of unchanged lines on the Code tab asked
+    /// for, while the details show the read. None unless `enabled`.
+    pub fn take_text_ask(&mut self, enabled: bool) -> Option<TextAsk> {
+        if !enabled || !self.showing_read() {
+            return None;
+        }
+        let ticket = self.tickets + 1;
+        let read = self.read.as_mut().expect("the shown read");
+        let code = read.code.as_mut()?;
+        let (change, old_path, new_path) = code.ask_text(ticket)?;
+        self.tickets = ticket;
+        Some(TextAsk {
+            ticket,
+            host: read.host.clone(),
+            repository: read.repository.clone(),
+            number: read.number,
+            commit: code.commit().map(str::to_string),
+            change,
+            old_path,
+            new_path,
+        })
+    }
+
+    /// Takes the answer to read `ticket` of a file's text, or why it failed. Says whether what
+    /// the details show changed. A run whose lines all show once it came goes, and so does
+    /// its choice. An answer to a read the details no longer hold is dropped.
+    pub fn answer_text(
+        &mut self,
+        ticket: u64,
+        answer: Result<Box<pull_request::FileContents>, String>,
+    ) -> bool {
+        let Some(read) = self.read.as_mut() else {
+            return false;
+        };
+        let Some(code) = read.code.as_mut() else {
+            return false;
+        };
+        if !code.take_text(ticket, answer) {
+            return false;
+        }
+        if let Some(pick @ Control::Stretch(..)) = self.pick
+            && !code.has(pick, &[])
+        {
+            self.pick = None;
+        }
+        self.relay();
+        true
     }
 
     /// Takes the answer to read `ticket` of a page of a review thread's remarks, or why it
@@ -7059,6 +7124,148 @@ mod tests {
             count(&rows, "│ 1 more comment on the host."),
             1,
             "{rows:#?}"
+        );
+    }
+
+    /// A diff of one file changed in place, whose hunks at lines 3, 254 and 256 leave runs of
+    /// 2, 250 and 1 unchanged lines before them.
+    fn stretched() -> Box<pull_request::Diff> {
+        let patch = "diff --git a/f.rs b/f.rs\n--- a/f.rs\n+++ b/f.rs\n\
+                     @@ -3 +3 @@\n-o3\n+l3\n@@ -254 +254 @@\n-o254\n+l254\n\
+                     @@ -256 +256 @@\n-o256\n+l256\n";
+        Box::new(pull_request::Diff {
+            patch: patch.into(),
+            truncated: false,
+            next_cursor: None,
+            omitted: Vec::new(),
+            omitted_cut: false,
+        })
+    }
+
+    #[test]
+    fn a_run_of_unchanged_lines_reads_its_files_text_once() {
+        let theme = theme();
+        let diff = stretched;
+        let text = |count: u64| {
+            let new = (1..=count).map(|n| format!("l{n}\n")).collect();
+            Ok(Box::new(pull_request::FileContents { new }))
+        };
+        let text_ask = |ticket: u64| TextAsk {
+            ticket,
+            host: "github.com".into(),
+            repository: "krishhgg/t3term".into(),
+            number: 31,
+            commit: None,
+            change: pull_request::ChangeType::Change,
+            old_path: "f.rs".into(),
+            new_path: "f.rs".into(),
+        };
+        let mut pulls = conversing(remarks(1));
+        assert!(!pulls.answer(1, Part::Done, now()));
+        assert!(pulls.forward() && pulls.forward());
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
+        assert!(pulls.answer_diff(2, Ok(diff()), now()));
+        pulls.page(60, 40, now(), true, &theme);
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::File(0)));
+        pulls.enter();
+        pulls.page(60, 40, now(), true, &theme);
+        // Nothing reads until Enter on a run.
+        assert_eq!(pulls.take_text_ask(true), None);
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::Stretch(0, 0)));
+        assert_eq!(pulls.action().as_deref(), Some("show 2 unmodified lines"));
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::Stretch(0, 1)));
+        assert_eq!(pulls.action().as_deref(), Some("show 200 unmodified lines"));
+
+        // Enter asks for the file's text once, and the run stays chosen while it comes.
+        pulls.enter();
+        assert_eq!(pulls.pick, Some(Control::Stretch(0, 1)));
+        assert_eq!(pulls.take_text_ask(false), None);
+        assert_eq!(pulls.take_text_ask(true), Some(text_ask(3)));
+        assert_eq!(pulls.take_text_ask(true), None);
+        pulls.page(60, 40, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(
+            rows.contains(&"⋯ 250 unmodified lines · Reading…".to_string()),
+            "{rows:#?}"
+        );
+
+        // An answer to another read changes nothing. A failure says why under the run, and
+        // Enter reads again.
+        assert!(!pulls.answer_text(99, text(400)));
+        let failure = Err("GitHub took too long to answer.".to_string());
+        assert!(pulls.answer_text(3, failure));
+        assert!(!pulls.answer_text(3, text(400)));
+        pulls.page(60, 40, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        let at = rows
+            .iter()
+            .position(|row| row == "⋯ 250 unmodified lines")
+            .expect("the run");
+        assert_eq!(rows[at + 1], "GitHub took too long to answer.");
+        assert_eq!(pulls.pick, Some(Control::Stretch(0, 1)));
+
+        // A run that shows whole once the text comes goes, and so does its choice.
+        pulls.pick = Some(Control::Stretch(0, 2));
+        assert_eq!(pulls.action().as_deref(), Some("show 1 unmodified line"));
+        pulls.enter();
+        assert_eq!(pulls.take_text_ask(true), Some(text_ask(4)));
+        assert!(pulls.answer_text(4, text(400)));
+        assert_eq!(pulls.pick, None);
+        pulls.page(60, 40, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        let at = rows
+            .iter()
+            .position(|row| row == "255   l255")
+            .expect("the run shown");
+        assert_eq!(rows[at - 1], "254 + l254");
+        assert_eq!(rows[at + 1], "256 - o256");
+
+        // With the text read, Enter shows lines at once and asks for nothing.
+        pulls.pick = Some(Control::Stretch(0, 1));
+        pulls.enter();
+        assert_eq!(pulls.take_text_ask(true), None);
+        assert_eq!(pulls.pick, Some(Control::Stretch(0, 1)));
+        assert_eq!(pulls.action().as_deref(), Some("show 50 unmodified lines"));
+        pulls.page(60, 40, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(rows.contains(&"103   l103".to_string()), "{rows:#?}");
+        assert!(rows.contains(&"⋯ 50 unmodified lines".to_string()));
+    }
+
+    #[test]
+    fn a_run_under_a_commits_diff_reads_that_commits_text() {
+        let theme = theme();
+        let mut activity = remarks(1);
+        activity["commits"] = json!([{"oid": "abc1234def", "messageHeadline": "One",
+            "committedDate": "2026-10-13T00:00:00Z"}]);
+        let mut pulls = conversing(activity);
+        assert!(!pulls.answer(1, Part::Done, now()));
+        assert!(pulls.forward() && pulls.forward());
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
+        assert!(pulls.answer_diff(2, Ok(stretched()), now()));
+        pulls.page(60, 40, now(), true, &theme);
+        pulls.pick = Some(Control::Commits);
+        pulls.enter();
+        pulls.page(60, 40, now(), true, &theme);
+        pulls.pick = Some(Control::Commit(0));
+        pulls.enter();
+        let ask = pulls.take_diff_ask(true, now()).expect("the commit's diff");
+        assert_eq!(ask.commit.as_deref(), Some("abc1234def"));
+        assert!(pulls.answer_diff(ask.ticket, Ok(stretched()), now()));
+        pulls.page(60, 40, now(), true, &theme);
+        pulls.pick = Some(Control::File(0));
+        pulls.enter();
+        pulls.page(60, 40, now(), true, &theme);
+        pulls.pick = Some(Control::Stretch(0, 1));
+        pulls.enter();
+        let ask = pulls.take_text_ask(true).expect("the file's text");
+        assert_eq!(ask.commit.as_deref(), Some("abc1234def"));
+        assert_eq!(
+            (ask.old_path.as_str(), ask.new_path.as_str()),
+            ("f.rs", "f.rs")
         );
     }
 
