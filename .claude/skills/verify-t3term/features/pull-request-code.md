@@ -11,16 +11,20 @@
 - **Viewed files.** Where the detail's `capabilities.viewedFiles` says who keeps the reader's marks, the Code reads them through `pullRequests.filesViewed` the first time it shows. Once they come the count reads `8 files · 3 / 8 viewed`, counting the files read so far, and a viewed file reads `› M src/config/reader.rs +7 -5 · ✓ Viewed`, with the mark in grey. A file pushed to since its mark reads `Changed since viewed` in yellow, on the row under its header where it doesn't fit, and a file not viewed shows nothing. Showing the Code again 15 s or more after the marks came, or after their read failed, reads them again, and so does each read of the diff again. A commit's diff keeps the marks and reads none. A first read that fails shows `t3term couldn't read which files you viewed.` in yellow and the reason, with no marks in the count. A later one keeps the marks under `The viewed marks may be out of date: t3term couldn't read them again.` A read that says the host had more files than it covered shows `This change has more files than the host reports viewed marks for in one read, so the count is short.` in yellow.
 - **Order.** Each slice's files show in the desktop's reading order, not the patch's. Source files come first, each after the changed files it imports and otherwise by path. Tests come next, each after the source file whose name it has, then lockfiles, snapshots and files under `dist`, `build`, `vendor`, `__generated__` or `__snapshots__`, by path. A later slice never moves the files above it. So the first slice reads `assets/config-flow.png`, `src/config/reader.rs`, `src/config/schema.rs`, the rename and `tests/config_reload.rs`, and the second `docs/config.md`, `src/legacy/reader_v1.rs` and `Cargo.lock`.
 - **Unfolding.** Enter on the chosen file, or a click on it, turns `›` into `⌄` and shows its lines. Each line has its number in grey, the new one or the old for a removed line, then `-` and the line in red, `+` and the line in green, or a space and the line. `⋯ 14 unmodified lines` comes before a hunk that doesn't start at line 1. A line that wraps leaves the number and the mark blank on its later rows, and a tab stops every 4 columns. A binary file reads `A binary file, whose changes have no lines to show.` and a file the host withheld `The host withheld this file's changes.` Enter or a click again folds the file.
+- **Whitespace.** Changes to whitespace start hidden. Where the tab has files, `¶ Show whitespace changes` sits under the count and its notes. A line changed only in its whitespace shows unchanged, with its text after the change, and the counts leave it out, so reader.rs reads `+5 -3` and schema.rs `+7 -0`. Enter or a click on the row shows them in every file, and the row reads `¶ Hide whitespace changes`. Neither reads anything. A read again and a commit picked keep the choice, and another link starts with them hidden. A hunk too large to compare shows its whitespace changes, and a note under the count says how many do. The other bullets' examples show the whitespace changes.
+- **Fold all.** Where the tab has files, `⇊ Expand all files` sits under the whitespace row, above the list off the diff. Enter or a click unfolds every file. While any file shows unfolded the row reads `⇈ Collapse all files`, and Enter or a click folds them all. Either way each file's own fold is forgotten, and files read later, such as a later slice's, follow the row. A file folded or unfolded after keeps its fold through a read of the diff again. Picking a commit starts its files folded.
+- **Split.** The lines stack at first, and `◫ Split diff view` sits under the fold row. Enter or a click sets the lines before the change on the left and those after it on the right, each side with its own numbers and a grey `│` between them, and the row reads `⊟ Stacked diff view`, which stacks them again. Each side has half the room, 26 columns at 100x30, and the right one takes the column left over. The lines removed and added in a row pair by position, and a side with no line stays blank. A file added or deleted keeps one column. Unwrapped, both sides scroll sideways by the same columns. A read again and another diff picked keep the choice, and another link starts stacked.
+- **Wrap.** The lines wrap at first, and `↵ Disable line wrapping` sits under the layout row. Enter or a click lets each line run on in one row, cut at the details' edge, and the row reads `↵ Enable line wrapping`, which wraps them again. A read again and another diff picked keep the choice, and another link starts wrapped. While the lines don't wrap, `L` or Shift+→ scrolls their text half the details' width to the right, 26 columns at 100x30, and `H` or Shift+← scrolls it back. The numbers, the marks and the other rows stay put, and the text stops once the end of the widest line shows. Esc and Alt+B keep the text where it was, and so does a read again. The details opened again from the list start it at the left, and so does another diff picked. The status line offers `H/L sideways` while a line runs past the edge, ahead of `r refresh`, which a narrow status line drops first.
 - **Unchanged lines.** Each run of unchanged lines around a file's hunks is a control. Before a hunk it reads `⋯ 14 unmodified lines`. After the last hunk of a file changed in place or renamed and changed it reads `⋯ More unchanged context may be available` until the file's text comes, then counts what is left, as `⋯ 7 unmodified lines`. The first Enter or click on a run reads the file's text through `pullRequests.diffFileContents`, and the run reads `· Reading…` until it comes. Then the run shows up to 100 more lines at each end that touches a hunk, and each Enter after shows 100 more, until the run shows whole and its row goes. A failed read shows its reason under the run, and Enter reads again. The file keeps its text and the lines it showed while a read of the diff again leaves its hunks as they were.
 - **Review threads.** A thread on a line of an unfolded file shows under that line, behind a grey bar, where the line has that number on the thread's side. Its first row reads `⌄ Open · 4 comments`, with `Resolved` in green and `· outdated` where the host says so. A thread starts open unless it is resolved. Open, it shows each comment with its author and age. Where the host has another page, `Load more comments` follows. It reads the page through `pullRequests.threadComments`, reads `Loading more comments…` until the page comes, then shows the page's comments after the thread's, each once, and goes once the thread is whole. A failed page shows `t3term couldn't read more comments.` and the reason above the button, which reads the same page again. Where the host counts comments it has no page for, `2 more comments on the host.` shows instead. The pages stay with the thread when the conversation is read again. On a row with both numbers, a thread on the old side comes before one on the new. Enter or a click on the first row opens or closes it, and it stays so across reads. A folded file shows none of its threads.
 - **Off the diff.** Threads on a line no file read so far shows go to a list above the files that starts closed: `› 1 conversation not on the diff read so far` while slices are left, then `› 1 conversation not on the current diff`. Open, it lists each path once, then `Line 12` and the thread.
-- **Choosing.** Once a file, a thread, the list or `↻ Retry` is in view, ↓ chooses the next one and ↑ the one before, and the status line leads with what Enter does: `Enter expand file`, `Enter collapse file`, `Enter choose commit`, `Enter hide commits`, `Enter show all commits`, `Enter show commit 9dc565a`, `Enter show more commits`, `Enter show 14 unmodified lines`, `Enter show unmodified lines` before the text is read, `Enter show conversation`, `Enter hide conversation`, `Enter load more comments`, `Enter show conversations off the diff` or `Enter retry`. A click or Enter on `Load more comments` or `↻ Retry` lets go of the pick, since the row turns into a loading one. Where none is in view, they scroll.
+- **Choosing.** Once a file, the whitespace row, the row that folds them all, the layout row, the wrap row, a thread, the list or `↻ Retry` is in view, ↓ chooses the next one and ↑ the one before, and the status line leads with what Enter does: `Enter expand file`, `Enter collapse file`, `Enter choose commit`, `Enter hide commits`, `Enter show whitespace changes`, `Enter hide whitespace changes`, `Enter expand all files`, `Enter collapse all files`, `Enter show split diff view`, `Enter show stacked diff view`, `Enter disable line wrapping`, `Enter enable line wrapping`, `Enter show all commits`, `Enter show commit 9dc565a`, `Enter show more commits`, `Enter show 14 unmodified lines`, `Enter show unmodified lines` before the text is read, `Enter show conversation`, `Enter hide conversation`, `Enter load more comments`, `Enter show conversations off the diff` or `Enter retry`. A click or Enter on `Load more comments` or `↻ Retry` lets go of the pick, since the row turns into a loading one. Where none is in view, they scroll.
 - **Reading again.** A new refresh number, `r` and a detail whose `updatedAt` changed each read the first slice again. The files read before stay, each with its fold, until the new slice replaces them, and the count goes back to `5 files+` until the end of the files comes near again. After `r` the diff waits for the refresh number `pullRequests.invalidate` raises, or for the end of the read that sent it, so T3 has forgotten the diff it held.
 - **Failures.** A first slice that fails shows `Couldn't read this diff: GitHub took too long to answer.` alone. Showing the Code again, or `r`, reads it again, and the failure stays until the files come. A later slice that fails shows `t3term couldn't read the rest of this diff.`, the reason and `↻ Retry` under the files, and Retry reads that slice again. A read again of the first slice that fails keeps the files under `May be out of date: t3term couldn't read the diff again.` and the reason.
 
 ## How to get to it (user POV)
 
-Open a thread, open its details (Alt+B), press → for `Pull requests`, choose a link and press Enter, then press → twice or click `Code`. Once a file is in view, ↑ and ↓ choose it and Enter unfolds or folds it, or click the file. PgUp, PgDn, Home, End and the wheel scroll. `r` reads the pull request and its diff from the host again.
+Open a thread, open its details (Alt+B), press → for `Pull requests`, choose a link and press Enter, then press → twice or click `Code`. Once a file is in view, ↑ and ↓ choose it and Enter unfolds or folds it, or click the file. Enter or a click on `¶ Show whitespace changes` shows the changes to whitespace, on `⇊ Expand all files` unfolds every file, on `◫ Split diff view` sets the lines side by side, and on `↵ Disable line wrapping` lets each line run on in one row, which `H` and `L` scroll sideways. PgUp, PgDn, Home, End and the wheel scroll. `r` reads the pull request and its diff from the host again.
 
 ## Driving it with t3v
 
@@ -36,6 +40,9 @@ settle() { local i; for i in $(seq 50); do [ "$(since)" = "$1" ] && return 0; sl
 viewed() { jq -s -c '[.[] | select(.event == "pr.filesViewed") | .number]' "$E/events.jsonl"; }
 vsettle() { local i; for i in $(seq 50); do [ "$(viewed)" = "$1" ] && return 0; sleep 0.2; done; viewed; return 1; }
 vcount() { local i; for i in $(seq 50); do [ "$(viewed | jq length)" = "$1" ] && return 0; sleep 0.2; done; viewed; return 1; }
+# The toolbar's rows under the count push the files down by one row each, and ↓ chooses each of them.
+TB=4
+down() { $T3V keys $(printf 'Down %.0s' $(seq "$1")); }
 $T3V click --text "Single: one open link" && $T3V wait --text "/  Single: one open link"
 $T3V keys M-b && $T3V wait --text "Thread details" && $T3V keys Right && $T3V wait --text "#7 Open: ready to merge" --idle 300
 $T3V keys Enter && $T3V wait --text "← List  Summary  Timeline  Code" --text "Read from github.com just now" --text "r refresh" --idle 300
@@ -47,11 +54,28 @@ touch "$RUN/diff-slow"
 $T3V keys Right && $T3V wait --text "→ code · ← summary"
 $T3V keys Right && $T3V wait --text "Loading pull request diff…" --text "← timeline"
 $T3V capture loading-100x30
-$T3V wait --text "5 files+ · 2 / 5 viewed" --text "The host withheld part of this diff, such as a" --text "› A tests/config_reload.rs +8 -0" --text "Loading more files…"
+$T3V wait --text "5 files+ · 2 / 5 viewed" --text "The host withheld part of this diff, such as a" --text "¶ Show whitespace changes" --text "⇊ Expand all files" --text "◫ Split diff view" --text "↵ Disable line wrapping"
+# The wheel brings the end of the files into view, as the toolbar pushed it down.
+$T3V click --text "src/config/reader.rs" --button wheel-down --repeat $TB && $T3V wait --text "› A tests/config_reload.rs +8 -0" --text "Loading more files…"
 $T3V capture more-100x30
-$T3V wait --text "› All commits" --text "8 files · 3 / 8 viewed" --text "› M docs/config.md +2 -1" --gone "Loading more files…" --idle 300
+$T3V wait --text "› M docs/config.md +2 -1" --gone "Loading more files…" --idle 300
+$T3V click --text "src/config/reader.rs" --button wheel-up --repeat $TB && $T3V wait --text "› All commits" --text "8 files · 3 / 8 viewed" --idle 300
 rm "$RUN/diff-slow"
 [ "$(reads)" = '[null,"s2"]' ]
+# Changes to whitespace start hidden. reader.rs's reindented Ok(config) and the let it removed and added again show unchanged, and so does schema.rs's respaced line.
+$T3V wait --text "› M src/config/reader.rs +5 -3 · ✓ Viewed" --text "› M src/config/schema.rs +7 -0"
+$T3V click --text "src/config/reader.rs" && $T3V wait --text "⌄ M src/config/reader.rs +5 -3" --text " 4 - use crate::config::Source;"
+$T3V click --text "src/config/reader.rs" --button wheel-down --repeat $((12 + TB)) && $T3V wait --text "26 -         let first = toml::from_str" --text "27           let config = toml::from_str" --text "28 +         Schema::current().check(&config)?;" --text "29           Ok(config)" --gone "28 -     Ok(config)" --idle 300
+$T3V capture whitespace-hidden-100x30
+# The row shows them, in every file, and reads nothing.
+mark
+$T3V keys Home && $T3V wait --text "¶ Show whitespace changes" --idle 300
+$T3V keys Down Down && $T3V wait --text "Enter show whitespace changes"
+$T3V keys Enter && $T3V wait --text "¶ Hide whitespace changes" --text "Enter hide whitespace changes" --text "⌄ M src/config/reader.rs +7 -5" --idle 300
+$T3V click --text "src/config/reader.rs" --button wheel-down --repeat $((12 + TB)) && $T3V wait --text "27 -         let config = toml::from_str" --text "28 -     Ok(config)" --text "27 +         let config = toml::from_str" --idle 300
+[ "$(since)" = '[]' ]
+$T3V keys Home && $T3V wait --text "⌄ M src/config/reader.rs +7 -5" --idle 300
+$T3V click --text "src/config/reader.rs" && $T3V wait --text "› M src/config/reader.rs +7 -5"
 # The marks came once, a second after the Code first showed. Back from the Timeline within 15 s of their coming reads nothing. 16 s later, showing the Code reads them again, but not the diff, whose first slice came less than a minute ago.
 [ "$(viewed)" = '[7]' ]
 mark
@@ -63,25 +87,78 @@ $T3V keys Left && $T3V wait --text "→ code · ← summary"
 $T3V keys Right && vsettle '[7,7]'
 $T3V wait --text "8 files · 3 / 8 viewed" --text "← timeline" --idle 1500
 [ "$(viewed)" = '[7,7]' ] && [ "$(since)" = '[]' ]
-C=$($T3V capture files-100x30); S=$(echo "$C" | grep 'ans$'); T=$(echo "$C" | grep 'txt$')
+C=$($T3V capture files-100x30); S=$(echo "$C" | grep 'ans$')
+grep -q '38;2;255;185;0mThe host withheld part' "$S" && grep -q '38;2;129;129;129m8 files · 3 / 8 viewed' "$S" && grep -q '38;2;245;245;245m ⇊ Expand all files' "$S" && grep -q '38;2;245;245;245m ¶ Hide whitespace changes' "$S"
+$T3V click --text "src/config/reader.rs" --button wheel-down --repeat $TB && $T3V wait --text "› M docs/config.md +2 -1" --idle 300
+C=$($T3V capture files-list-100x30); S=$(echo "$C" | grep 'ans$'); T=$(echo "$C" | grep 'txt$')
 # Each slice in reading order: source by path, as none imports another, then the test, then the second slice.
 [ "$(grep -o '› [AMDR] [^ ]*' "$T" | head -6 | paste -sd' ' -)" = '› M assets/config-flow.png › M src/config/reader.rs › M src/config/schema.rs › R src/config/source.rs › A tests/config_reload.rs › M docs/config.md' ]
-grep -q '38;2;255;185;0mM.\[38;2;245;245;245m src/config/reader.rs.\[38;2;129;129;129m .\[38;2;0;212;146m+7.\[38;2;245;245;245m .\[38;2;255;100;103m-5' "$S" && grep -q '38;2;43;127;255mR.\[38;2;245;245;245m src/config/source.rs → src/config/sources.rs' "$S" && grep -q '38;2;0;212;146mA.\[38;2;245;245;245m tests/config_reload.rs' "$S" && grep -q '38;2;255;185;0mThe host withheld part' "$S"
+grep -q '38;2;255;185;0mM.\[38;2;245;245;245m src/config/reader.rs.\[38;2;129;129;129m .\[38;2;0;212;146m+7.\[38;2;245;245;245m .\[38;2;255;100;103m-5' "$S" && grep -q '38;2;43;127;255mR.\[38;2;245;245;245m src/config/source.rs → src/config/sources.rs' "$S" && grep -q '38;2;0;212;146mA.\[38;2;245;245;245m tests/config_reload.rs' "$S"
 # A viewed file says so after its counts in grey. schema.rs, pushed to since its mark, says so in yellow on the row under it, and docs/config.md, not viewed, says nothing.
-grep -q 'src/config/reader.rs.*-5.\[38;2;129;129;129m · ✓ Viewed' "$S" && grep -q 'tests/config_reload.rs.*-0.\[38;2;129;129;129m · ✓ Viewed' "$S" && grep -q '38;2;255;185;0mChanged since viewed' "$S" && grep -q '38;2;129;129;129m8 files · 3 / 8 viewed' "$S"
+grep -q 'src/config/reader.rs.*-5.\[38;2;129;129;129m · ✓ Viewed' "$S" && grep -q 'tests/config_reload.rs.*-0.\[38;2;129;129;129m · ✓ Viewed' "$S" && grep -q '38;2;255;185;0mChanged since viewed' "$S"
 grep -q '› M src/config/schema.rs +8 -1 *│' "$T" && grep -q '│     Changed since viewed' "$T" && grep -q '› M docs/config.md +2 -1 *│' "$T"
+$T3V click --text "src/config/reader.rs" --button wheel-up --repeat $TB && $T3V wait --text "› All commits" --idle 300
 
 # ↓ chooses the commits row, ↓ again the first file, the binary, and ↓ once more the reader. Enter unfolds it: numbers in grey, removed lines red, added green.
-$T3V keys Down Down Down && $T3V wait --text "Enter expand file"
+down $((3 + TB)) && $T3V wait --text "Enter expand file"
 $T3V keys Enter && $T3V wait --text "⌄ M src/config/reader.rs +7 -5" --text " 4 - use crate::config::Source;" --text " 4 + use crate::config::schema::Schema;" --text "Enter collapse file"
 S=$($T3V capture reader-100x30 | grep 'ans$')
 grep -q '38;2;129;129;129m 4 .\[38;2;255;100;103m- use crate::config::Source;' "$S" && grep -q '38;2;129;129;129m 4 .\[38;2;0;212;146m+ use crate::config::schema::Schema;' "$S" && grep -q '38;2;129;129;129m 1 .\[38;2;245;245;245m  use std::fs;' "$S"
 # The unmodified lines before its second hunk, a tab stopping at 4 columns, and a wrapped line leaving the number and the mark blank.
-$T3V keys PgDn && $T3V wait --text "⋯ 14 unmodified lines" --text "28 -     Ok(config)" --text "33 +         // A reload reads and checks the file a" --text "     s a load does, so a file edited on disk since t"
-$T3V keys Home && $T3V keys Down Down Down && $T3V wait --text "Enter collapse file"
+$T3V keys PgDn && $T3V click --text "unmodified lines" --button wheel-down --repeat $TB && $T3V wait --text "⋯ 14 unmodified lines" --text "28 -     Ok(config)" --text "33 +         // A reload reads and checks the file a" --text "     s a load does, so a file edited on disk since t"
+# ↓ after the fold row chooses the wrap row. Enter lets each line run on in one row, cut at the details' edge. While one runs past the edge, the status line offers H/L sideways.
+$T3V keys Home Down Down Down Down Down && $T3V wait --text "Enter disable line wrapping"
+$T3V keys Enter && $T3V wait --text "↵ Enable line wrapping" --text "Enter enable line wrapping" --idle 300
+$T3V keys PgDn && $T3V wait --text "33 +         // A reload reads and checks the file a" --text "34 +         self.load()" --text "H/L sideways" --gone "     s a load does, so a file edited on disk since t" --idle 300
+# L scrolls the text half the details' width, 26 columns. The numbers, the marks and the other rows stay. The text stops once the end of the widest line shows. Shift+← and Shift+→ scroll too, and H scrolls back.
+$T3V keys L && $T3V wait --text "33 + and checks the file as a load does, so a file e" --text "25   Result<Config, Error> {" --text "⋯ 14 unmodified lines" --idle 300
+S=$($T3V capture sideways-100x30 | grep 'ans$')
+grep -q '38;2;129;129;129m33 .\[38;2;0;212;146m+ and checks the file as a load does' "$S"
+$T3V keys L L L L && $T3V wait --text "33 + ince the last load can't skip the schema check." --idle 300
+$T3V keys S-Left && $T3V wait --text "33 + so a file edited on disk since the last load ca" --idle 300
+$T3V keys S-Right && $T3V wait --text "33 + ince the last load can't skip the schema check." --idle 300
+$T3V keys H H H && $T3V wait --text "33 +  A reload reads and checks the file as a load d" --idle 300
+$T3V keys H && $T3V wait --text "33 +         // A reload reads and checks the file a" --idle 300
+$T3V keys L && $T3V wait --text "33 + and checks the file as a load does, so a file e" --idle 300
+# Esc and Alt+B keep the text where it was, and so does a read again. The details opened again from the list start it at the left, still unwrapped.
+$T3V keys Escape && $T3V wait --gone "Thread details"
+$T3V keys M-b && $T3V wait --text "33 + and checks the file as a load does, so a file e" --idle 300
+mark
+$T3V refresh && settle '[null,"s2",null,"s2"]'
+$T3V wait --text "33 + and checks the file as a load does, so a file e" --text "H/L sideways" --idle 1500
+$T3V keys Left Left Left && $T3V wait --gone "← List"
+$T3V keys Enter && $T3V wait --text "← List  Summary  Timeline  Code" --idle 300
+$T3V keys Right Right && $T3V wait --text "↵ Enable line wrapping" --text "⌄ M src/config/reader.rs +7 -5" --text "← timeline" --idle 300
+$T3V keys PgDn && $T3V wait --text "33 +         // A reload reads and checks the file a" --gone "     s a load does, so a file edited on disk since t" --idle 300
+# A click on the row wraps the lines again.
+$T3V keys Home && $T3V click --text "↵ Enable line wrapping" && $T3V wait --text "↵ Disable line wrapping" --text "Enter disable line wrapping" --idle 300
+$T3V keys PgDn && $T3V click --text "unmodified lines" --button wheel-down --repeat 5 && $T3V wait --text "33 +         // A reload reads and checks the file a" --text "     s a load does, so a file edited on disk since t" --idle 300
+# ↓ after the fold row chooses the layout row. Enter sets the lines before the change on the left and those after it on the right, each side with its own numbers. The lines removed and added in a row pair by position, and a side with no line stays blank.
+$T3V keys Home Down Down Down Down && $T3V wait --text "Enter show split diff view"
+$T3V keys Enter && $T3V wait --text "⊟ Stacked diff view" --text "Enter show stacked diff view" --text " 1   use std::fs;        │  1   use std::fs;" --text " 4 - use crate::config::S│  4 + use crate::config::s" --idle 300
+S=$($T3V capture split-100x30 | grep 'ans$')
+grep -q '38;2;129;129;129m 4 .\[38;2;255;100;103m- use crate::config::S.\[38;2;129;129;129m│  4 .\[38;2;0;212;146m+ use crate::config::s' "$S"
+$T3V keys PgDn && $T3V wait --text "26 -         let first = │ 27 +         let config =" --text "28 -     Ok(config)      │ 29 +         Ok(config)" --idle 300
+$T3V keys PgDn && $T3V wait --text "32 -         self.load_un│ 33 +         // A reload" --text "                          │      e schema check." --text "                          │ 34 +         self.load()" --idle 300
+# Unwrapped, both sides scroll sideways by the same columns, each cut at the end of its side, until the end of the side that runs on furthest shows.
+$T3V keys Home && $T3V click --text "↵ Disable line wrapping" && $T3V wait --text "↵ Enable line wrapping" --idle 300
+$T3V keys PgDn && $T3V wait --text "32 -         self.load_un│ 33 +         // A reload" --text "                          │ 34 +         self.load()" --gone "e schema check." --idle 300
+$T3V keys L && $T3V wait --text "26 - from_str::<Config>(&│ 27 + :from_str::<Config>(" --text "32 - d()                 │ 33 + and checks the file" --idle 300
+$T3V keys L L L L L && $T3V wait --text "32 -                     │ 33 + ip the schema check." --idle 300
+$T3V keys H H H H H H && $T3V wait --text "32 -         self.load_un│ 33 +         // A reload" --idle 300
+$T3V keys Home && $T3V click --text "↵ Enable line wrapping" && $T3V wait --text "↵ Disable line wrapping" --idle 300
+# A file added keeps one column.
+$T3V keys End && $T3V click --text "tests/config_reload.rs" && $T3V wait --text "⌄ A tests/config_reload.rs +8 -0" --text "1 + use fixture_config::Reader;" --idle 300
+T=$($T3V capture split-added-100x30 | grep 'txt$')
+grep -q '│ 1 + use fixture_config::Reader;  *│$' "$T"
+$T3V click --text "tests/config_reload.rs" && $T3V wait --text "› A tests/config_reload.rs +8 -0" --idle 300
+# A click on the row stacks the lines again.
+$T3V keys Home && $T3V click --text "⊟ Stacked diff view" && $T3V wait --text "◫ Split diff view" --text " 4 - use crate::config::Source;" --text " 4 + use crate::config::schema::Schema;" --idle 300
+$T3V keys Home && down $((3 + TB)) && $T3V wait --text "Enter collapse file"
 $T3V keys Enter && $T3V wait --text "› M src/config/reader.rs +7 -5" --gone "⋯ 14 unmodified lines"
 
 # A click unfolds the others: the binary, the rename and the new file with its tabs.
+$T3V click --text "src/config/reader.rs" --button wheel-down --repeat $TB && $T3V wait --text "› A tests/config_reload.rs +8 -0" --idle 300
 $T3V click --text "tests/config_reload.rs" && $T3V wait --text "⌄ A tests/config_reload.rs +8 -0" --text "1 + use fixture_config::Reader;"
 $T3V click --text "src/config/source.rs" && $T3V wait --text "⌄ R src/config/source.rs → src/config/sources.rs" --text "1 - /// Where a config comes from." --text "1 + /// Where a config comes from: a file, the envir"
 $T3V click --text "assets/config-flow.png" && $T3V wait --text "⌄ M assets/config-flow.png" --text "A binary file, whose changes have no lines to show."
@@ -92,12 +169,13 @@ grep -q '38;2;255;100;103mD.\[38;2;245;245;245m src/legacy/reader_v1.rs' "$S"
 $T3V click --text "Cargo.lock" && $T3V wait --text "⌄ M Cargo.lock +40 -12 · ✓ Viewed"
 $T3V keys End && $T3V wait --text "The host withheld this file's changes."
 
-# A read of the marks again that fails keeps them under a yellow note and the reason. Showing the Code again reads them again at once, and once a read works the note goes. r reads the marks again with the diff, twice as it reads the diff twice.
+# A read of the marks again that fails keeps them under a yellow note and the reason. Showing the Code again reads them again at once, and once a read works the note goes. r reads the marks again with the diff, twice as it reads the diff twice. Each read of the first slice drops the later ones, so r is pressed at the end, where the second slice follows each time.
 touch "$RUN/viewed-fail"
 $T3V wait --text "r refresh"
 V=$(viewed | jq length)
-$T3V keys r && $T3V keys Home && $T3V wait --text "The viewed marks may be out of date: t3term" --text "GitHub took too long to answer." --text "› M src/config/reader.rs +7 -5 · ✓ Viewed" --idle 300
-$T3V wait --text "r refresh" && vcount $((V + 2)) && $T3V wait --text "r refresh" --idle 1500
+mark
+$T3V keys r && settle '[null,"s2",null,"s2"]' && vcount $((V + 2)) && $T3V wait --text "r refresh" --idle 1500
+$T3V keys Home && $T3V wait --text "The viewed marks may be out of date: t3term" --text "GitHub took too long to answer." --text "8 files · 3 / 8 viewed" --text "› M src/config/reader.rs +7 -5 · ✓ Viewed" --idle 300
 S=$($T3V capture viewed-stale-100x30 | grep 'ans$')
 grep -q '38;2;255;185;0mThe viewed marks may be out of date' "$S" && grep -q '38;2;129;129;129m8 files · 3 / 8 viewed' "$S"
 $T3V keys Left && $T3V wait --text "→ code · ← summary"
@@ -110,14 +188,18 @@ $T3V keys Right && $T3V wait --gone "The viewed marks may be out of date" --text
 # A read that says the host has more files than it covered says the count is short.
 touch "$RUN/viewed-short"
 $T3V wait --text "r refresh"
-$T3V keys r && $T3V wait --text "This change has more files than the host reports" --text "8 files · 3 / 8 viewed" --idle 300
+$T3V keys End && $T3V wait --text "The host withheld this file's changes."
+mark
+$T3V keys r && settle '[null,"s2",null,"s2"]' && $T3V wait --text "r refresh" --idle 1500
+$T3V keys Home && $T3V wait --text "This change has more files than the host reports" --text "8 files · 3 / 8 viewed" --idle 300
 S=$($T3V capture viewed-short-100x30 | grep 'ans$')
 grep -q '38;2;255;185;0mThis change has more files than the host reports' "$S"
 rm "$RUN/viewed-short"
 $T3V wait --text "r refresh"
+$T3V keys End && $T3V wait --text "The host withheld this file's changes."
 mark
-$T3V keys r && settle '[null,"s2",null,"s2"]'
-$T3V wait --gone "This change has more files than the host" --text "r refresh" --idle 1500
+$T3V keys r && settle '[null,"s2",null,"s2"]' && $T3V wait --text "r refresh" --idle 1500
+$T3V keys Home && $T3V wait --gone "This change has more files than the host" --text "8 files · 3 / 8 viewed" --idle 300
 $T3V keys End && $T3V wait --text "⌄ M Cargo.lock +40 -12 · ✓ Viewed" --text "The host withheld this file's changes." --idle 300
 
 # The Timeline and back within the minute reads nothing.
@@ -131,7 +213,7 @@ contents() { jq -s -c '[.[] | select(.event == "pr.diffFileContents") | .newPath
 $T3V keys Home && $T3V wait --text "8 files" --idle 300
 $T3V click --text "src/config/reader.rs" && $T3V wait --text "⌄ M src/config/reader.rs +7 -5"
 # The wheel brings the file's first line to the top, so ↓ chooses the run, the first control in view.
-$T3V click --text "src/config/reader.rs" --button wheel-down --repeat 13 && $T3V wait --text "⋯ 14 unmodified lines" --gone "⌄ M src/config/reader.rs" --idle 300
+$T3V click --text "src/config/reader.rs" --button wheel-down --repeat $((13 + TB)) && $T3V wait --text "⋯ 14 unmodified lines" --gone "⌄ M src/config/reader.rs" --idle 300
 $T3V keys Down && $T3V wait --text "Enter show 14 unmodified lines"
 touch "$RUN/contents-fail"
 $T3V keys Enter && $T3V wait --text "⋯ 14 unmodified lines · Reading…"
@@ -234,7 +316,8 @@ $T3V wait --text "› 1 conversation not on the diff read so far" --text "⌄ M 
 $T3V keys End && settle '[null,null,"s2"]'
 $T3V keys Home && $T3V wait --text "› 1 conversation not on the current diff" --idle 300
 # Under reader.rs, the resolved thread on removed line 26 starts closed, in green, and the open one on added line 28 shows its comments behind a bar, then the ones the host has beyond T3's.
-$T3V keys PgDn && $T3V wait --text "› Resolved · 1 comment" --text "⌄ Open · 4 comments" --text "Should reload check the schema too?" --idle 300
+$T3V keys PgDn && $T3V wait --text "› Resolved · 1 comment" --idle 300
+$T3V click --text "Resolved · 1 comment" --button wheel-down --repeat $TB && $T3V wait --text "› Resolved · 1 comment" --text "⌄ Open · 4 comments" --text "Should reload check the schema too?" --idle 300
 C=$($T3V capture threads-100x30); S=$(echo "$C" | grep 'ans$'); T=$(echo "$C" | grep 'txt$')
 [ "$(grep -o -e '26 - ' -e 'Resolved · 1 comment' -e '28 + ' -e 'Open · 4 comments' "$T" | paste -sd'|' -)" = '26 - |Resolved · 1 comment|28 + |Open · 4 comments' ]
 grep -q '38;2;0;212;146m› Resolved.\[38;2;129;129;129m · 1 comment' "$S" && grep -q '38;2;58;58;58m│ .\[38;2;245;245;245m⌄ Open.\[38;2;129;129;129m · 4 comments' "$S"
@@ -261,11 +344,12 @@ mark
 $T3V refresh && settle '[null,null]'
 $T3V wait --text "⌄ Resolved · 1 comment" --text "› Open · 4 comments" --idle 300
 # The page stays with the thread.
-$T3V click --text "Open · 4 comments" && $T3V wait --text "⌄ Open · 4 comments" --text "fixture-reviewer"
+$T3V click --text "Open · 4 comments" && $T3V wait --text "⌄ Open · 4 comments" --text "Enter hide conversation"
+$T3V click --text "Open · 4 comments" --button wheel-down --repeat $TB && $T3V wait --text "⌄ Open · 4 comments" --text "fixture-reviewer"
 $T3V keys PgDn && $T3V wait --text "Added a_reload_checks_the_schema." --gone "Load more comments" --idle 300
 # ↓ from the top chooses the commits row, and ↓ again the list. Enter opens it: each path once, then the line and the thread.
 $T3V keys Home Down && $T3V wait --text "Enter choose commit"
-$T3V keys Down && $T3V wait --text "Enter show conversations off the diff"
+down $((1 + TB)) && $T3V wait --text "Enter show conversations off the diff"
 $T3V keys Enter && $T3V wait --text "⌄ 1 conversation not on the diff read so far" --text "src/config/watch.rs" --text "Line 12" --text "The watcher still calls load_unchecked." --text "Enter hide conversations off the diff"
 $T3V capture off-diff-100x30
 $T3V keys Enter && $T3V wait --text "› 1 conversation not on the diff read so far" --gone "Line 12"
@@ -273,6 +357,33 @@ $T3V keys Enter && $T3V wait --text "› 1 conversation not on the diff read so 
 $T3V click --text "src/config/reader.rs" && $T3V wait --text "› M src/config/reader.rs +7 -5" --gone "Resolved · 1 comment" --gone "Open · 4 comments"
 $T3V keys PgDn && $T3V wait --text "⌄ Open · 1 comment · outdated" --text "A config with no version reads as 0 here."
 
+# The row under the count unfolds every file while all are folded, and folds them all once one shows unfolded. ↓ chooses it after the commits row and the whitespace row, and before the list off the diff.
+$T3V keys Home && $T3V wait --text "⇈ Collapse all files" --idle 300
+$T3V keys Down && $T3V wait --text "Enter choose commit"
+$T3V keys Down && $T3V wait --text "Enter hide whitespace changes"
+$T3V keys Down && $T3V wait --text "Enter collapse all files"
+$T3V keys Enter && $T3V wait --text "⇊ Expand all files" --text "Enter expand all files" --text "› M assets/config-flow.png" --text "› M src/config/schema.rs +8 -1" --gone "⌄ M " --gone "⌄ A " --gone "⌄ R " --idle 300
+S=$($T3V capture folded-all-100x30 | grep 'ans$')
+grep -q '38;2;245;245;245m .\[48;2;38;38;38m⇊ Expand all files' "$S"
+$T3V keys Enter && $T3V wait --text "⇈ Collapse all files" --text "Enter collapse all files" --text "⌄ M assets/config-flow.png" --text "⌄ M src/config/reader.rs +7 -5" --idle 300
+$T3V keys End && $T3V wait --text "⌄ D src/legacy/reader_v1.rs +0 -4" --text "⌄ M Cargo.lock +40 -12" --text "The host withheld this file's changes." --idle 300
+# A file folded after keeps its fold through a read again, and the second slice's files, read after the row, follow it.
+$T3V keys Home && $T3V wait --text "⌄ M assets/config-flow.png" --idle 300
+$T3V click --text "assets/config-flow.png" && $T3V wait --text "› M assets/config-flow.png" --text "⇈ Collapse all files"
+# The lines side by side stay so through a read again and another diff picked.
+$T3V click --text "◫ Split diff view" && $T3V wait --text "⊟ Stacked diff view" --idle 300
+mark
+$T3V refresh && settle '[null,null]'
+$T3V wait --text "5 files+" --text "⊟ Stacked diff view" --text "› M assets/config-flow.png" --text "⌄ M src/config/reader.rs +7 -5" --idle 300
+$T3V keys End && settle '[null,null,"s2"]'
+$T3V keys End && $T3V wait --text "⌄ M Cargo.lock +40 -12" --text "The host withheld this file's changes." --idle 300
+# A click on the row folds them all, that one too, and another unfolds them all.
+$T3V keys Home && $T3V wait --text "⇈ Collapse all files" --idle 300
+$T3V click --text "⇈ Collapse all files" && $T3V wait --text "⇊ Expand all files" --text "› M src/config/reader.rs +7 -5" --gone "⌄ M " --gone "⌄ A " --gone "⌄ R " --idle 300
+$T3V click --text "⇊ Expand all files" && $T3V wait --text "⇈ Collapse all files" --text "⌄ M assets/config-flow.png" --text "⌄ M src/config/reader.rs +7 -5" --idle 300
+
+# Unwrapped lines stay so through another diff picked.
+$T3V keys Home && $T3V click --text "↵ Disable line wrapping" && $T3V wait --text "↵ Enable line wrapping" --idle 300
 # The commits row opens the list, newest first. Picking a commit reads its own diff from the first slice, with its files folded and every thread off the diff.
 $T3V keys Home && $T3V wait --text "› All commits"
 $T3V click --text "› All commits" && $T3V wait --text "⌄ All commits" --text "✓ All commits" --text "Reuse the parsed config on reload" --text "Split the config reader" --text "Enter hide commits"
@@ -281,7 +392,7 @@ C=$($T3V capture commits-100x30); T=$(echo "$C" | grep 'txt$')
 $T3V keys Down && $T3V wait --text "Enter show all commits"
 $T3V keys Down && $T3V wait --text "Enter show commit 9dc565a"
 mark; V=$(viewed | jq length)
-$T3V keys Enter && $T3V wait --text "› Reuse the parsed config on reload · 9dc565a" --text "› M src/config/reader.rs" --text "› A tests/config_reload.rs" --text "› 4 conversations not on the current diff" --gone "Split the config reader" --gone "src/config/schema.rs" --idle 300
+$T3V keys Enter && $T3V wait --text "› Reuse the parsed config on reload · 9dc565a" --text "¶ Hide whitespace changes" --text "⇊ Expand all files" --text "⊟ Stacked diff view" --text "↵ Enable line wrapping" --text "› M src/config/reader.rs" --text "› A tests/config_reload.rs" --text "› 4 conversations not on the current diff" --gone "Split the config reader" --gone "src/config/schema.rs" --idle 300
 # The commit's files keep their marks, and picking it reads none.
 $T3V wait --text "2 files · 2 / 2 viewed" && [ "$(viewed | jq length)" = "$V" ]
 [ "$(jq -s -c '[.[] | select(.event == "pr.diff") | [.cursor, .commit]] | .['"$M"':]' "$E/events.jsonl")" = '[[null,"9dc565a0"]]' ]
@@ -293,7 +404,7 @@ $T3V click --text "Split the config reader" && $T3V wait --text "› Split the c
 # All commits reads the whole change again from its first slice, with every file folded, so the end is near and the second slice comes at once. Only the thread on watch.rs stays off the diff.
 $T3V click --text "Split the config reader" && $T3V wait --text "✓ Split the config reader"
 mark
-$T3V click --text "  All commits" && $T3V wait --text "› All commits" --text "8 files" --text "› 1 conversation not on the current diff" --text "› M src/config/reader.rs +7 -5" --idle 300
+$T3V click --text "  All commits" && $T3V wait --text "› All commits" --text "8 files" --text "⊟ Stacked diff view" --text "› 1 conversation not on the current diff" --text "› M src/config/reader.rs +7 -5" --idle 300
 [ "$(jq -s -c '[.[] | select(.event == "pr.diff") | [.cursor, .commit]] | .['"$M"':]' "$E/events.jsonl")" = '[[null,null],["s2",null]]' ]
 
 # A commit's rows on the Timeline open its own diff on the Code, picked in the list of commits. The same commit again shows the Code as it was and reads nothing.
@@ -316,8 +427,8 @@ $T3V keys Enter && $T3V wait --text "› Split the config reader · 1f3e2a9" --t
 [ "$(jq -s -c '[.[] | select(.event == "pr.diff") | [.cursor, .commit]] | .['"$M"':]' "$E/events.jsonl")" = '[[null,"1f3e2a90"]]' ]
 rm "$RUN/diff-threads"
 
-# Another thread's link, whose first slice fails: the failure alone. Showing the Code again reads it again, and so does opening the details again.
-touch "$RUN/diff-fail"
+# Another thread's link, whose first slice fails: the failure alone. Showing the Code again reads it again, and so does opening the details again. Its marks fail to read from here on, so the details never hold any for it, and their notes show only with the files.
+touch "$RUN/diff-fail" "$RUN/viewed-fail"
 $T3V keys Escape && $T3V wait --gone "Thread details"
 $T3V click --text "Mixed: every state" && $T3V wait --text "/  Mixed: every state"
 $T3V keys M-b && $T3V wait --text "Pull requests 11" --idle 300
@@ -331,10 +442,9 @@ $T3V keys Right && settle '[null,null]'
 $T3V wait --text "Couldn't read this diff: GitHub took too long to" --text "← timeline" --idle 300
 rm "$RUN/diff-fail"
 $T3V keys Left Left Left && $T3V wait --gone "← List"
-# The details' first read of #70's marks fails: the note and the reason, and no marks in the count. Showing the Code again reads them, and #70 has none viewed.
-touch "$RUN/viewed-fail"
+# Opening #70 again, its marks fail to read once more: the note and the reason, and no marks in the count. Showing the Code again reads them, and #70 has none viewed.
 $T3V keys Enter && $T3V wait --text "#70 Watched: checks running" --text "← List  Summary  Timeline  Code" --idle 300
-$T3V keys Right Right && $T3V wait --text "8 files" --text "› M src/config/reader.rs +7 -5" --text "t3term couldn't read which files you viewed." --text "GitHub took too long to answer." --gone "/ 8 viewed" --idle 1500
+$T3V keys Right Right && $T3V wait --text "8 files" --text "¶ Show whitespace changes" --text "◫ Split diff view" --text "↵ Disable line wrapping" --text "› M src/config/reader.rs +5 -3" --text "t3term couldn't read which files you viewed." --text "GitHub took too long to answer." --gone "/ 8 viewed" --idle 1500
 [ "$(since)" = '[null,null,null,"s2"]' ]
 S=$($T3V capture viewed-failed-100x30 | grep 'ans$')
 grep -q "38;2;255;185;0mt3term couldn't read which files you viewed." "$S"
@@ -345,7 +455,8 @@ $T3V keys Right && $T3V wait --text "8 files · 0 / 8 viewed" --gone "t3term cou
 
 # At 80x24 every row still fits the pane.
 $T3V resize 80 24 && $T3V wait --text "8 files" --idle 300
-$T3V keys Down Down Down Enter && $T3V wait --text "⌄ M src/config/reader.rs +7 -5" --text " 4 + use crate::config::schema::Schema;" --text "Enter collapse file"
+down $((3 + TB)) && $T3V keys Enter && $T3V wait --text "⌄ M src/config/reader.rs +5 -3" --text "Enter collapse file"
+$T3V click --text "src/config/reader.rs" --button wheel-down --repeat $TB && $T3V wait --text "⌄ M src/config/reader.rs +5 -3" --text " 4 + use crate::config::schema::Schema;"
 $T3V capture reader-80x24
 $T3V status --json | jq -e '.scopeViolations == 0 and .unknownRpcs == 0 and .fixtureErrors == 0'
 ```
@@ -363,10 +474,17 @@ $T3V status --json | jq -e '.scopeViolations == 0 and .unknownRpcs == 0 and .fix
 - The fixture's links have at most three commits, so `Show more` never shows, and the route answers an unknown commit with an empty patch the TUI never asks for. The force-push that drops a picked commit isn't served either.
 - The recipe doesn't wait out the minute after which showing the Code reads it again, though it checks that showing it again reads a first slice that failed, and the fixture can't serve an empty diff (`This pull request has no file changes.`) or one the parser can't split.
 - The fixture's files have no run of unchanged lines longer than 200 between two hunks, so a run that shows 100 lines at each end and keeps its row in the middle isn't driven. The unit tests cover it.
-- A wheel notch on the Code scrolls one row. The recipe uses 13 notches to bring reader.rs's first line to the top, so ↓ picks the run before its second hunk rather than the file.
+- A wheel notch on the Code scrolls one row. The recipe uses 13 notches, plus `TB`, to bring reader.rs's first line to the top, so ↓ picks the run before its second hunk rather than the file.
+- The fixture's changes to whitespace: reader.rs's `Ok(config)` goes from a tab to spaces and its `let config` line is removed and added again unchanged, and schema.rs's `Self {version: 3}` only gains spaces. The recipe checks them hidden on #7, then shows them, so the later steps see `+7 -5`. #70's Code starts with them hidden again, so it reads `+5 -3`.
+- The fixture has no hunk too large to compare, so the note that counts the hunks showing their whitespace changes isn't driven. The unit tests cover it.
+- t3v's wheel turns only up and down, so a sideways turn, which scrolls 4 columns, isn't driven, and neither is another diff picked starting the text at the left. The unit tests cover both.
+- While a line runs past the details' edge, the status line at 100x30 has no room for `r refresh`. The recipe wraps the lines again before the steps that wait for it.
+- The toolbar's rows under the count push the files down a row each, and ↓ chooses each one. The recipe counts them in `TB`, and adds `TB` presses of ↓ or notches of the wheel where a step needs a row the toolbar pushed under the view.
 - Line numbers widen to three digits past line 99, which moves every column of schema.rs's later lines one to the right. Wait for ` 52   #[cfg(test)]` with its leading space.
 - The reason a read of the text failed wraps at 100 columns. Wait for a prefix of it, such as `This host cannot expand unchanged pull request`.
 - A read of the marks takes a second, and showing the Code while one is under way asks for none. After a read that fails, let its answer come before showing the Code again, or nothing is read.
 - `r` and `t3v refresh` read the marks twice, as they read the diff twice.
+- Each read of the first slice drops the later slices, and the second comes back only where the end of the files is in view. With the toolbar's rows above the files, Home after `r` may be too far from the end, so the recipe presses `r` at the end and Home once the reads settle.
+- Side by side, a review thread shows across both sides under its row. The recipe stacks the lines again before the threads, so a thread across both sides isn't driven, and neither are the lines stacking below 6 columns. The unit tests cover both.
 - The fixture's detail always says the host keeps the marks, so `viewed in T3 Code`, a detail without `viewedFiles` and more marks than the 1,000 t3term reads aren't driven. The unit tests cover them.
 - Clicks land on the rows the last frame drew. Click the lowest file first when unfolding several, so the rows above don't move.
