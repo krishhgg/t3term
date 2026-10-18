@@ -3142,9 +3142,13 @@ impl App {
     /// keeps what depends on it in step. A change can add or drop menu rows, so an open menu's
     /// highlight follows its entry, not its row number. The sidebar is laid out again when the
     /// change turns snooze or settlement on or off, which decide whether those shelves apply.
-    /// The provider banner follows the selected provider's new status.
+    /// The provider banner follows the selected provider's new status. A change that turns
+    /// `pullRequests` on or off opens or closes T3's refresh numbers at once, rather than at
+    /// the next key or answer, as the desktop's queries follow the server config on each
+    /// render (apps/web/src/components/RightPanelTabs.tsx:749-760).
     fn update_config(&mut self, change: impl FnOnce(&mut Option<Value>) -> bool) -> bool {
         let (pick, capabilities) = (self.selected_pick(), self.capabilities());
+        let reads_pulls = self.environment_can("pullRequests");
         if !change(&mut self.config) {
             return false;
         }
@@ -3153,6 +3157,9 @@ impl App {
         }
         if self.capabilities() != capabilities {
             self.rebuild_rows();
+        }
+        if self.environment_can("pullRequests") != reads_pulls {
+            self.read_opened_pull();
         }
         self.follow_provider(true);
         true
@@ -15621,6 +15628,34 @@ mod tests {
         assert_eq!(reads(&asked).len(), 2);
         press(&mut app, KeyCode::Char('r'));
         assert_eq!(reads(&asked), [(1, false), (2, true), (3, true)]);
+    }
+
+    #[test]
+    fn the_refresh_numbers_follow_a_config_that_turns_pull_requests_off_and_on() {
+        let mut app = readable_pulls_tui(vec![linked(31, "Bound titles")]);
+        let asked = note_reads(&mut app);
+        let opened = note_refreshes(&mut app);
+        press(&mut app, KeyCode::Enter);
+        let detail = Part::Detail(Ok(Box::new(host_detail())));
+        let activity = Part::Activity(Ok(Box::new(host_activity())));
+        hear(&mut app, 1, vec![detail, activity, Part::Done]);
+        // On the list, nothing reads the details again on a timer.
+        press(&mut app, KeyCode::Left);
+        assert_eq!(opened.borrow().len(), 1);
+        let capabilities = |reads: bool| json!({"threadPullRequests": true, "pullRequests": reads});
+
+        // A config that turns `pullRequests` off closes the subscription before any key.
+        app.on_config_event(config_snapshot(vec![], capabilities(false)));
+        assert!(app.refreshes.is_none());
+        assert!(opened.borrow()[0].is_closed());
+
+        // One that turns it on again opens another, and one that leaves it on keeps that.
+        app.on_config_event(config_snapshot(vec![], capabilities(true)));
+        assert_eq!(opened.borrow().len(), 2);
+        app.on_config_event(config_snapshot(vec![], capabilities(true)));
+        assert_eq!(opened.borrow().len(), 2);
+        assert!(!opened.borrow()[1].is_closed());
+        assert_eq!(asked.borrow().len(), 1);
     }
 
     #[test]

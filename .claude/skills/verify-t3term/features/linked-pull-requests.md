@@ -44,3 +44,4 @@ $T3V capability on  && $T3V wait --text "Pull requests 11"
 - `thr-many` has 1,005 links and `thr-hostile` has text full of control characters and huge fields. `t3v check` fails with `screenLeaks` if text that must stay hidden reaches the screen.
 - The footer's age (`synced 1m ago`) and each link's age move with time, so wait on the count, not the age.
 - A click right after a key, a wheel notch or a change from the server does nothing until the next frame.
+- `capability off` closes T3's refresh numbers at once and `capability on` opens them again while a link's read is held, so the recipe ends with two `pullRequests.subscribeRefreshes` in `rpcRequestsByTag`.
