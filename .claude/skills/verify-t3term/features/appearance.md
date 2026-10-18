@@ -155,7 +155,7 @@ grep -q '"theme": "grove"' "$S" && grep -q '"appearanceMode": "light"' "$S"
 - tmux writes one SGR code per attribute and repeats a color only where it changes, so look for a color's code, not for a whole cell's style. The send button is the exception the recipe relies on: its foreground and background codes come next to each other.
 - The send button takes the primary color only while the composer holds a draft. Without one it draws muted.
 - Alt+A, Alt+S and Alt+D answer an approval, and the fake server serves none, so the recipe can't show that Alt+A still answers one. Alt+Shift+A never does.
-- The worktree setup card isn't reachable: the fake server answers `subscribeWorktreeSetup` with null only.
+- The recipe doesn't draw the worktree setup card, which needs a thread with a worktree. worktree-setup.md serves one with `t3v setup` in the `terminal` scenario.
 - The choice is saved in the run's HOME and survives `restart`. A new run starts dark.
 - t3term reads `theme` from settings.json only at start, so a recipe that writes the file then runs `t3v restart`. A file written without `appearanceMode` starts dark. The Change theme list needs no restart.
 - tmux sends `C-M-a` as Esc then Ctrl+A, which t3term reads as Ctrl+Alt+A. Wait for `│ Change theme` before the next key: a key sent before the list draws goes to the pane under it.
