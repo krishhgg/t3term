@@ -6648,6 +6648,8 @@ mod tests {
         // The first file unfolds, and stays so through the reads again.
         pulls.page(40, 30, now(), true, &theme);
         pulls.step(true);
+        assert_eq!(pulls.action().as_deref(), Some("expand all files"));
+        pulls.step(true);
         assert_eq!(pulls.action().as_deref(), Some("expand file"));
         pulls.enter();
         let unfolded = |pulls: &mut PullRequests| {
@@ -6760,6 +6762,38 @@ mod tests {
     }
 
     #[test]
+    fn enter_or_a_click_on_the_row_above_the_files_unfolds_or_folds_them_all() {
+        let theme = theme();
+        let mut pulls = on_code();
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
+        assert!(pulls.answer_diff(2, Ok(added(0, 2, None)), now()));
+        let lines = |pulls: &mut PullRequests| {
+            pulls.page(40, 30, now(), true, &theme);
+            let rows = detail_rows(pulls);
+            let shown = |text: &str| rows.contains(&text.to_string());
+            [shown("1 + line 0"), shown("1 + line 1")]
+        };
+        assert_eq!(lines(&mut pulls), [false, false]);
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::Folds));
+        assert_eq!(pulls.action().as_deref(), Some("expand all files"));
+        pulls.enter();
+        assert_eq!(pulls.pick, Some(Control::Folds));
+        assert_eq!(pulls.action().as_deref(), Some("collapse all files"));
+        assert_eq!(lines(&mut pulls), [true, true]);
+        assert_eq!(pulls.take_diff_ask(true, now()), None, "nothing to read");
+
+        // A click on the row does the same.
+        let page = pulls.page(40, 30, now(), true, &theme);
+        let spot = Some(Spot::Control(Control::Folds));
+        let row = page.rows.iter().position(|row| *row == spot).unwrap();
+        assert!(pulls.click(4, row));
+        assert_eq!(lines(&mut pulls), [false, false]);
+        assert!(pulls.click(4, row));
+        assert_eq!(lines(&mut pulls), [true, true]);
+    }
+
+    #[test]
     fn enter_or_a_click_unfolds_a_file_and_a_slice_that_failed_reads_again() {
         let theme = theme();
         let mut pulls = on_code();
@@ -6790,6 +6824,8 @@ mod tests {
                 .expect("the row")
         };
         let second = at(page, Control::File(1));
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::Folds));
         pulls.step(true);
         assert_eq!(pulls.pick, Some(Control::File(0)));
         assert_eq!(pulls.action().as_deref(), Some("expand file"));
@@ -6878,6 +6914,8 @@ mod tests {
         assert!(rows.contains(&label.to_string()), "{rows:#?}");
 
         // The list opens, and its thread shows its remark, laid out for the frame.
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::Folds));
         pulls.step(true);
         assert_eq!(pulls.pick, Some(Control::OffDiff));
         assert_eq!(
@@ -7024,10 +7062,11 @@ mod tests {
         pulls.page(60, 40, now(), true, &theme);
         let rows = detail_rows(&pulls);
         assert_eq!(
-            rows[at..at + 4],
+            rows[at..at + 5],
             [
                 "› Commit 0 · 0000000",
                 "1 file",
+                "⇊ Expand all files",
                 "",
                 "› 1 conversation not on the current diff"
             ]
@@ -7102,6 +7141,7 @@ mod tests {
         assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
         assert!(pulls.answer_diff(2, Ok(added(0, 1, None)), now()));
         pulls.page(60, 40, now(), true, &theme);
+        pulls.step(true);
         pulls.step(true);
         assert_eq!(pulls.pick, Some(Control::File(0)));
         pulls.enter();
@@ -7387,6 +7427,7 @@ mod tests {
         assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
         assert!(pulls.answer_diff(2, Ok(diff()), now()));
         pulls.page(60, 40, now(), true, &theme);
+        pulls.step(true);
         pulls.step(true);
         assert_eq!(pulls.pick, Some(Control::File(0)));
         pulls.enter();
