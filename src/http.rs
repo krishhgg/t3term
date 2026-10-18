@@ -22,6 +22,18 @@ pub(crate) fn direct_client() -> reqwest::Client {
         .expect("an HTTP client")
 }
 
+/// Why `Api::post_bounded` has no answer to read.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(crate) enum Unanswered {
+    /// The request failed before an answer came, or the answer broke off or took longer than
+    /// the time allowed. The text is reqwest's, without the URL.
+    Failed(String),
+    /// The server answered with a redirect, which t3term doesn't follow.
+    Redirected,
+    /// The body is longer than the bound.
+    TooLong,
+}
+
 #[derive(Clone)]
 pub struct Api {
     pub origin: String,
@@ -128,6 +140,48 @@ impl Api {
         self.request(reqwest::Method::POST, path, body).await
     }
 
+    /// POSTs `body` as JSON to `path` and reads the answer's status and body, all within
+    /// `timeout`. Unlike `request`, it leaves the status to the caller, and it never reads
+    /// more than `most` bytes of the body.
+    pub(crate) async fn post_bounded(
+        &self,
+        path: &str,
+        body: &Value,
+        timeout: Duration,
+        most: usize,
+    ) -> std::result::Result<(reqwest::StatusCode, Vec<u8>), Unanswered> {
+        let failed = |error: reqwest::Error| Unanswered::Failed(error.without_url().to_string());
+        let mut response = self
+            .http
+            .post(format!("{}{}", self.origin, path))
+            .bearer_auth(&self.token)
+            .header(PROTOCOL_HEADER, PROTOCOL_VERSION.to_string())
+            .timeout(timeout)
+            .json(body)
+            .send()
+            .await
+            .map_err(failed)?;
+        let status = response.status();
+        // As in `request`, a redirect would send the body to a server t3term didn't choose.
+        if status.is_redirection() {
+            return Err(Unanswered::Redirected);
+        }
+        if response
+            .content_length()
+            .is_some_and(|length| length > most as u64)
+        {
+            return Err(Unanswered::TooLong);
+        }
+        let mut read = Vec::new();
+        while let Some(chunk) = response.chunk().await.map_err(failed)? {
+            if read.len() + chunk.len() > most {
+                return Err(Unanswered::TooLong);
+            }
+            read.extend_from_slice(&chunk);
+        }
+        Ok((status, read))
+    }
+
     /// A single-use ticket that authenticates one WebSocket connection.
     pub async fn websocket_ticket(&self) -> Result<String> {
         let issued = self.post("/api/auth/websocket-ticket", None).await?;
@@ -141,17 +195,17 @@ impl Api {
 }
 
 /// A fake T3 for unit tests, on 127.0.0.1. It answers each request with the raw HTTP response
-/// `respond` gives for the request's path, and records the paths. An empty response closes the
-/// connection without an answer.
+/// `respond` gives for the request's path, and records the paths and bodies. An empty response
+/// closes the connection without an answer.
 #[cfg(test)]
 pub(crate) mod fake {
-    use std::io::{BufRead, BufReader, Write};
+    use std::io::{BufRead, BufReader, Read, Write};
     use std::net::TcpListener;
     use std::sync::{Arc, Mutex};
 
     pub(crate) struct Server {
         pub(crate) origin: String,
-        paths: Arc<Mutex<Vec<String>>>,
+        requests: Arc<Mutex<Vec<(String, String)>>>,
     }
 
     impl Server {
@@ -159,8 +213,8 @@ pub(crate) mod fake {
         pub(crate) fn start(respond: impl Fn(&str) -> String + Send + 'static) -> Server {
             let listener = TcpListener::bind("127.0.0.1:0").unwrap();
             let origin = format!("http://{}", listener.local_addr().unwrap());
-            let paths = Arc::new(Mutex::new(Vec::new()));
-            let seen = paths.clone();
+            let requests = Arc::new(Mutex::new(Vec::new()));
+            let seen = requests.clone();
             std::thread::spawn(move || {
                 for stream in listener.incoming() {
                     let Ok(mut stream) = stream else { continue };
@@ -172,24 +226,41 @@ pub(crate) mod fake {
                     if reader.read_line(&mut request_line).is_err() {
                         continue;
                     }
-                    // Read up to the blank line that ends the headers. No request a test sends
-                    // has a body.
+                    // Read up to the blank line that ends the headers, then the body its length
+                    // gives.
                     let mut header = String::new();
+                    let mut length = 0;
                     while reader.read_line(&mut header).is_ok_and(|read| read > 2) {
+                        let (name, value) = header.split_once(':').unwrap_or_default();
+                        if name.eq_ignore_ascii_case("content-length") {
+                            length = value.trim().parse().unwrap_or(0);
+                        }
                         header.clear();
+                    }
+                    let mut body = vec![0; length];
+                    if reader.read_exact(&mut body).is_err() {
+                        continue;
                     }
                     let path = request_line.split_whitespace().nth(1).unwrap_or_default();
                     let reply = respond(path);
-                    seen.lock().unwrap().push(path.to_string());
+                    let body = String::from_utf8_lossy(&body).into_owned();
+                    seen.lock().unwrap().push((path.to_string(), body));
                     let _ = stream.write_all(reply.as_bytes());
                 }
             });
-            Server { origin, paths }
+            Server { origin, requests }
         }
 
         /// The path of each request so far, in order.
         pub(crate) fn paths(&self) -> Vec<String> {
-            self.paths.lock().unwrap().clone()
+            let requests = self.requests.lock().unwrap();
+            requests.iter().map(|(path, _)| path.clone()).collect()
+        }
+
+        /// The body of each request so far, in order. A request without one has "".
+        pub(crate) fn bodies(&self) -> Vec<String> {
+            let requests = self.requests.lock().unwrap();
+            requests.iter().map(|(_, body)| body.clone()).collect()
         }
     }
 

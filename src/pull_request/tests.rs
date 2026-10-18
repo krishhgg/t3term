@@ -1086,3 +1086,226 @@ fn other_failures_keep_t3s_message() {
     assert!(matches!(&lost, PullRequestError::Rpc(_)));
     assert_eq!(lost.to_string(), "T3 connection lost: socket ended");
 }
+
+mod diff {
+    use super::*;
+    use crate::http::fake;
+
+    fn reference() -> Reference {
+        Reference::new("project-1", None, "owner/repo", 7).unwrap()
+    }
+
+    /// The error `diff` gives when T3 answers with `status` and `body`.
+    async fn failure(status: &str, body: &str) -> PullRequestError {
+        let answer = fake::response(status, &["location: http://127.0.0.1:1/"], body);
+        let t3 = fake::Server::start(move |_| answer.clone());
+        let api = Api::without_proxy(&t3.origin);
+        diff(&api, &reference(), None).await.unwrap_err()
+    }
+
+    fn http(error: PullRequestError) -> String {
+        match error {
+            PullRequestError::Http(message) => message,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slice_of_the_diff_reads_and_the_next_one_sends_its_cursor() {
+        let body = json!({
+            "patch": "diff --git a/a b/a\n",
+            "truncated": true,
+            "nextCursor": "2",
+            "omittedFileStats": [
+                {"path": "assets/big.bin", "additions": 3, "deletions": 1.0},
+                {"path": "huge.json", "additions": -1, "deletions": 1e3}
+            ]
+        });
+        let answer = fake::response("200 OK", &[], &body.to_string());
+        let t3 = fake::Server::start(move |_| answer.clone());
+        let api = Api::without_proxy(&t3.origin);
+        let first = diff(&api, &reference(), None).await.unwrap();
+        assert_eq!(
+            first,
+            Diff {
+                patch: "diff --git a/a b/a\n".into(),
+                truncated: true,
+                next_cursor: Some("2".into()),
+                omitted: vec![
+                    Omitted {
+                        path: "assets/big.bin".into(),
+                        additions: 3,
+                        deletions: 1
+                    },
+                    Omitted {
+                        path: "huge.json".into(),
+                        additions: 0,
+                        deletions: 1000
+                    },
+                ],
+                omitted_cut: false,
+            }
+        );
+        diff(&api, &reference(), first.next_cursor.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(t3.paths(), [DIFF, DIFF]);
+        let bodies: Vec<Value> = t3
+            .bodies()
+            .iter()
+            .map(|body| serde_json::from_str(body).unwrap())
+            .collect();
+        let mut next = reference().payload();
+        next["cursor"] = json!("2");
+        assert_eq!(bodies, [reference().payload(), next]);
+    }
+
+    #[test]
+    fn a_diff_answer_is_read_with_the_checks_of_the_others() {
+        let last = Diff::read(json!({"patch": "", "truncated": false, "nextCursor": null}));
+        assert_eq!(
+            last.unwrap(),
+            Diff {
+                patch: String::new(),
+                truncated: false,
+                next_cursor: None,
+                omitted: Vec::new(),
+                omitted_cut: false,
+            }
+        );
+        let many: Vec<_> = (0..=MOST_OMITTED)
+            .map(|n| json!({"path": format!("f{n}"), "additions": 1, "deletions": 0}))
+            .collect();
+        let read = Diff::read(json!({
+            "patch": "", "truncated": true, "nextCursor": null, "omittedFileStats": many
+        }))
+        .unwrap();
+        assert!(read.omitted_cut);
+        assert_eq!(read.omitted.len(), MOST_OMITTED);
+        let broken = [
+            json!({"truncated": false, "nextCursor": null}),
+            json!({"patch": 1, "truncated": false, "nextCursor": null}),
+            json!({"patch": "", "nextCursor": null}),
+            json!({"patch": "", "truncated": false}),
+            json!({"patch": "", "truncated": false, "nextCursor": " "}),
+            json!({"patch": "", "truncated": false, "nextCursor": null,
+                "omittedFileStats": [{"path": "a", "additions": "1", "deletions": 0}]}),
+            json!({"patch": "", "truncated": false, "nextCursor": null,
+                "omittedFileStats": [{"path": " ", "additions": 1, "deletions": 0}]}),
+        ];
+        for value in broken {
+            let error = Diff::read(value.clone()).unwrap_err();
+            assert!(matches!(error, PullRequestError::Malformed(_)), "{value}");
+        }
+    }
+
+    /// The route encodes each failure with its own status (environmentHttp.ts:650-663). A pull
+    /// request failure reads as it does over RPC.
+    #[tokio::test]
+    async fn each_failure_t3_answers_the_diff_with_reads_as_its_kind() {
+        let gone = json!({"_tag": "PullRequestOperationError", "operation": "diff",
+            "detail": "No pull request #7.", "reason": "not-found"});
+        let error = failure("502 Bad Gateway", &gone.to_string()).await;
+        assert!(
+            matches!(&error, PullRequestError::NotFound(message) if message == "No pull request #7."),
+            "{error:?}"
+        );
+
+        let missing = json!({"_tag": "PullRequestUnavailableError", "provider": "github",
+            "reason": "cli-missing"});
+        let error = failure("503 Service Unavailable", &missing.to_string()).await;
+        assert!(
+            matches!(
+                error,
+                PullRequestError::Unavailable {
+                    reason: Unavailable::CliMissing,
+                    provider: Some(Provider::Github)
+                }
+            ),
+            "{error:?}"
+        );
+
+        let slow = json!({"_tag": "PullRequestOperationError", "operation": "diff",
+            "detail": "GitHub took too long to answer."});
+        let error = failure("502 Bad Gateway", &slow.to_string()).await;
+        assert!(matches!(&error, PullRequestError::Rpc(_)), "{error:?}");
+        assert_eq!(error.to_string(), "GitHub took too long to answer.");
+
+        let answers = [
+            (
+                "401 Unauthorized",
+                json!({"_tag": "EnvironmentAuthInvalidError", "code": "expired",
+                    "reason": "The session expired.", "traceId": "t"})
+                .to_string(),
+                "T3 refused t3term's credentials for the diff (The session expired.).",
+            ),
+            (
+                "403 Forbidden",
+                json!({"_tag": "EnvironmentScopeRequiredError",
+                    "requiredScope": "orchestration:read"})
+                .to_string(),
+                "Reading the diff needs the orchestration:read scope, which t3term's session doesn't have.",
+            ),
+            (
+                "500 Internal Server Error",
+                json!({"_tag": "EnvironmentInternalError", "reason": "disk full"}).to_string(),
+                "T3 failed to read the diff (disk full).",
+            ),
+            (
+                "418 I'm a teapot",
+                json!({"_tag": "Teapot"}).to_string(),
+                "T3 answered the diff with HTTP 418.",
+            ),
+            (
+                "500 Internal Server Error",
+                "<html>oops</html>".to_string(),
+                "T3 answered the diff with HTTP 500.",
+            ),
+            (
+                "302 Found",
+                String::new(),
+                "T3 answered the diff with a redirect, which t3term doesn't follow.",
+            ),
+        ];
+        for (status, body, expected) in answers {
+            assert_eq!(http(failure(status, &body).await), expected, "{status}");
+        }
+
+        let error = failure("200 OK", "not json").await;
+        assert_eq!(
+            error.to_string(),
+            malformed("the diff isn't JSON".into()).to_string()
+        );
+        let error = failure("200 OK", r#"{"truncated":false,"nextCursor":null}"#).await;
+        assert!(matches!(error, PullRequestError::Malformed(_)), "{error:?}");
+
+        let t3 = fake::Server::start(|_| String::new());
+        let api = Api::without_proxy(&t3.origin);
+        let error = http(diff(&api, &reference(), None).await.unwrap_err());
+        assert!(
+            error.starts_with("t3term couldn't read the diff from T3: "),
+            "{error}"
+        );
+        assert!(!error.contains(&t3.origin), "{error}");
+    }
+
+    /// The bound holds whether or not T3 says the length up front.
+    #[tokio::test]
+    async fn a_diff_past_the_bound_is_left_unread() {
+        let body =
+            json!({"patch": "0123456789", "truncated": false, "nextCursor": null}).to_string();
+        let sized = fake::response("200 OK", &[], &body);
+        let streamed = format!("HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n{body}");
+        for answer in [sized, streamed] {
+            let t3 = fake::Server::start(move |_| answer.clone());
+            let api = Api::without_proxy(&t3.origin);
+            let read = read_diff(&api, &reference(), None, body.len()).await;
+            assert_eq!(read.unwrap().patch, "0123456789");
+            let error = read_diff(&api, &reference(), None, body.len() - 1).await;
+            assert_eq!(
+                http(error.unwrap_err()),
+                "The diff is longer than the 16 MiB t3term reads."
+            );
+        }
+    }
+}
