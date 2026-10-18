@@ -14460,11 +14460,12 @@ mod tests {
         let rows = body_after(&mut app, 200, 50);
         let text: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
         assert_eq!(
-            text[4..10],
+            text[4..11],
             [
                 "1 file",
                 "¶ Show whitespace changes",
                 "⇊ Expand all files",
+                "◫ Split diff view",
                 "↵ Disable line wrapping",
                 "",
                 "› M src/lib.rs +1 -1"
@@ -14481,6 +14482,9 @@ mod tests {
         assert!(shown.contains("Enter expand all files · "), "{shown}");
         press(&mut app, KeyCode::Down);
         let shown = status(&mut app);
+        assert!(shown.contains("Enter show split diff view · "), "{shown}");
+        press(&mut app, KeyCode::Down);
+        let shown = status(&mut app);
         assert!(shown.contains("Enter disable line wrapping · "), "{shown}");
         press(&mut app, KeyCode::Down);
         let shown = status(&mut app);
@@ -14488,7 +14492,7 @@ mod tests {
         press(&mut app, KeyCode::Enter);
         let rows = body_after(&mut app, 200, 50);
         let text: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
-        assert_eq!(text[9..12], ["⌄ M src/lib.rs +1 -1", "1 - old", "1 + new"]);
+        assert_eq!(text[10..13], ["⌄ M src/lib.rs +1 -1", "1 - old", "1 + new"]);
         press(&mut app, KeyCode::Right);
         assert_eq!(app.details.pulls.tabs(), Some(Tab::Code));
         assert_eq!(*diffs.borrow(), [named, again]);
@@ -14625,6 +14629,7 @@ mod tests {
 
         // Once they don't wrap, Shift and the arrows, `H` and `L` scroll them half the pane,
         // and the wheel 4 columns.
+        press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Down);
         press(&mut app, KeyCode::Enter);
         let shown = status(&mut app);

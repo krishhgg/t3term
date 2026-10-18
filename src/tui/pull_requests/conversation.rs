@@ -142,6 +142,7 @@ impl Shown {
             Control::File(_)
             | Control::Whitespace
             | Control::Folds
+            | Control::Layout
             | Control::Wrap
             | Control::Stretch(..)
             | Control::Retry
@@ -231,6 +232,9 @@ pub(super) enum Control {
     Whitespace,
     /// Unfolds every file of the Code tab, or folds them all once one shows unfolded.
     Folds,
+    /// Shows the Code tab's lines before and after the change side by side, or one under the
+    /// other again.
+    Layout,
     /// Lets the lines of the Code tab run on past the end of their rows, or wraps them again.
     Wrap,
     /// Reads again the slice of the diff whose read failed, at the end of the Code tab.
@@ -271,6 +275,7 @@ impl Control {
             Control::File(_)
                 | Control::Whitespace
                 | Control::Folds
+                | Control::Layout
                 | Control::Wrap
                 | Control::Stretch(..)
                 | Control::Retry
@@ -867,6 +872,7 @@ impl Conversation {
             Control::File(_)
             | Control::Whitespace
             | Control::Folds
+            | Control::Layout
             | Control::Wrap
             | Control::Stretch(..)
             | Control::Retry
@@ -927,6 +933,7 @@ impl Conversation {
             Control::File(_)
             | Control::Whitespace
             | Control::Folds
+            | Control::Layout
             | Control::Wrap
             | Control::Stretch(..)
             | Control::Retry
