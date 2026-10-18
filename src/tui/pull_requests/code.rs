@@ -387,19 +387,27 @@ impl Code {
     }
 
     /// Whether `control`, one of a thread's or the list of those off the diff, shows among
-    /// `threads` while the reader opened what `shown` says.
+    /// `threads` while the reader opened what `shown` says. A thread's `Load more comments`
+    /// shows while it is open and has a page left that no read is under way for.
     pub(super) fn shows(&self, control: Control, threads: &[Thread], shown: &Shown) -> bool {
         if !self.lists_files() {
             return false;
         }
         let placed = self.place(threads);
+        let visible = |index: usize| {
+            let on_open = placed.on.iter().any(|(&at, on)| {
+                let (_, file) = self.file(at).expect("a file shown");
+                on.contains(&index) && self.open.contains(file.path())
+            });
+            on_open || (shown.off_diff_open() && placed.off.contains(&index))
+        };
         match control {
-            Control::Thread(index) => {
-                let on_open = placed.on.iter().any(|(&at, on)| {
-                    let (_, file) = self.file(at).expect("a file shown");
-                    on.contains(&index) && self.open.contains(file.path())
-                });
-                on_open || (shown.off_diff_open() && placed.off.contains(&index))
+            Control::Thread(index) => visible(index),
+            Control::More(index) => {
+                visible(index)
+                    && threads
+                        .get(index)
+                        .is_some_and(|thread| shown.thread_open(thread) && thread.offers_more())
             }
             Control::OffDiff => !placed.off.is_empty(),
             _ => false,
@@ -506,12 +514,16 @@ impl Code {
         }
         let placed = self.place(threads);
         // A thread, open as the reader left it, with its first row as the target that opens
-        // and closes it.
+        // and closes it, and `Load more comments` as the one that reads its next page.
         let card = |lines: &mut Vec<Line<'static>>, targets: &mut Targets, index: usize| {
             let thread: &Thread = &threads[index];
-            let (rows, header) = thread.lines(shown.thread_open(thread), width, now, theme);
-            targets.push((lines.len()..lines.len() + header, Control::Thread(index)));
-            lines.extend(rows);
+            let card = thread.lines(shown.thread_open(thread), width, now, theme);
+            let start = lines.len();
+            targets.push((start..start + card.header, Control::Thread(index)));
+            if let Some(more) = card.more {
+                targets.push((start + more.start..start + more.end, Control::More(index)));
+            }
+            lines.extend(card.lines);
         };
         if !placed.off.is_empty() {
             lines.push(Line::default());

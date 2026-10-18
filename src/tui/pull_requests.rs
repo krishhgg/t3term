@@ -937,6 +937,19 @@ pub(super) struct DiffAsk {
     pub cursor: Option<String>,
 }
 
+/// What reading the next page of a review thread's remarks names: the link's host, repository
+/// and number as T3 sent them, the thread's id, the cursor of the page, and the ticket its
+/// answer comes back with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct CommentsAsk {
+    pub ticket: u64,
+    pub host: String,
+    pub repository: String,
+    pub number: u64,
+    pub thread: String,
+    pub cursor: String,
+}
+
 /// Part of what a host said of a pull request. A read sends its detail, its conversation and,
 /// where the host keeps stacks, its stack, as each arrives, then `Done`.
 pub(super) enum Part {
@@ -1115,7 +1128,12 @@ impl Read {
             _ => {}
         }
         match next.conversation {
-            Some(Ok(conversation)) => self.conversation = Answer::Read(conversation),
+            Some(Ok(mut conversation)) => {
+                if let Answer::Read(old) = &mut self.conversation {
+                    conversation.carry(old);
+                }
+                self.conversation = Answer::Read(conversation);
+            }
             Some(Err(failure)) if !matches!(self.conversation, Answer::Read(_)) => {
                 self.conversation = Answer::Failed(failure);
             }
@@ -1687,6 +1705,21 @@ impl PullRequests {
             self.relay();
             return;
         }
+        if let Control::More(index) = control {
+            let read = self.read.as_mut().expect("the shown read");
+            let (Some(code), Answer::Read(conversation)) = (&read.code, &mut read.conversation)
+            else {
+                return;
+            };
+            if !code.shows(control, conversation.threads(), &self.shown) {
+                return;
+            }
+            conversation.want_more(index);
+            // `Loading more comments…` takes the control's place until the page comes.
+            self.pick = None;
+            self.relay();
+            return;
+        }
         if let Control::Thread(_) | Control::OffDiff = control {
             let read = self.read.as_ref().expect("the shown read");
             let (Some(code), Answer::Read(conversation)) = (&read.code, &read.conversation) else {
@@ -2204,6 +2237,51 @@ impl PullRequests {
             number: read.number,
             cursor,
         })
+    }
+
+    /// The read of the next page of a review thread's remarks that Enter on its `Load more
+    /// comments` asked for, while the details show the read. None unless `enabled`.
+    pub fn take_comments_ask(&mut self, enabled: bool) -> Option<CommentsAsk> {
+        if !enabled || !self.showing_read() {
+            return None;
+        }
+        let ticket = self.tickets + 1;
+        let read = self.read.as_mut().expect("the shown read");
+        let Answer::Read(conversation) = &mut read.conversation else {
+            return None;
+        };
+        let (thread, cursor) = conversation.take_wanted(ticket)?;
+        self.tickets = ticket;
+        Some(CommentsAsk {
+            ticket,
+            host: read.host.clone(),
+            repository: read.repository.clone(),
+            number: read.number,
+            thread,
+            cursor,
+        })
+    }
+
+    /// Takes the answer to read `ticket` of a page of a review thread's remarks, or why it
+    /// failed. Says whether what the details show changed. An answer to a read the details
+    /// no longer hold is dropped.
+    pub fn answer_comments(
+        &mut self,
+        ticket: u64,
+        answer: Result<Box<pull_request::CommentPage>, String>,
+    ) -> bool {
+        let Some(read) = self.read.as_mut() else {
+            return false;
+        };
+        let Answer::Read(conversation) = &mut read.conversation else {
+            return false;
+        };
+        let answer = answer.as_deref().map_err(String::as_str);
+        if !conversation.take_page(ticket, answer) {
+            return false;
+        }
+        self.relay();
+        true
     }
 
     /// Takes the answer to read `ticket` of a slice of the diff, which came at `now`, or why it
@@ -6659,6 +6737,136 @@ mod tests {
             "{rows:#?}"
         );
         assert!(rows.contains(&"› A f1.rs +1 -0".to_string()), "{rows:#?}");
+    }
+
+    #[test]
+    fn a_thread_reads_more_comments_a_page_at_a_time() {
+        let theme = theme();
+        let remark = |id: &str| {
+            json!({"id": id, "author": {"login": "mona", "name": null},
+                "body": format!("Remark {id}."), "createdAt": "2026-10-13T00:30:00Z",
+                "url": null})
+        };
+        let mut activity = remarks(1);
+        activity["reviewThreads"] = json!([
+            {"id": "t0", "path": "f0.rs", "line": 1, "side": "right", "isResolved": false,
+                "isOutdated": false, "commentCount": 5, "nextCommentsCursor": "p2",
+                "comments": [remark("a")]},
+        ]);
+        let page = |ids: &[&str], next: Option<&str>| {
+            let page = json!({"comments": ids.iter().map(|id| remark(id)).collect::<Vec<_>>(),
+                "nextCursor": next});
+            Box::new(pull_request::CommentPage::read(&page).unwrap())
+        };
+        let comments_ask = |ticket: u64, cursor: &str| CommentsAsk {
+            ticket,
+            host: "github.com".into(),
+            repository: "krishhgg/t3term".into(),
+            number: 31,
+            thread: "t0".into(),
+            cursor: cursor.into(),
+        };
+        let count = |rows: &[String], text: &str| rows.iter().filter(|row| *row == text).count();
+        let mut pulls = conversing(activity.clone());
+        assert!(!pulls.answer(1, Part::Done, now()));
+        assert!(pulls.forward() && pulls.forward());
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
+        assert!(pulls.answer_diff(2, Ok(added(0, 1, None)), now()));
+        pulls.page(60, 40, now(), true, &theme);
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::File(0)));
+        pulls.enter();
+        pulls.page(60, 40, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert_eq!(count(&rows, "│ Load more comments"), 1, "{rows:#?}");
+        // Nothing reads until the reader asks, nor from a button that no longer shows, as
+        // a click on a closed thread's last frame would.
+        assert_eq!(pulls.take_comments_ask(true), None);
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::Thread(0)));
+        pulls.enter();
+        pulls.pick = Some(Control::More(0));
+        pulls.enter();
+        assert_eq!(pulls.take_comments_ask(true), None);
+        pulls.pick = Some(Control::Thread(0));
+        pulls.enter();
+        pulls.page(60, 40, now(), true, &theme);
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::More(0)));
+        assert_eq!(pulls.action().as_deref(), Some("load more comments"));
+
+        // Enter asks for the page at the thread's cursor, once, and the row says it is coming.
+        pulls.enter();
+        assert_eq!(pulls.pick, None);
+        assert_eq!(pulls.take_comments_ask(false), None);
+        assert_eq!(pulls.take_comments_ask(true), Some(comments_ask(3, "p2")));
+        assert_eq!(pulls.take_comments_ask(true), None);
+        pulls.page(60, 40, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert_eq!(count(&rows, "│ Loading more comments…"), 1, "{rows:#?}");
+        assert_eq!(count(&rows, "│ Load more comments"), 0);
+        // While it comes, Enter on where the button was asks for nothing more.
+        pulls.pick = Some(Control::More(0));
+        pulls.enter();
+        assert_eq!(pulls.take_comments_ask(true), None);
+
+        // An answer to another read changes nothing. A failure says why, and the button
+        // reads the same page again.
+        assert!(!pulls.answer_comments(99, Ok(page(&["b"], None))));
+        let failure = Err("GitHub took too long to answer.".to_string());
+        assert!(pulls.answer_comments(3, failure));
+        assert!(!pulls.answer_comments(3, Ok(page(&["b"], None))));
+        pulls.page(60, 40, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        let at = rows
+            .iter()
+            .position(|row| row == "│ t3term couldn't read more comments.")
+            .expect("the failure");
+        assert_eq!(
+            rows[at + 1..at + 3],
+            ["│ GitHub took too long to answer.", "│ Load more comments"]
+        );
+        pulls.pick = Some(Control::More(0));
+        pulls.enter();
+        assert_eq!(pulls.take_comments_ask(true), Some(comments_ask(4, "p2")));
+
+        // The page's remarks follow the thread's, each once, and its cursor reads the next.
+        assert!(pulls.answer_comments(4, Ok(page(&["a", "b", "c"], Some("p3")))));
+        pulls.page(60, 40, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        for body in ["│   Remark a.", "│   Remark b.", "│   Remark c."] {
+            assert_eq!(count(&rows, body), 1, "{body}: {rows:#?}");
+        }
+        assert_eq!(count(&rows, "│ Load more comments"), 1);
+
+        // A read again of the conversation keeps the pages, and the next is the page's.
+        assert!(pulls.reload(now()));
+        let ask = pulls.take_ask(true, now()).expect("the read again");
+        let detail = Part::Detail(Ok(read_detail(&bare_detail())));
+        pulls.answer(ask.ticket, detail, now());
+        let again = pull_request::Activity::read(&activity).unwrap();
+        pulls.answer(ask.ticket, Part::Activity(Ok(Box::new(again))), now());
+        pulls.answer(ask.ticket, Part::Done, now());
+        pulls.page(60, 40, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert_eq!(count(&rows, "│   Remark c."), 1, "{rows:#?}");
+        pulls.pick = Some(Control::More(0));
+        pulls.enter();
+        let ask = pulls.take_comments_ask(true).expect("the next page");
+        assert_eq!(ask.cursor, "p3");
+
+        // The last page takes the button away. The host counts one more than came, which
+        // t3term can't read.
+        assert!(pulls.answer_comments(ask.ticket, Ok(page(&["d"], None))));
+        pulls.page(60, 40, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert_eq!(count(&rows, "│ Load more comments"), 0);
+        assert_eq!(count(&rows, "│   Remark d."), 1);
+        assert_eq!(
+            count(&rows, "│ 1 more comment on the host."),
+            1,
+            "{rows:#?}"
+        );
     }
 
     #[test]

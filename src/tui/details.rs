@@ -988,6 +988,18 @@ impl Details {
         }
     }
 
+    /// Takes a page of a review thread's remarks, or why reading it failed, for the thread of
+    /// the details that asked for it with `ticket`.
+    pub fn answer_comments(
+        &mut self,
+        ticket: u64,
+        answer: Result<Box<crate::pull_request::CommentPage>, String>,
+    ) {
+        if self.pulls.answer_comments(ticket, answer) {
+            self.moved = true;
+        }
+    }
+
     /// Enter on the thread's tab hands back the Lineage row ↑ and ↓ chose, for the caller to
     /// act on. On the pull requests' tab it does what the control ↑ and ↓ chose in a pull
     /// request's details does, or else shows the selected one's details in the list's place,

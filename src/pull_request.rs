@@ -38,6 +38,7 @@ pub const DETAIL: &str = "pullRequests.detail";
 pub const CHECKS: &str = "pullRequests.checks";
 pub const ACTIVITY: &str = "pullRequests.activity";
 pub const STACK: &str = "pullRequests.stack";
+pub const THREAD_COMMENTS: &str = "pullRequests.threadComments";
 pub const INVALIDATE: &str = "pullRequests.invalidate";
 pub const SUBSCRIBE_REFRESHES: &str = "pullRequests.subscribeRefreshes";
 /// The HTTP route of a pull request's diff (packages/contracts/src/environmentHttp.ts:650-663).
@@ -75,7 +76,7 @@ const MOST_COMMENTS: usize = 2000;
 /// The most review threads kept. T3 reads at most ten pages of a hundred from GitHub.
 const MOST_THREADS: usize = 1000;
 /// The most remarks kept in one review thread.
-const MOST_THREAD_COMMENTS: usize = 1000;
+pub const MOST_THREAD_COMMENTS: usize = 1000;
 /// The most commits kept.
 const MOST_COMMITS: usize = 1000;
 /// The most layers of a stack kept.
@@ -354,6 +355,23 @@ pub async fn stack(
         return Ok(None);
     }
     Stack::read(&answer).map(Some)
+}
+
+/// The page of review thread `thread`'s remarks that starts at `cursor`, a cursor T3 sent with
+/// the thread or with the page before, as the desktop's `Load more comments` reads it
+/// (apps/web/src/components/pullRequest/PullRequestCodeTab.tsx:928-940 at f570bd2). T3 fails
+/// where the host doesn't page a thread's remarks (PullRequestService.ts:1853-1865).
+pub async fn thread_comments(
+    rpc: &RpcClient,
+    reference: &Reference,
+    thread: &str,
+    cursor: &str,
+) -> Result<CommentPage, PullRequestError> {
+    let mut payload = reference.payload();
+    payload["threadId"] = json!(thread);
+    payload["cursor"] = json!(cursor);
+    let answer = rpc.call(THREAD_COMMENTS, payload, CALL_TIMEOUT).await?;
+    CommentPage::read(&answer)
 }
 
 /// One slice of the pull request's diff, from the slice `cursor` names or from the first.
@@ -971,6 +989,18 @@ pub struct ReviewThread {
     pub cut: bool,
 }
 
+/// A page of a review thread's remarks after those the activity sent.
+/// `PullRequestThreadCommentsResult`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CommentPage {
+    /// Oldest first, as T3 sends them.
+    pub comments: Vec<ThreadComment>,
+    /// Where the page after this starts. `None` once the thread is whole.
+    pub next_cursor: Option<String>,
+    /// t3term left remarks out past its bound.
+    pub cut: bool,
+}
+
 /// `PullRequestCommit`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Commit {
@@ -1209,6 +1239,23 @@ impl Activity {
             reactions: read_reactions(&object)?,
             cut,
             verdicts_cut,
+        })
+    }
+}
+
+impl CommentPage {
+    pub fn read(value: &Value) -> Result<CommentPage, PullRequestError> {
+        let object = Object::of(value, "page of thread comments")?;
+        let (comments, cut) =
+            object.entries("comments", MOST_THREAD_COMMENTS, read_thread_comment)?;
+        let next_cursor = match object.nullable("nextCursor")? {
+            Some(_) => Some(object.name("nextCursor")?),
+            None => None,
+        };
+        Ok(CommentPage {
+            comments,
+            next_cursor,
+            cut,
         })
     }
 }
