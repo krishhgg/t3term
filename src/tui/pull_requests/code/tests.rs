@@ -21,7 +21,7 @@ fn rows_of(lines: &[Line]) -> Vec<String> {
 
 /// The tab's rows and targets at `width`, with no review threads.
 fn laid(code: &Code, width: usize) -> (Vec<Line<'static>>, Targets) {
-    code.lay_out(&[], &Shown::default(), width, 0, &theme())
+    code.lay_out(&[], &[], &Shown::default(), width, 0, &theme())
 }
 
 /// The tab's rows at `width`.
@@ -117,14 +117,14 @@ fn files_show_folded_and_each_unfolds_into_its_hunks() {
             .zip(files)
             .collect::<Vec<_>>()
     );
-    assert_eq!(code.action(Control::File(0)), "expand file");
+    assert_eq!(code.action(Control::File(0), &[]), "expand file");
 
     // Each line has the number it has after the change, or before it where it was removed,
     // and the unchanged lines between two hunks are counted.
     for at in 0..5 {
-        code.act(Control::File(at));
+        code.act(Control::File(at), &[]);
     }
-    assert_eq!(code.action(Control::File(0)), "collapse file");
+    assert_eq!(code.action(Control::File(0), &[]), "collapse file");
     assert_eq!(
         rows(&code, 40),
         [
@@ -158,7 +158,7 @@ fn files_show_folded_and_each_unfolds_into_its_hunks() {
     );
     let (_, targets) = laid(&code, 40);
     assert_eq!(targets[1], (7..8, Control::File(1)));
-    code.act(Control::File(0));
+    code.act(Control::File(0), &[]);
     assert_eq!(rows(&code, 40)[2..4], ["› A docs/new.md +2 -0", ""]);
 }
 
@@ -178,7 +178,7 @@ fn the_unchanged_lines_before_a_hunk_count_from_the_line_git_names() {
 +y
 ";
     let mut code = read(slice(patch, None), 0);
-    code.act(Control::File(0));
+    code.act(Control::File(0), &[]);
     assert_eq!(
         rows(&code, 40),
         [
@@ -202,7 +202,7 @@ fn the_unchanged_lines_before_a_hunk_count_from_the_line_git_names() {
 +y
 ";
     let mut code = read(slice(patch, None), 0);
-    code.act(Control::File(0));
+    code.act(Control::File(0), &[]);
     assert_eq!(rows(&code, 40)[3], "⋯ 1 unmodified line");
 }
 
@@ -218,7 +218,7 @@ fn a_hunk_that_removes_nothing_after_the_highest_line_unfolds() {
 +added
 ";
     let mut code = read(slice(patch, None), 0);
-    code.act(Control::File(0));
+    code.act(Control::File(0), &[]);
     let rows = rows(&code, 60);
     assert_eq!(
         rows[2..4],
@@ -297,7 +297,7 @@ fn a_failure_says_why_and_a_later_slice_s_offers_retry() {
         ["Couldn't read this diff: [31mGitHub said", "no"]
     );
     assert!(laid(&code, 40).1.is_empty());
-    assert!(!code.has(Control::Retry));
+    assert!(!code.has(Control::Retry, &[]));
     assert_eq!(code.ask(2), None, "a failure isn't read again by itself");
     assert!(code.stale(0), "showing the tab again reads it");
 
@@ -325,10 +325,10 @@ fn a_failure_says_why_and_a_later_slice_s_offers_retry() {
     );
     let (_, targets) = laid(&code, 40);
     assert_eq!(targets[1], (7..8, Control::Retry));
-    assert!(code.has(Control::Retry));
-    assert_eq!(code.action(Control::Retry), "retry");
-    code.act(Control::Retry);
-    assert!(!code.has(Control::Retry));
+    assert!(code.has(Control::Retry, &[]));
+    assert_eq!(code.action(Control::Retry, &[]), "retry");
+    code.act(Control::Retry, &[]);
+    assert!(!code.has(Control::Retry, &[]));
     assert_eq!(code.ask(3), Some(Some("2".to_string())));
 
     // A read of the first slice again that failed leaves the slices shown under a note that
@@ -347,7 +347,7 @@ fn a_failure_says_why_and_a_later_slice_s_offers_retry() {
         "› M one +1 -1",
     ];
     assert_eq!(rows(&code, 40), shown);
-    assert!(!code.has(Control::Retry));
+    assert!(!code.has(Control::Retry, &[]));
     code.near_end();
     assert_eq!(code.ask(3), None);
     assert!(code.stale(0));
@@ -381,7 +381,7 @@ diff --git a/two b/two
     code.near_end();
     assert_eq!(code.ask(2), Some(Some("2".to_string())));
     assert_eq!(code.take(2, Ok(slice(first, None)), 0), Some(false));
-    code.act(Control::File(1));
+    code.act(Control::File(1), &[]);
 
     // A read under way when the diff is wanted again is dropped when it comes.
     code.near_end();
@@ -428,8 +428,8 @@ diff --git a/two b/two
 +f
 ";
     let mut code = read(slice(first, Some("2")), 0);
-    code.act(Control::File(0));
-    code.act(Control::File(1));
+    code.act(Control::File(0), &[]);
+    code.act(Control::File(1), &[]);
     let fresh = rows(&code, 40);
     code.prepare(40, &theme());
     // The rows the tab keeps are those it lays out afresh, and it shows those it keeps.
@@ -445,8 +445,8 @@ diff --git a/two b/two
 
     // Unfolding another file, or the minute changing, lays out that file alone, and folding
     // one forgets its rows.
-    code.act(Control::File(2));
-    code.act(Control::File(0));
+    code.act(Control::File(2), &[]);
+    code.act(Control::File(0), &[]);
     code.prepare(40, &theme());
     assert_eq!(code.bodies[&(0, 1)].lines.as_ptr(), one);
     let mut kept: Vec<_> = code.bodies.keys().copied().collect();
@@ -457,7 +457,7 @@ diff --git a/two b/two
 
     // A later slice keeps the rows of the files before it, unless it says the host withheld
     // one of them.
-    code.act(Control::File(0));
+    code.act(Control::File(0), &[]);
     code.prepare(41, &theme());
     assert_eq!(rows_of(&code.bodies[&(0, 0)].lines), ["No lines changed."]);
     let two = code.bodies[&(0, 2)].lines.as_ptr();
@@ -514,7 +514,7 @@ diff --git a/small b/small
         },
     ];
     let mut code = read(diff, 0);
-    code.act(Control::File(0));
+    code.act(Control::File(0), &[]);
     assert_eq!(
         rows(&code, 60),
         [
@@ -556,8 +556,8 @@ fn an_empty_or_unreadable_diff_says_so() {
     let text =
         "diff --git a/a b/a\n@@ -x +1 @@\n+lost\ndiff --git a/b b/b\n@@ -1,2 +1,2 @@\n kept\n";
     let mut code = read(slice(text, None), 0);
-    code.act(Control::File(0));
-    code.act(Control::File(1));
+    code.act(Control::File(0), &[]);
+    code.act(Control::File(1), &[]);
     let note = "t3term couldn't read some lines of this file's patch.";
     assert_eq!(
         rows(&code, 60),
@@ -572,7 +572,7 @@ fn an_empty_or_unreadable_diff_says_so() {
     text.push_str(&"+x\n".repeat(patch::MOST_LINES));
     text.push_str("diff --git a/next b/next\n@@ -1 +1 @@\n-a\n+b\n");
     let mut code = read(slice(&text, None), 0);
-    code.act(Control::File(1));
+    code.act(Control::File(1), &[]);
     let rows = rows(&code, 100);
     assert_eq!(
         rows[rows.len() - 2..],
@@ -610,8 +610,8 @@ diff --git a/other b/other
         rows(&code, 40),
         ["2 files", "", "› A link +1 -0", "", "› M other +1 -1"]
     );
-    assert!(code.has(Control::File(1)));
-    assert!(!code.has(Control::File(2)));
+    assert!(code.has(Control::File(1), &[]));
+    assert!(!code.has(Control::File(2), &[]));
 }
 
 #[test]
@@ -643,7 +643,7 @@ fn every_row_fits_its_width_and_hostile_text_is_cleaned() {
 +new line that is rather long and has to wrap at narrow widths
 ";
     let mut code = read(slice(patch, Some("2")), 0);
-    code.act(Control::File(0));
+    code.act(Control::File(0), &[]);
     for width in 1..=80 {
         let (lines, targets) = laid(&code, width);
         for line in &lines {
@@ -715,7 +715,7 @@ fn with_threads(
 ) -> (Vec<String>, Targets) {
     let showing = code.threads_shown(conversation.threads(), shown);
     conversation.lay_out_threads(&showing, width, &theme());
-    let (lines, targets) = code.lay_out(conversation.threads(), shown, width, NOW, &theme());
+    let (lines, targets) = code.lay_out(conversation.threads(), &[], shown, width, NOW, &theme());
     (rows_of(&lines), targets)
 }
 
@@ -763,7 +763,7 @@ fn review_threads_show_under_their_lines() {
     let lib = (0..code.files.len())
         .find(|&at| code.file(at).unwrap().1.path() == "src/lib.rs")
         .unwrap();
-    code.act(Control::File(lib));
+    code.act(Control::File(lib), &[]);
     let mut shown = Shown::default();
     let (rows, targets) = with_threads(&code, &mut conversation, &shown, 40);
     let at = rows
@@ -870,7 +870,7 @@ fn review_threads_show_under_their_lines() {
     );
 
     // Folding the file takes its threads away, with their controls.
-    code.act(Control::File(lib));
+    code.act(Control::File(lib), &[]);
     assert!(!code.shows(Control::Thread(0), conversation.threads(), &shown));
     assert_eq!(
         code.threads_shown(conversation.threads(), &shown),
@@ -906,8 +906,8 @@ diff --git a/b b/b
         thread("short", "b", Some(3), "right", false, &["Short."]),
     ]);
     let mut code = read(slice(patch, None), 0);
-    code.act(Control::File(0));
-    code.act(Control::File(1));
+    code.act(Control::File(0), &[]);
+    code.act(Control::File(1), &[]);
     let (rows, _) = with_threads(&code, &mut conversation, &Shown::default(), 40);
     let card = |text: &str| {
         [
@@ -997,7 +997,7 @@ fn a_thread_reads_its_remarks_a_page_at_a_time() {
     first["nextCommentsCursor"] = json!("p2");
     let mut conversation = conversation(vec![first]);
     let mut code = read(slice(ONE, None), 0);
-    code.act(Control::File(0));
+    code.act(Control::File(0), &[]);
     let mut shown = Shown::default();
     let (rows, targets) = with_threads(&code, &mut conversation, &shown, 40);
     let at = rows
@@ -1076,9 +1076,9 @@ fn a_thread_reads_its_remarks_a_page_at_a_time() {
     shown.act(Control::Thread(0), &conversation);
     // Nor under a folded file.
     assert!(code.shows(Control::More(0), conversation.threads(), &shown));
-    code.act(Control::File(0));
+    code.act(Control::File(0), &[]);
     assert!(!code.shows(Control::More(0), conversation.threads(), &shown));
-    code.act(Control::File(0));
+    code.act(Control::File(0), &[]);
     assert!(conversation.want_more(0));
     assert_eq!(
         conversation.take_wanted(10),
@@ -1110,7 +1110,7 @@ fn a_thread_reads_no_page_past_what_t3term_keeps() {
     cut["nextCommentsCursor"] = json!("p2");
     let mut conversation = conversation(vec![nearly, full, cut]);
     let mut code = read(slice(ONE, None), 0);
-    code.act(Control::File(0));
+    code.act(Control::File(0), &[]);
     let shown = Shown::default();
 
     // A thread that came with as many remarks as t3term keeps reads no page after them.
@@ -1171,7 +1171,7 @@ fn pages_go_with_their_thread_when_the_conversation_is_read_again() {
     let mut new = conversation(threads(&["First.", "Second."], "fresh"));
     new.carry(&mut old);
     let mut code = read(slice(ONE, None), 0);
-    code.act(Control::File(0));
+    code.act(Control::File(0), &[]);
     let shown = Shown::default();
     let (rows, _) = with_threads(&code, &mut new, &shown, 40);
     for body in ["│   First.", "│   Second.", "│   Remark t-2."] {
@@ -1269,14 +1269,14 @@ fn a_new_theme_restyles_the_threads() {
     let lib = (0..code.files.len())
         .find(|&at| code.file(at).unwrap().1.path() == "src/lib.rs")
         .unwrap();
-    code.act(Control::File(lib));
+    code.act(Control::File(lib), &[]);
     let shown = Shown::default();
     // The color of a remark's `text`, laid out at one width as the panel lays it out: the
     // thread's own and one from a page read after.
     let color = |conversation: &mut Conversation, theme: &Theme, text: &str| {
         let showing = code.threads_shown(conversation.threads(), &shown);
         conversation.lay_out_threads(&showing, 40, theme);
-        let (lines, _) = code.lay_out(conversation.threads(), &shown, 40, NOW, theme);
+        let (lines, _) = code.lay_out(conversation.threads(), &[], &shown, 40, NOW, theme);
         lines.iter().find_map(|line| {
             let span = line.spans.iter().find(|span| span.content.contains(text))?;
             line.style.patch(span.style).fg
@@ -1339,14 +1339,15 @@ fn threads_fit_every_width_and_hostile_text_is_cleaned() {
     );
     assert!(conversation.take_page(1, Err(hostile)));
     let mut code = read(slice(&patch, None), 0);
-    code.act(Control::File(0));
+    code.act(Control::File(0), &[]);
     let mut shown = Shown::default();
     shown.act(Control::OffDiff, &conversation);
     for width in 1..=80 {
         let showing = code.threads_shown(conversation.threads(), &shown);
         assert_eq!(showing, [0, 1]);
         conversation.lay_out_threads(&showing, width, &theme());
-        let (lines, targets) = code.lay_out(conversation.threads(), &shown, width, NOW, &theme());
+        let (lines, targets) =
+            code.lay_out(conversation.threads(), &[], &shown, width, NOW, &theme());
         for line in &lines {
             let text = line.to_string();
             // The Markdown renderer keeps 8 columns for text beside the bar's 2, and the
@@ -1403,4 +1404,341 @@ fn threads_fit_every_width_and_hostile_text_is_cleaned() {
     let at = rows.iter().position(|row| row == "│   Second.").unwrap();
     assert_eq!(rows[at - 2], "│");
     assert!(rows[at - 1].starts_with("│ mona"));
+}
+
+/// A conversation with `threads` and a commit for each of `commits`, as its id, headline and
+/// time, in the order T3 sent them, and no remarks.
+fn committed(threads: Vec<Value>, commits: &[(&str, &str, &str)]) -> Conversation {
+    let commits: Vec<Value> = commits
+        .iter()
+        .map(|(oid, headline, at)| {
+            json!({"oid": oid, "messageHeadline": headline, "committedDate": at})
+        })
+        .collect();
+    let activity = json!({"comments": [], "commentCount": 0, "commentsTruncated": false,
+        "reviewThreads": threads, "commits": commits});
+    Conversation::of(&pull_request::Activity::read(&activity).unwrap())
+}
+
+/// The tab's rows and targets at `width` with `conversation`'s threads and commits.
+fn scoped(
+    code: &Code,
+    conversation: &Conversation,
+    shown: &Shown,
+    width: usize,
+) -> (Vec<String>, Targets) {
+    let commits = conversation.commits();
+    let threads = conversation.threads();
+    let (lines, targets) = code.lay_out(threads, &commits, shown, width, NOW, &theme());
+    (rows_of(&lines), targets)
+}
+
+/// An entry of the list of commits on a row of `width`: `lead`, then `text`, then `short` at
+/// the end.
+fn entry_row(lead: &str, text: &str, short: &str, width: usize) -> String {
+    let gap = width - lead.width() - text.width() - short.width();
+    format!("{lead}{text}{}{short}", " ".repeat(gap))
+}
+
+#[test]
+fn the_list_of_commits_picks_the_diff_the_tab_reads() {
+    // In the order T3 sent them: one in another zone, two at the same instant and one with
+    // no time t3term reads.
+    let on_line = thread(
+        "t1",
+        "src/lib.rs",
+        Some(2),
+        "right",
+        false,
+        &["On the new line."],
+    );
+    let conversation = committed(
+        vec![on_line],
+        &[
+            ("aaaaaaa1111", "First", "2026-10-15T08:00:00Z"),
+            ("bbbbbbb2222", "Zone", "2026-10-15T11:30:00+02:00"),
+            ("ccccccc3333", "Newest", "2026-10-15T10:00:00Z"),
+            ("ddddddd4444", "", "not a date"),
+            ("eeeeeee5555", "Same time", "2026-10-15T08:00:00Z"),
+        ],
+    );
+    let commits = conversation.commits();
+    let shown = Shown::default();
+    let mut code = read(slice(PATCH, None), 0);
+    let (rows, targets) = scoped(&code, &conversation, &shown, 40);
+    assert_eq!(rows[..2], ["› All commits", "5 files"]);
+    assert_eq!(targets[0], (0..1, Control::Commits));
+    assert_eq!(code.action(Control::Commits, &commits), "choose commit");
+    for control in [
+        Control::AllCommits,
+        Control::Commit(0),
+        Control::MoreCommits,
+    ] {
+        assert!(!code.has(control, &commits), "{control:?}");
+    }
+    // Under the whole change, the thread is under its line.
+    assert!(
+        !rows.iter().any(|row| row.contains("conversation")),
+        "{rows:#?}"
+    );
+
+    // Newest first by when each was committed, ties in T3's order, the unreadable time last.
+    assert!(!code.act(Control::Commits, &commits));
+    assert_eq!(code.action(Control::Commits, &commits), "hide commits");
+    let (rows, targets) = scoped(&code, &conversation, &shown, 40);
+    assert_eq!(
+        rows[..9],
+        [
+            "⌄ All commits".to_string(),
+            "  ✓ All commits".into(),
+            entry_row("    ", "Newest", "ccccccc", 40),
+            entry_row("    ", "Zone", "bbbbbbb", 40),
+            entry_row("    ", "First", "aaaaaaa", 40),
+            entry_row("    ", "Same time", "eeeeeee", 40),
+            entry_row("    ", "Untitled commit", "ddddddd", 40),
+            String::new(),
+            "5 files".into(),
+        ]
+    );
+    let entries = [Control::AllCommits]
+        .into_iter()
+        .chain((0..5).map(Control::Commit));
+    let expected: Vec<_> = (1..7).map(|row| row..row + 1).zip(entries).collect();
+    assert_eq!(targets[1..7], expected);
+    assert!(code.has(Control::Commit(4), &commits));
+    assert!(!code.has(Control::Commit(5), &commits));
+    assert!(!code.has(Control::MoreCommits, &commits));
+    assert_eq!(
+        code.action(Control::AllCommits, &commits),
+        "show all commits"
+    );
+    assert_eq!(
+        code.action(Control::Commit(1), &commits),
+        "show commit bbbbbbb"
+    );
+    assert_eq!(code.action(Control::Commit(9), &commits), "show commit");
+
+    // Picking the diff shown closes the list and reads nothing.
+    code.act(Control::File(4), &commits);
+    assert!(!code.act(Control::AllCommits, &commits));
+    assert!(!code.has(Control::AllCommits, &commits));
+    assert_eq!(code.ask(2), None);
+
+    // Another commit's diff reads at once from its first slice, and a read for the whole
+    // change under way is dropped when it comes.
+    code.again();
+    assert_eq!(code.ask(2), Some(None));
+    code.act(Control::Commits, &commits);
+    assert!(code.act(Control::Commit(1), &commits));
+    assert_eq!(code.commit(), Some("bbbbbbb2222"));
+    assert!(!code.has(Control::Commit(1), &commits));
+    assert_eq!(code.ask(3), Some(None));
+    assert_eq!(code.take(2, Ok(slice(PATCH, None)), 10), None);
+    let (rows, targets) = scoped(&code, &conversation, &shown, 40);
+    assert_eq!(rows, ["› Zone · bbbbbbb", "Loading pull request diff…"]);
+    assert_eq!(targets, [(0..1, Control::Commits)]);
+
+    // Its files show folded, and the thread goes off its diff though its line is in it.
+    assert_eq!(code.take(3, Ok(slice(PATCH, None)), 10), Some(true));
+    let (rows, _) = scoped(&code, &conversation, &shown, 40);
+    assert_eq!(
+        rows[..4],
+        [
+            "› Zone · bbbbbbb",
+            "5 files",
+            "",
+            "› 1 conversation not on the current diff"
+        ]
+    );
+    assert!(
+        rows.contains(&"› R from.rs → to.rs".to_string()),
+        "{rows:#?}"
+    );
+    code.act(Control::File(3), &commits);
+    assert!(
+        code.threads_shown(conversation.threads(), &shown)
+            .is_empty()
+    );
+
+    // A commit with no files says so.
+    code.act(Control::Commits, &commits);
+    assert!(code.act(Control::Commit(0), &commits));
+    assert_eq!(code.ask(4), Some(None));
+    assert_eq!(code.take(4, Ok(slice("", None)), 20), Some(true));
+    let (rows, _) = scoped(&code, &conversation, &shown, 40);
+    assert_eq!(
+        rows,
+        [
+            "› Newest · ccccccc",
+            "0 files",
+            "",
+            "This commit has no file changes."
+        ]
+    );
+
+    // All commits reads the whole change again, and a failure shows under the row.
+    code.act(Control::Commits, &commits);
+    assert!(code.act(Control::AllCommits, &commits));
+    assert_eq!(code.commit(), None);
+    assert_eq!(code.ask(5), Some(None));
+    let failure = Err("T3 couldn't read the diff.".to_string());
+    assert_eq!(code.take(5, failure, 30), Some(true));
+    let (rows, _) = scoped(&code, &conversation, &shown, 40);
+    assert_eq!(rows, ["› All commits", "T3 couldn't read the diff."]);
+
+    // A commit picked after that reads its own diff, and the failure goes with the diff it
+    // was of.
+    code.act(Control::Commits, &commits);
+    assert!(code.act(Control::Commit(0), &commits));
+    let (rows, _) = scoped(&code, &conversation, &shown, 40);
+    assert_eq!(rows, ["› Newest · ccccccc", "Loading pull request diff…"]);
+}
+
+#[test]
+fn the_list_shows_10_commits_at_a_time_and_a_rebase_takes_it_back_to_all() {
+    let oids: Vec<String> = (0..23).map(|n| format!("{n:07}abc")).collect();
+    let headlines: Vec<String> = (0..23).map(|n| format!("Commit {n}")).collect();
+    let times: Vec<String> = (0..23)
+        .map(|n| format!("2026-10-15T08:{n:02}:00Z"))
+        .collect();
+    let all: Vec<(&str, &str, &str)> = (0..23)
+        .map(|n| (oids[n].as_str(), headlines[n].as_str(), times[n].as_str()))
+        .collect();
+    let conversation = committed(Vec::new(), &all);
+    let commits = conversation.commits();
+    let shown = Shown::default();
+    let mut code = read(slice(ONE, None), 0);
+    code.act(Control::Commits, &commits);
+    let more = |code: &Code| {
+        let (rows, targets) = scoped(code, &conversation, &shown, 40);
+        let at = targets
+            .iter()
+            .find(|(_, control)| *control == Control::MoreCommits)
+            .map(|(rows, _)| rows.start);
+        (at.map(|at| rows[at].clone()), rows)
+    };
+    let (row, rows) = more(&code);
+    assert_eq!(row.as_deref(), Some("    Show more (13 left)"));
+    assert_eq!(rows[2], entry_row("    ", "Commit 22", "0000022", 40));
+    assert_eq!(rows[11], entry_row("    ", "Commit 13", "0000013", 40));
+    assert_eq!(rows[12..15], ["    Show more (13 left)", "", "1 file"]);
+    assert!(code.has(Control::Commit(9), &commits));
+    assert!(!code.has(Control::Commit(10), &commits));
+    assert_eq!(
+        code.action(Control::MoreCommits, &commits),
+        "show more commits"
+    );
+
+    assert!(!code.act(Control::MoreCommits, &commits));
+    assert_eq!(more(&code).0.as_deref(), Some("    Show more (3 left)"));
+    code.act(Control::MoreCommits, &commits);
+    let (row, rows) = more(&code);
+    assert_eq!(row, None);
+    assert_eq!(rows[24], entry_row("    ", "Commit 0", "0000000", 40));
+    assert!(code.has(Control::Commit(22), &commits));
+    assert!(!code.has(Control::MoreCommits, &commits));
+
+    // Another commit lists 10 again when the list opens.
+    assert!(code.act(Control::Commit(15), &commits));
+    assert_eq!(code.commit(), Some("0000007abc"));
+    code.act(Control::Commits, &commits);
+    let (row, rows) = more(&code);
+    assert_eq!(row.as_deref(), Some("    Show more (13 left)"));
+    assert_eq!(rows[..2], ["⌄ Commit 7 · 0000007", "    All commits"]);
+
+    // A read of the conversation that still lists the commit keeps it. One that doesn't, as
+    // after a force-push, reads the whole change again, the list closed.
+    assert!(!code.follow(&commits));
+    assert_eq!(code.ask(2), Some(None));
+    let kept = committed(Vec::new(), &all[..5]);
+    assert!(code.follow(&kept.commits()));
+    assert_eq!(code.commit(), None);
+    assert!(!code.has(Control::AllCommits, &kept.commits()));
+    assert_eq!(code.ask(3), Some(None));
+    assert!(!code.follow(&kept.commits()));
+
+    // A conversation with no commits has no row to pick one.
+    let none = committed(Vec::new(), &[]);
+    assert!(!code.has(Control::Commits, &none.commits()));
+    assert_eq!(code.take(3, Ok(slice(ONE, None)), 10), Some(true));
+    let (rows, targets) = scoped(&code, &none, &shown, 40);
+    assert_eq!(rows[..3], ["1 file", "", "› M a +1 -1"]);
+    assert_eq!(targets, [(2..3, Control::File(0))]);
+}
+
+#[test]
+fn the_list_of_commits_fits_every_width_and_cleans_its_headlines() {
+    let hostile = "Fix \u{1b}[2J the \u{7}bell, 漢字漢字, and a headline long enough to wrap";
+    let conversation = committed(
+        Vec::new(),
+        &[
+            ("f00d\u{1b}]0;x", hostile, "2026-10-15T08:00:00Z"),
+            ("beadbeef", "Two", "2026-10-15T09:00:00Z"),
+        ],
+    );
+    let commits = conversation.commits();
+    let shown = Shown::default();
+    let mut code = read(slice(ONE, None), 0);
+    code.act(Control::Commits, &commits);
+    assert!(code.act(Control::Commit(1), &commits));
+    // T3 gets the id as it sent it.
+    assert_eq!(code.commit(), Some("f00d\u{1b}]0;x"));
+    code.act(Control::Commits, &commits);
+    let (rows, _) = scoped(&code, &conversation, &shown, 80);
+    let cleaned = "Fix [2J the bell, 漢字漢字, and a headline long enough to wrap";
+    assert_eq!(
+        rows[..5],
+        [
+            format!("⌄ {cleaned} · f00d]0;"),
+            "    All commits".into(),
+            entry_row("    ", "Two", "beadbee", 80),
+            entry_row("  ✓ ", cleaned, "f00d]0;", 80),
+            String::new(),
+        ]
+    );
+    for width in 1..=80 {
+        let threads = conversation.threads();
+        let (lines, targets) = code.lay_out(threads, &commits, &shown, width, NOW, &theme());
+        for line in &lines {
+            let text = line.to_string();
+            assert!(text.width() <= width, "{width}: {text:?}");
+            assert!(
+                !text.contains(|c: char| c.is_control()),
+                "{width}: {text:?}"
+            );
+        }
+        assert!(targets.iter().all(|(rows, _)| rows.end <= lines.len()));
+        // Each entry is one row, and the row that opens the list wraps under itself.
+        let entries: Vec<_> = targets
+            .iter()
+            .filter(|(_, control)| matches!(control, Control::AllCommits | Control::Commit(_)))
+            .collect();
+        assert_eq!(entries.len(), 3, "{width}");
+        assert!(entries.iter().all(|(rows, _)| rows.len() == 1), "{width}");
+        let rows = rows_of(&lines);
+        // The id shows beside at least four columns of the headline.
+        let two = &rows[targets[2].0.start];
+        assert_eq!(
+            two.ends_with("beadbee"),
+            width >= 4 + 4 + 1 + 7,
+            "{width}: {two:?}"
+        );
+        // Where the width leaves no room beside the lead, the headline shows without it.
+        if (2..=4).contains(&width) {
+            assert!(two.starts_with('T'), "{width}: {two:?}");
+        }
+    }
+
+    // The row closes the list as it opened it, and an open list has nothing to pick once the
+    // conversation lists no commits.
+    code.act(Control::Commits, &commits);
+    assert!(!code.has(Control::AllCommits, &commits));
+    let (rows, _) = scoped(&code, &conversation, &shown, 80);
+    assert_eq!(
+        rows[..2],
+        [format!("› {cleaned} · f00d]0;"), LOADING.into()]
+    );
+    code.act(Control::Commits, &commits);
+    assert!(code.has(Control::AllCommits, &commits));
+    assert!(!code.has(Control::AllCommits, &[]));
 }

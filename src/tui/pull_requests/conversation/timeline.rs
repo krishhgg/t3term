@@ -69,12 +69,14 @@ impl Lifecycle {
 }
 
 /// A commit on the branch, cleaned and bounded once, when the conversation arrives.
-pub(super) struct Commit {
+pub(in super::super) struct Commit {
+    /// Its id as T3 sent it, which a read of its own diff names.
+    pub(in super::super) oid: String,
     /// The first seven characters of its id, as the desktop shows them.
-    short: String,
+    pub(in super::super) short: String,
     /// Its headline, which may be empty.
     headline: String,
-    at: Option<i64>,
+    pub(super) at: Option<i64>,
     /// The lines it adds and removes, where the host counted both.
     counts: Option<(u64, u64)>,
     /// Its first author's login, which stands in for the desktop's avatar.
@@ -85,11 +87,21 @@ impl Commit {
     pub(super) fn of(commit: &pull_request::Commit) -> Commit {
         let author = commit.authors.as_deref().and_then(<[_]>::first);
         Commit {
+            oid: commit.oid.clone(),
             short: bounded(&commit.oid, NAME).chars().take(7).collect(),
             headline: bounded(&commit.headline, TITLE),
             at: instant(&commit.committed_at),
             counts: commit.additions.zip(commit.deletions),
             author: author.map(|actor| bounded(&actor.login, NAME)),
+        }
+    }
+
+    /// Its headline, or `Untitled commit` where it has none, as the desktop's `CommitEvent`
+    /// says.
+    pub(in super::super) fn headline(&self) -> &str {
+        match self.headline.is_empty() {
+            true => "Untitled commit",
+            false => &self.headline,
         }
     }
 }
@@ -460,10 +472,7 @@ fn plural(count: u64, what: &str) -> String {
 fn commit_lines(commit: &Commit, width: usize, now: i64, theme: &Theme) -> Vec<Line<'static>> {
     let gutter = gutter(width);
     let strong = Style::new().fg(theme.fg).add_modifier(Modifier::BOLD);
-    let headline = match commit.headline.is_empty() {
-        true => "Untitled commit",
-        false => &commit.headline,
-    };
+    let headline = commit.headline();
     // No counts show where the host counted none, as the desktop's `PullRequestDiffStat`
     // leaves `+0 -0` out.
     let counts = match commit.counts {

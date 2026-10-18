@@ -374,15 +374,18 @@ pub async fn thread_comments(
     CommentPage::read(&answer)
 }
 
-/// One slice of the pull request's diff, from the slice `cursor` names or from the first.
-/// T3 sends the whole diff in one slice where the host gives it whole, and a page of files at a
-/// time otherwise, with the cursor of the next in `next_cursor`.
+/// One slice of the pull request's diff, from the slice `cursor` names or from the first, of
+/// the whole change or of the commit `commit` names alone, as the desktop's Code tab scopes it
+/// (PullRequestCodeTab.tsx:262-290 at f570bd2). T3 sends the whole diff in one slice where the
+/// host gives it whole, and a page of files at a time otherwise, with the cursor of the next in
+/// `next_cursor`. A commit's cursors are its own.
 pub async fn diff(
     api: &Api,
     reference: &Reference,
     cursor: Option<&str>,
+    commit: Option<&str>,
 ) -> Result<Diff, PullRequestError> {
-    read_diff(api, reference, cursor, MOST_DIFF).await
+    read_diff(api, reference, cursor, commit, MOST_DIFF).await
 }
 
 /// `diff`, reading at most `most` bytes of the answer.
@@ -390,11 +393,15 @@ async fn read_diff(
     api: &Api,
     reference: &Reference,
     cursor: Option<&str>,
+    commit: Option<&str>,
     most: usize,
 ) -> Result<Diff, PullRequestError> {
     let mut payload = reference.payload();
     if let Some(cursor) = cursor {
         payload["cursor"] = json!(cursor);
+    }
+    if let Some(commit) = commit {
+        payload["commit"] = json!(commit);
     }
     let (status, body) = api
         .post_bounded(DIFF, &payload, DIFF_TIMEOUT, most)
