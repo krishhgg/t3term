@@ -3,7 +3,7 @@
 ## Sub-features
 
 - **The wordmark row.** `T3 Code` with the feed's dot on the right. Live is a green `●` with no word. `connecting` and `reconnecting` are amber and `closed` is red, each shown before the dot when the row has room.
-- **The environment.** The row under the wordmark names the environment and its address, such as `Fixture Mac · 127.0.0.1:51099`. A narrow sidebar shows the label alone. With the sidebar hidden or too narrow, the breadcrumb row ends with the dot, the word and the environment.
+- **The environment.** The row under the wordmark names the environment and its address, such as `Fixture Mac · 127.0.0.1:51099`. A narrow sidebar shows the label alone. A click on it opens the Environments dialog ([environments.md](environments.md)). With the sidebar hidden or too narrow, the breadcrumb row ends with the dot, the word and the environment, which take no clicks.
 - **The breadcrumb.** `Pick a thread in the sidebar` with no thread open, `Loading…` while one loads, then the project's monogram and name, `  /  ` and the title. When the open thread's watch isn't live, its state follows in amber at the right end: `connecting`, `reconnecting: <reason>` or `closed`.
 - **The status line.** `● <state>  ·  <keys>`. The state is the open thread's watch, or the feed's word with no thread open. A failure replaces the whole line in red until the next key.
 - **The composer.** It reads `Connecting to the thread…` whenever the thread's watch isn't live.
