@@ -57,6 +57,13 @@
 //! above the files shows them, or hides them again, as the desktop's toolbar toggle does
 //! (PullRequestCodeTab.tsx:1211-1234), for every file and every diff the tab shows after.
 //!
+//! The lines wrap at first, as the desktop's `wordWrap` setting is true until changed
+//! (packages/contracts/src/settings.ts:506). A row under the fold row lets them run on past the
+//! end of their rows, or wraps them again, as the desktop's toolbar toggle does
+//! (PullRequestCodeTab.tsx:1279-1298). Each line then takes one row, and the panel scrolls the
+//! text of those rows sideways while their numbers stay, as `Sideways` says, as the desktop's
+//! numbers stay while its lines scroll.
+//!
 //! Only the files unfolded are laid out, each once for each width. Each line of them is cleaned
 //! of control characters, its tabs set every `TAB` columns, and cut at `LINE` characters as it
 //! is.
@@ -118,6 +125,11 @@ const WHITESPACE_SHOWN: &str = "¶ Hide whitespace changes";
 /// `Expand all files` and `Collapse all files` with their chevrons.
 const FOLDED_ALL: &str = "⇊ Expand all files";
 const UNFOLDED_ANY: &str = "⇈ Collapse all files";
+/// The row that lets the lines run on past their rows, and the one that wraps them again, after
+/// the desktop's `Disable line wrapping` and `Enable line wrapping` with its icon of a line
+/// that turns back.
+const WRAPPED: &str = "↵ Disable line wrapping";
+const UNWRAPPED: &str = "↵ Enable line wrapping";
 const VIEWED_FAILED: &str = "t3term couldn't read which files you viewed.";
 const VIEWED_STALE: &str = "The viewed marks may be out of date: t3term couldn't read them again.";
 const VIEWED_SHORT: &str = "This change has more files than the host reports viewed marks for in one read, so the count is short.";
@@ -157,6 +169,9 @@ pub(super) struct Code {
     /// `diffIgnoreWhitespace` setting is true until changed. Another diff picked from the
     /// commits keeps it, as the desktop's toggle does.
     whitespace: bool,
+    /// Whether the lines wrap: true at first, as the desktop's `wordWrap` setting is true until
+    /// changed. Another diff picked from the commits keeps it, as the desktop's toggle does.
+    wrap: bool,
     /// The rows of each unfolded file's lines, by its slice's place and its place in that
     /// slice, so a file is laid out again only when its slice, the width or its fold changes.
     bodies: HashMap<(usize, usize), Body>,
@@ -181,10 +196,58 @@ struct Body {
     /// Whether the host withheld part of the file, which adds a note.
     withheld: bool,
     lines: Vec<Line<'static>>,
+    /// While its lines don't wrap, the rows they take, which scroll sideways past the first
+    /// `lead` columns, those of the numbers and the marks.
+    slides: Slides,
+    lead: usize,
     marks: Vec<Mark>,
     /// The rows that count each run of unchanged lines Enter shows more of, with the run's
     /// place among the file's.
     stretches: Vec<(Range<usize>, usize)>,
+}
+
+impl Body {
+    /// Whether it was laid out at `width`, for a file whose changes the host withheld or not.
+    fn fits(&self, width: usize, withheld: bool) -> bool {
+        (self.width, self.withheld) == (width, withheld)
+    }
+}
+
+/// The rows a file's lines take while they don't wrap, one each, as `Body` keeps them.
+#[derive(Default)]
+struct Slides {
+    /// Each run of rows that are lines, in order.
+    runs: Vec<Range<usize>>,
+    /// The columns of the widest of those rows.
+    widest: usize,
+}
+
+impl Slides {
+    /// Adds the rows of a line to `lines`, and where they don't wrap, to the runs.
+    fn add(&mut self, lines: &mut Vec<Line<'static>>, rows: Vec<Line<'static>>, wrap: bool) {
+        if !wrap {
+            let (start, end) = (lines.len(), lines.len() + rows.len());
+            let widest = rows.iter().map(Line::width).max().unwrap_or_default();
+            self.widest = self.widest.max(widest);
+            match self.runs.last_mut() {
+                Some(run) if run.end == start => run.end = end,
+                _ => self.runs.push(start..end),
+            }
+        }
+        lines.extend(rows);
+    }
+}
+
+/// The rows of the tab's lines while they don't wrap, which scroll sideways past their numbers
+/// and marks, as the desktop's numbers stay while its lines scroll (@pierre/diffs 1.5.2, whose
+/// style sets `[data-overflow=scroll] [data-gutter]{position:sticky}`).
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(super) struct Sideways {
+    /// Each run of those rows, with the columns of the numbers and marks before their text, in
+    /// order.
+    pub runs: Vec<(Range<usize>, usize)>,
+    /// The columns of the widest of them.
+    pub widest: usize,
 }
 
 /// What the tab read of one file's text after the change, which fills the runs of unchanged
@@ -343,6 +406,7 @@ impl Code {
             unfolded: false,
             toggled: HashSet::new(),
             whitespace: false,
+            wrap: true,
             bodies: HashMap::new(),
             commit: None,
             commits_open: false,
@@ -581,7 +645,7 @@ impl Code {
         let open = self.commits_open && !commits.is_empty();
         match control {
             Control::File(at) => at < self.files.len(),
-            Control::Whitespace | Control::Folds => !self.files.is_empty(),
+            Control::Whitespace | Control::Folds | Control::Wrap => !self.files.is_empty(),
             Control::Retry => self.retries(),
             Control::Commits => !commits.is_empty(),
             Control::AllCommits => open,
@@ -654,6 +718,10 @@ impl Code {
             Control::Folds => {
                 self.unfolded = self.all_folded();
                 self.toggled.clear();
+            }
+            Control::Wrap => {
+                self.wrap = !self.wrap;
+                self.bodies.clear();
             }
             Control::Retry => {
                 if let Some((_, first)) = self.failed.take() {
@@ -839,6 +907,8 @@ impl Code {
             Control::Whitespace => "show whitespace changes".to_string(),
             Control::Folds if self.all_folded() => "expand all files".to_string(),
             Control::Folds => "collapse all files".to_string(),
+            Control::Wrap if self.wrap => "disable line wrapping".to_string(),
+            Control::Wrap => "enable line wrapping".to_string(),
             Control::Commits if self.commits_open => "hide commits".to_string(),
             Control::Commits => "choose commit".to_string(),
             Control::AllCommits => "show all commits".to_string(),
@@ -988,14 +1058,15 @@ impl Code {
             }
             let withheld = self.omitted.contains_key(file.path());
             let laid = match self.bodies.remove(&(at, place)) {
-                Some(laid) if laid.width == width && laid.withheld == withheld => laid,
+                Some(laid) if laid.fits(width, withheld) => laid,
                 _ => {
                     #[cfg(test)]
                     {
                         self.builds += 1;
                     }
                     let context = find(&self.contexts, file.path(), slice.prints[place]);
-                    body(&slice.diff.patch, file, withheld, context, width, theme)
+                    let text = &slice.diff.patch;
+                    body(text, file, withheld, context, width, self.wrap, theme)
                 }
             };
             bodies.insert((at, place), laid);
@@ -1004,17 +1075,18 @@ impl Code {
     }
 
     /// The tab's rows at `width`, with the rows of each control: the list of the `reads`'
-    /// commits, newest first, the rows that show or hide the changes to whitespace and that
-    /// unfold or fold every file, each file's header,
+    /// commits, newest first, the rows that show or hide the changes to whitespace, that
+    /// unfold or fold every file and that wrap the lines, each file's header,
     /// each review thread's first row, the list of those off the diff and Retry. First the row
     /// that picks the diff from the commits, and its list while it is open. Until the first
     /// slice came, or when its read failed, it says so. Then the count of files, `+` while more
     /// are to be read, and how many are viewed where the marks show, then a note when the host
     /// withheld part of the diff, some hunks show their whitespace changes or the marks are
-    /// short or failed, then the rows for the whitespace and for every file.
+    /// short or failed, then the rows for the whitespace, every file and the wrapping.
     /// Then the list of the review threads off the diff, then each file with its mark and the
     /// threads on its lines, and at the end `Loading more files…`, or Retry once that failed.
-    /// `shown` says which threads and whether the list are open.
+    /// `shown` says which threads and whether the list are open. While the lines don't wrap,
+    /// the rows they take run on past `width`, and `Sideways` says which.
     pub(super) fn lay_out(
         &self,
         reads: Reads,
@@ -1022,12 +1094,13 @@ impl Code {
         width: usize,
         now: i64,
         theme: &Theme,
-    ) -> (Vec<Line<'static>>, Targets) {
+    ) -> (Vec<Line<'static>>, Targets, Sideways) {
         let muted = Style::new().fg(theme.muted);
         let mut lines = Vec::new();
         let mut targets = Vec::new();
+        let mut sideways = Sideways::default();
         if width == 0 {
-            return (lines, targets);
+            return (lines, targets, sideways);
         }
         // Above the diff while it loads too, so the list that picked a commit stays where it
         // was while that commit's diff comes (PullRequestCodeTab.tsx:1322-1335).
@@ -1041,7 +1114,7 @@ impl Code {
                 None => LOADING,
             };
             lines.extend(whole(text, width, muted));
-            return (lines, targets);
+            return (lines, targets, sideways);
         }
         let count = self.files.len();
         let noun = if count == 1 { "file" } else { "files" };
@@ -1113,11 +1186,11 @@ impl Code {
                 (false, None) => EMPTY,
             };
             lines.extend(whole(text, width, muted));
-            return (lines, targets);
+            return (lines, targets, sideways);
         }
-        // The toolbar's toggle that shows or hides the changes to whitespace, then its button
-        // that unfolds every file, or folds them all once one shows unfolded
-        // (PullRequestCodeTab.tsx:1211-1258).
+        // The toolbar's toggle that shows or hides the changes to whitespace, its button that
+        // unfolds every file, or folds them all once one shows unfolded, and its toggle that
+        // wraps the lines (PullRequestCodeTab.tsx:1211-1258 and 1279-1298).
         if count > 0 {
             let fg = Style::new().fg(theme.fg);
             let label = match self.whitespace {
@@ -1134,6 +1207,13 @@ impl Code {
             let start = lines.len();
             lines.extend(whole(label, width, fg));
             targets.push((start..lines.len(), Control::Folds));
+            let label = match self.wrap {
+                true => WRAPPED,
+                false => UNWRAPPED,
+            };
+            let start = lines.len();
+            lines.extend(whole(label, width, fg));
+            targets.push((start..lines.len(), Control::Wrap));
         }
         let placed = self.place(threads);
         // A thread, open as the reader left it, with its first row as the target that opens
@@ -1210,16 +1290,34 @@ impl Code {
                 let withheld = self.omitted.contains_key(file.path());
                 let fresh;
                 let laid = match self.bodies.get(&self.files[at]) {
-                    Some(laid) if laid.width == width && laid.withheld == withheld => laid,
+                    Some(laid) if laid.fits(width, withheld) => laid,
                     _ => {
                         let (slice, place) = self.files[at];
                         let print = self.slices[slice].prints[place];
                         let context = find(&self.contexts, file.path(), print);
-                        fresh = body(text, file, withheld, context, width, theme);
+                        fresh = body(text, file, withheld, context, width, self.wrap, theme);
                         &fresh
                     }
                 };
-                let (rows, marks) = (&laid.lines, &laid.marks);
+                let marks = &laid.marks;
+                sideways.widest = sideways.widest.max(laid.slides.widest);
+                // The file's rows from `rows.start` to `rows.end`, with the runs among them that
+                // scroll sideways where they land.
+                let mut slides = laid.slides.runs.iter().cloned().peekable();
+                let mut copy = |lines: &mut Vec<Line<'static>>, rows: Range<usize>| {
+                    let shift = lines.len() - rows.start;
+                    while let Some(run) = slides.peek_mut().filter(|run| run.start < rows.end) {
+                        let end = run.end.min(rows.end);
+                        sideways
+                            .runs
+                            .push((run.start + shift..end + shift, laid.lead));
+                        match end == run.end {
+                            true => _ = slides.next(),
+                            false => run.start = end,
+                        }
+                    }
+                    lines.extend(laid.lines[rows].iter().cloned());
+                };
                 // The threads on each line, those on its number before the change first, as
                 // the desktop's stacked view puts them, then in the order T3 sent them.
                 let mut on: HashMap<(Side, u64), Vec<usize>> = HashMap::new();
@@ -1251,7 +1349,7 @@ impl Code {
                         continue;
                     }
                     counted(&mut targets, mark.end, added);
-                    lines.extend(rows[from..mark.end].iter().cloned());
+                    copy(&mut lines, from..mark.end);
                     from = mark.end;
                     let before = lines.len();
                     // A blank row keeps two threads on one line apart.
@@ -1264,7 +1362,7 @@ impl Code {
                     added += lines.len() - before;
                 }
                 counted(&mut targets, usize::MAX, added);
-                lines.extend(rows[from..].iter().cloned());
+                copy(&mut lines, from..laid.lines.len());
             }
         }
         if self.next_cursor().is_some() && !self.failed.as_ref().is_some_and(|(_, first)| *first) {
@@ -1280,7 +1378,7 @@ impl Code {
                 None => lines.extend(whole(LOADING_MORE, width, muted)),
             }
         }
-        (lines, targets)
+        (lines, targets, sideways)
     }
 
     /// The notes on the marks on files viewed: that the last read failed, with its reason, and
@@ -1507,17 +1605,20 @@ fn status(status: patch::Status, theme: &Theme) -> (&'static str, Color) {
 /// it, and a note for each part t3term couldn't show. A file without hunks says why: it is
 /// binary, the host withheld its changes, or the change touched no line, as a rename or a mode
 /// change does. Where `context` holds the file's text, the unchanged lines it shows go around
-/// those rows, and a row after the last hunk counts the lines after it.
+/// those rows, and a row after the last hunk counts the lines after it. Where `wrap` is false,
+/// each line takes one row, as long as its text.
 fn body(
     text: &str,
     file: &patch::File,
     withheld: bool,
     context: Option<&Context>,
     width: usize,
+    wrap: bool,
     theme: &Theme,
 ) -> Body {
     let muted = Style::new().fg(theme.muted);
     let mut lines = Vec::new();
+    let mut slides = Slides::default();
     let mut marks: Vec<Mark> = Vec::new();
     let mut counted = Vec::new();
     // A file past the bound or with a broken hunk header can have no hunks, and its notes
@@ -1534,6 +1635,8 @@ fn body(
             width,
             withheld,
             lines: whole(note, width, muted),
+            slides,
+            lead: 0,
             marks,
             stretches: counted,
         };
@@ -1574,9 +1677,10 @@ fn body(
     } else {
         None
     };
+    let lead = lead(gutter, width);
     // A run of unchanged lines: those from its start, the row that counts the rest, then those
     // at its end.
-    let mut stretch = |lines: &mut Vec<Line<'static>>, place: usize| {
+    let mut stretch = |lines: &mut Vec<Line<'static>>, slides: &mut Slides, place: usize| {
         let (Some(stretch), Some(showing)) = (stretches.get(place), showings.get(place)) else {
             return;
         };
@@ -1591,7 +1695,8 @@ fn body(
                     new: Some(number),
                     text,
                 };
-                lines.extend(line_rows(contents, &line, gutter, width, theme));
+                let rows = line_rows(contents, &line, gutter, width, wrap, theme);
+                slides.add(lines, rows, wrap);
             }
         };
         let end = stretch.first + showing.head + showing.tail + rest(showing.rest);
@@ -1635,11 +1740,12 @@ fn body(
                 lines.extend(whole(&note, width, muted));
             }
         } else {
-            stretch(&mut lines, place);
+            stretch(&mut lines, &mut slides, place);
         }
         after = first + hunk.old_count;
         for line in &hunk.lines {
-            lines.extend(line_rows(text, line, gutter, width, theme));
+            let rows = line_rows(text, line, gutter, width, wrap, theme);
+            slides.add(&mut lines, rows, wrap);
             let end = lines.len();
             match (line.kind, marks.last_mut()) {
                 (patch::Kind::NoNewline, Some(last)) => last.end = end,
@@ -1652,7 +1758,7 @@ fn body(
             }
         }
     }
-    stretch(&mut lines, file.hunks.len());
+    stretch(&mut lines, &mut slides, file.hunks.len());
     if file.lines_cut {
         let note = format!(
             "t3term reads at most {} lines of a slice, so the rest of this file doesn't show.",
@@ -1671,6 +1777,8 @@ fn body(
         width,
         withheld,
         lines,
+        slides,
+        lead,
         marks,
         stretches: counted,
     }
@@ -1892,14 +2000,27 @@ fn has_line(file: &patch::File, side: Side, line: u64) -> bool {
     })
 }
 
+/// The columns before a line's text at `width`: its number in `gutter` columns, a space, its
+/// mark and a space where there is room for a number, else its mark alone.
+fn lead(gutter: Option<usize>, width: usize) -> usize {
+    match gutter {
+        Some(digits) => digits + 3,
+        // A column of its own leaves none for the text.
+        None if width > 1 => 1,
+        None => 0,
+    }
+}
+
 /// A line of a hunk on as many rows as its text takes at `width`: its number in `digits`
 /// columns where there is room for one, its mark and its text, in the color of what happened to
-/// it. The rows after the first leave the number and the mark blank.
+/// it. The rows after the first leave the number and the mark blank. Where `wrap` is false, it
+/// takes one row, as long as its text.
 fn line_rows(
     text: &str,
     line: &patch::Line,
     gutter: Option<usize>,
     width: usize,
+    wrap: bool,
     theme: &Theme,
 ) -> Vec<Line<'static>> {
     let muted = Style::new().fg(theme.muted);
@@ -1918,15 +2039,14 @@ fn line_rows(
         patch::Kind::NoNewline => None,
         _ => line.new.or(line.old),
     };
-    // A column of its own leaves none for the text.
-    let lead = match gutter {
-        Some(digits) => digits + 3,
-        None if width > 1 => 1,
-        None => 0,
-    };
+    let lead = lead(gutter, width);
     let room = width.saturating_sub(lead).max(1);
+    let pieces = match wrap {
+        true => broken(&shown, room),
+        false => vec![shown],
+    };
     let mut rows = Vec::new();
-    for (at, piece) in broken(&shown, room).into_iter().enumerate() {
+    for (at, piece) in pieces.into_iter().enumerate() {
         let mut spans = Vec::with_capacity(3);
         match (gutter, at) {
             (Some(digits), 0) => {
@@ -1937,7 +2057,11 @@ fn line_rows(
             (None, 0) if lead > 0 => spans.push(Span::styled(mark, style)),
             _ => spans.push(Span::raw(" ".repeat(lead))),
         }
-        spans.push(Span::styled(clip(&piece, room), style));
+        let piece = match wrap {
+            true => clip(&piece, room),
+            false => piece,
+        };
+        spans.push(Span::styled(piece, style));
         rows.push(Line::from(spans));
     }
     rows

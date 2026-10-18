@@ -1130,21 +1130,27 @@ impl Details {
         keys
     }
 
-    /// The keys of `plain_keys`, with `r` before Esc in each while `r` reads the pull request
-    /// whose details show from its host again. Each shape follows itself with `r`, so a
-    /// narrower status line drops `r` before the other keys of that shape.
+    /// The keys of `plain_keys`, with `H/L sideways` before Esc in each while the Code tab's
+    /// lines don't wrap and run past the details, and `r` while `r` reads the pull request
+    /// whose details show from its host again. Each shape follows itself with fewer of them,
+    /// so a narrower status line drops `r`, then `H/L`, before the other keys of that shape.
     fn plain(&self, modal: bool) -> Vec<String> {
         let shapes = self.plain_keys(modal);
-        if !(self.tab == Tab::PullRequests && self.pulls.reloads()) {
-            return shapes.iter().map(|keys| keys.to_string()).collect();
-        }
+        let pulls = self.tab == Tab::PullRequests;
+        let extra: Vec<&str> = [
+            (pulls && self.pulls.slides(), "H/L sideways · "),
+            (pulls && self.pulls.reloads(), "r refresh · "),
+        ]
+        .into_iter()
+        .filter_map(|(on, keys)| on.then_some(keys))
+        .collect();
         shapes
             .iter()
             .flat_map(|keys| {
-                [
-                    keys.replacen("Esc ", "r refresh · Esc ", 1),
-                    keys.to_string(),
-                ]
+                (0..=extra.len()).rev().map(|kept| {
+                    let before = format!("{}Esc ", extra[..kept].concat());
+                    keys.replacen("Esc ", &before, 1)
+                })
             })
             .collect()
     }
@@ -1291,6 +1297,29 @@ impl Details {
                 self.scroll_by(delta);
             }
             Tab::PullRequests => self.pulls.move_by(delta),
+        }
+    }
+
+    /// Whether a pull request's Code tab shows, where Shift+← and Shift+→ scroll its lines
+    /// sideways rather than show another tab.
+    pub fn on_code(&self) -> bool {
+        self.tab == Tab::PullRequests && self.pulls.tabs() == Some(PullTab::Code)
+    }
+
+    /// Scrolls the Code tab's lines that don't wrap half the details' width sideways, right or
+    /// left where `right` is false, as Shift+→, `L`, Shift+← and `H` do. Elsewhere it does
+    /// nothing.
+    pub fn sideways(&mut self, right: bool) {
+        if self.tab == Tab::PullRequests {
+            self.pulls.sideways(right);
+        }
+    }
+
+    /// Scrolls the Code tab's lines that don't wrap a few columns sideways for the wheel turned
+    /// right, or left where `right` is false. Elsewhere it does nothing.
+    pub fn wheel_sideways(&mut self, right: bool) {
+        if self.tab == Tab::PullRequests {
+            self.pulls.wheel_sideways(right);
         }
     }
 
