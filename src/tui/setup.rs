@@ -8,6 +8,7 @@
 //! replaces the held one, nothing is merged, and nothing is kept for another thread or for
 //! later.
 
+use ratatui::layout::Rect;
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use serde_json::Value;
@@ -431,33 +432,37 @@ pub(super) struct Card {
     pub lines: Vec<Line<'static>>,
     /// The Details row's index, when the card has one.
     pub toggle: Option<usize>,
-    /// Whether a clock or a spinner on the card moves while the setup runs.
-    pub live: bool,
+    /// The rows whose spinner and clock move while the setup runs: the title row, or the row
+    /// that says the script still runs, and each running stage's row. None once it settles.
+    pub moving: Vec<usize>,
 }
 
 impl Card {
-    /// The rows from `from` to `to` that a frame drew, starting `top` rows below the
-    /// transcript's first row on screen, which is screen row `y`. None when they are only the
-    /// blank row the card ends with, or none at all.
+    /// The rows from `from` to `to` that a frame drew, starting `top` rows below the first row
+    /// of the transcript's `area`. None when they are only the blank row the card ends with, or
+    /// none at all.
     pub(super) fn drawn(
         &self,
         from: usize,
         to: usize,
         top: isize,
-        y: u16,
+        area: Rect,
         scroll: usize,
     ) -> Option<Drawn> {
         if from >= to || from + 1 >= self.lines.len() {
             return None;
         }
+        let first = (top + from as isize).max(0) as u16;
         Some(Drawn {
             toggle: self.toggle.map(|toggle| top + toggle as isize),
             row: self
                 .toggle
                 .filter(|toggle| (from..to).contains(toggle))
-                .map(|toggle| y + (top + toggle as isize) as u16),
+                .map(|toggle| area.y + (top + toggle as isize) as u16),
             scroll,
-            live: self.live,
+            live: self.moving.iter().any(|at| (from..to).contains(at)),
+            from,
+            rows: Rect::new(area.x, area.y + first, area.width, (to - from) as u16),
         })
     }
 }
@@ -472,8 +477,25 @@ pub(super) struct Drawn {
     pub row: Option<u16>,
     /// The scroll the frame drew.
     pub scroll: usize,
-    /// Whether the rows drawn had a moving clock or spinner.
+    /// Whether the rows drawn showed a moving clock or spinner. A banner, a menu or a dialog
+    /// over all of them leaves it false.
     pub live: bool,
+    /// The first of the card's rows the frame drew.
+    pub from: usize,
+    /// The screen rows the card took, the transcript's width.
+    pub rows: Rect,
+}
+
+impl Drawn {
+    /// Where the frame drew the card's row `at`, while it was in view.
+    fn row_of(&self, at: usize) -> Option<Rect> {
+        let below = at.checked_sub(self.from)?;
+        (below < usize::from(self.rows.height)).then(|| Rect {
+            y: self.rows.y + below as u16,
+            height: 1,
+            ..self.rows
+        })
+    }
 }
 
 /// What an item from the subscription did.
@@ -669,6 +691,19 @@ impl Watch {
                 .is_some_and(|held| held.phase == Phase::Running)
             && self.drawn.is_some_and(|drawn| drawn.live)
     }
+
+    /// Notes that the frame drew `over` on top of the transcript. A card whose rows that move
+    /// they cover all of has no clock in view, though its other rows show.
+    pub fn cover(&mut self, over: &[Rect]) {
+        let (Some(drawn), Some((_, card))) = (self.drawn.as_mut(), self.card.as_ref()) else {
+            return;
+        };
+        drawn.live &= card.moving.iter().any(|&at| {
+            drawn
+                .row_of(at)
+                .is_some_and(|row| !super::covered(row, over))
+        });
+    }
 }
 
 /// The card's rows. Under the stages and the script's output come the error, for a failed
@@ -681,14 +716,19 @@ fn lay_out(setup: &Setup, mode: Mode, details: bool, width: usize, now: i64, t: 
     let muted = Style::new().fg(t.muted);
     let total = elapsed(setup.started, setup.ended, now);
     let mut lines = Vec::new();
+    let mut moving = Vec::new();
     match mode {
         Mode::Full => {
+            moving.push(lines.len());
             lines.push(title_row(setup, total, width, now, t));
             lines.push(Line::styled("─".repeat(width), Style::new().fg(t.border)));
-            stage_rows(&mut lines, setup, width, now, t);
+            stage_rows(&mut lines, &mut moving, setup, width, now, t);
         }
         Mode::Summary => lines.push(summary_row(setup, total, width, t)),
-        Mode::Background => lines.push(background_row(setup, width, now, t)),
+        Mode::Background => {
+            moving.push(lines.len());
+            lines.push(background_row(setup, width, now, t));
+        }
     }
     if setup.phase == Phase::Failed
         && let Some(error) = &setup.error
@@ -722,15 +762,18 @@ fn lay_out(setup: &Setup, mode: Mode, details: bool, width: usize, now: i64, t: 
     });
     if details {
         if mode == Mode::Background {
-            stage_rows(&mut lines, setup, width, now, t);
+            stage_rows(&mut lines, &mut moving, setup, width, now, t);
         }
         detail_rows(&mut lines, setup, width, t);
     }
     lines.push(Line::default());
+    if setup.phase != Phase::Running {
+        moving.clear();
+    }
     Card {
         lines,
         toggle,
-        live: setup.phase == Phase::Running,
+        moving,
     }
 }
 
@@ -790,9 +833,19 @@ fn title_row(
 }
 
 /// The stages, each as a row like a tool call's, with the script's output under its row while
-/// it runs with output and after it fails.
-fn stage_rows(lines: &mut Vec<Line<'static>>, setup: &Setup, width: usize, now: i64, t: &Theme) {
+/// it runs with output and after it fails. Each running stage's row goes in `moving`.
+fn stage_rows(
+    lines: &mut Vec<Line<'static>>,
+    moving: &mut Vec<usize>,
+    setup: &Setup,
+    width: usize,
+    now: i64,
+    t: &Theme,
+) {
     for stage in &setup.stages {
+        if stage.status == Status::Running {
+            moving.push(lines.len());
+        }
         lines.push(stage_row(stage, setup.script.as_deref(), width, now, t));
         let shows_tail = stage.index == SCRIPT
             && (stage.status == Status::Failed
@@ -1518,6 +1571,75 @@ mod tests {
     }
 
     #[test]
+    fn the_rows_that_move_are_the_rows_with_a_spinner() {
+        let theme = Theme::new(Depth::TrueColor);
+        let spinner = spinner_frame(now());
+        let mut script = stage("setup-script", "running");
+        script["startedAt"] = json!(START);
+        script["tail"] = json!(["installing"]);
+        let stages = vec![
+            finished("fetch", "done"),
+            finished("checkout", "done"),
+            script,
+            stage("agent", "running"),
+        ];
+        let running = setup("running", stages.clone());
+        // Before the agent starts, the title row and the two running stages. After it, the row
+        // that says the script still runs, and the stages under Details.
+        for (mode, details) in [(Mode::Full, false), (Mode::Background, true)] {
+            let card = lay_out(&running, mode, details, 60, now(), &theme);
+            let spinning: Vec<usize> = (0..card.lines.len())
+                .filter(|&at| card.lines[at].to_string().contains(spinner))
+                .collect();
+            assert_eq!(card.moving, spinning, "{mode:?}");
+            assert_eq!(card.moving.len(), 3, "{mode:?}");
+        }
+        let card = lay_out(&running, Mode::Background, false, 60, now(), &theme);
+        assert_eq!(card.moving, [0]);
+        // A setup that settled has none, though a stage still says it runs.
+        let failed = setup("failed", stages);
+        let card = lay_out(&failed, Mode::Full, false, 60, now(), &theme);
+        assert!(card.moving.is_empty());
+    }
+
+    #[test]
+    fn a_card_ticks_while_a_row_that_moves_shows() {
+        let theme = Theme::new(Depth::TrueColor);
+        let area = Rect::new(0, 0, 60, 40);
+        let mut watch = Watch::default();
+        watch.watch(mpsc::unbounded_channel().1);
+        watch.apply(item(1, 40), "t");
+        watch.lay_out(BEFORE, 60, now(), &theme);
+        let card = watch.card().expect("a card");
+        // The title row and the checkout's row, with the rule, the other stages and Details
+        // between and under them.
+        assert_eq!(card.moving.len(), 2);
+        let (len, checkout) = (card.lines.len(), card.moving[1]);
+        assert!(checkout + 2 < len);
+        let drawn = |watch: &Watch, from: usize| {
+            let card = watch.card().expect("a card");
+            card.drawn(from, len, -(from as isize), area, 0)
+        };
+        let y = checkout as u16;
+        watch.drawn = drawn(&watch, 0);
+        assert!(watch.ticks());
+        // A dialog over the two leaves only rows that don't move in view.
+        watch.cover(&[Rect::new(0, 0, 60, 1), Rect::new(0, y, 60, 1)]);
+        assert!(!watch.ticks());
+        // A column of the checkout's row in view is enough.
+        watch.drawn = drawn(&watch, 0);
+        watch.cover(&[Rect::new(0, 0, 60, 1), Rect::new(1, y, 59, 1)]);
+        assert!(watch.ticks());
+        // Scrolled to the rows under the checkout's, nothing that moves shows.
+        watch.drawn = drawn(&watch, checkout + 1);
+        assert!(!watch.ticks());
+        watch.drawn = drawn(&watch, checkout);
+        assert!(watch.ticks());
+        watch.cover(&[Rect::new(0, 0, 60, 1)]);
+        assert!(!watch.ticks());
+    }
+
+    #[test]
     fn only_a_running_card_on_screen_ticks() {
         let theme = Theme::new(Depth::TrueColor);
         // A frame that lays the card out at `now` and draws all of it.
@@ -1525,7 +1647,7 @@ mod tests {
             watch.lay_out(BEFORE, 60, now, &theme);
             watch.drawn = watch
                 .card()
-                .and_then(|card| card.drawn(0, card.lines.len(), 0, 0, 0));
+                .and_then(|card| card.drawn(0, card.lines.len(), 0, Rect::new(0, 0, 60, 40), 0));
         };
         let mut watch = Watch::default();
         watch.watch(mpsc::unbounded_channel().1);
@@ -1543,7 +1665,10 @@ mod tests {
         // The blank row the card ends with isn't the card.
         let card = watch.card().expect("a card");
         let last = card.lines.len();
-        assert_eq!(card.drawn(last - 1, last, 0, 0, 0), None);
+        assert_eq!(
+            card.drawn(last - 1, last, 0, Rect::new(0, 0, 60, 40), 0),
+            None
+        );
         // Out of view it doesn't tick.
         watch.drawn = None;
         assert!(!watch.ticks());
@@ -1592,6 +1717,8 @@ mod tests {
             row,
             scroll: 7,
             live: false,
+            from: 0,
+            rows: Rect::default(),
         };
         let mut watch = Watch::default();
         assert_eq!((watch.toggle(), watch.hint()), (None, None));
