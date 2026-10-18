@@ -141,6 +141,13 @@ def fixture_held(report):
 
 
 @rule
+def launches_read(report):
+    if report.get('launchesUnreadable'):
+        yield (f'launchesUnreadable {report["launchesUnreadable"]}: t3term sent an orchestration.launchThread '
+               'without a field T3 requires, and launch.unreadable in events.jsonl names it')
+
+
+@rule
 def stopped_cleanly(report):
     if not report['stopped']:
         return
