@@ -8,13 +8,15 @@ from __future__ import annotations
 import copy
 from collections import Counter
 
-from .text import MINUTE, MISSING, RUST_WHITESPACE, SECOND, bounded, without_controls
+from .text import MINUTE, MISSING, RUST_WHITESPACE, SECOND, bounded, iso, without_controls
 
 INSTANCE, MODEL = 'codex', 'gpt-6'
 ACTIVE = ('preparing', 'starting', 'running', 'waiting')
-# No `preparing`: a preparing run would make t3term subscribe to the thread's worktree setup,
-# which the fake answers only with null.
+# No `preparing`: a preparing run would make t3term subscribe to the worktree setup of a thread
+# with no worktree path yet, and `t3v setup` serves only a thread with one.
 RUN_STATUSES = ('starting', 'running', 'waiting', 'completed', 'interrupted', 'failed', 'cancelled')
+# What `t3v setup` serves for a thread's worktree setup. `none` is T3's null.
+SETUP_PHASES = ('running', 'done', 'failed', 'none')
 EFFORT = {'id': 'effort', 'label': 'Effort', 'type': 'select',
           'options': [{'id': 'low', 'label': 'Low'},
                       {'id': 'medium', 'label': 'Medium', 'isDefault': True},
@@ -282,3 +284,44 @@ class Thread:
                 'providerSessions': [], 'runtimeRequests': [], 'plans': [],
                 'attempts': [], 'nodes': [], 'subagents': [], 'providerThreads': [], 'providerTurns': [],
                 'checkpointScopes': [], 'checkpoints': [], 'contextHandoffs': [], 'contextTransfers': []}
+
+
+def setup_snapshot(thread: Thread, phase: str, sequence: int, now: int) -> dict:
+    """A `WorktreeSetupSnapshot`, as T3's packages/contracts/src/worktreeSetup.ts shapes it, for
+    the thread's worktree. It began 9 seconds before `now`: the base branch fetched and the files
+    checked out, no submodules, and the setup script `npm install` started 6 seconds before `now`.
+    `running` leaves the script and the setup going, so the card's clocks read 6 s and 9 s on.
+    `done` ends both now and starts the agent. `failed` ends the script with exit 1 and the setup
+    with T3's error."""
+    def at(seconds: float) -> str:
+        return iso(now - int(seconds * 1000))
+
+    ended = None if phase == 'running' else at(0)
+    script = {'id': 'setup-script', 'status': phase, 'startedAt': at(6),
+              'tail': ['added 312 packages in 3s', '41 packages are looking for funding',
+                       '  run `npm fund` for details']}
+    if ended:
+        script['endedAt'] = ended
+    if phase == 'failed':
+        script['tail'] = script['tail'][:2] + ['npm ERR! code ELIFECYCLE']
+    agent = {'id': 'agent', 'status': 'pending'}
+    if phase == 'done':
+        agent = {'id': 'agent', 'status': 'done', 'startedAt': ended, 'endedAt': ended}
+    snapshot = {
+        'threadId': thread.tid, 'phase': phase, 'sequence': sequence, 'startedAt': at(9),
+        'branch': thread.watched.get('branch'), 'baseRef': 'main',
+        'worktreePath': thread.watched.get('worktreePath'),
+        'setupScript': {'name': 'Install', 'command': 'npm install'},
+        'stages': [
+            {'id': 'fetch', 'status': 'done', 'startedAt': at(9), 'endedAt': at(8)},
+            {'id': 'checkout', 'status': 'done', 'startedAt': at(8), 'endedAt': at(6)},
+            {'id': 'submodules', 'status': 'skipped'},
+            script,
+            agent,
+        ],
+    }
+    if ended:
+        snapshot['endedAt'] = ended
+    if phase == 'failed':
+        snapshot['error'] = 'The setup script exited with code 1.'
+    return snapshot
