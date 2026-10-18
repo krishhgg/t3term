@@ -769,9 +769,10 @@ fn body(
     // Where the line after the last hunk is in the file before the change.
     let mut after = 1;
     for hunk in &file.hunks {
-        // A hunk that removes nothing names the line before it, as git writes `-5,0`.
+        // A hunk that removes nothing names the line before it, as git writes `-5,0`. The
+        // parser lets that line be u64::MAX, where the count of the lines above stops.
         let first = match hunk.old_count {
-            0 => hunk.old_start + 1,
+            0 => hunk.old_start.saturating_add(1),
             _ => hunk.old_start,
         };
         let gap = first.saturating_sub(after);
