@@ -79,47 +79,230 @@ fn output(command: &mut Command) -> Output {
     spawn(command).wait_with_output().expect("run t3term")
 }
 
+/// `source` with its comments and its string and character literals turned to spaces, and its
+/// line ends kept, so what is left is its code, line for line.
+fn code_only(source: &str) -> String {
+    let chars: Vec<char> = source.chars().collect();
+    let ident = |c: char| c.is_alphanumeric() || c == '_';
+    // Whether a raw string starts at `at`: `r`, `br` or `cr` at the start of a token, any
+    // number of `#`, then `"`. Gives the number of `#`.
+    let raw = |at: usize| {
+        let prefix = match at.checked_sub(1).map(|before| chars[before]) {
+            Some('b' | 'c') => at.checked_sub(2).map(|before| chars[before]),
+            before => before,
+        };
+        if chars[at] != 'r' || prefix.is_some_and(ident) {
+            return None;
+        }
+        let hashes = chars[at + 1..].iter().take_while(|&&c| c == '#').count();
+        (chars.get(at + 1 + hashes) == Some(&'"')).then_some(hashes)
+    };
+    let mut kept: Vec<char> = Vec::with_capacity(chars.len());
+    let mut at = 0;
+    // Turns the characters from `at` to `end` to spaces, with line ends kept.
+    let blank = |kept: &mut Vec<char>, from: usize, end: usize| {
+        let end = end.min(chars.len());
+        kept.extend(
+            chars[from..end]
+                .iter()
+                .map(|&c| if c == '\n' { '\n' } else { ' ' }),
+        );
+        end
+    };
+    while at < chars.len() {
+        if let Some(hashes) = raw(at) {
+            let close: String = std::iter::once('"')
+                .chain("#".repeat(hashes).chars())
+                .collect();
+            let body = at + 2 + hashes;
+            let text: String = chars[body..].iter().collect();
+            let end = text.find(&close).map_or(chars.len(), |end| {
+                body + text[..end].chars().count() + close.len()
+            });
+            kept.push('r');
+            at = blank(&mut kept, at + 1, end);
+            continue;
+        }
+        let next = chars.get(at + 1).copied();
+        at = match chars[at] {
+            '/' if next == Some('/') => {
+                let end = chars[at..].iter().position(|&c| c == '\n');
+                blank(&mut kept, at, end.map_or(chars.len(), |end| at + end))
+            }
+            '/' if next == Some('*') => {
+                // Block comments nest.
+                let (mut depth, mut end) = (0, at);
+                while end < chars.len() {
+                    match (chars[end], chars.get(end + 1)) {
+                        ('/', Some('*')) => (depth, end) = (depth + 1, end + 2),
+                        ('*', Some('/')) => (depth, end) = (depth - 1, end + 2),
+                        _ => end += 1,
+                    }
+                    if depth == 0 {
+                        break;
+                    }
+                }
+                blank(&mut kept, at, end)
+            }
+            '"' => {
+                let mut end = at + 1;
+                while end < chars.len() && chars[end] != '"' {
+                    end += if chars[end] == '\\' { 2 } else { 1 };
+                }
+                blank(&mut kept, at, end + 1)
+            }
+            // A character literal, as against a lifetime or a label.
+            '\'' if next == Some('\\') => {
+                let rest = chars.get(at + 3..).unwrap_or(&[]);
+                let end = rest.iter().position(|&c| c == '\'');
+                blank(
+                    &mut kept,
+                    at,
+                    end.map_or(chars.len(), |end| at + 3 + end + 1),
+                )
+            }
+            '\'' if chars.get(at + 2) == Some(&'\'') => blank(&mut kept, at, at + 3),
+            c => {
+                kept.push(c);
+                at + 1
+            }
+        };
+    }
+    kept.into_iter().collect()
+}
+
+/// The lines, counted from 1, where `code`, as `code_only` gives it, names a process's
+/// `output`, `spawn` or `status`, as a method call or by a path. White space between the parts
+/// counts for nothing. Only `std::thread::spawn`, by that whole path, starts no process.
+fn process_starts(code: &str) -> Vec<usize> {
+    let mut line = 1;
+    let mut kept = Vec::new();
+    for c in code.chars() {
+        if c == '\n' {
+            line += 1;
+        } else if !c.is_whitespace() {
+            kept.push((c, line));
+        }
+    }
+    let chars: Vec<char> = kept.iter().map(|&(c, _)| c).collect();
+    let has = |at: usize, word: &str| {
+        word.chars()
+            .enumerate()
+            .all(|(k, c)| chars.get(at + k) == Some(&c))
+    };
+    let ident = |at: Option<usize>| {
+        at.and_then(|at| chars.get(at))
+            .is_some_and(|&c| c.is_alphanumeric() || c == '_')
+    };
+    let thread = "std::thread::";
+    let mut lines = Vec::new();
+    for at in 0..chars.len() {
+        for name in ["output", "spawn", "status"] {
+            let after = at + 1 + name.len();
+            let called = chars[at] == '.' && has(at + 1, name) && chars.get(after) == Some(&'(');
+            let path = at > 0 && has(at - 1, "::") && has(at + 1, name) && !ident(Some(after));
+            let root =
+                |from: usize| from == 0 || !(ident(Some(from - 1)) || chars[from - 1] == ':');
+            let threads = name == "spawn"
+                && at + 1 >= thread.len()
+                && has(at + 1 - thread.len(), thread)
+                && root(at + 1 - thread.len());
+            if called || path && !threads {
+                lines.push(kept[at].1);
+            }
+        }
+    }
+    lines.dedup();
+    lines
+}
+
 /// Every process these tests start goes through `spawn_holding`, which takes the held lock.
-/// Outside its body no line of code in this file names a process's `output`, `spawn` or
-/// `status`, as a method call or by its path, as in `Command::spawn(command)` or
-/// `.map(Command::spawn)`. `thread::spawn` starts no process. A test that starts one straight,
-/// as a merge from master can bring in, fails here rather than now and then on macOS.
+/// Outside its body, the code of this file, with its comments and its string and character
+/// literals left out, names no process's `output`, `spawn` or `status`, as a method call or by
+/// a path, as in `Command::spawn(command)` or `.map(Command::spawn)`. Only `std::thread::spawn`,
+/// by that whole path, gets through, as it starts no process. A test that starts one straight,
+/// as a merge from master can bring in, fails here rather than now and then on macOS. A macro
+/// that builds the call from pieces, or a module of this file named `std`, would get past it.
 #[test]
 fn every_process_starts_through_spawn_holding() {
-    let lines: Vec<&str> = include_str!("cli.rs").lines().collect();
-    // Built here, so that this line doesn't count as one.
-    let head = format!("fn {}(", "spawn_holding");
+    let source = include_str!("cli.rs");
+    let code = code_only(source);
+    let lines: Vec<&str> = code.lines().collect();
     let heads: Vec<usize> = (0..lines.len())
-        .filter(|&at| lines[at].contains(&head))
+        .filter(|&at| lines[at].contains("fn spawn_holding("))
         .collect();
     assert_eq!(heads.len(), 1, "one spawn_holding");
     let start = heads[0];
     assert!(
-        lines[start].starts_with(&head),
+        lines[start].starts_with("fn spawn_holding("),
         "spawn_holding is in no other item"
     );
     // rustfmt ends a function at the top of the file with a `}` alone at the start of a line.
     let end = start + lines[start..].iter().position(|line| *line == "}").unwrap();
-    let ident = |c: char| c.is_alphanumeric() || c == '_';
-    let mut elsewhere = Vec::new();
-    for (at, line) in lines.iter().enumerate() {
-        if (start..=end).contains(&at) || line.trim_start().starts_with("//") {
-            continue;
-        }
-        let code: String = line.split_whitespace().collect();
-        let starts = ["output", "spawn", "status"].iter().any(|name| {
-            let called = code.contains(&format!(".{name}("));
-            let named = code.match_indices(&format!("::{name}")).any(|(i, path)| {
-                let after = code[i + path.len()..].chars().next();
-                !after.is_some_and(ident) && !code[..i].ends_with("thread")
-            });
-            called || named
-        });
-        if starts {
-            elsewhere.push((at + 1, line.trim()));
-        }
-    }
+    let outside: Vec<&str> = lines
+        .iter()
+        .enumerate()
+        .map(|(at, line)| {
+            if (start..=end).contains(&at) {
+                ""
+            } else {
+                line
+            }
+        })
+        .collect();
+    let raw: Vec<&str> = source.lines().collect();
+    let elsewhere: Vec<(usize, &str)> = process_starts(&outside.join("\n"))
+        .into_iter()
+        .map(|line| (line, raw[line - 1].trim()))
+        .collect();
     assert!(elsewhere.is_empty(), "{elsewhere:#?}");
+}
+
+/// The scan for process starts reads the code alone, past comments, literals, white space and
+/// renamed imports.
+#[test]
+fn the_scan_for_process_starts_reads_code_alone() {
+    let starts = |source: &str| process_starts(&code_only(source));
+    for source in [
+        "command.spawn()",
+        "command\n    .output()\n",
+        "command.spawn /* here */ ()",
+        "command.spawn /* a /* nested */ one */ ()",
+        "command.status // here\n    ()",
+        "use std::process::Command as thread;\nthread::spawn(&mut command)",
+        "use std::thread;\nthread::spawn(|| ())",
+        "my::std::thread::spawn(&mut command)",
+        ".map(Command::spawn)",
+        "Command::output(&mut command)",
+        "<Command>::status(&mut command)",
+        "let quote = '\"'; command.spawn()",
+        "let quote = '\\''; command.spawn()",
+        "let quote = b'\"'; command.spawn()",
+        "let s = r#\"a \" b\"#; command.spawn()",
+        "fn run<'a>(command: &'a mut Command) { command.spawn(); }",
+    ] {
+        assert!(!starts(source).is_empty(), "{source}");
+    }
+    for source in [
+        "std::thread::spawn(|| ())",
+        "let started = std::thread::spawn(move || spawn(&mut touch));",
+        "// command.spawn()",
+        "/* command.spawn() */",
+        "/* /* command.spawn() */ */",
+        "let s = \"command.spawn()\";",
+        "let s = \"\\\"command.spawn()\";",
+        "let s = r#\"command.spawn()\"#;",
+        "let s = br\"x.output()\";",
+        "let s = b\"x.status()\";",
+        "command.spawned(); outputs.status_of(); spawn_alone(command); Thread::spawner",
+    ] {
+        assert!(starts(source).is_empty(), "{source}");
+    }
+    // The lines are the source's.
+    assert_eq!(
+        starts("/* one\ntwo */\nlet a = '\\n';\ncommand.spawn()"),
+        [4]
+    );
 }
 
 /// A process starts while the test that started it holds `SPAWNING`, at the moment it starts
