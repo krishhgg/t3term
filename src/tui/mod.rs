@@ -674,6 +674,8 @@ fn changed_since(
 /// the cache, as the desktop's Refresh does (PullRequestDetailPanel.tsx:857-875). With
 /// `ask.updated`, it reads the detail alone, and the conversation after it only when the detail's
 /// `updatedAt` differs, as the desktop's live refresh does (PullRequestDetailPanel.tsx:836-856).
+/// With `ask.stack`, once a detail came whose host keeps stacks, it reads the stack the pull
+/// request is in, as the desktop asks for it only then (PullRequestDetailPanel.tsx:801-810).
 async fn read_pull_request(client: &Client, reference: &Reference, ask: &Ask, send: impl Fn(Part)) {
     fn failed(e: &dyn std::fmt::Display) -> String {
         format!("Couldn't read this pull request: {e}")
@@ -690,7 +692,16 @@ async fn read_pull_request(client: &Client, reference: &Reference, ask: &Ask, se
                     Err(e) => Err(e.to_string()),
                 };
                 let changed = changed_since(&answer, ask.updated.as_deref());
+                let stacks = ask.stack
+                    && answer
+                        .as_ref()
+                        .is_ok_and(|detail| detail.capabilities.stacks);
                 send(Part::Detail(answer));
+                if stacks {
+                    let answer = pull_request::stack(&rpc, reference).await;
+                    let answer = answer.map(|stack| stack.map(Box::new));
+                    send(Part::Stack(answer.map_err(|e| e.to_string())));
+                }
                 changed
             };
             let activity = async {
@@ -14164,8 +14175,8 @@ mod tests {
     /// The reader against a fake T3 on 127.0.0.1. A read that keeps the details current asks
     /// for the conversation only once a detail came whose `updatedAt` differs from the one
     /// shown, and none after a detail that stayed the same or failed. A person's refresh sends
-    /// `pullRequests.invalidate`, then asks for both at once. Each read ends with
-    /// `Part::Done`.
+    /// `pullRequests.invalidate`, then asks for both at once. A read of both asks for the stack
+    /// once a detail came whose host keeps stacks. Each read ends with `Part::Done`.
     #[tokio::test]
     async fn a_read_asks_t3_for_the_conversation_as_its_ask_says() {
         use futures_util::SinkExt;
@@ -14215,6 +14226,9 @@ mod tests {
                     Part::Detail(Err(_)) => "no detail",
                     Part::Activity(Ok(_)) => "activity",
                     Part::Activity(Err(_)) => "no activity",
+                    Part::Stack(Ok(Some(_))) => "stack",
+                    Part::Stack(Ok(None)) => "no stack",
+                    Part::Stack(Err(_)) => "stack failed",
                     Part::Done => "done",
                 });
             })
@@ -14238,6 +14252,7 @@ mod tests {
             number: 31,
             invalidate,
             updated: updated.map(str::to_string),
+            stack: updated.is_none(),
         };
         let success = |value: Value| json!({"_tag": "Success", "value": value});
         let soon = Duration::from_secs(5);
@@ -14305,6 +14320,68 @@ mod tests {
         assert_eq!(read.pop(), Some("done"));
         read.sort();
         assert_eq!(read, ["activity", "detail"]);
+        assert_eq!(request(&mut socket, Duration::from_millis(200)).await, None);
+
+        // A host that keeps stacks: a read of both asks for the stack once the detail came,
+        // with the same reference.
+        let mut stacked = host_detail_sent();
+        stacked["capabilities"]["stacks"] = json!(true);
+        let stack = json!({"id": "S_1", "number": 7, "url": "https://github.com/o/r/stacks/7",
+            "base": "master", "layers": [{"number": 31, "headBranch": "feature-31",
+            "state": "open"}]});
+        let server = async {
+            let first = request(&mut socket, soon).await.expect("a read");
+            let second = request(&mut socket, soon).await.expect("the other read");
+            let detail = match first["tag"] == "pullRequests.detail" {
+                true => &first,
+                false => &second,
+            };
+            reply(&mut socket, detail, success(stacked.clone())).await;
+            let asked = request(&mut socket, soon).await.expect("the stack");
+            assert_eq!(asked["tag"], "pullRequests.stack");
+            assert_eq!(asked["payload"], detail["payload"]);
+            reply(&mut socket, &asked, success(stack.clone())).await;
+            let activity = match first["tag"] == "pullRequests.activity" {
+                true => &first,
+                false => &second,
+            };
+            reply(&mut socket, activity, success(host_activity_sent())).await;
+        };
+        let (mut read, ()) = beside(parts(&client, &reference, ask(false, None)), server).await;
+        // The stack and the conversation are read at once, so either answer can come first.
+        read[1..3].sort();
+        assert_eq!(read, ["detail", "activity", "stack", "done"]);
+
+        // A read that keeps the details current reads no stack, as the desktop's live refresh
+        // reads only the detail.
+        let server = async {
+            let asked = request(&mut socket, soon).await.expect("the detail");
+            assert_eq!(asked["tag"], "pullRequests.detail");
+            reply(&mut socket, &asked, success(stacked.clone())).await;
+            let asked = request(&mut socket, soon).await.expect("the conversation");
+            assert_eq!(asked["tag"], "pullRequests.activity");
+            reply(&mut socket, &asked, success(host_activity_sent())).await;
+        };
+        let (read, ()) = beside(parts(&client, &reference, ask(false, older)), server).await;
+        assert_eq!(read, ["detail", "activity", "done"]);
+        assert_eq!(request(&mut socket, Duration::from_millis(200)).await, None);
+
+        // One that opening the details again asks for with a stale stack reads the stack too,
+        // and still the conversation only once the detail changed.
+        let server = async {
+            let asked = request(&mut socket, soon).await.expect("the detail");
+            assert_eq!(asked["tag"], "pullRequests.detail");
+            reply(&mut socket, &asked, success(stacked.clone())).await;
+            let asked = request(&mut socket, soon).await.expect("the stack");
+            assert_eq!(asked["tag"], "pullRequests.stack");
+            reply(&mut socket, &asked, success(stack.clone())).await;
+        };
+        let stale = Ask {
+            stack: true,
+            ..ask(false, shown)
+        };
+        let (read, ()) = beside(parts(&client, &reference, stale), server).await;
+        assert_eq!(read, ["detail", "stack", "done"]);
         assert_eq!(request(&mut socket, Duration::from_millis(200)).await, None);
     }
 

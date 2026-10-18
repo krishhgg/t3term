@@ -1,6 +1,6 @@
 # Pull request reads
 
-`src/pull_request.rs` reads one pull request from T3's server: its detail, its checks, its conversation and the stack it is in. It is the first part of PR reviews in the TUI ([parity.md, group 12](parity.md#12-pull-requests)). The thread details call `detail` and `activity` at once when a link's details open, and `r` there sends `invalidate` first, as [linked pull requests](pull-request-panel.md#what-a-links-details-read-from-its-host) says. Nothing calls `checks` or `stack` yet.
+`src/pull_request.rs` reads one pull request from T3's server: its detail, its checks, its conversation and the stack it is in. It is the first part of PR reviews in the TUI ([parity.md, group 12](parity.md#12-pull-requests)). The thread details call `detail` and `activity` at once when a link's details open, then `stack` once the detail says its host keeps stacks, and `r` there sends `invalidate` first, as [linked pull requests](pull-request-panel.md#what-a-links-details-read-from-its-host) says. Nothing calls `checks` yet.
 
 ```rust
 let reference = Reference::new(&thread_project_id, Some(&link.host), &link.repository, link.number)?;
@@ -83,7 +83,7 @@ The unit tests read a detail with every field filled in, then without each optio
 
 ## Not done yet
 
-- The TUI calls `detail`, `activity` and `invalidate`, and follows `pullRequests.subscribeRefreshes` through `client::spawn_pull_request_refresh_watch`. It shows the activity's remarks, verdicts, commits and reactions, not its review threads. It never reads `checks` or `stack`.
+- The TUI calls `detail`, `activity`, `stack` and `invalidate`, and follows `pullRequests.subscribeRefreshes` through `client::spawn_pull_request_refresh_watch`. It shows the activity's remarks, verdicts, commits and reactions, not its review threads. It never reads `checks`.
 - There is no CLI command for a pull request.
 - The list of pull requests, the diff, viewed files, and reviewer and label candidates aren't read.
 - Nothing writes: no comment, review, reaction, resolution, label, reviewer or action. Those need `source-control:write`.
