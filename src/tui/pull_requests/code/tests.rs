@@ -209,6 +209,30 @@ fn the_unchanged_lines_before_a_hunk_count_from_the_line_git_names() {
 }
 
 #[test]
+fn a_hunk_that_removes_nothing_after_the_highest_line_unfolds() {
+    // The parser takes a range that ends at the highest number, so a hunk that removes nothing
+    // can name u64::MAX as the line before it. The first line after it can't be numbered, and
+    // the count of the lines above stops at the highest.
+    let patch = "diff --git a/a b/a
+--- a/a
++++ b/a
+@@ -18446744073709551615,0 +1 @@
++added
+";
+    let mut code = read(slice(patch, None), 0);
+    code.act(Control::File(0), &[]);
+    let rows = rows(&code, 60);
+    assert_eq!(
+        rows[2..4],
+        [
+            "⌄ M a +1 -0",
+            "⋯ 18,446,744,073,709,551,614 unmodified lines"
+        ]
+    );
+    assert_eq!(rows[4].trim_start(), "1 + added");
+}
+
+#[test]
 fn the_first_slice_is_read_once_and_the_next_as_the_end_comes_near() {
     let first = "diff --git a/one b/one
 --- a/one
