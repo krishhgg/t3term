@@ -6,6 +6,7 @@
 - **Reading the diff.** The first time the Code shows after the details open, t3term POSTs `/api/pull-requests/diff` with the link's project, host, repository and number and no cursor. `Loading pull request diff…` shows until the first slice comes. Once a frame shows the end of the files within two pages of the view, t3term reads the next slice with the cursor the last one gave. One slice is read at a time. Nothing reads the diff before the Code shows. Going to another tab and back within the minute reads nothing, and coming back a minute or more after the first slice came reads it again.
 - **The count and the note.** The count reads `5 files+` while more slices are left, with `Loading more files…` under the files while the next one is read, then `8 files`. `The host withheld part of this diff, such as a binary file or a change too large to show.` shows in yellow under it when a slice says the host left something out.
 - **Commits.** Where the change has commits, `› All commits` sits above the count. Enter or a click opens the list under it: `✓ All commits`, then each commit's headline with the first seven characters of its id at the end, newest first, and `Show more (13 left)` while more than 10 are left. ✓ marks the diff shown. Picking a commit closes the list, reads that commit's own diff from its first slice with every file folded, and the row reads `› Reuse the parsed config on reload · 9dc565a`. Under a commit's diff every review thread goes to the list off the diff. `All commits` reads the whole change again. A read of the conversation that no longer lists the commit goes back to the whole change.
+- **From the Timeline.** Where the host gives a diff, a commit's two rows on the Timeline are a control: ↑ and ↓ choose it, the status line reads `Enter view commit 9dc565a`, and Enter or a click shows the Code with that commit picked. The same commit again shows the Code as the reader left it and reads nothing. Another commit reads its first slice and starts the Code at its top, with the list off the diff closed. Without a diff the rows are plain text.
 - **Files.** Each file starts folded: `› M src/config/reader.rs +7 -5`, with `A` green, `D` red, `R` blue and `M` yellow, and the counts in green and red. A rename shows both paths, `› R src/config/source.rs → src/config/sources.rs`, with the counts on the next row where they don't fit. A file whose hunks the host left out takes the host's counts, as in `› M Cargo.lock +40 -12`.
 - **Order.** Each slice's files show in the desktop's reading order, not the patch's. Source files come first, each after the changed files it imports and otherwise by path. Tests come next, each after the source file whose name it has, then lockfiles, snapshots and files under `dist`, `build`, `vendor`, `__generated__` or `__snapshots__`, by path. A later slice never moves the files above it. So the first slice reads `assets/config-flow.png`, `src/config/reader.rs`, `src/config/schema.rs`, the rename and `tests/config_reload.rs`, and the second `docs/config.md`, `src/legacy/reader_v1.rs` and `Cargo.lock`.
 - **Unfolding.** Enter on the chosen file, or a click on it, turns `›` into `⌄` and shows its lines. Each line has its number in grey, the new one or the old for a removed line, then `-` and the line in red, `+` and the line in green, or a space and the line. `⋯ 14 unmodified lines` comes before a hunk that doesn't start at line 1. A line that wraps leaves the number and the mark blank on its later rows, and a tab stops every 4 columns. A binary file reads `A binary file, whose changes have no lines to show.` and a file the host withheld `The host withheld this file's changes.` Enter or a click again folds the file.
@@ -116,6 +117,12 @@ $T3V wait --text "5 files+" --gone "May be out of date" --text "r refresh" --idl
 # A detail without a diff takes the tab away and lands on the Summary. With the diff back, the Code reads again.
 touch "$RUN/diff-off"
 $T3V refresh && $T3V wait --text "← List  Summary  Timeline" --text "Read from github.com just now" --text "→ timeline · ← list" --gone "Timeline  Code" --idle 300
+# Without a diff a Timeline commit is plain text, and a click on it reads nothing.
+$T3V keys Right && $T3V wait --text "○ Reuse the parsed config on reload" --idle 300
+mark
+$T3V click --text "Reuse the parsed config on reload" && $T3V wait --text "○ Reuse the parsed config on reload" --gone "Enter view commit" --idle 300
+[ "$(since)" = '[]' ]
+$T3V keys Left && $T3V wait --text "→ timeline · ← list"
 rm "$RUN/diff-off"
 mark
 $T3V refresh && $T3V wait --text "← List  Summary  Timeline  Code" --text "r refresh" --idle 300
@@ -199,6 +206,25 @@ $T3V click --text "Split the config reader" && $T3V wait --text "✓ Split the c
 mark
 $T3V click --text "  All commits" && $T3V wait --text "› All commits" --text "8 files" --text "› 1 conversation not on the current diff" --text "› M src/config/reader.rs +7 -5" --idle 300
 [ "$(jq -s -c '[.[] | select(.event == "pr.diff") | [.cursor, .commit]] | .['"$M"':]' "$E/events.jsonl")" = '[[null,null],["s2",null]]' ]
+
+# A commit's rows on the Timeline open its own diff on the Code, picked in the list of commits. The same commit again shows the Code as it was and reads nothing.
+$T3V keys Left && $T3V wait --text "○ Reuse the parsed config on reload" --text "→ code · ← summary" --idle 300
+mark
+$T3V click --text "Reuse the parsed config on reload" && $T3V wait --text "› Reuse the parsed config on reload · 9dc565a" --text "2 files" --text "← timeline" --idle 300
+[ "$(jq -s -c '[.[] | select(.event == "pr.diff") | [.cursor, .commit]] | .['"$M"':]' "$E/events.jsonl")" = '[[null,"9dc565a0"]]' ]
+$T3V click --text "tests/config_reload.rs" && $T3V wait --text "⌄ A tests/config_reload.rs +8 -0"
+$T3V keys Left && $T3V wait --text "○ Reuse the parsed config on reload" --idle 300
+mark
+$T3V keys Down Down Down && $T3V wait --text "Enter view commit 9dc565a"
+$T3V capture timeline-commit-100x30
+$T3V keys Enter && $T3V wait --text "⌄ A tests/config_reload.rs +8 -0" --text "← timeline" --idle 300
+[ "$(since)" = '[]' ]
+# Another commit reads its first slice and starts the Code at its top.
+$T3V keys Left && $T3V wait --text "○ Split the config reader" --idle 300
+mark
+$T3V keys Down Down Down Down Down && $T3V wait --text "Enter view commit 1f3e2a9"
+$T3V keys Enter && $T3V wait --text "› Split the config reader · 1f3e2a9" --text "src/config/schema.rs" --text "← timeline" --idle 300
+[ "$(jq -s -c '[.[] | select(.event == "pr.diff") | [.cursor, .commit]] | .['"$M"':]' "$E/events.jsonl")" = '[[null,"1f3e2a90"]]' ]
 rm "$RUN/diff-threads"
 
 # Another thread's link, whose first slice fails: the failure alone. Showing the Code again reads it again, and so does opening the details again.

@@ -145,7 +145,8 @@ impl Shown {
             | Control::Commits
             | Control::AllCommits
             | Control::Commit(_)
-            | Control::MoreCommits => {}
+            | Control::MoreCommits
+            | Control::TimelineCommit(_) => {}
         }
     }
 
@@ -241,6 +242,9 @@ pub(super) enum Control {
     Commit(usize),
     /// Lists up to 10 more commits in the Code tab's list.
     MoreCommits,
+    /// Shows a commit's own diff on the Code tab, from its row on the Timeline, by its place
+    /// among the commits as T3 sent them.
+    TimelineCommit(usize),
 }
 
 impl Control {
@@ -652,6 +656,11 @@ impl Conversation {
         self.newest.iter().map(|&at| &self.commits[at]).collect()
     }
 
+    /// The commit at `at` among the commits as T3 sent them, as the Timeline knows it.
+    pub(super) fn commit(&self, at: usize) -> Option<&Commit> {
+        self.commits.get(at)
+    }
+
     /// Lays the text of each remark of the threads at `at` out at `width`, unless it already
     /// is. The Code tab says which threads show.
     pub(super) fn lay_out_threads(&mut self, at: &[usize], width: usize, theme: &Theme) {
@@ -831,6 +840,7 @@ impl Conversation {
             Control::Remark(at) => shown.finished_open && at < self.finished.len(),
             Control::TimelineOrder => self.timeline.is_some(),
             Control::Run(at) => self.timeline.as_ref().is_some_and(|t| at < t.runs()),
+            Control::TimelineCommit(at) => self.timeline.is_some() && at < self.commits.len(),
             Control::File(_)
             | Control::Retry
             | Control::Thread(_)
@@ -883,6 +893,10 @@ impl Conversation {
             }
             Control::OffDiff => toggle(shown.off_diff_open, "conversations off the diff"),
             Control::More(_) => "load more comments".to_string(),
+            Control::TimelineCommit(at) => match self.commits.get(at) {
+                Some(commit) => format!("view commit {}", commit.short),
+                None => "view commit".to_string(),
+            },
             Control::File(_)
             | Control::Retry
             | Control::Commits

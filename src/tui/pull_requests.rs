@@ -1696,6 +1696,10 @@ impl PullRequests {
         {
             return;
         }
+        if let Control::TimelineCommit(at) = control {
+            self.open_commit(at);
+            return;
+        }
         if control.on_code() {
             let read = self.read.as_mut().expect("the shown read");
             let commits = match &read.conversation {
@@ -1767,6 +1771,35 @@ impl PullRequests {
             .or_else(|| control.partner())
             .filter(|control| conversation.has(*control, &self.shown));
         self.relay();
+    }
+
+    /// Shows the Code tab with the own diff of the commit at `at` among the conversation's
+    /// commits as T3 sent them, as a commit on the desktop's Timeline opens it
+    /// (PullRequestDetailPanel.tsx:516-519). Another diff than the one shown is read from its
+    /// first slice, with the list off the diff closed and the Code at its top. The same one
+    /// shows where the reader left it.
+    fn open_commit(&mut self, at: usize) {
+        if !self.offers_code() {
+            return;
+        }
+        let read = self.read.as_mut().expect("the shown read");
+        let Answer::Read(conversation) = &read.conversation else {
+            return;
+        };
+        if !conversation.has(Control::TimelineCommit(at), &self.shown) {
+            return;
+        }
+        let oid = conversation
+            .commit(at)
+            .expect("a commit it has")
+            .oid
+            .clone();
+        let code = read.code.get_or_insert_with(Code::new);
+        if code.show(oid) {
+            self.shown.close_off_diff();
+            self.kept[Tab::Code.place()] = Offset::Top(0);
+        }
+        self.switch(Tab::Code);
     }
 
     /// Whether `read` is of the selected link.
@@ -3080,7 +3113,10 @@ fn detail_lines(
     if let (Tab::Timeline, Some(read)) = (tab, read) {
         lines.push(Line::default());
         let at = lines.len();
-        let timeline = conversation::timeline_section(&read.conversation, shown, width, now, theme);
+        // A commit opens its own diff on the Code tab where the host gives a diff.
+        let opens = matches!(&read.answer, Answer::Read(summary) if summary.diff);
+        let timeline =
+            conversation::timeline_section(&read.conversation, shown, opens, width, now, theme);
         lines.extend(timeline.lines);
         let moved = |rows: Range<usize>| rows.start + at..rows.end + at;
         targets.extend(
@@ -7044,6 +7080,115 @@ mod tests {
         assert_eq!(pulls.tabs(), Some(Tab::Summary));
         assert!(!pulls.offers_code());
         assert!(pulls.forward() && !pulls.forward());
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+    }
+
+    #[test]
+    fn a_commit_on_the_timeline_shows_its_diff_on_the_code_tab() {
+        let theme = theme();
+        let mut activity = remarks(1);
+        activity["commits"] = json!([
+            {"oid": "1111111aaaa", "messageHeadline": "First",
+                "committedDate": "2026-10-13T00:01:00Z"},
+            {"oid": "2222222bbbb", "messageHeadline": "Second",
+                "committedDate": "2026-10-13T00:02:00Z"},
+        ]);
+        activity["reviewThreads"] = json!([
+            {"id": "t0", "path": "f0.rs", "line": 1, "side": "right", "isResolved": false,
+                "isOutdated": false, "comments": [{"id": "r0",
+                "author": {"login": "mona", "name": null}, "body": "On line 1.",
+                "createdAt": "2026-10-13T00:30:00Z", "url": null}]},
+        ]);
+        let scoped = |ticket: u64, commit: &str| DiffAsk {
+            commit: Some(commit.to_string()),
+            ..diff_ask(ticket, None)
+        };
+        let commits_of = |pulls: &PullRequests| -> Vec<Control> {
+            let targets = &pulls.detail.as_ref().expect("the details").targets;
+            let commits = targets.iter().map(|(_, control)| *control);
+            commits
+                .filter(|control| matches!(control, Control::TimelineCommit(_)))
+                .collect()
+        };
+        let mut pulls = conversing(activity.clone());
+        assert!(!pulls.answer(1, Part::Done, now()));
+        assert!(pulls.forward());
+        pulls.page(60, 40, now(), true, &theme);
+        // Each commit's rows are a control, the newest first, by its place as T3 sent it.
+        assert_eq!(
+            commits_of(&pulls),
+            [Control::TimelineCommit(1), Control::TimelineCommit(0)]
+        );
+        for _ in 0..10 {
+            if pulls.pick == Some(Control::TimelineCommit(1)) {
+                break;
+            }
+            pulls.step(true);
+        }
+        assert_eq!(pulls.pick, Some(Control::TimelineCommit(1)));
+        assert_eq!(pulls.action().as_deref(), Some("view commit 2222222"));
+
+        // Enter shows the Code with that commit's diff, though the Code never showed before.
+        pulls.enter();
+        assert_eq!(pulls.tabs(), Some(Tab::Code));
+        assert_eq!(pulls.pick, None);
+        assert_eq!(
+            pulls.take_diff_ask(true, now()),
+            Some(scoped(2, "2222222bbbb"))
+        );
+        assert!(pulls.answer_diff(2, Ok(added(0, 1, None)), now()));
+        pulls.page(60, 40, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(
+            rows.contains(&"› Second · 2222222".to_string()),
+            "{rows:#?}"
+        );
+        pulls.pick = Some(Control::OffDiff);
+        pulls.enter();
+        assert!(pulls.shown.off_diff_open());
+
+        // The same commit again shows the Code where the reader left it, and reads nothing.
+        pulls.scroll = Offset::Top(3);
+        assert!(pulls.back());
+        assert_eq!(pulls.tabs(), Some(Tab::Timeline));
+        pulls.pick = Some(Control::TimelineCommit(1));
+        pulls.enter();
+        assert_eq!(pulls.tabs(), Some(Tab::Code));
+        assert_eq!(pulls.scroll, Offset::Top(3));
+        assert!(pulls.shown.off_diff_open());
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+
+        // A click on another shows it from the top of the Code, with the list off the diff closed.
+        assert!(pulls.back());
+        pulls.pick = Some(Control::TimelineCommit(0));
+        assert_eq!(pulls.action().as_deref(), Some("view commit 1111111"));
+        let (rows, _) = control_rows(&mut pulls, 40, true, Control::TimelineCommit(0));
+        assert_eq!(rows.len(), 2, "{rows:?}");
+        assert!(pulls.click(0, rows[1]));
+        assert_eq!(pulls.tabs(), Some(Tab::Code));
+        assert_eq!(pulls.scroll, Offset::Top(0));
+        assert!(!pulls.shown.off_diff_open());
+        assert_eq!(
+            pulls.take_diff_ask(true, now()),
+            Some(scoped(3, "1111111aaaa"))
+        );
+        // A place T3 sent no commit at opens nothing.
+        assert!(pulls.back());
+        pulls.pick = Some(Control::TimelineCommit(2));
+        pulls.enter();
+        assert_eq!(pulls.tabs(), Some(Tab::Timeline));
+
+        // Where the host gives no diff, a commit opens nothing.
+        let mut detail = bare_detail();
+        detail["capabilities"]["diff"] = json!(false);
+        let mut pulls = conversing_on(&detail, activity);
+        assert!(!pulls.answer(1, Part::Done, now()));
+        assert!(pulls.forward());
+        pulls.page(60, 40, now(), true, &theme);
+        assert_eq!(commits_of(&pulls), []);
+        pulls.pick = Some(Control::TimelineCommit(1));
+        pulls.enter();
+        assert_eq!(pulls.tabs(), Some(Tab::Timeline));
         assert_eq!(pulls.take_diff_ask(true, now()), None);
     }
 }
