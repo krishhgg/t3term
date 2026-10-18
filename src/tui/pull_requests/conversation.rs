@@ -830,7 +830,7 @@ impl Conversation {
         let threads = self
             .threads
             .iter_mut()
-            .flat_map(|thread| &mut thread.remarks);
+            .flat_map(|thread| thread.remarks.iter_mut().chain(&mut thread.loaded));
         for remark in remarks.chain(&mut self.finished).chain(threads) {
             remark.laid_out = None;
         }
