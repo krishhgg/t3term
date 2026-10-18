@@ -25,6 +25,7 @@ $T3V keys Tab Tab Right && $T3V wait --text "#62" --text "Waiting for host state
 
 # A link's details and back.
 $T3V keys Down Enter && $T3V wait --text "← List" --text "Repository" --text "Activity"
+$T3V wait --text "Read from github.com"
 $T3V click --text "← List" && $T3V wait --gone "← List"
 
 # T3 changes the links: each preset replaces the thread's list.
@@ -44,4 +45,5 @@ $T3V capability on  && $T3V wait --text "Pull requests 11"
 - `thr-many` has 1,005 links and `thr-hostile` has text full of control characters and huge fields. `t3v check` fails with `screenLeaks` if text that must stay hidden reaches the screen.
 - The footer's age (`synced 1m ago`) and each link's age move with time, so wait on the count, not the age.
 - A click right after a key, a wheel notch or a change from the server does nothing until the next frame.
+- The host's detail answers 1.5 s after t3term asks, and its Summary takes the place of the link's `Repository` and `Activity` rows. Wait for `Read from github.com` in its own wait before the links change, or the fixture fails the read as not found and t3term asks for no `pullRequests.stack`.
 - `capability off` closes T3's refresh numbers at once and `capability on` opens them again while a link's read is held, so the recipe ends with two `pullRequests.subscribeRefreshes` in `rpcRequestsByTag`.
