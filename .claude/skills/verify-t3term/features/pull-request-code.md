@@ -3,14 +3,14 @@
 ## Sub-features
 
 - **The tab.** Where the detail's `capabilities.diff` is true, the row above a link's details reads `← List  Summary  Timeline  Code`. → or `l` on the Timeline, or a click on `Code`, shows it, and ← or `h` goes back to the Timeline. The status line reads `→ code · ← summary` on the Timeline and `← timeline` on the Code. A detail read again without `diff` takes the tab away, and a reader on the Code lands on the Summary.
-- **Reading the diff.** The first time the Code shows after the details open, t3term POSTs `/api/pull-requests/diff` with the link's project, host, repository and number and no cursor. `Loading pull request diff…` shows until the first slice comes. Once a frame shows the end of the files within two pages of the view, t3term reads the next slice with the cursor the last one gave. One slice is read at a time. Nothing reads the diff before the Code shows, and going to another tab and back within the minute reads nothing.
+- **Reading the diff.** The first time the Code shows after the details open, t3term POSTs `/api/pull-requests/diff` with the link's project, host, repository and number and no cursor. `Loading pull request diff…` shows until the first slice comes. Once a frame shows the end of the files within two pages of the view, t3term reads the next slice with the cursor the last one gave. One slice is read at a time. Nothing reads the diff before the Code shows. Going to another tab and back within the minute reads nothing, and coming back a minute or more after the first slice came reads it again.
 - **The count and the note.** The count reads `5 files+` while more slices are left, with `Loading more files…` under the files while the next one is read, then `8 files`. `The host withheld part of this diff, such as a binary file or a change too large to show.` shows in yellow under it when a slice says the host left something out.
 - **Files.** Each file starts folded: `› M src/config/reader.rs +7 -5`, with `A` green, `D` red, `R` blue and `M` yellow, and the counts in green and red. A rename shows both paths, `› R src/config/source.rs → src/config/sources.rs`, with the counts on the next row where they don't fit. A file whose hunks the host left out takes the host's counts, as in `› M Cargo.lock +40 -12`.
 - **Order.** Each slice's files show in the desktop's reading order, not the patch's. Source files come first, each after the changed files it imports and otherwise by path. Tests come next, each after the source file whose name it has, then lockfiles, snapshots and files under `dist`, `build`, `vendor`, `__generated__` or `__snapshots__`, by path. A later slice never moves the files above it. So the first slice reads `assets/config-flow.png`, `src/config/reader.rs`, `src/config/schema.rs`, the rename and `tests/config_reload.rs`, and the second `docs/config.md`, `src/legacy/reader_v1.rs` and `Cargo.lock`.
 - **Unfolding.** Enter on the chosen file, or a click on it, turns `›` into `⌄` and shows its lines. Each line has its number in grey, the new one or the old for a removed line, then `-` and the line in red, `+` and the line in green, or a space and the line. `⋯ 14 unmodified lines` comes before a hunk that doesn't start at line 1. A line that wraps leaves the number and the mark blank on its later rows, and a tab stops every 4 columns. A binary file reads `A binary file, whose changes have no lines to show.` and a file the host withheld `The host withheld this file's changes.` Enter or a click again folds the file.
 - **Choosing.** Once a file or `↻ Retry` is in view, ↓ chooses the next one and ↑ the one before, and the status line leads with what Enter does: `Enter expand file`, `Enter collapse file` or `Enter retry`. Where none is in view, they scroll.
 - **Reading again.** A new refresh number, `r` and a detail whose `updatedAt` changed each read the first slice again. The files read before stay, each with its fold, until the new slice replaces them, and the count goes back to `5 files+` until the end of the files comes near again. After `r` the diff waits for the refresh number `pullRequests.invalidate` raises, or for the end of the read that sent it, so T3 has forgotten the diff it held.
-- **Failures.** A first slice that fails shows `Couldn't read this diff: GitHub took too long to answer.` alone. Showing the Code after the details open again, or `r`, reads it again, and the failure stays until the files come. A later slice that fails shows `t3term couldn't read the rest of this diff.`, the reason and `↻ Retry` under the files, and Retry reads that slice again. A read again of the first slice that fails keeps the files under `May be out of date: t3term couldn't read the diff again.` and the reason.
+- **Failures.** A first slice that fails shows `Couldn't read this diff: GitHub took too long to answer.` alone. Showing the Code again, or `r`, reads it again, and the failure stays until the files come. A later slice that fails shows `t3term couldn't read the rest of this diff.`, the reason and `↻ Retry` under the files, and Retry reads that slice again. A read again of the first slice that fails keeps the files under `May be out of date: t3term couldn't read the diff again.` and the reason.
 
 ## How to get to it (user POV)
 
@@ -127,7 +127,7 @@ rm "$RUN/diff-ts"
 T=$($T3V capture typescript-100x30 | grep 'txt$')
 [ "$(grep -o '› [AMDR] [^ ]*' "$T" | paste -sd' ' -)" = '› A src/lib/format.ts › M src/settings/store.ts › M src/settings/panel.tsx › M src/settings/panel.test.tsx › M pnpm-lock.yaml' ]
 
-# Another thread's link, whose first slice fails: the failure alone. Opening the details again reads it again.
+# Another thread's link, whose first slice fails: the failure alone. Showing the Code again reads it again, and so does opening the details again.
 touch "$RUN/diff-fail"
 $T3V keys Escape && $T3V wait --gone "Thread details"
 $T3V click --text "Mixed: every state" && $T3V wait --text "/  Mixed: every state"
@@ -137,11 +137,14 @@ mark
 $T3V keys Right Right && $T3V wait --text "Couldn't read this diff: GitHub took too long to" --gone "8 files" --gone "5 files+" --idle 300
 $T3V capture failed-100x30
 [ "$(since)" = '[null]' ]
+$T3V keys Left && $T3V wait --text "→ code"
+$T3V keys Right && settle '[null,null]'
+$T3V wait --text "Couldn't read this diff: GitHub took too long to" --text "← timeline" --idle 300
 rm "$RUN/diff-fail"
 $T3V keys Left Left Left && $T3V wait --gone "← List"
 $T3V keys Enter && $T3V wait --text "#70 Watched: checks running" --text "← List  Summary  Timeline  Code" --idle 300
 $T3V keys Right Right && $T3V wait --text "8 files" --text "› M src/config/reader.rs +7 -5"
-[ "$(since)" = '[null,null,"s2"]' ]
+[ "$(since)" = '[null,null,null,"s2"]' ]
 
 # At 80x24 every row still fits the pane.
 $T3V resize 80 24 && $T3V wait --text "8 files" --idle 300
@@ -160,5 +163,5 @@ $T3V status --json | jq -e '.scopeViolations == 0 and .unknownRpcs == 0 and .fix
 - `r` does nothing until the read of the detail and the conversation is done, 3 s after it starts. Wait for `r refresh` in the status line before each press.
 - A first slice that failed shows its failure, not `Loading pull request diff…`, while it is read again.
 - Switching threads drops the read and its Code, so coming back reads the diff from the start with every file folded. Closing the dialog with Esc and opening it again keeps them.
-- The recipe doesn't wait out the minute after which showing the Code reads it again, and the fixture can't serve an empty diff (`This pull request has no file changes.`) or one the parser can't split.
+- The recipe doesn't wait out the minute after which showing the Code reads it again, though it checks that showing it again reads a first slice that failed, and the fixture can't serve an empty diff (`This pull request has no file changes.`) or one the parser can't split.
 - Clicks land on the rows the last frame drew. Click the lowest file first when unfolding several, so the rows above don't move.
