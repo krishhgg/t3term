@@ -91,9 +91,18 @@ pub(super) fn hide(patch: &str, files: &[File]) -> Hidden {
 /// patch.
 type Rebuilt = (Vec<Line>, u64);
 
+#[cfg(test)]
+thread_local! {
+    /// How many hunks this thread has read to compare, so a test can see that none is read once
+    /// the steps run out.
+    static READ: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
 /// `hunk`'s lines as `Rebuilt` says. None where comparing them would take more steps than are
 /// `left`.
 fn rebuilt(patch: &str, hunk: &Hunk, left: &mut usize) -> Option<Rebuilt> {
+    #[cfg(test)]
+    READ.set(READ.get() + 1);
     let old: Vec<&Line> = hunk
         .lines
         .iter()
