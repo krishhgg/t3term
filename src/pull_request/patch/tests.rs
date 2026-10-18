@@ -289,6 +289,30 @@ diff --git a/e.txt b/e.txt
         assert_eq!(read.files[0].hunks, [], "{broken}");
     }
 
+    // So does a range whose lines would be numbered past the highest number. One that ends
+    // at it reads.
+    for header in [
+        "-18446744073709551615 +1",
+        "-1 +18446744073709551615",
+        "-18446744073709551614,2 +1,2",
+        "-1,2 +18446744073709551614,2",
+    ] {
+        let patch = format!("diff --git a/a b/a\n@@ {header} @@\n same\n same\n");
+        let read = Patch::read(&patch);
+        assert!(read.files[0].unreadable, "{header}");
+        assert_eq!(read.files[0].hunks, [], "{header}");
+    }
+    let patch = "diff --git a/a b/a\n@@ -18446744073709551614 +1,0 @@\n-a\n";
+    let read = Patch::read(patch);
+    assert!(!read.files[0].unreadable);
+    assert_eq!(
+        rows(patch, &read.files[0]),
+        [
+            "@@ 18446744073709551614,1 1,0 ",
+            "-18446744073709551614 . a"
+        ]
+    );
+
     // So do a patch that ends inside a hunk and a hunk with more lines on a side than its
     // header counts. The lines that fit stay.
     for (patch, kept) in [
