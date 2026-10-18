@@ -10,7 +10,7 @@
 - **Files.** Each file starts folded: `› M src/config/reader.rs +7 -5`, with `A` green, `D` red, `R` blue and `M` yellow, and the counts in green and red. A rename shows both paths, `› R src/config/source.rs → src/config/sources.rs`, with the counts on the next row where they don't fit. A file whose hunks the host left out takes the host's counts, as in `› M Cargo.lock +40 -12`.
 - **Viewed files.** Where the detail's `capabilities.viewedFiles` says who keeps the reader's marks, the Code reads them through `pullRequests.filesViewed` the first time it shows. Once they come the count reads `8 files · 3 / 8 viewed`, counting the files read so far, and a viewed file reads `› M src/config/reader.rs +7 -5 · ✓ Viewed`, with the mark in grey. A file pushed to since its mark reads `Changed since viewed` in yellow, on the row under its header where it doesn't fit, and a file not viewed shows nothing. Showing the Code again 15 s or more after the marks came, or after their read failed, reads them again, and so does each read of the diff again. A commit's diff keeps the marks and reads none. A first read that fails shows `t3term couldn't read which files you viewed.` in yellow and the reason, with no marks in the count. A later one keeps the marks under `The viewed marks may be out of date: t3term couldn't read them again.` A read that says the host had more files than it covered shows `This change has more files than the host reports viewed marks for in one read, so the count is short.` in yellow.
 - **Order.** Each slice's files show in the desktop's reading order, not the patch's. Source files come first, each after the changed files it imports and otherwise by path. Tests come next, each after the source file whose name it has, then lockfiles, snapshots and files under `dist`, `build`, `vendor`, `__generated__` or `__snapshots__`, by path. A later slice never moves the files above it. So the first slice reads `assets/config-flow.png`, `src/config/reader.rs`, `src/config/schema.rs`, the rename and `tests/config_reload.rs`, and the second `docs/config.md`, `src/legacy/reader_v1.rs` and `Cargo.lock`.
-- **Unfolding.** Enter on the chosen file, or a click on it, turns `›` into `⌄` and shows its lines. Each line has its number in grey, the new one or the old for a removed line, then `-` and the line in red, `+` and the line in green, or a space and the line. `⋯ 14 unmodified lines` comes before a hunk that doesn't start at line 1. A line that wraps leaves the number and the mark blank on its later rows, and a tab stops every 4 columns. A binary file reads `A binary file, whose changes have no lines to show.` and a file the host withheld `The host withheld this file's changes.` Enter or a click again folds the file.
+- **Unfolding.** Enter on the chosen file, or a click on it, turns `›` into `⌄` and shows its lines. Each line has its number in grey, the new one or the old for a removed line, then `-` and the line in red, `+` and the line in green, or a space and the line. `⋯ 14 unmodified lines` comes before a hunk that doesn't start at line 1. A line that wraps breaks where Unicode's line breaking allows, such as after a space or a `/`, and leaves the number and the mark blank on its later rows. A word wider than the row starts a row of its own and breaks anywhere, so in a split side added line 28 shows its number alone on a row and `Schema::current().ch` under it. A tab stops every 4 columns. A binary file reads `A binary file, whose changes have no lines to show.` and a file the host withheld `The host withheld this file's changes.` Enter or a click again folds the file.
 - **Whitespace.** Changes to whitespace start hidden. Where the tab has files, `¶ Show whitespace changes` sits under the count and its notes. A line changed only in its whitespace shows unchanged, with its text after the change, and the counts leave it out, so reader.rs reads `+5 -3` and schema.rs `+7 -0`. Enter or a click on the row shows them in every file, and the row reads `¶ Hide whitespace changes`. Neither reads anything. A read again and a commit picked keep the choice, and another link starts with them hidden. A hunk too large to compare shows its whitespace changes, and a note under the count says how many do. The other bullets' examples show the whitespace changes.
 - **Fold all.** Where the tab has files, `⇊ Expand all files` sits under the whitespace row, above the list off the diff. Enter or a click unfolds every file. While any file shows unfolded the row reads `⇈ Collapse all files`, and Enter or a click folds them all. Either way each file's own fold is forgotten, and files read later, such as a later slice's, follow the row. A file folded or unfolded after keeps its fold through a read of the diff again. Picking a commit starts its files folded.
 - **Split.** The lines stack at first, and `◫ Split diff view` sits under the fold row. Enter or a click sets the lines before the change on the left and those after it on the right, each side with its own numbers and a grey `│` between them, and the row reads `⊟ Stacked diff view`, which stacks them again. Each side has half the room, 26 columns at 100x30, and the right one takes the column left over. The lines removed and added in a row pair by position, and a side with no line stays blank. A file added or deleted keeps one column. Unwrapped, both sides scroll sideways by the same columns. A read again and another diff picked keep the choice, and another link starts stacked.
@@ -72,14 +72,14 @@ $T3V keys Right && $T3V wait --text "8 files · 3 / 8 viewed" --text "← timeli
 # Changes to whitespace start hidden. reader.rs's reindented Ok(config) and the let it removed and added again show unchanged, and so does schema.rs's respaced line.
 $T3V wait --text "› M src/config/reader.rs +5 -3 · ✓ Viewed" --text "› M src/config/schema.rs +7 -0"
 $T3V click --text "src/config/reader.rs" && $T3V wait --text "⌄ M src/config/reader.rs +5 -3" --text " 4 - use crate::config::Source;"
-$T3V click --text "src/config/reader.rs" --button wheel-down --repeat $((12 + TB)) && $T3V wait --text "26 -         let first = toml::from_str" --text "27           let config = toml::from_str" --text "28 +         Schema::current().check(&config)?;" --text "29           Ok(config)" --gone "28 -     Ok(config)" --idle 300
+$T3V click --text "src/config/reader.rs" --button wheel-down --repeat $((12 + TB)) && $T3V wait --text "26 -         let first =" --text "27           let config =" --text "28 +         Schema::current().check(&config)?;" --text "29           Ok(config)" --gone "28 -     Ok(config)" --idle 300
 $T3V capture whitespace-hidden-100x30
 # The row shows them, in every file, and reads nothing.
 mark
 $T3V keys Home && $T3V wait --text "¶ Show whitespace changes" --idle 300
 $T3V keys Down Down && $T3V wait --text "Enter show whitespace changes"
 $T3V keys Enter && $T3V wait --text "¶ Hide whitespace changes" --text "Enter hide whitespace changes" --text "⌄ M src/config/reader.rs +7 -5" --idle 300
-$T3V click --text "src/config/reader.rs" --button wheel-down --repeat $((12 + TB)) && $T3V wait --text "27 -         let config = toml::from_str" --text "28 -     Ok(config)" --text "27 +         let config = toml::from_str" --idle 300
+$T3V click --text "src/config/reader.rs" --button wheel-down --repeat $((12 + TB)) && $T3V wait --text "27 -         let config =" --text "28 -     Ok(config)" --text "27 +         let config =" --idle 300
 [ "$(since)" = '[]' ]
 $T3V keys Home && $T3V wait --text "⌄ M src/config/reader.rs +7 -5" --idle 300
 $T3V click --text "src/config/reader.rs" && $T3V wait --text "› M src/config/reader.rs +7 -5"
@@ -106,12 +106,12 @@ down $((3 + TB)) && $T3V wait --text "Enter expand file"
 $T3V keys Enter && $T3V wait --text "⌄ M src/config/reader.rs +7 -5" --text " 4 - use crate::config::Source;" --text " 4 + use crate::config::schema::Schema;" --text "Enter collapse file"
 S=$($T3V capture reader-100x30 | grep 'ans$')
 grep -q '38;2;129;129;129m 4 .\[38;2;255;100;103m- use crate::config::Source;' "$S" && grep -q '38;2;129;129;129m 4 .\[38;2;0;212;146m+ use crate::config::schema::Schema;' "$S" && grep -q '38;2;129;129;129m 1 .\[38;2;245;245;245m  use std::fs;' "$S"
-# The unmodified lines before its second hunk, a tab stopping at 4 columns, and a wrapped line leaving the number and the mark blank.
-$T3V keys PgDn && $T3V click --text "unmodified lines" --button wheel-down --repeat $TB && $T3V wait --text "⋯ 14 unmodified lines" --text "28 -     Ok(config)" --text "33 +         // A reload reads and checks the file a" --text "     s a load does, so a file edited on disk since t"
+# The unmodified lines before its second hunk, a tab stopping at 4 columns, and a wrapped line breaking after a space and leaving the number and the mark blank.
+$T3V keys PgDn && $T3V click --text "unmodified lines" --button wheel-down --repeat $TB && $T3V wait --text "⋯ 14 unmodified lines" --text "28 -     Ok(config)" --text "33 +         // A reload reads and checks the file" --text "     as a load does, so a file edited on disk since"
 # ↓ after the layout row chooses the wrap row. Enter lets each line run on in one row, cut at the details' edge. While one runs past the edge, the status line offers H/L sideways.
 $T3V keys Home Down Down Down Down Down && $T3V wait --text "Enter disable line wrapping"
 $T3V keys Enter && $T3V wait --text "↵ Enable line wrapping" --text "Enter enable line wrapping" --idle 300
-$T3V keys PgDn && $T3V wait --text "33 +         // A reload reads and checks the file a" --text "34 +         self.load()" --text "H/L sideways" --gone "     s a load does, so a file edited on disk since t" --idle 300
+$T3V keys PgDn && $T3V wait --text "33 +         // A reload reads and checks the file" --text "34 +         self.load()" --text "H/L sideways" --gone "     as a load does, so a file edited on disk since" --idle 300
 # L scrolls the text half the details' width, 26 columns. The numbers, the marks and the other rows stay. The text stops once the end of the widest line shows. Shift+← and Shift+→ scroll too, and H scrolls back.
 $T3V keys L && $T3V wait --text "33 + and checks the file as a load does, so a file e" --text "25   Result<Config, Error> {" --text "⋯ 14 unmodified lines" --idle 300
 S=$($T3V capture sideways-100x30 | grep 'ans$')
@@ -120,7 +120,7 @@ $T3V keys L L L L && $T3V wait --text "33 + ince the last load can't skip the sc
 $T3V keys S-Left && $T3V wait --text "33 + so a file edited on disk since the last load ca" --idle 300
 $T3V keys S-Right && $T3V wait --text "33 + ince the last load can't skip the schema check." --idle 300
 $T3V keys H H H && $T3V wait --text "33 +  A reload reads and checks the file as a load d" --idle 300
-$T3V keys H && $T3V wait --text "33 +         // A reload reads and checks the file a" --idle 300
+$T3V keys H && $T3V wait --text "33 +         // A reload reads and checks the file" --idle 300
 $T3V keys L && $T3V wait --text "33 + and checks the file as a load does, so a file e" --idle 300
 # Esc and Alt+B keep the text where it was, and so does a read again. The details opened again from the list start it at the left, still unwrapped.
 $T3V keys Escape && $T3V wait --gone "Thread details"
@@ -131,20 +131,20 @@ $T3V wait --text "33 + and checks the file as a load does, so a file e" --text "
 $T3V keys Left Left Left && $T3V wait --gone "← List"
 $T3V keys Enter && $T3V wait --text "← List  Summary  Timeline  Code" --idle 300
 $T3V keys Right Right && $T3V wait --text "↵ Enable line wrapping" --text "⌄ M src/config/reader.rs +7 -5" --text "← timeline" --idle 300
-$T3V keys PgDn && $T3V wait --text "33 +         // A reload reads and checks the file a" --gone "     s a load does, so a file edited on disk since t" --idle 300
+$T3V keys PgDn && $T3V wait --text "33 +         // A reload reads and checks the file" --gone "     as a load does, so a file edited on disk since" --idle 300
 # A click on the row wraps the lines again.
 $T3V keys Home && $T3V click --text "↵ Enable line wrapping" && $T3V wait --text "↵ Disable line wrapping" --text "Enter disable line wrapping" --idle 300
-$T3V keys PgDn && $T3V click --text "unmodified lines" --button wheel-down --repeat 5 && $T3V wait --text "33 +         // A reload reads and checks the file a" --text "     s a load does, so a file edited on disk since t" --idle 300
+$T3V keys PgDn && $T3V click --text "unmodified lines" --button wheel-down --repeat 5 && $T3V wait --text "33 +         // A reload reads and checks the file" --text "     as a load does, so a file edited on disk since" --idle 300
 # ↓ after the fold row chooses the layout row. Enter sets the lines before the change on the left and those after it on the right, each side with its own numbers. The lines removed and added in a row pair by position, and a side with no line stays blank.
 $T3V keys Home Down Down Down Down && $T3V wait --text "Enter show split diff view"
-$T3V keys Enter && $T3V wait --text "⊟ Stacked diff view" --text "Enter show stacked diff view" --text " 1   use std::fs;        │  1   use std::fs;" --text " 4 - use crate::config::S│  4 + use crate::config::s" --idle 300
+$T3V keys Enter && $T3V wait --text "⊟ Stacked diff view" --text "Enter show stacked diff view" --text " 1   use std::fs;        │  1   use std::fs;" --text " 4 - use                 │  4 + use" --text "      crate::config::Sourc│      crate::config::schem" --idle 300
 S=$($T3V capture split-100x30 | grep 'ans$')
-grep -q '38;2;129;129;129m 4 .\[38;2;255;100;103m- use crate::config::S.\[38;2;129;129;129m│  4 .\[38;2;0;212;146m+ use crate::config::s' "$S"
-$T3V keys PgDn && $T3V wait --text "26 -         let first = │ 27 +         let config =" --text "28 -     Ok(config)      │ 29 +         Ok(config)" --idle 300
-$T3V keys PgDn && $T3V wait --text "32 -         self.load_un│ 33 +         // A reload" --text "                          │      e schema check." --text "                          │ 34 +         self.load()" --idle 300
+grep -q '38;2;129;129;129m 4 .\[38;2;255;100;103m- use .\[38;2;245;245;245m  *.\[38;2;129;129;129m│  4 .\[38;2;0;212;146m+ use ' "$S"
+$T3V keys PgDn && $T3V wait --text "      e;                  │      a::Schema;" --text "                          │  5 + use" --text "26 -         let first = │ 27 +         let config =" --idle 300
+$T3V keys PgDn && $T3V wait --text "28 -     Ok(config)      │ 29 +         Ok(config)" --text "32 -                     │ 33 +         // A reload" --text "                          │      schema check." --text "                          │ 34 +         self.load()" --idle 300
 # Unwrapped, both sides scroll sideways by the same columns, each cut at the end of its side, until the end of the side that runs on furthest shows.
 $T3V keys Home && $T3V click --text "↵ Disable line wrapping" && $T3V wait --text "↵ Enable line wrapping" --idle 300
-$T3V keys PgDn && $T3V wait --text "32 -         self.load_un│ 33 +         // A reload" --text "                          │ 34 +         self.load()" --gone "e schema check." --idle 300
+$T3V keys PgDn && $T3V wait --text "32 -         self.load_un│ 33 +         // A reload" --text "                          │ 34 +         self.load()" --gone "schema check." --idle 300
 $T3V keys L && $T3V wait --text "26 - from_str::<Config>(&│ 27 + :from_str::<Config>(" --text "32 - d()                 │ 33 + and checks the file" --idle 300
 $T3V keys L L L L L && $T3V wait --text "32 -                     │ 33 + ip the schema check." --idle 300
 $T3V keys H H H H H H && $T3V wait --text "32 -         self.load_un│ 33 +         // A reload" --idle 300
@@ -212,13 +212,13 @@ $T3V click --text "⊢ Hide file tree" && $T3V wait --text "⊢ Show file tree" 
 $T3V keys Home && down $((3 + TB)) && $T3V wait --text "Enter collapse file"
 $T3V keys Enter && $T3V wait --text "› M src/config/reader.rs +7 -5" --gone "⋯ 14 unmodified lines"
 
-# A click unfolds the others: the binary, the rename and the new file with its tabs.
+# A click unfolds the others: the binary, the rename and the new file with its tabs, whose path breaks after its /.
 $T3V click --text "src/config/reader.rs" --button wheel-down --repeat $TB && $T3V wait --text "› A tests/config_reload.rs +8 -0" --idle 300
 $T3V click --text "tests/config_reload.rs" && $T3V wait --text "⌄ A tests/config_reload.rs +8 -0" --text "1 + use fixture_config::Reader;"
-$T3V click --text "src/config/source.rs" && $T3V wait --text "⌄ R src/config/source.rs → src/config/sources.rs" --text "1 - /// Where a config comes from." --text "1 + /// Where a config comes from: a file, the envir"
+$T3V click --text "src/config/source.rs" && $T3V wait --text "⌄ R src/config/source.rs → src/config/sources.rs" --text "1 - /// Where a config comes from." --text "1 + /// Where a config comes from: a file, the" --text "    environment or a default."
 $T3V click --text "assets/config-flow.png" && $T3V wait --text "⌄ M assets/config-flow.png" --text "A binary file, whose changes have no lines to show."
 $T3V capture kinds-100x30
-$T3V keys End && $T3V wait --text "› M Cargo.lock +40 -12" --text "› D src/legacy/reader_v1.rs +0 -4" --text "5 +     let reader = Reader::new(\"tests/newer.toml\")"
+$T3V keys End && $T3V wait --text "› M Cargo.lock +40 -12" --text "› D src/legacy/reader_v1.rs +0 -4" --text "5 +     let reader = Reader::new(\"tests/" --text "    newer.toml\");"
 S=$($T3V capture end-100x30 | grep 'ans$')
 grep -q '38;2;255;100;103mD.\[38;2;245;245;245m src/legacy/reader_v1.rs' "$S"
 $T3V click --text "Cargo.lock" && $T3V wait --text "⌄ M Cargo.lock +40 -12 · ✓ Viewed"
@@ -292,7 +292,7 @@ $T3V keys Enter && $T3V wait --text "⋯ More unchanged context may be available
 $T3V wait --text " 52   #[cfg(test)]" --text "Enter show 85 unmodified lines" --gone "Reading…" --idle 300
 $T3V capture lines-schema-100x30
 [ "$(contents)" = '["src/config/reader.rs","src/config/reader.rs","src/config/schema.rs"]' ]
-$T3V keys PgDn PgDn PgDn PgDn PgDn && $T3V wait --text "150       }" --text "⋯ 85 unmodified lines" --idle 300
+$T3V keys PgDn PgDn PgDn PgDn PgDn PgDn && $T3V wait --text "150       }" --text "⋯ 85 unmodified lines" --idle 300
 # A read of the diff again that leaves the hunks as they were keeps each file's text and the lines it showed. The end of the files is near, so each read of the first slice brings the second.
 mark
 $T3V refresh && settle '[null,"s2",null,"s2"]'
@@ -535,6 +535,7 @@ $T3V status --json | jq -e '.scopeViolations == 0 and .unknownRpcs == 0 and .fix
 - t3v's wheel turns only up and down, so a sideways turn, which scrolls 4 columns, isn't driven, and neither is another diff picked starting the text at the left. The unit tests cover both.
 - While a line runs past the details' edge, the status line at 100x30 has no room for `r refresh`. The recipe wraps the lines again before the steps that wait for it.
 - The toolbar's rows under the count push the files down a row each, and ↓ chooses each one. The recipe counts them in `TB`, and adds `TB` presses of ↓ or notches of the wheel where a step needs a row the toolbar pushed under the view.
+- A quote of a wrapped row ends where the row breaks, at a word, so a wait for one names the row's text up to that word, such as `33 +         // A reload reads and checks the file`, and the next row's text separately.
 - Line numbers widen to three digits past line 99, which moves every column of schema.rs's later lines one to the right. Wait for ` 52   #[cfg(test)]` with its leading space.
 - The reason a read of the text failed wraps at 100 columns. Wait for a prefix of it, such as `This host cannot expand unchanged pull request`.
 - A read of the marks takes a second, and showing the Code while one is under way asks for none. After a read that fails, let its answer come before showing the Code again, or nothing is read.

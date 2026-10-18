@@ -482,8 +482,8 @@ fn lines_wrap_at_first_and_one_row_lets_them_run_on() {
         "⋯ 8 unmodified lines",
         " 9   fn keep() {}",
         "10 - let short = 1;",
-        "10 + let long = \"a line that runs on wel",
-        "     l past forty columns\";",
+        "10 + let long = \"a line that runs on",
+        "     well past forty columns\";",
         "11   fn end() {}",
         "⋯ More unchanged context may be",
         "available",
@@ -1304,10 +1304,10 @@ fn every_row_fits_its_width_and_hostile_text_is_cleaned() {
         split[9..14],
         [
             "1       let x =│ 1       let x =",
-            "     \"界界界界 │      \"界界界界",
+            "    \"界界界界界│     \"界界界界界",
             "    界界界界界 │     界界界界界",
             "    界界界界界 │     界界界界界",
-            "    界界\";[2J  │     界界\";[2J",
+            "    界\";[2J    │     界\";[2J",
         ]
     );
     for row in &split[9..20] {
@@ -1333,12 +1333,12 @@ fn every_row_fits_its_width_and_hostile_text_is_cleaned() {
         wide[at..at + 2],
         [
             "2 - old line that is rather long and has",
-            "     to wrap at narrow widths"
+            "    to wrap at narrow widths"
         ]
     );
     // A pane too narrow for the numbers leaves them out and keeps the marks.
     assert!(rows(&code, 12).contains(&"2 - old line".to_string()));
-    assert!(rows(&code, 11).contains(&"-old line t".to_string()));
+    assert!(rows(&code, 11).contains(&"-old line".to_string()));
 }
 
 /// A review thread `id` on `path` at `line` on `side`, with a remark by mona for each of
@@ -3612,9 +3612,9 @@ fn lines_stack_at_first_and_one_row_sets_them_side_by_side() {
         "10 - let a = 1;    │ 10 + let b = 2;",
         "11 - let c = 3;    │ 11 + let long = \"a",
         "                   │      line that runs",
-        "                   │       on well past",
-        "                   │      forty columns\"",
-        "                   │      ;",
+        "                   │      on well past",
+        "                   │      forty",
+        "                   │      columns\";",
         "12 - let d = 4;    │",
         "13   fn end() {}   │ 12   fn end() {}",
         "14 - last          │ 13 + final",
@@ -3654,25 +3654,34 @@ fn lines_stack_at_first_and_one_row_sets_them_side_by_side() {
     // column goes to the right side.
     let numbered = rows(&code, 28);
     assert_eq!(
-        numbered[11..13],
+        numbered[12..14],
         ["10 - let a = │ 10 + let b =", "     1;      │      2;"]
     );
     let narrow = rows(&code, 27);
     assert_eq!(
-        narrow[11..13],
-        ["-let a = 1; │ +let b = 2;", "-let c = 3; │ +let long = \""]
+        narrow[9..13],
+        [
+            " fn keep()  │  fn keep() {}",
+            " {}         │",
+            "-let a = 1; │ +let b = 2;",
+            "-let c = 3; │ +let long =",
+        ]
     );
     let narrow = rows(&code, 26);
     assert_eq!(
-        narrow[11..13],
-        ["-let a = 1; │ +let b = 2;", "-let c = 3; │ +let long ="]
+        narrow[9..11],
+        [" fn keep()  │  fn keep()", " {}         │  {}"]
     );
     // A row too narrow for two sides with a column of text each shows the lines one under the
     // other.
-    assert_eq!(rows(&code, 6)[44..47], ["-l│ +l", " e│  e", " t│  t"]);
+    // A space takes no row of its own, as it hangs past the end of the one before it.
+    assert_eq!(
+        rows(&code, 6)[42..47],
+        ["-l│ +l", " e│  e", " t│  t", " a│  b", " =│  ="]
+    );
     let one_under_the_other = rows(&code, 5);
     assert!(one_under_the_other.iter().all(|row| !row.contains('│')));
-    assert_eq!(one_under_the_other[46..49], ["-let", " a =", " 1;"]);
+    assert_eq!(one_under_the_other[47..50], ["-let", " a =", " 1;"]);
 
     // Stacked again, the rows are as before.
     code.act(Control::Layout, &[]);
@@ -3724,7 +3733,7 @@ fn threads_show_under_the_row_side_by_side_that_has_their_line() {
         ]
     };
     assert_eq!(rows[11], "11 - let c = 3;    │ 11 + let long = \"a");
-    assert_eq!(rows[15], "                   │      ;");
+    assert_eq!(rows[15], "                   │      columns\";");
     assert_eq!(rows[16..19], card("Why c?"));
     assert_eq!(rows[19], "");
     assert_eq!(rows[20..23], card("Too long."));
@@ -4036,16 +4045,16 @@ diff --git a/b.rs b/b.rs
         [
             "1 - x              │ 1 + y",
             "2   end            │ 2   end",
-            "    No newline at e│     No newline at e",
-            "    nd of file     │     nd of file",
+            "    No newline at  │     No newline at",
+            "    end of file    │     end of file",
         ]
     );
     assert_eq!(
         shown[16..19],
         [
             "1 - x              │ 1 + y",
-            "                   │     No newline at e",
-            "                   │     nd of file",
+            "                   │     No newline at",
+            "                   │     end of file",
         ]
     );
 }
@@ -4067,9 +4076,9 @@ fn the_side_whose_text_runs_furthest_sets_how_far_the_rows_scroll() {
         rows(&code, 41)[8..12],
         [
             "1 - a line removed │ 1 + short",
-            "    that runs on we│",
-            "    ll past its sid│",
-            "    e              │",
+            "    that runs on   │",
+            "    well past its  │",
+            "    side           │",
         ]
     );
 
@@ -4534,4 +4543,58 @@ diff --git a/src/b.rs b/src/b.rs
             MORE_FILES,
         ]
     );
+}
+
+#[test]
+fn a_line_wraps_where_a_browser_would() {
+    // After a run of spaces, which stay where they fit.
+    assert_eq!(
+        wrapped("let value = compute(first, second);", 16),
+        ["let value = ", "compute(first, ", "second);"]
+    );
+    // Spaces that end a row take no room, so the next word starts the next row and the row
+    // keeps only the spaces that fit.
+    assert_eq!(wrapped("x        y", 4), ["x   ", "y"]);
+    assert_eq!(wrapped("        indented", 6), ["      ", "indent", "ed"]);
+    // ICU's rules break after a slash, and between two CJK characters, and keep an emoji and
+    // its marks whole.
+    assert_eq!(
+        wrapped("https://example.com/a/b", 12),
+        ["https://", "example.com/", "a/b"]
+    );
+    assert_eq!(wrapped("漢字かな交じり", 5), ["漢字", "かな", "交じ", "り"]);
+    assert_eq!(
+        wrapped("⚠\u{fe0f} 👩\u{200d}💻 done", 3),
+        ["⚠\u{fe0f} ", "👩\u{200d}💻 ", "don", "e"]
+    );
+    // A word wider than a row starts one, breaks anywhere, and what follows goes on after it.
+    assert_eq!(wrapped("a abcdefgh", 4), ["a ", "abcd", "efgh"]);
+    assert_eq!(wrapped("abcde f", 4), ["abcd", "e f"]);
+    assert_eq!(wrapped("abcdef gh", 4), ["abcd", "ef ", "gh"]);
+    assert_eq!(wrapped("", 4), [""]);
+}
+
+#[test]
+fn a_wrapped_line_fits_and_keeps_every_character_it_shows() {
+    let texts = [
+        "    let value = compute(first, second); // a comment   ",
+        "self.items.iter().map(|item| item.name.clone()).collect::<Vec<_>>()",
+        "\"界界界界界\" + 'é' + \"👩\u{200d}💻👍🏽⚠\u{fe0f}\"  x",
+        "https://example.com/a/b/c?x=1&y=2 well-known --flag",
+        "                                        deep",
+    ];
+    for text in texts {
+        for width in 1..=40 {
+            let rows = wrapped(text, width);
+            for row in &rows {
+                // A character wider than the row is all a row can hold.
+                assert!(
+                    row.width() <= width || clusters(row).len() == 1,
+                    "{width}: {row:?}"
+                );
+            }
+            let seen: String = rows.concat().split(' ').collect();
+            assert_eq!(seen, text.split(' ').collect::<String>(), "{width}");
+        }
+    }
 }
