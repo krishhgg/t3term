@@ -316,8 +316,8 @@ $T3V keys Enter && $T3V wait --text "› Split the config reader · 1f3e2a9" --t
 [ "$(jq -s -c '[.[] | select(.event == "pr.diff") | [.cursor, .commit]] | .['"$M"':]' "$E/events.jsonl")" = '[[null,"1f3e2a90"]]' ]
 rm "$RUN/diff-threads"
 
-# Another thread's link, whose first slice fails: the failure alone. Showing the Code again reads it again, and so does opening the details again.
-touch "$RUN/diff-fail"
+# Another thread's link, whose first slice fails: the failure alone. Showing the Code again reads it again, and so does opening the details again. Its marks fail to read from here on, so the details never hold any for it, and their notes show only with the files.
+touch "$RUN/diff-fail" "$RUN/viewed-fail"
 $T3V keys Escape && $T3V wait --gone "Thread details"
 $T3V click --text "Mixed: every state" && $T3V wait --text "/  Mixed: every state"
 $T3V keys M-b && $T3V wait --text "Pull requests 11" --idle 300
@@ -331,8 +331,7 @@ $T3V keys Right && settle '[null,null]'
 $T3V wait --text "Couldn't read this diff: GitHub took too long to" --text "← timeline" --idle 300
 rm "$RUN/diff-fail"
 $T3V keys Left Left Left && $T3V wait --gone "← List"
-# The details' first read of #70's marks fails: the note and the reason, and no marks in the count. Showing the Code again reads them, and #70 has none viewed.
-touch "$RUN/viewed-fail"
+# Opening #70 again, its marks fail to read once more: the note and the reason, and no marks in the count. Showing the Code again reads them, and #70 has none viewed.
 $T3V keys Enter && $T3V wait --text "#70 Watched: checks running" --text "← List  Summary  Timeline  Code" --idle 300
 $T3V keys Right Right && $T3V wait --text "8 files" --text "› M src/config/reader.rs +7 -5" --text "t3term couldn't read which files you viewed." --text "GitHub took too long to answer." --gone "/ 8 viewed" --idle 1500
 [ "$(since)" = '[null,null,null,"s2"]' ]
