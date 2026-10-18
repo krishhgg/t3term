@@ -7,7 +7,7 @@ from __future__ import annotations
 
 from .runs import control_post, locate, post
 from .text import die, safe
-from .world import LABEL_PRESETS, RUN_STATUSES
+from .world import LABEL_PRESETS, RUN_STATUSES, SETUP_PHASES
 
 
 def scenario_for(state: dict):
@@ -123,6 +123,11 @@ def cmd_run(args) -> int:
     return 0
 
 
+def cmd_setup(args) -> int:
+    send(args, '/__fixture/thread/setup', {'threadId': args.thread, 'phase': args.phase})
+    return 0
+
+
 def cmd_close(args) -> int:
     send(args, '/__fixture/thread/close', {'threadId': args.thread})
     return 0
@@ -203,6 +208,14 @@ def add_commands(commands, run_option):
     run.add_argument('status', choices=RUN_STATUSES)
     run.set_defaults(func=cmd_run)
     added.append(run)
+
+    setup = commands.add_parser('setup', help="serve the thread's worktree setup on its open subscribeWorktreeSetup "
+                                              'streams and new ones: running, done, failed or none, which is '
+                                              "T3's null; refused for a thread without a worktree")
+    setup.add_argument('thread')
+    setup.add_argument('phase', choices=SETUP_PHASES)
+    setup.set_defaults(func=cmd_setup)
+    added.append(setup)
 
     close = commands.add_parser('close', help="fail the thread's own subscribeThread streams, held ones too")
     close.add_argument('thread')
