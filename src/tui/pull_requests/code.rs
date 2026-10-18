@@ -51,6 +51,12 @@
 //! 832-870 and 1127-1180). The marks are the reader's whatever diff shows, the whole change's
 //! or a commit's.
 //!
+//! The changes to whitespace start hidden, as the desktop's `diffIgnoreWhitespace` setting is
+//! true until changed (packages/contracts/src/settings.ts:377): a line changed only in its
+//! whitespace shows unchanged, with its text after the change, as `whitespace` says. A row
+//! above the files shows them, or hides them again, as the desktop's toolbar toggle does
+//! (PullRequestCodeTab.tsx:1211-1234), for every file and every diff the tab shows after.
+//!
 //! Only the files unfolded are laid out, each once for each width. Each line of them is cleaned
 //! of control characters, its tabs set every `TAB` columns, and cut at `LINE` characters as it
 //! is.
@@ -104,6 +110,10 @@ const UNMATCHED: &str =
 /// How long the marks on files viewed stay fresh, in milliseconds, as the desktop's query keeps
 /// them (packages/client-runtime/src/state/pullRequests.ts:301-305).
 const VIEWED_FRESH: i64 = 15_000;
+/// The row that shows the changes to whitespace, and the one that hides them, after the
+/// desktop's toggle with its pilcrow.
+const WHITESPACE_HIDDEN: &str = "¶ Show whitespace changes";
+const WHITESPACE_SHOWN: &str = "¶ Hide whitespace changes";
 /// The row that unfolds every file, and the one that folds them all, after the desktop's
 /// `Expand all files` and `Collapse all files` with their chevrons.
 const FOLDED_ALL: &str = "⇊ Expand all files";
@@ -143,6 +153,10 @@ pub(super) struct Code {
     /// The paths of the files the reader folded or unfolded apart from `unfolded`, which stay
     /// so when the diff is read again.
     toggled: HashSet<String>,
+    /// Whether the changes to whitespace show: false at first, as the desktop's
+    /// `diffIgnoreWhitespace` setting is true until changed. Another diff picked from the
+    /// commits keeps it, as the desktop's toggle does.
+    whitespace: bool,
     /// The rows of each unfolded file's lines, by its slice's place and its place in that
     /// slice, so a file is laid out again only when its slice, the width or its fold changes.
     bodies: HashMap<(usize, usize), Body>,
@@ -299,6 +313,19 @@ struct Slice {
     order: Vec<usize>,
     /// Each file's fingerprint, by its place, as `fingerprint` gives it.
     prints: Vec<u64>,
+    /// Its files with the changes to whitespace hidden, by their places in `patch`.
+    hidden: whitespace::Hidden,
+}
+
+impl Slice {
+    /// Its files as they show, by their places: as the patch has them where `whitespace` says
+    /// the changes to whitespace show, and else with those hidden.
+    fn files(&self, whitespace: bool) -> &[patch::File] {
+        match whitespace {
+            true => &self.patch.files,
+            false => &self.hidden.files,
+        }
+    }
 }
 
 impl Code {
@@ -315,6 +342,7 @@ impl Code {
             due: false,
             unfolded: false,
             toggled: HashSet::new(),
+            whitespace: false,
             bodies: HashMap::new(),
             commit: None,
             commits_open: false,
@@ -470,11 +498,13 @@ impl Code {
                     .iter()
                     .map(|file| fingerprint(&diff.patch, file))
                     .collect();
+                let hidden = whitespace::hide(&diff.patch, &patch.files);
                 self.slices.push(Slice {
                     diff: *diff,
                     patch,
                     order,
                     prints,
+                    hidden,
                 });
                 self.failed = None;
                 self.index();
@@ -551,7 +581,7 @@ impl Code {
         let open = self.commits_open && !commits.is_empty();
         match control {
             Control::File(at) => at < self.files.len(),
-            Control::Folds => !self.files.is_empty(),
+            Control::Whitespace | Control::Folds => !self.files.is_empty(),
             Control::Retry => self.retries(),
             Control::Commits => !commits.is_empty(),
             Control::AllCommits => open,
@@ -569,7 +599,7 @@ impl Code {
     fn rest(&self, at: usize, place: usize) -> Option<Rest> {
         let &(slice, index) = self.files.get(at)?;
         let slice = &self.slices[slice];
-        let file = &slice.patch.files[index];
+        let file = &slice.files(self.whitespace)[index];
         if !self.open(file.path()) {
             return None;
         }
@@ -591,10 +621,10 @@ impl Code {
             && self.next_cursor().is_some()
     }
 
-    /// Does what `control` does, with `commits` newest first in the list: folds or unfolds a
-    /// file or all of them, reads again the slice whose read failed, opens or closes the list
-    /// of commits, lists more of them, or picks the diff the tab shows. Says whether that diff
-    /// changed.
+    /// Does what `control` does, with `commits` newest first in the list: shows or hides the
+    /// changes to whitespace, folds or unfolds a file or all of them, reads again the slice
+    /// whose read failed, opens or closes the list of commits, lists more of them, or picks the
+    /// diff the tab shows. Says whether that diff changed.
     pub(super) fn act(&mut self, control: Control, commits: &[&Commit]) -> bool {
         match control {
             Control::Commits => self.commits_open = !self.commits_open,
@@ -612,6 +642,12 @@ impl Code {
                 if !self.toggled.remove(&path) {
                     self.toggled.insert(path);
                 }
+            }
+            // In every file, those read later too, as the desktop's toggle parses every slice
+            // again (PullRequestCodeTab.tsx:384-402).
+            Control::Whitespace => {
+                self.whitespace = !self.whitespace;
+                self.bodies.clear();
             }
             // Every file the other way, those read later too, as the desktop's toolbar sets
             // its fold override and forgets each file's own (PullRequestCodeTab.tsx:675-681).
@@ -640,7 +676,7 @@ impl Code {
             return;
         };
         let slice = &self.slices[slice];
-        let (file, print) = (&slice.patch.files[index], slice.prints[index]);
+        let (file, print) = (&slice.files(self.whitespace)[index], slice.prints[index]);
         let Some(change) = change_type(file) else {
             return;
         };
@@ -799,6 +835,8 @@ impl Code {
                     .is_some_and(|(_, file)| self.open(file.path()));
                 if open { "collapse file" } else { "expand file" }.to_string()
             }
+            Control::Whitespace if self.whitespace => "hide whitespace changes".to_string(),
+            Control::Whitespace => "show whitespace changes".to_string(),
             Control::Folds if self.all_folded() => "expand all files".to_string(),
             Control::Folds => "collapse all files".to_string(),
             Control::Commits if self.commits_open => "hide commits".to_string(),
@@ -827,7 +865,7 @@ impl Code {
     fn file(&self, at: usize) -> Option<(&str, &patch::File)> {
         let &(slice, file) = self.files.get(at)?;
         let slice = &self.slices[slice];
-        Some((&slice.diff.patch, &slice.patch.files[file]))
+        Some((&slice.diff.patch, &slice.files(self.whitespace)[file]))
     }
 
     /// Whether the file at `path` shows unfolded.
@@ -944,7 +982,7 @@ impl Code {
         let mut bodies = HashMap::new();
         for &(at, place) in &self.files {
             let slice = &self.slices[at];
-            let file = &slice.patch.files[place];
+            let file = &slice.files(self.whitespace)[place];
             if !self.open(file.path()) {
                 continue;
             }
@@ -966,12 +1004,14 @@ impl Code {
     }
 
     /// The tab's rows at `width`, with the rows of each control: the list of the `reads`'
-    /// commits, newest first, the row that unfolds or folds every file, each file's header,
+    /// commits, newest first, the rows that show or hide the changes to whitespace and that
+    /// unfold or fold every file, each file's header,
     /// each review thread's first row, the list of those off the diff and Retry. First the row
     /// that picks the diff from the commits, and its list while it is open. Until the first
     /// slice came, or when its read failed, it says so. Then the count of files, `+` while more
     /// are to be read, and how many are viewed where the marks show, then a note when the host
-    /// withheld part of the diff or the marks are short or failed, then the row for every file.
+    /// withheld part of the diff, some hunks show their whitespace changes or the marks are
+    /// short or failed, then the rows for the whitespace and for every file.
     /// Then the list of the review threads off the diff, then each file with its mark and the
     /// threads on its lines, and at the end `Loading more files…`, or Retry once that failed.
     /// `shown` says which threads and whether the list are open.
@@ -1050,6 +1090,18 @@ impl Code {
             );
             lines.extend(whole(&note, width, muted));
         }
+        let kept: usize = match self.whitespace {
+            true => 0,
+            false => self.slices.iter().map(|slice| slice.hidden.kept).sum(),
+        };
+        if kept > 0 {
+            let noun = if kept == 1 { "hunk" } else { "hunks" };
+            let note = format!(
+                "{} {noun} too large to compare show their whitespace changes.",
+                grouped(kept as u64)
+            );
+            lines.extend(whole(&note, width, muted));
+        }
         if reads.viewed.is_some() && count > 0 {
             self.viewed_notes(&mut lines, width, theme);
         }
@@ -1063,15 +1115,24 @@ impl Code {
             lines.extend(whole(text, width, muted));
             return (lines, targets);
         }
-        // The toolbar's button that unfolds every file, or folds them all once one shows
-        // unfolded (PullRequestCodeTab.tsx:1239-1258).
+        // The toolbar's toggle that shows or hides the changes to whitespace, then its button
+        // that unfolds every file, or folds them all once one shows unfolded
+        // (PullRequestCodeTab.tsx:1211-1258).
         if count > 0 {
+            let fg = Style::new().fg(theme.fg);
+            let label = match self.whitespace {
+                true => WHITESPACE_SHOWN,
+                false => WHITESPACE_HIDDEN,
+            };
+            let start = lines.len();
+            lines.extend(whole(label, width, fg));
+            targets.push((start..lines.len(), Control::Whitespace));
             let label = match self.all_folded() {
                 true => FOLDED_ALL,
                 false => UNFOLDED_ANY,
             };
             let start = lines.len();
-            lines.extend(whole(label, width, Style::new().fg(theme.fg)));
+            lines.extend(whole(label, width, fg));
             targets.push((start..lines.len(), Control::Folds));
         }
         let placed = self.place(threads);
@@ -1222,12 +1283,6 @@ impl Code {
         (lines, targets)
     }
 
-    /// The row that says which diff the tab shows, `All commits` or the commit's headline and
-    /// the first seven characters of its id, and opens the list of `commits`, newest first.
-    /// While open, the list follows: `All commits`, then each commit's headline with those
-    /// seven characters at the end, ✓ before the diff shown, and `Show more (N left)` while
-    /// more are left, then a blank row. Nothing shows where there are no commits, as the
-    /// desktop draws no menu with nothing to pick (PullRequestCodeTab.tsx:1067-1069).
     /// The notes on the marks on files viewed: that the last read failed, with its reason, and
     /// that the host or t3term left marks out, as the desktop's warnings beside its count say.
     fn viewed_notes(&self, lines: &mut Vec<Line<'static>>, width: usize, theme: &Theme) {
@@ -1254,6 +1309,12 @@ impl Code {
         }
     }
 
+    /// The row that says which diff the tab shows, `All commits` or the commit's headline and
+    /// the first seven characters of its id, and opens the list of `commits`, newest first.
+    /// While open, the list follows: `All commits`, then each commit's headline with those
+    /// seven characters at the end, ✓ before the diff shown, and `Show more (N left)` while
+    /// more are left, then a blank row. Nothing shows where there are no commits, as the
+    /// desktop draws no menu with nothing to pick (PullRequestCodeTab.tsx:1067-1069).
     fn scope_lines(
         &self,
         commits: &[&Commit],
@@ -1926,6 +1987,7 @@ fn broken(text: &str, width: usize) -> Vec<String> {
 }
 
 mod order;
+mod whitespace;
 
 #[cfg(test)]
 mod tests;
