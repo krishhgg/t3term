@@ -1412,6 +1412,44 @@ fn pages_go_with_their_thread_when_the_conversation_is_read_again() {
 }
 
 #[test]
+fn a_new_theme_restyles_the_threads() {
+    let mut conversation = conversation(vec![thread(
+        "on",
+        "src/lib.rs",
+        Some(2),
+        "right",
+        false,
+        &["Body text."],
+    )]);
+    let mut code = read(slice(PATCH, None), 0);
+    let lib = (0..code.files.len())
+        .find(|&at| code.file(at).unwrap().1.path() == "src/lib.rs")
+        .unwrap();
+    code.act(Control::File(lib), &[]);
+    let shown = Shown::default();
+    // The color of the remark's text, laid out at one width as the panel lays it out.
+    let body = |conversation: &mut Conversation, theme: &Theme| {
+        let showing = code.threads_shown(conversation.threads(), &shown);
+        conversation.lay_out_threads(&showing, 40, theme);
+        let (lines, _) = code.lay_out(threads_of(conversation.threads()), &shown, 40, NOW, theme);
+        lines.iter().find_map(|line| {
+            let span = line
+                .spans
+                .iter()
+                .find(|span| span.content.contains("Body"))?;
+            line.style.patch(span.style).fg
+        })
+    };
+    let dark = theme();
+    let light = Theme::light(Depth::TrueColor);
+    assert_ne!(dark.fg, light.fg);
+    assert_eq!(body(&mut conversation, &dark), Some(dark.fg));
+    // Another theme at the same width lays the text out again in its colors.
+    conversation.restyle();
+    assert_eq!(body(&mut conversation, &light), Some(light.fg));
+}
+
+#[test]
 fn threads_fit_every_width_and_hostile_text_is_cleaned() {
     let path = "src/\u{1b}]8;;evil\u{7}name.rs";
     let patch = format!(
@@ -1960,8 +1998,6 @@ fn the_unchanged_lines_around_hunks_show_a_run_at_a_time() {
         Some((ChangeType::Change, "f.rs".into(), "f.rs".into()))
     );
     assert_eq!(code.ask_text(6), None);
-    code.act(Control::Stretch(0, 1), &[]);
-    assert_eq!(code.ask_text(6), None, "one read at a time");
     assert!(!code.take_text(4, text(numbered(400))));
 
     // Once it came, the run shows 100 lines at each end, and a run of one line shows whole.
@@ -2025,6 +2061,32 @@ fn the_unchanged_lines_around_hunks_show_a_run_at_a_time() {
     assert!(!code.has(Control::Stretch(0, 1), &[]));
     code.act(Control::File(0), &[]);
     assert_eq!(rows(&code, 80).len(), 4 + 403);
+}
+
+#[test]
+fn each_press_while_the_text_is_read_counts_once_it_comes() {
+    let mut code = read(slice(STRETCHED, None), 0);
+    code.act(Control::File(0), &[]);
+    code.act(Control::Stretch(0, 1), &[]);
+    code.act(Control::Stretch(0, 3), &[]);
+    // Both runs say the read is under way, and the second press asks for nothing more.
+    let rows_now = rows(&code, 80);
+    assert!(rows_now.contains(&"⋯ 250 unmodified lines · Reading…".to_string()));
+    assert_eq!(
+        rows_now.last().unwrap(),
+        "⋯ More unchanged context may be available · Reading…"
+    );
+    assert!(code.ask_text(2).is_some());
+    assert_eq!(code.ask_text(3), None);
+    code.act(Control::Stretch(0, 3), &[]);
+    assert_eq!(code.ask_text(4), None, "one read at a time");
+
+    // As on the desktop, each press shows 100 more lines: the run after the last hunk twice.
+    assert!(code.take_text(2, text(numbered(400))));
+    let rows_now = rows(&code, 80);
+    assert!(rows_now.contains(&"⋯ 50 unmodified lines".to_string()));
+    assert_eq!(rows_now.last().unwrap(), "400   l400");
+    assert!(!code.has(Control::Stretch(0, 3), &[]));
 }
 
 #[test]
