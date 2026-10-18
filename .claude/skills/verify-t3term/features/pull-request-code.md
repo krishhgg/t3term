@@ -106,7 +106,7 @@ S=$($T3V capture reader-100x30 | grep 'ans$')
 grep -q '38;2;129;129;129m 4 .\[38;2;255;100;103m- use crate::config::Source;' "$S" && grep -q '38;2;129;129;129m 4 .\[38;2;0;212;146m+ use crate::config::schema::Schema;' "$S" && grep -q '38;2;129;129;129m 1 .\[38;2;245;245;245m  use std::fs;' "$S"
 # The unmodified lines before its second hunk, a tab stopping at 4 columns, and a wrapped line leaving the number and the mark blank.
 $T3V keys PgDn && $T3V click --text "unmodified lines" --button wheel-down --repeat $TB && $T3V wait --text "⋯ 14 unmodified lines" --text "28 -     Ok(config)" --text "33 +         // A reload reads and checks the file a" --text "     s a load does, so a file edited on disk since t"
-# ↓ after the fold row chooses the wrap row. Enter lets each line run on in one row, cut at the details' edge. While one runs past the edge, the status line offers H/L sideways.
+# ↓ after the layout row chooses the wrap row. Enter lets each line run on in one row, cut at the details' edge. While one runs past the edge, the status line offers H/L sideways.
 $T3V keys Home Down Down Down Down Down && $T3V wait --text "Enter disable line wrapping"
 $T3V keys Enter && $T3V wait --text "↵ Enable line wrapping" --text "Enter enable line wrapping" --idle 300
 $T3V keys PgDn && $T3V wait --text "33 +         // A reload reads and checks the file a" --text "34 +         self.load()" --text "H/L sideways" --gone "     s a load does, so a file edited on disk since t" --idle 300
