@@ -15,16 +15,17 @@
 - **Fold all.** Where the tab has files, `⇊ Expand all files` sits under the whitespace row, above the list off the diff. Enter or a click unfolds every file. While any file shows unfolded the row reads `⇈ Collapse all files`, and Enter or a click folds them all. Either way each file's own fold is forgotten, and files read later, such as a later slice's, follow the row. A file folded or unfolded after keeps its fold through a read of the diff again. Picking a commit starts its files folded.
 - **Split.** The lines stack at first, and `◫ Split diff view` sits under the fold row. Enter or a click sets the lines before the change on the left and those after it on the right, each side with its own numbers and a grey `│` between them, and the row reads `⊟ Stacked diff view`, which stacks them again. Each side has half the room, 26 columns at 100x30, and the right one takes the column left over. The lines removed and added in a row pair by position, and a side with no line stays blank. A file added or deleted keeps one column. Unwrapped, both sides scroll sideways by the same columns. A read again and another diff picked keep the choice, and another link starts stacked.
 - **Wrap.** The lines wrap at first, and `↵ Disable line wrapping` sits under the layout row. Enter or a click lets each line run on in one row, cut at the details' edge, and the row reads `↵ Enable line wrapping`, which wraps them again. A read again and another diff picked keep the choice, and another link starts wrapped. While the lines don't wrap, `L` or Shift+→ scrolls their text half the details' width to the right, 26 columns at 100x30, and `H` or Shift+← scrolls it back. The numbers, the marks and the other rows stay put, and the text stops once the end of the widest line shows. Esc and Alt+B keep the text where it was, and so does a read again. The details opened again from the list start it at the left, and so does another diff picked. The status line offers `H/L sideways` while a line runs past the edge, ahead of `r refresh`, which a narrow status line drops first.
+- **File tree.** Where the tab has files, `⊢ Show file tree` sits under the wrap row. Enter or a click lists the files by folder between the toolbar and the files, under `Files · 8`, counting the files read so far, and `⇈ Collapse all folders`, and the row reads `⊢ Hide file tree`. Every folder starts open, its `⌄` in grey, and the rows in it are indented 2 columns more. A folder takes the place of its first file, and a later slice's files join their folders, so the tree reads assets, src with config and legacy, tests, docs, then `Cargo.lock`. A file's row has its letter and its name in its header's color. Enter or a click on a folder closes or opens it, with `›` while it is closed, and while any is closed the row above reads `⇊ Expand all folders`, which opens them all. A file's row unfolds the file and shows its header at the top of the details, chosen. While slices are left, the tree ends with `Load more files`, which reads the next, `Loading more files…` while it comes, or `↻ Retry` after it failed. A read again keeps the folders as they were, and the tree hidden or another diff picked opens them all again. Another link starts with the tree hidden.
 - **Unchanged lines.** Each run of unchanged lines around a file's hunks is a control. Before a hunk it reads `⋯ 14 unmodified lines`. After the last hunk of a file changed in place or renamed and changed it reads `⋯ More unchanged context may be available` until the file's text comes, then counts what is left, as `⋯ 7 unmodified lines`. The first Enter or click on a run reads the file's text through `pullRequests.diffFileContents`, and the run reads `· Reading…` until it comes. Then the run shows up to 100 more lines at each end that touches a hunk, and each Enter after shows 100 more, until the run shows whole and its row goes. A failed read shows its reason under the run, and Enter reads again. The file keeps its text and the lines it showed while a read of the diff again leaves its hunks as they were.
 - **Review threads.** A thread on a line of an unfolded file shows under that line, behind a grey bar, where the line has that number on the thread's side. Its first row reads `⌄ Open · 4 comments`, with `Resolved` in green and `· outdated` where the host says so. A thread starts open unless it is resolved. Open, it shows each comment with its author and age. Where the host has another page, `Load more comments` follows. It reads the page through `pullRequests.threadComments`, reads `Loading more comments…` until the page comes, then shows the page's comments after the thread's, each once, and goes once the thread is whole. A failed page shows `t3term couldn't read more comments.` and the reason above the button, which reads the same page again. Where the host counts comments it has no page for, `2 more comments on the host.` shows instead. The pages stay with the thread when the conversation is read again. On a row with both numbers, a thread on the old side comes before one on the new. Enter or a click on the first row opens or closes it, and it stays so across reads. A folded file shows none of its threads.
 - **Off the diff.** Threads on a line no file read so far shows go to a list above the files that starts closed: `› 1 conversation not on the diff read so far` while slices are left, then `› 1 conversation not on the current diff`. Open, it lists each path once, then `Line 12` and the thread.
-- **Choosing.** Once a file, the whitespace row, the row that folds them all, the layout row, the wrap row, a thread, the list or `↻ Retry` is in view, ↓ chooses the next one and ↑ the one before, and the status line leads with what Enter does: `Enter expand file`, `Enter collapse file`, `Enter choose commit`, `Enter hide commits`, `Enter show whitespace changes`, `Enter hide whitespace changes`, `Enter expand all files`, `Enter collapse all files`, `Enter show split diff view`, `Enter show stacked diff view`, `Enter disable line wrapping`, `Enter enable line wrapping`, `Enter show all commits`, `Enter show commit 9dc565a`, `Enter show more commits`, `Enter show 14 unmodified lines`, `Enter show unmodified lines` before the text is read, `Enter show conversation`, `Enter hide conversation`, `Enter load more comments`, `Enter show conversations off the diff` or `Enter retry`. A click or Enter on `Load more comments` or `↻ Retry` lets go of the pick, since the row turns into a loading one. Where none is in view, they scroll.
+- **Choosing.** Once a file, the whitespace row, the row that folds them all, the layout row, the wrap row, the tree row, the row that closes the folders, a folder or file in the tree, `Load more files`, a thread, the list or `↻ Retry` is in view, ↓ chooses the next one and ↑ the one before, and the status line leads with what Enter does: `Enter expand file`, `Enter collapse file`, `Enter choose commit`, `Enter hide commits`, `Enter show whitespace changes`, `Enter hide whitespace changes`, `Enter expand all files`, `Enter collapse all files`, `Enter show split diff view`, `Enter show stacked diff view`, `Enter disable line wrapping`, `Enter enable line wrapping`, `Enter show file tree`, `Enter hide file tree`, `Enter collapse all folders`, `Enter expand all folders`, `Enter collapse folder`, `Enter expand folder`, `Enter go to file`, `Enter load more files`, `Enter show all commits`, `Enter show commit 9dc565a`, `Enter show more commits`, `Enter show 14 unmodified lines`, `Enter show unmodified lines` before the text is read, `Enter show conversation`, `Enter hide conversation`, `Enter load more comments`, `Enter show conversations off the diff` or `Enter retry`. A click or Enter on `Load more comments` or `↻ Retry` lets go of the pick, since the row turns into a loading one. Where none is in view, they scroll.
 - **Reading again.** A new refresh number, `r` and a detail whose `updatedAt` changed each read the first slice again. The files read before stay, each with its fold, until the new slice replaces them, and the count goes back to `5 files+` until the end of the files comes near again. After `r` the diff waits for the refresh number `pullRequests.invalidate` raises, or for the end of the read that sent it, so T3 has forgotten the diff it held.
 - **Failures.** A first slice that fails shows `Couldn't read this diff: GitHub took too long to answer.` alone. Showing the Code again, or `r`, reads it again, and the failure stays until the files come. A later slice that fails shows `t3term couldn't read the rest of this diff.`, the reason and `↻ Retry` under the files, and Retry reads that slice again. A read again of the first slice that fails keeps the files under `May be out of date: t3term couldn't read the diff again.` and the reason.
 
 ## How to get to it (user POV)
 
-Open a thread, open its details (Alt+B), press → for `Pull requests`, choose a link and press Enter, then press → twice or click `Code`. Once a file is in view, ↑ and ↓ choose it and Enter unfolds or folds it, or click the file. Enter or a click on `¶ Show whitespace changes` shows the changes to whitespace, on `⇊ Expand all files` unfolds every file, on `◫ Split diff view` sets the lines side by side, and on `↵ Disable line wrapping` lets each line run on in one row, which `H` and `L` scroll sideways. PgUp, PgDn, Home, End and the wheel scroll. `r` reads the pull request and its diff from the host again.
+Open a thread, open its details (Alt+B), press → for `Pull requests`, choose a link and press Enter, then press → twice or click `Code`. Once a file is in view, ↑ and ↓ choose it and Enter unfolds or folds it, or click the file. Enter or a click on `¶ Show whitespace changes` shows the changes to whitespace, on `⇊ Expand all files` unfolds every file, on `◫ Split diff view` sets the lines side by side, on `↵ Disable line wrapping` lets each line run on in one row, which `H` and `L` scroll sideways, and on `⊢ Show file tree` lists the files by folder above them, where a file's row shows that file at the top. PgUp, PgDn, Home, End and the wheel scroll. `r` reads the pull request and its diff from the host again.
 
 ## Driving it with t3v
 
@@ -41,7 +42,7 @@ viewed() { jq -s -c '[.[] | select(.event == "pr.filesViewed") | .number]' "$E/e
 vsettle() { local i; for i in $(seq 50); do [ "$(viewed)" = "$1" ] && return 0; sleep 0.2; done; viewed; return 1; }
 vcount() { local i; for i in $(seq 50); do [ "$(viewed | jq length)" = "$1" ] && return 0; sleep 0.2; done; viewed; return 1; }
 # The toolbar's rows under the count push the files down by one row each, and ↓ chooses each of them.
-TB=4
+TB=5
 down() { $T3V keys $(printf 'Down %.0s' $(seq "$1")); }
 $T3V click --text "Single: one open link" && $T3V wait --text "/  Single: one open link"
 $T3V keys M-b && $T3V wait --text "Thread details" && $T3V keys Right && $T3V wait --text "#7 Open: ready to merge" --idle 300
@@ -54,7 +55,7 @@ touch "$RUN/diff-slow"
 $T3V keys Right && $T3V wait --text "→ code · ← summary"
 $T3V keys Right && $T3V wait --text "Loading pull request diff…" --text "← timeline"
 $T3V capture loading-100x30
-$T3V wait --text "5 files+ · 2 / 5 viewed" --text "The host withheld part of this diff, such as a" --text "¶ Show whitespace changes" --text "⇊ Expand all files" --text "◫ Split diff view" --text "↵ Disable line wrapping"
+$T3V wait --text "5 files+ · 2 / 5 viewed" --text "The host withheld part of this diff, such as a" --text "¶ Show whitespace changes" --text "⇊ Expand all files" --text "◫ Split diff view" --text "↵ Disable line wrapping" --text "⊢ Show file tree"
 # The wheel brings the end of the files into view, as the toolbar pushed it down.
 $T3V click --text "src/config/reader.rs" --button wheel-down --repeat $TB && $T3V wait --text "› A tests/config_reload.rs +8 -0" --text "Loading more files…"
 $T3V capture more-100x30
@@ -154,6 +155,59 @@ grep -q '│ 1 + use fixture_config::Reader;  *│$' "$T"
 $T3V click --text "tests/config_reload.rs" && $T3V wait --text "› A tests/config_reload.rs +8 -0" --idle 300
 # A click on the row stacks the lines again.
 $T3V keys Home && $T3V click --text "⊟ Stacked diff view" && $T3V wait --text "◫ Split diff view" --text " 4 - use crate::config::Source;" --text " 4 + use crate::config::schema::Schema;" --idle 300
+
+# ↓ after the wrap row chooses the tree row. Enter lists the files by folder between the toolbar and the files, under their count and a row that closes or opens every folder. Every folder starts open, a folder takes the place of its first file, and a file's letter and name take its header's color.
+$T3V keys Home Down Down Down Down Down Down && $T3V wait --text "Enter show file tree"
+$T3V keys Enter && $T3V wait --text "⊢ Hide file tree" --text "Enter hide file tree" --text "Files · 8" --text "⇈ Collapse all folders" --text "⌄ assets" --text "  M config-flow.png" --text "⌄ src" --text "  ⌄ config" --text "    M reader.rs" --idle 300
+C=$($T3V capture tree-100x30); S=$(echo "$C" | grep 'ans$')
+grep -q '38;2;129;129;129m⌄.\[38;2;245;245;245m src ' "$S" && grep -q '38;2;255;185;0mM.\[38;2;245;245;245m .\[38;2;255;185;0mreader.rs' "$S"
+# A later slice's files join their folders: legacy goes under src, and docs and Cargo.lock come last.
+$T3V keys PgDn && $T3V wait --text "    R sources.rs" --text "  ⌄ legacy" --text "    D reader_v1.rs" --text "⌄ tests" --text "  A config_reload.rs" --text "⌄ docs" --text "  M config.md" --text "│ M Cargo.lock " --idle 300
+T=$($T3V capture tree-end-100x30 | grep 'txt$')
+[ "$(grep -o '│ *[⌄›AMDR] [A-Za-z0-9_.-]* *│' "$T" | sed 's/^│ //; s/ *│$//' | paste -sd'|' -)" = '    R sources.rs|  ⌄ legacy|    D reader_v1.rs|⌄ tests|  A config_reload.rs|⌄ docs|  M config.md|M Cargo.lock' ]
+S=$($T3V capture tree-end-colors-100x30 | grep 'ans$')
+grep -q '38;2;43;127;255mR.\[38;2;245;245;245m .\[38;2;43;127;255msources.rs' "$S" && grep -q '38;2;255;100;103mD.\[38;2;245;245;245m .\[38;2;255;100;103mreader_v1.rs' "$S" && grep -q '38;2;0;212;146mA.\[38;2;245;245;245m .\[38;2;0;212;146mconfig_reload.rs' "$S"
+# Enter or a click on a folder closes or opens it, and while one is closed the row above reads ⇊ Expand all folders. ↓ and ↑ choose the folders and files.
+$T3V keys Home && $T3V click --text "⌄ src" && $T3V wait --text "› src" --text "⇊ Expand all folders" --text "Enter expand folder" --gone "  ⌄ config" --gone "    M reader.rs" --idle 300
+$T3V keys Up && $T3V wait --text "Enter go to file"
+$T3V keys Up && $T3V wait --text "Enter collapse folder"
+$T3V keys Up && $T3V wait --text "Enter expand all folders"
+$T3V keys Enter && $T3V wait --text "⇈ Collapse all folders" --text "Enter collapse all folders" --text "⌄ src" --text "  ⌄ config" --idle 300
+$T3V keys Enter && $T3V wait --text "⇊ Expand all folders" --text "› assets" --text "› src" --text "› tests" --text "› docs" --text "│ M Cargo.lock " --gone "  M config-flow.png" --idle 300
+$T3V click --text "⇊ Expand all folders" && $T3V wait --text "⇈ Collapse all folders" --text "⌄ src" --text "    M schema.rs" --idle 300
+# A file's row unfolds the file and shows its header at the top of the details, chosen.
+$T3V click --text "    M schema.rs" && $T3V wait --text "⌄ M src/config/schema.rs +8 -1" --text "Enter collapse file" --idle 300
+T=$($T3V capture tree-pick-100x30 | grep 'txt$')
+grep -A1 '← List  Summary  Timeline  Code' "$T" | tail -1 | grep -q '│ ⌄ M src/config/schema.rs +8 -1'
+$T3V keys Enter && $T3V wait --text "› M src/config/schema.rs +8 -1" --idle 300
+# While slices are left, the tree ends with Load more files, which reads the next, and Loading more files… while it comes. A read again keeps the folders as they were. With reader.rs unfolded, the end of the files is far from the top, so r there reads only the first slice.
+$T3V keys Home PgDn && $T3V click --text "⌄ tests" && $T3V wait --text "› tests" --gone "  A config_reload.rs" --idle 300
+$T3V keys Home && $T3V wait --text "r refresh"
+mark
+$T3V keys r && settle '[null,null]' && $T3V wait --text "r refresh" --idle 1500
+$T3V keys Home && $T3V wait --text "5 files+" --text "Files · 5" --idle 300
+$T3V keys PgDn && $T3V wait --text "› tests" --text "Load more files" --gone "⌄ docs" --idle 300
+touch "$RUN/diff-slow"
+$T3V click --text "Load more files" && $T3V wait --text "Loading more files…"
+S=$($T3V capture tree-loading-100x30 | grep 'ans$')
+$T3V wait --text "    D reader_v1.rs" --text "⌄ docs" --text "› tests" --gone "Loading more files…" --idle 300
+[ "$(since)" = '[null,null,"s2"]' ]
+rm "$RUN/diff-slow"
+# A later slice that fails ends the tree with ↻ Retry, which reads it again.
+touch "$RUN/diff-fail-rest"
+$T3V wait --text "r refresh"
+mark
+$T3V keys r && settle '[null,null]' && $T3V wait --text "r refresh" --idle 1500
+$T3V keys Home && $T3V keys PgDn && $T3V wait --text "Load more files" --idle 300
+$T3V click --text "Load more files" && $T3V wait --text "↻ Retry" --gone "Load more files" --idle 300
+$T3V capture tree-retry-100x30
+rm "$RUN/diff-fail-rest"
+$T3V click --text "↻ Retry" && $T3V wait --text "⌄ docs" --gone "↻ Retry" --idle 300
+[ "$(since)" = '[null,null,"s2","s2"]' ]
+# Hidden and shown again, the tree opens every folder. A click on the row hides it.
+$T3V keys Home && $T3V click --text "⊢ Hide file tree" && $T3V wait --text "⊢ Show file tree" --gone "Files · 8" --idle 300
+$T3V click --text "⊢ Show file tree" && $T3V wait --text "⊢ Hide file tree" --text "⇈ Collapse all folders" --idle 300
+$T3V click --text "⊢ Hide file tree" && $T3V wait --text "⊢ Show file tree" --gone "Files · 8" --idle 300
 $T3V keys Home && down $((3 + TB)) && $T3V wait --text "Enter collapse file"
 $T3V keys Enter && $T3V wait --text "› M src/config/reader.rs +7 -5" --gone "⋯ 14 unmodified lines"
 
@@ -485,6 +539,7 @@ $T3V status --json | jq -e '.scopeViolations == 0 and .unknownRpcs == 0 and .fix
 - A read of the marks takes a second, and showing the Code while one is under way asks for none. After a read that fails, let its answer come before showing the Code again, or nothing is read.
 - `r` and `t3v refresh` read the marks twice, as they read the diff twice.
 - Each read of the first slice drops the later slices, and the second comes back only where the end of the files is in view. With the toolbar's rows above the files, Home after `r` may be too far from the end, so the recipe presses `r` at the end and Home once the reads settle.
+- The file tree shows only in its own steps, which hide it again, so the rows below keep their places. The fixture has no folder whose only child is a folder, so a row that folders share isn't driven, and neither are the folders opening again for another diff picked. The unit tests cover both.
 - Side by side, a review thread shows across both sides under its row. The recipe stacks the lines again before the threads, so a thread across both sides isn't driven, and neither are the lines stacking below 6 columns. The unit tests cover both.
 - The fixture's detail always says the host keeps the marks, so `viewed in T3 Code`, a detail without `viewedFiles` and more marks than the 1,000 t3term reads aren't driven. The unit tests cover them.
 - Clicks land on the rows the last frame drew. Click the lowest file first when unfolding several, so the rows above don't move.
