@@ -977,7 +977,7 @@ fn a_new_theme_restyles_the_threads() {
     code.act(Control::File(lib));
     let shown = Shown::default();
     // The color of the remark's text, laid out at one width as the panel lays it out.
-    let mut body = |conversation: &mut Conversation, theme: &Theme| {
+    let body = |conversation: &mut Conversation, theme: &Theme| {
         let showing = code.threads_shown(conversation.threads(), &shown);
         conversation.lay_out_threads(&showing, 40, theme);
         let (lines, _) = code.lay_out(conversation.threads(), &shown, 40, NOW, theme);
