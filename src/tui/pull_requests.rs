@@ -1457,12 +1457,11 @@ pub(super) struct PullRequests {
     /// Each tab's scroll, by its place, which it shows at again when the reader goes back to
     /// it. The one that shows is `scroll`.
     kept: [Offset; 3],
-    /// Whether the Code tab showed since the details opened, as the desktop's tab stays
-    /// mounted once it showed (PullRequestDetailPanel.tsx:525-539).
-    mounted: bool,
-    /// Set when the Code tab shows for the first time since the details opened, until its
-    /// diff is read, or read again where it is stale, as the desktop's tab reads it when it
-    /// mounts.
+    /// Set each time the Code tab shows, until the next frame asks for its diff, which reads
+    /// it from the first slice where it came a minute or more before or failed. The desktop's
+    /// tab reads a stale diff when it mounts, and stays mounted to follow refreshes while
+    /// another tab shows (PullRequestDetailPanel.tsx:525-539). t3term reads only while the
+    /// Code shows, so it checks each time instead.
     mount: bool,
     /// How many times the links were worked out and a page laid out, so the tests can tell
     /// what a frame or an event did.
@@ -1494,7 +1493,6 @@ impl PullRequests {
         self.pick = None;
         self.tab = Tab::Summary;
         self.kept = Default::default();
-        self.mounted = false;
         self.mount = false;
     }
 
@@ -1601,8 +1599,7 @@ impl PullRequests {
         self.kept[self.tab.place()] = self.scroll;
         self.scroll = self.kept[tab.place()];
         self.tab = tab;
-        if tab == Tab::Code && !self.mounted {
-            self.mounted = true;
+        if tab == Tab::Code {
             self.mount = true;
         }
         self.pick = None;
@@ -1934,7 +1931,6 @@ impl PullRequests {
             self.scroll = Offset::Top(0);
             self.tab = Tab::Summary;
             self.kept = Default::default();
-            self.mounted = false;
             self.mount = false;
             self.current = false;
             self.asking = true;
@@ -2307,9 +2303,10 @@ impl PullRequests {
 
     /// The read of a slice of the diff that the Code tab wants, as `Code::ask` says: the first
     /// slice once the tab shows for the first time since the details opened, or again where
-    /// it is stale, and the next once the end of the files comes near. None unless `enabled`
-    /// and the tab shows. While a read that sends `pullRequests.invalidate` is under way, the
-    /// diff waits for it, so T3 forgets its cached diff before the read asks for it.
+    /// it is stale when the tab shows, and the next once the end of the files comes near. None unless `enabled`
+    /// and the tab shows. After a read that sends `pullRequests.invalidate`, the diff waits
+    /// until T3's refresh number moves or that read is done, so T3 has forgotten its cached
+    /// diff before the read asks for it.
     pub fn take_diff_ask(&mut self, enabled: bool, now: i64) -> Option<DiffAsk> {
         if !enabled || !self.showing_read() || self.tabs() != Some(Tab::Code) {
             return None;
@@ -6628,7 +6625,17 @@ mod tests {
 
         // Leaving the Code and coming back within a minute reads nothing again.
         assert!(pulls.back() && pulls.forward());
-        assert_eq!(pulls.take_diff_ask(true, now() + FRESH), None);
+        assert_eq!(pulls.take_diff_ask(true, now() + FRESH - 1), None);
+        // Coming back a minute or more after the first slice came reads it again.
+        let later = now() + FRESH;
+        assert_eq!(pulls.take_diff_ask(true, later), None);
+        assert!(pulls.back() && pulls.forward());
+        assert_eq!(pulls.take_diff_ask(true, later), Some(diff_ask(4, None)));
+        // A first slice that failed is read again each time the Code shows.
+        assert!(pulls.answer_diff(4, Err("timed out".into()), later));
+        assert_eq!(pulls.take_diff_ask(true, later), None);
+        assert!(pulls.back() && pulls.forward());
+        assert_eq!(pulls.take_diff_ask(true, later), Some(diff_ask(5, None)));
     }
 
     #[test]
@@ -6700,6 +6707,21 @@ mod tests {
         pulls.answer(ask.ticket, Part::Done, now());
         assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(6, None)));
         assert!(pulls.answer_diff(6, Ok(added(0, 2, None)), now()));
+        assert!(unfolded(&mut pulls));
+        // Or once T3's refresh number moves, which the invalidate moves after T3 forgot the
+        // diff, while the read that sent it is still under way.
+        assert!(pulls.reload(now()));
+        let ask = pulls.take_ask(true, now()).expect("the read again");
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        assert!(!pulls.refresh());
+        let ticket = ask.ticket + 1;
+        assert_eq!(
+            pulls.take_diff_ask(true, now()),
+            Some(diff_ask(ticket, None))
+        );
+        assert!(pulls.answer_diff(ticket, Ok(added(0, 2, None)), now()));
+        answer(&mut pulls, ask.ticket, &bare_detail(), true);
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
         assert!(unfolded(&mut pulls));
 
         // A read that keeps the details current reads it again where `updatedAt` moved.
