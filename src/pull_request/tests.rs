@@ -228,6 +228,7 @@ fn a_detail_reads_every_field_t3_sends() {
             edit_change_request: true,
             edit_comment: true,
             labels: true,
+            stacks: true,
         }
     );
     assert_eq!(
@@ -373,6 +374,7 @@ fn optional_fields_t3_leaves_out_read_as_the_schema_says() {
         "viewedFiles",
         "edit",
         "labels",
+        "stacks",
     ] {
         capabilities.remove(key);
     }
@@ -403,6 +405,7 @@ fn optional_fields_t3_leaves_out_read_as_the_schema_says() {
     assert_eq!(capabilities.viewed_files, None);
     assert!(!capabilities.edit_change_request && !capabilities.edit_comment);
     assert!(!capabilities.labels);
+    assert!(!capabilities.stacks);
     // A permission the host reports nothing about is granted, except updating the branch,
     // which absent says the viewer may not.
     assert!(detail.permissions.update_methods.is_empty());
@@ -835,6 +838,144 @@ fn checks_read_their_state_and_list() {
     assert!(Checks::read(&json!({"checks": []})).is_err());
 }
 
+/// A stack as T3's GitHub provider sends it: three layers, bottom to top, the middle one
+/// without its optional fields.
+fn stack_value() -> Value {
+    json!({
+        "id": "S_kwDOAbc", "number": 7, "url": "https://github.com/krishhgg/t3term/stacks/7",
+        "base": "master",
+        "layers": [
+            {"number": 49, "title": "Read a pull request over RPC", "isDraft": false,
+                "headSha": "2bb3739", "headBranch": "t3term/pull-request-detail",
+                "state": "merged"},
+            {"number": 50, "headBranch": "t3term/pull-request-page", "state": "open"},
+            {"number": 52, "title": "", "isDraft": true, "headSha": "abc1234",
+                "headBranch": "t3term/pull-request-comments", "state": "closed"}
+        ]
+    })
+}
+
+#[test]
+fn a_stack_reads_its_layers_bottom_to_top() {
+    let stack = Stack::read(&stack_value()).unwrap();
+    let layer =
+        |number, title: Option<&str>, is_draft, head_sha: Option<&str>, branch, state| Layer {
+            number,
+            title: title.map(str::to_string),
+            is_draft,
+            head_sha: head_sha.map(str::to_string),
+            head_branch: branch,
+            state,
+        };
+    assert_eq!(
+        stack,
+        Stack {
+            id: "S_kwDOAbc".to_string(),
+            number: 7,
+            url: "https://github.com/krishhgg/t3term/stacks/7".to_string(),
+            base: "master".to_string(),
+            layers: vec![
+                layer(
+                    49,
+                    Some("Read a pull request over RPC"),
+                    Some(false),
+                    Some("2bb3739"),
+                    "t3term/pull-request-detail".to_string(),
+                    State::Merged,
+                ),
+                layer(
+                    50,
+                    None,
+                    None,
+                    None,
+                    "t3term/pull-request-page".to_string(),
+                    State::Open,
+                ),
+                // An empty title is T3's to send, and the caller's to fall back from.
+                layer(
+                    52,
+                    Some(""),
+                    Some(true),
+                    Some("abc1234"),
+                    "t3term/pull-request-comments".to_string(),
+                    State::Closed,
+                ),
+            ],
+            cut: false,
+        }
+    );
+
+    let mut empty = stack_value();
+    empty["layers"] = json!([]);
+    assert!(Stack::read(&empty).unwrap().layers.is_empty());
+
+    let mut many = stack_value();
+    let layer = many["layers"][1].clone();
+    let mut layers = vec![layer; MOST_LAYERS];
+    // Past the bound, so never read.
+    layers.push(json!({"number": 0, "state": "draft"}));
+    many["layers"] = json!(layers);
+    let stack = Stack::read(&many).unwrap();
+    assert_eq!(stack.layers.len(), MOST_LAYERS);
+    assert!(stack.cut);
+}
+
+#[test]
+fn a_stack_without_a_field_t3_requires_is_malformed() {
+    // `pointer` is a JSON pointer into the stack, such as /layers/1/state.
+    let broken = |pointer: &str, value: Value| {
+        let mut stack = stack_value();
+        *stack.pointer_mut(pointer).unwrap() = value;
+        Stack::read(&stack).unwrap_err().to_string()
+    };
+    let says = |what: &str| format!("T3 sent a pull request answer t3term can't read: {what}");
+    assert_eq!(broken("/id", json!("  ")), says("a stack has no valid id"));
+    assert_eq!(
+        broken("/number", json!(0)),
+        says("a stack has no valid number")
+    );
+    assert_eq!(
+        broken("/url", Value::Null),
+        says("a stack has no valid url")
+    );
+    assert_eq!(broken("/base", json!(3)), says("a stack has no valid base"));
+    assert_eq!(
+        broken("/layers", json!({})),
+        says("a stack has no valid layers")
+    );
+    let layer = |key: &str, value| broken(&format!("/layers/2/{key}"), value);
+    assert_eq!(
+        layer("number", json!(-1)),
+        says("a layer has no valid number")
+    );
+    assert_eq!(
+        layer("headBranch", json!("")),
+        says("a layer has no valid headBranch")
+    );
+    // A state this version doesn't know breaks the answer, as it does a detail's.
+    assert_eq!(
+        layer("state", json!("draft")),
+        says("a layer has no valid state")
+    );
+    assert_eq!(
+        layer("isDraft", json!("yes")),
+        says("a layer has no valid isDraft")
+    );
+    assert_eq!(
+        layer("headSha", json!(" ")),
+        says("a layer has no valid headSha")
+    );
+    assert_eq!(layer("title", json!(5)), says("a layer has no valid title"));
+    assert_eq!(
+        broken("/layers/1", json!("t3term/pull-request-page")),
+        says("a layer isn't an object")
+    );
+    assert_eq!(
+        Stack::read(&json!([])).unwrap_err().to_string(),
+        says("a stack isn't an object")
+    );
+}
+
 #[test]
 fn an_unavailable_host_says_what_the_server_needs() {
     let error = PullRequestError::from(failed(json!({
@@ -944,4 +1085,227 @@ fn other_failures_keep_t3s_message() {
     let lost = PullRequestError::from(RpcError::Disconnected("socket ended".to_string()));
     assert!(matches!(&lost, PullRequestError::Rpc(_)));
     assert_eq!(lost.to_string(), "T3 connection lost: socket ended");
+}
+
+mod diff {
+    use super::*;
+    use crate::http::fake;
+
+    fn reference() -> Reference {
+        Reference::new("project-1", None, "owner/repo", 7).unwrap()
+    }
+
+    /// The error `diff` gives when T3 answers with `status` and `body`.
+    async fn failure(status: &str, body: &str) -> PullRequestError {
+        let answer = fake::response(status, &["location: http://127.0.0.1:1/"], body);
+        let t3 = fake::Server::start(move |_| answer.clone());
+        let api = Api::without_proxy(&t3.origin);
+        diff(&api, &reference(), None).await.unwrap_err()
+    }
+
+    fn http(error: PullRequestError) -> String {
+        match error {
+            PullRequestError::Http(message) => message,
+            other => panic!("{other:?}"),
+        }
+    }
+
+    #[tokio::test]
+    async fn a_slice_of_the_diff_reads_and_the_next_one_sends_its_cursor() {
+        let body = json!({
+            "patch": "diff --git a/a b/a\n",
+            "truncated": true,
+            "nextCursor": "2",
+            "omittedFileStats": [
+                {"path": "assets/big.bin", "additions": 3, "deletions": 1.0},
+                {"path": "huge.json", "additions": -1, "deletions": 1e3}
+            ]
+        });
+        let answer = fake::response("200 OK", &[], &body.to_string());
+        let t3 = fake::Server::start(move |_| answer.clone());
+        let api = Api::without_proxy(&t3.origin);
+        let first = diff(&api, &reference(), None).await.unwrap();
+        assert_eq!(
+            first,
+            Diff {
+                patch: "diff --git a/a b/a\n".into(),
+                truncated: true,
+                next_cursor: Some("2".into()),
+                omitted: vec![
+                    Omitted {
+                        path: "assets/big.bin".into(),
+                        additions: 3,
+                        deletions: 1
+                    },
+                    Omitted {
+                        path: "huge.json".into(),
+                        additions: 0,
+                        deletions: 1000
+                    },
+                ],
+                omitted_cut: false,
+            }
+        );
+        diff(&api, &reference(), first.next_cursor.as_deref())
+            .await
+            .unwrap();
+        assert_eq!(t3.paths(), [DIFF, DIFF]);
+        let bodies: Vec<Value> = t3
+            .bodies()
+            .iter()
+            .map(|body| serde_json::from_str(body).unwrap())
+            .collect();
+        let mut next = reference().payload();
+        next["cursor"] = json!("2");
+        assert_eq!(bodies, [reference().payload(), next]);
+    }
+
+    #[test]
+    fn a_diff_answer_is_read_with_the_checks_of_the_others() {
+        let last = Diff::read(json!({"patch": "", "truncated": false, "nextCursor": null}));
+        assert_eq!(
+            last.unwrap(),
+            Diff {
+                patch: String::new(),
+                truncated: false,
+                next_cursor: None,
+                omitted: Vec::new(),
+                omitted_cut: false,
+            }
+        );
+        let many: Vec<_> = (0..=MOST_OMITTED)
+            .map(|n| json!({"path": format!("f{n}"), "additions": 1, "deletions": 0}))
+            .collect();
+        let read = Diff::read(json!({
+            "patch": "", "truncated": true, "nextCursor": null, "omittedFileStats": many
+        }))
+        .unwrap();
+        assert!(read.omitted_cut);
+        assert_eq!(read.omitted.len(), MOST_OMITTED);
+        let broken = [
+            json!({"truncated": false, "nextCursor": null}),
+            json!({"patch": 1, "truncated": false, "nextCursor": null}),
+            json!({"patch": "", "nextCursor": null}),
+            json!({"patch": "", "truncated": false}),
+            json!({"patch": "", "truncated": false, "nextCursor": " "}),
+            json!({"patch": "", "truncated": false, "nextCursor": null,
+                "omittedFileStats": [{"path": "a", "additions": "1", "deletions": 0}]}),
+            json!({"patch": "", "truncated": false, "nextCursor": null,
+                "omittedFileStats": [{"path": " ", "additions": 1, "deletions": 0}]}),
+        ];
+        for value in broken {
+            let error = Diff::read(value.clone()).unwrap_err();
+            assert!(matches!(error, PullRequestError::Malformed(_)), "{value}");
+        }
+    }
+
+    /// The route encodes each failure with its own status (environmentHttp.ts:650-663). A pull
+    /// request failure reads as it does over RPC.
+    #[tokio::test]
+    async fn each_failure_t3_answers_the_diff_with_reads_as_its_kind() {
+        let gone = json!({"_tag": "PullRequestOperationError", "operation": "diff",
+            "detail": "No pull request #7.", "reason": "not-found"});
+        let error = failure("502 Bad Gateway", &gone.to_string()).await;
+        assert!(
+            matches!(&error, PullRequestError::NotFound(message) if message == "No pull request #7."),
+            "{error:?}"
+        );
+
+        let missing = json!({"_tag": "PullRequestUnavailableError", "provider": "github",
+            "reason": "cli-missing"});
+        let error = failure("503 Service Unavailable", &missing.to_string()).await;
+        assert!(
+            matches!(
+                error,
+                PullRequestError::Unavailable {
+                    reason: Unavailable::CliMissing,
+                    provider: Some(Provider::Github)
+                }
+            ),
+            "{error:?}"
+        );
+
+        let slow = json!({"_tag": "PullRequestOperationError", "operation": "diff",
+            "detail": "GitHub took too long to answer."});
+        let error = failure("502 Bad Gateway", &slow.to_string()).await;
+        assert!(matches!(&error, PullRequestError::Rpc(_)), "{error:?}");
+        assert_eq!(error.to_string(), "GitHub took too long to answer.");
+
+        let answers = [
+            (
+                "401 Unauthorized",
+                json!({"_tag": "EnvironmentAuthInvalidError", "code": "expired",
+                    "reason": "The session expired.", "traceId": "t"})
+                .to_string(),
+                "T3 refused t3term's credentials for the diff (The session expired.).",
+            ),
+            (
+                "403 Forbidden",
+                json!({"_tag": "EnvironmentScopeRequiredError",
+                    "requiredScope": "orchestration:read"})
+                .to_string(),
+                "Reading the diff needs the orchestration:read scope, which t3term's session doesn't have.",
+            ),
+            (
+                "500 Internal Server Error",
+                json!({"_tag": "EnvironmentInternalError", "reason": "disk full"}).to_string(),
+                "T3 failed to read the diff (disk full).",
+            ),
+            (
+                "418 I'm a teapot",
+                json!({"_tag": "Teapot"}).to_string(),
+                "T3 answered the diff with HTTP 418.",
+            ),
+            (
+                "500 Internal Server Error",
+                "<html>oops</html>".to_string(),
+                "T3 answered the diff with HTTP 500.",
+            ),
+            (
+                "302 Found",
+                String::new(),
+                "T3 answered the diff with a redirect, which t3term doesn't follow.",
+            ),
+        ];
+        for (status, body, expected) in answers {
+            assert_eq!(http(failure(status, &body).await), expected, "{status}");
+        }
+
+        let error = failure("200 OK", "not json").await;
+        assert_eq!(
+            error.to_string(),
+            malformed("the diff isn't JSON".into()).to_string()
+        );
+        let error = failure("200 OK", r#"{"truncated":false,"nextCursor":null}"#).await;
+        assert!(matches!(error, PullRequestError::Malformed(_)), "{error:?}");
+
+        let t3 = fake::Server::start(|_| String::new());
+        let api = Api::without_proxy(&t3.origin);
+        let error = http(diff(&api, &reference(), None).await.unwrap_err());
+        assert!(
+            error.starts_with("t3term couldn't read the diff from T3: "),
+            "{error}"
+        );
+        assert!(!error.contains(&t3.origin), "{error}");
+    }
+
+    /// The bound holds whether or not T3 says the length up front.
+    #[tokio::test]
+    async fn a_diff_past_the_bound_is_left_unread() {
+        let body =
+            json!({"patch": "0123456789", "truncated": false, "nextCursor": null}).to_string();
+        let sized = fake::response("200 OK", &[], &body);
+        let streamed = format!("HTTP/1.1 200 OK\r\nconnection: close\r\n\r\n{body}");
+        for answer in [sized, streamed] {
+            let t3 = fake::Server::start(move |_| answer.clone());
+            let api = Api::without_proxy(&t3.origin);
+            let read = read_diff(&api, &reference(), None, body.len()).await;
+            assert_eq!(read.unwrap().patch, "0123456789");
+            let error = read_diff(&api, &reference(), None, body.len() - 1).await;
+            assert_eq!(
+                http(error.unwrap_err()),
+                "The diff is longer than the 16 MiB t3term reads."
+            );
+        }
+    }
 }

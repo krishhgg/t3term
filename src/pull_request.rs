@@ -1,8 +1,10 @@
-//! One pull request as T3's server reads it from its host: the detail, the checks and the
-//! conversation, through `pullRequests.detail`, `pullRequests.checks` and
-//! `pullRequests.activity`. `pullRequests.invalidate` makes T3's next read of it ask the host
-//! again. Each is one RPC call, which T3 answers through the host's CLI or API or from a cache
-//! of its own. Nothing here writes to the host, and nothing keeps what it read.
+//! One pull request as T3's server reads it from its host: the detail, the checks, the
+//! conversation and the stack, through `pullRequests.detail`, `pullRequests.checks`,
+//! `pullRequests.activity` and `pullRequests.stack`. `pullRequests.invalidate` makes T3's next
+//! read of it ask the host again. Each is one RPC call, which T3 answers through the host's CLI or API or from a cache
+//! of its own. The diff comes over HTTP instead, from `POST /api/pull-requests/diff`, as the
+//! desktop reads it, and `patch` splits it into files and hunks. Nothing here writes to the
+//! host, and nothing keeps what it read.
 //! `pullRequests.subscribeRefreshes` is a stream of numbers that says when T3's reads may have
 //! changed, which `client::spawn_pull_request_refresh_watch` follows.
 //!
@@ -27,17 +29,32 @@ use std::time::Duration;
 
 use serde_json::{Map, Value, json};
 
+use crate::http::{Api, Unanswered};
 use crate::rpc::{RpcClient, RpcError};
+
+pub mod patch;
 
 pub const DETAIL: &str = "pullRequests.detail";
 pub const CHECKS: &str = "pullRequests.checks";
 pub const ACTIVITY: &str = "pullRequests.activity";
+pub const STACK: &str = "pullRequests.stack";
 pub const INVALIDATE: &str = "pullRequests.invalidate";
 pub const SUBSCRIBE_REFRESHES: &str = "pullRequests.subscribeRefreshes";
+/// The HTTP route of a pull request's diff (packages/contracts/src/environmentHttp.ts:650-663).
+pub const DIFF: &str = "/api/pull-requests/diff";
 
 /// How long a call waits for T3's answer. T3 asks the host, and GitHub can take several
 /// seconds to answer for a long conversation.
 const CALL_TIMEOUT: Duration = Duration::from_secs(60);
+/// How long a read of the diff waits, as the desktop's loader does
+/// (packages/client-runtime/src/state/pullRequestDiffHttp.ts:22).
+const DIFF_TIMEOUT: Duration = Duration::from_secs(60);
+/// The longest answer to a read of the diff, in bytes. T3 reads at most 8 MiB of a diff from
+/// GitHub (apps/server/src/pullRequest/GitHubPullRequestCli.ts:342-343), and JSON's escapes
+/// make most patches only a little longer.
+pub const MOST_DIFF: usize = 16 * 1024 * 1024;
+/// The most files the host left out of a diff kept.
+const MOST_OMITTED: usize = 3000;
 
 /// The longest project id, host or repository a `Reference` sends, in bytes.
 const KEY: usize = 1024;
@@ -61,6 +78,8 @@ const MOST_THREADS: usize = 1000;
 const MOST_THREAD_COMMENTS: usize = 1000;
 /// The most commits kept.
 const MOST_COMMITS: usize = 1000;
+/// The most layers of a stack kept.
+const MOST_LAYERS: usize = 1000;
 /// The most actions, merge methods, verdicts or reactions read from one list. Each list has
 /// at most ten values T3 knows today.
 const MOST_LITERALS: usize = 64;
@@ -85,6 +104,8 @@ pub enum PullRequestError {
     Malformed(String),
     /// The connection failed, or T3 or the host failed the call another way.
     Rpc(RpcError),
+    /// A read over HTTP failed before T3 answered, or T3 refused it. The message is t3term's.
+    Http(String),
 }
 
 /// Why T3 can't read a host's pull requests, as `PullRequestUnavailableReason` says it.
@@ -110,6 +131,7 @@ impl fmt::Display for PullRequestError {
                 write!(f, "T3 sent a pull request answer t3term can't read: {what}")
             }
             PullRequestError::Rpc(error) => error.fmt(f),
+            PullRequestError::Http(message) => f.write_str(message),
         }
     }
 }
@@ -317,6 +339,102 @@ pub async fn activity(
         .call(ACTIVITY, reference.payload(), CALL_TIMEOUT)
         .await?;
     Activity::read(&answer)
+}
+
+/// The stack the host keeps the pull request in, or `None` where it is in none. T3 also answers
+/// null where it reads no stacks from the host, which is every host but GitHub at f570bd2
+/// (PullRequestService.ts:1689-1693), and where GitHub answers 404, as one without stacks does
+/// (GitHubPullRequestCli.ts:2150-2154). `PullRequestStack`.
+pub async fn stack(
+    rpc: &RpcClient,
+    reference: &Reference,
+) -> Result<Option<Stack>, PullRequestError> {
+    let answer = rpc.call(STACK, reference.payload(), CALL_TIMEOUT).await?;
+    if answer.is_null() {
+        return Ok(None);
+    }
+    Stack::read(&answer).map(Some)
+}
+
+/// One slice of the pull request's diff, from the slice `cursor` names or from the first.
+/// T3 sends the whole diff in one slice where the host gives it whole, and a page of files at a
+/// time otherwise, with the cursor of the next in `next_cursor`.
+pub async fn diff(
+    api: &Api,
+    reference: &Reference,
+    cursor: Option<&str>,
+) -> Result<Diff, PullRequestError> {
+    read_diff(api, reference, cursor, MOST_DIFF).await
+}
+
+/// `diff`, reading at most `most` bytes of the answer.
+async fn read_diff(
+    api: &Api,
+    reference: &Reference,
+    cursor: Option<&str>,
+    most: usize,
+) -> Result<Diff, PullRequestError> {
+    let mut payload = reference.payload();
+    if let Some(cursor) = cursor {
+        payload["cursor"] = json!(cursor);
+    }
+    let (status, body) = api
+        .post_bounded(DIFF, &payload, DIFF_TIMEOUT, most)
+        .await
+        .map_err(|unanswered| {
+            PullRequestError::Http(match unanswered {
+                Unanswered::Failed(why) => format!("t3term couldn't read the diff from T3: {why}"),
+                Unanswered::Redirected => {
+                    "T3 answered the diff with a redirect, which t3term doesn't follow.".into()
+                }
+                Unanswered::TooLong => "The diff is longer than the 16 MiB t3term reads.".into(),
+            })
+        })?;
+    let value = serde_json::from_slice::<Value>(&body);
+    if !status.is_success() {
+        return Err(match value {
+            Ok(error) => diff_failure(status.as_u16(), &error),
+            Err(_) => PullRequestError::Http(format!(
+                "T3 answered the diff with HTTP {}.",
+                status.as_u16()
+            )),
+        });
+    }
+    match value {
+        Ok(value) => Diff::read(value),
+        Err(_) => Err(malformed("the diff isn't JSON".into())),
+    }
+}
+
+/// The failure T3 sent for a read of the diff with HTTP `status`, as the route's errors encode
+/// it (environmentHttp.ts:650-663). A pull request failure reads as it does over RPC.
+fn diff_failure(status: u16, error: &Value) -> PullRequestError {
+    let tag = error
+        .get("_tag")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let text = |key: &str| {
+        let text = error.get(key).and_then(Value::as_str).unwrap_or_default();
+        cut(text, NAME).0
+    };
+    match tag {
+        "PullRequestUnavailableError" | "PullRequestOperationError" => {
+            let exit = json!({"cause": [{"_tag": "Fail", "error": error}]});
+            RpcError::failed(DIFF, &exit).into()
+        }
+        "EnvironmentAuthInvalidError" => PullRequestError::Http(format!(
+            "T3 refused t3term's credentials for the diff ({}).",
+            text("reason")
+        )),
+        "EnvironmentScopeRequiredError" => PullRequestError::Http(format!(
+            "Reading the diff needs the {} scope, which t3term's session doesn't have.",
+            text("requiredScope")
+        )),
+        "EnvironmentInternalError" => {
+            PullRequestError::Http(format!("T3 failed to read the diff ({}).", text("reason")))
+        }
+        _ => PullRequestError::Http(format!("T3 answered the diff with HTTP {status}.")),
+    }
 }
 
 /// Makes T3 forget its cached detail and diff of the pull request, so its next read asks the
@@ -696,9 +814,9 @@ pub struct ReviewerCapabilities {
     pub list_candidates: bool,
 }
 
-/// What the host can do at all. `PullRequestCapabilities`, without the stack fields. An
-/// optional flag T3 leaves out is false, as its schema says: a server that says nothing about
-/// a feature has none.
+/// What the host can do at all. `PullRequestCapabilities`, without `stackActions`. An optional
+/// flag T3 leaves out is false, as its schema says: a server that says nothing about a feature
+/// has none.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Capabilities {
     pub diff: bool,
@@ -717,6 +835,8 @@ pub struct Capabilities {
     /// A remark can be rewritten by whoever wrote it.
     pub edit_comment: bool,
     pub labels: bool,
+    /// The host keeps stacks of pull requests as objects of its own, which `stack` reads.
+    pub stacks: bool,
 }
 
 /// What this viewer may do. `PullRequestViewerPermissions`, without `stackRebase`.
@@ -891,6 +1011,102 @@ pub struct Activity {
     pub verdicts_cut: bool,
 }
 
+/// One slice of a pull request's diff. `PullRequestDiffResult`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Diff {
+    /// The changes as a unified diff, which `patch::Patch::read` splits into files. It is the
+    /// whole patch T3 sent, at most `MOST_DIFF` bytes.
+    pub patch: String,
+    /// Whether the host left part of the diff out: a binary file, or a change too large to
+    /// show.
+    pub truncated: bool,
+    /// The cursor of the next slice, or `None` where this is the last.
+    pub next_cursor: Option<String>,
+    /// The files the host left the changes of out, with their counts.
+    pub omitted: Vec<Omitted>,
+    /// Whether T3 named more such files than t3term keeps.
+    pub omitted_cut: bool,
+}
+
+/// A file whose changes the host left out of the diff. `PullRequestOmittedFileStat`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Omitted {
+    pub path: String,
+    pub additions: u64,
+    pub deletions: u64,
+}
+
+impl Diff {
+    /// Reads T3's answer, taking its patch without copying it.
+    pub fn read(mut value: Value) -> Result<Diff, PullRequestError> {
+        let patch = match value.get_mut("patch").map(Value::take) {
+            Some(Value::String(patch)) => patch,
+            _ => return Err(malformed("a diff has no valid patch".into())),
+        };
+        let object = Object::of(&value, "diff")?;
+        let (omitted, omitted_cut) = match object.optional("omittedFileStats") {
+            Some(_) => object.entries("omittedFileStats", MOST_OMITTED, read_omitted)?,
+            None => (Vec::new(), false),
+        };
+        let next_cursor = match object.nullable("nextCursor")? {
+            Some(_) => Some(object.name("nextCursor")?),
+            None => None,
+        };
+        Ok(Diff {
+            patch,
+            truncated: object.flag("truncated")?,
+            next_cursor,
+            omitted,
+            omitted_cut,
+        })
+    }
+}
+
+fn read_omitted(value: &Value) -> Result<Omitted, PullRequestError> {
+    let object = Object::of(value, "file left out")?;
+    // T3's schema takes any number here, as GitHub's counts are whole numbers from 0. `as`
+    // takes a negative count to 0 and drops a fraction.
+    let count = |key: &str| match object.optional(key).and_then(Value::as_f64) {
+        Some(count) => Ok(count as u64),
+        _ => Err(object.wrong(key)),
+    };
+    Ok(Omitted {
+        path: object.trimmed("path", LINE)?,
+        additions: count("additions")?,
+        deletions: count("deletions")?,
+    })
+}
+
+/// The stack the host keeps a pull request in. `PullRequestStack`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Stack {
+    /// The host's id for the stack.
+    pub id: String,
+    /// The stack's own number on the host, which isn't any layer's.
+    pub number: u64,
+    /// The stack's page on the host.
+    pub url: String,
+    /// The branch the bottom layer merges into.
+    pub base: String,
+    /// Bottom to top, as GitHub lists them.
+    pub layers: Vec<Layer>,
+    /// t3term left layers out past its bound.
+    pub cut: bool,
+}
+
+/// One pull request in a stack. `PullRequestStack`'s layer.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Layer {
+    pub number: u64,
+    /// `None` where T3 leaves it out. It may be empty.
+    pub title: Option<String>,
+    /// `None` where T3 leaves it out.
+    pub is_draft: Option<bool>,
+    pub head_sha: Option<String>,
+    pub head_branch: String,
+    pub state: State,
+}
+
 impl Detail {
     pub fn read(value: &Value) -> Result<Detail, PullRequestError> {
         let object = Object::of(value, "detail")?;
@@ -995,6 +1211,33 @@ impl Activity {
             verdicts_cut,
         })
     }
+}
+
+impl Stack {
+    pub fn read(value: &Value) -> Result<Stack, PullRequestError> {
+        let object = Object::of(value, "stack")?;
+        let (layers, cut) = object.entries("layers", MOST_LAYERS, read_layer)?;
+        Ok(Stack {
+            id: object.name("id")?,
+            number: object.positive("number")?,
+            url: object.trimmed("url", LINE)?,
+            base: object.name("base")?,
+            layers,
+            cut,
+        })
+    }
+}
+
+fn read_layer(value: &Value) -> Result<Layer, PullRequestError> {
+    let object = Object::of(value, "layer")?;
+    Ok(Layer {
+        number: object.positive("number")?,
+        title: object.optional_text("title", LINE)?,
+        is_draft: object.optional_flag("isDraft")?,
+        head_sha: object.optional_name("headSha")?,
+        head_branch: object.name("headBranch")?,
+        state: object.literal("state", State::of)?,
+    })
 }
 
 fn read_actor(value: &Value) -> Result<Actor, PullRequestError> {
@@ -1157,6 +1400,7 @@ fn read_capabilities(object: &Object) -> Result<Capabilities, PullRequestError> 
             None => false,
         },
         labels: object.optional_flag("labels")?.unwrap_or(false),
+        stacks: object.optional_flag("stacks")?.unwrap_or(false),
     })
 }
 
