@@ -12,5 +12,6 @@ pub mod pull_request;
 pub mod rpc;
 pub mod settings;
 pub mod terminal;
+pub mod terminal_emulator;
 pub mod transcript;
 pub mod tui;
