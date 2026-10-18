@@ -124,6 +124,7 @@ fn files_show_folded_and_each_unfolds_into_its_hunks() {
             "⇊ Expand all files",
             "◫ Split diff view",
             "↵ Disable line wrapping",
+            "⊢ Show file tree",
             "",
             "› A docs/new.md +2 -0",
             "",
@@ -137,7 +138,7 @@ fn files_show_folded_and_each_unfolds_into_its_hunks() {
         ]
     );
     let (_, targets) = laid(&code, 40);
-    let files = [6..7, 8..9, 10..11, 12..13, 14..15]
+    let files = [7..8, 9..10, 11..12, 13..14, 15..16]
         .into_iter()
         .zip((0..5).map(Control::File));
     let folds = [
@@ -145,6 +146,7 @@ fn files_show_folded_and_each_unfolds_into_its_hunks() {
         (2..3, Control::Folds),
         (3..4, Control::Layout),
         (4..5, Control::Wrap),
+        (5..6, Control::Tree),
     ];
     assert_eq!(targets, folds.into_iter().chain(files).collect::<Vec<_>>());
     assert_eq!(code.action(Control::File(0), &[]), "expand file");
@@ -163,6 +165,7 @@ fn files_show_folded_and_each_unfolds_into_its_hunks() {
             "⇈ Collapse all files",
             "◫ Split diff view",
             "↵ Disable line wrapping",
+            "⊢ Show file tree",
             "",
             "⌄ A docs/new.md +2 -0",
             "1 + # New",
@@ -193,9 +196,9 @@ fn files_show_folded_and_each_unfolds_into_its_hunks() {
         ]
     );
     let (_, targets) = laid(&code, 40);
-    assert_eq!(targets[5], (11..12, Control::File(1)));
+    assert_eq!(targets[6], (12..13, Control::File(1)));
     code.act(Control::File(0), &[]);
-    assert_eq!(rows(&code, 40)[6..8], ["› A docs/new.md +2 -0", ""]);
+    assert_eq!(rows(&code, 40)[7..9], ["› A docs/new.md +2 -0", ""]);
 }
 
 #[test]
@@ -330,6 +333,7 @@ fn whitespace_starts_hidden_and_one_row_shows_it() {
             "⇈ Collapse all files",
             "◫ Split diff view",
             "↵ Disable line wrapping",
+            "⊢ Show file tree",
             "",
             "⌄ M notes.md",
             "1   Some    text",
@@ -375,12 +379,13 @@ fn whitespace_starts_hidden_and_one_row_shows_it() {
     );
     let (lines, _) = laid(&code, 40);
     assert_eq!(
-        rows_of(&lines)[1..20],
+        rows_of(&lines)[1..21],
         [
             "¶ Hide whitespace changes",
             "⇈ Collapse all files",
             "◫ Split diff view",
             "↵ Disable line wrapping",
+            "⊢ Show file tree",
             "",
             "⌄ M notes.md +1 -1",
             "1 - Some text",
@@ -431,9 +436,9 @@ fn the_whitespace_shown_stays_through_reads_and_commits() {
     assert_eq!(code.ask(4), Some(None));
     assert_eq!(code.take(4, Ok(slice(raw, None)), 0), Some(true));
     assert_eq!(rows(&code, 40)[1], "¶ Hide whitespace changes");
-    assert_eq!(rows(&code, 40)[6], "› M z +1 -1");
+    assert_eq!(rows(&code, 40)[7], "› M z +1 -1");
     code.act(Control::Whitespace, &[]);
-    assert_eq!(rows(&code, 40)[6], "› M z");
+    assert_eq!(rows(&code, 40)[7], "› M z");
 }
 
 /// A file with an unchanged run before its hunk and a line longer than most rows.
@@ -471,6 +476,7 @@ fn lines_wrap_at_first_and_one_row_lets_them_run_on() {
         "⇈ Collapse all files",
         "◫ Split diff view",
         "↵ Disable line wrapping",
+        "⊢ Show file tree",
         "",
         "⌄ M src/lib.rs +1 -1",
         "⋯ 8 unmodified lines",
@@ -526,6 +532,7 @@ fn lines_wrap_at_first_and_one_row_lets_them_run_on() {
         [
             "◫ Split diff view",
             "↵ Enable line wrapping",
+            "⊢ Show file tree",
             "",
             "⌄ M src/lib.rs +1 -1",
             "⋯ 8 unmodified lines",
@@ -539,11 +546,11 @@ fn lines_wrap_at_first_and_one_row_lets_them_run_on() {
     );
     assert_eq!(targets[3], (4..5, Control::Wrap));
     assert_eq!(color_of(&lines, UNWRAPPED), Some(theme().fg));
-    assert_eq!(lines[10].width(), long.width());
+    assert_eq!(lines[11].width(), long.width());
     assert_eq!(
         slid,
         Sideways {
-            runs: vec![(8..12, 5, None)],
+            runs: vec![(9..13, 5, None)],
             widest: long.width(),
         }
     );
@@ -659,10 +666,10 @@ fn the_lines_left_unwrapped_stay_so_through_reads_and_commits() {
     code.act(Control::File(0), &[]);
     let (lines, _, slid) = sideways(&code, 40);
     assert_eq!(
-        rows_of(&lines)[6..9],
+        rows_of(&lines)[7..10],
         ["⌄ M z +1 -1", "1 - a", "1 + a line longer than its row"]
     );
-    assert_eq!(slid.runs, [(7..9, 4, None)]);
+    assert_eq!(slid.runs, [(8..10, 4, None)]);
     code.act(Control::Wrap, &[]);
     assert_eq!(rows(&code, 40)[4], "↵ Disable line wrapping");
     assert_eq!(sideways(&code, 20).2, Sideways::default());
@@ -738,6 +745,7 @@ fn the_unchanged_lines_before_a_hunk_count_from_the_line_git_names() {
             "⇈ Collapse all files",
             "◫ Split diff view",
             "↵ Disable line wrapping",
+            "⊢ Show file tree",
             "",
             "⌄ M a +2 -2",
             "⋯ 5 unmodified lines",
@@ -758,7 +766,7 @@ fn the_unchanged_lines_before_a_hunk_count_from_the_line_git_names() {
 ";
     let mut code = read(slice(patch, None), 0);
     code.act(Control::File(0), &[]);
-    assert_eq!(rows(&code, 40)[7], "⋯ 1 unmodified line");
+    assert_eq!(rows(&code, 40)[8], "⋯ 1 unmodified line");
 }
 
 #[test]
@@ -815,6 +823,7 @@ fn the_first_slice_is_read_once_and_the_next_as_the_end_comes_near() {
             "⇊ Expand all files",
             "◫ Split diff view",
             "↵ Disable line wrapping",
+            "⊢ Show file tree",
             "",
             "› M one +1 -1",
             "",
@@ -841,6 +850,7 @@ fn the_first_slice_is_read_once_and_the_next_as_the_end_comes_near() {
             "⇊ Expand all files",
             "◫ Split diff view",
             "↵ Disable line wrapping",
+            "⊢ Show file tree",
             "",
             "› M one +1 -1",
             "",
@@ -892,6 +902,7 @@ fn a_failure_says_why_and_a_later_slice_s_offers_retry() {
             "⇊ Expand all files",
             "◫ Split diff view",
             "↵ Disable line wrapping",
+            "⊢ Show file tree",
             "",
             "› M one +1 -1",
             "",
@@ -902,7 +913,7 @@ fn a_failure_says_why_and_a_later_slice_s_offers_retry() {
         ]
     );
     let (_, targets) = laid(&code, 40);
-    assert_eq!(targets[5], (11..12, Control::Retry));
+    assert_eq!(targets[6], (12..13, Control::Retry));
     assert!(code.has(Control::Retry, &[]));
     assert_eq!(code.action(Control::Retry, &[]), "retry");
     code.act(Control::Retry, &[]);
@@ -925,6 +936,7 @@ fn a_failure_says_why_and_a_later_slice_s_offers_retry() {
         "⇊ Expand all files",
         "◫ Split diff view",
         "↵ Disable line wrapping",
+        "⊢ Show file tree",
         "",
         "› M one +1 -1",
     ];
@@ -982,6 +994,7 @@ diff --git a/two b/two
             "⇈ Collapse all files",
             "◫ Split diff view",
             "↵ Disable line wrapping",
+            "⊢ Show file tree",
             "",
             "⌄ M two +1 -1",
             "1 - c",
@@ -1118,6 +1131,7 @@ diff --git a/small b/small
             "⇈ Collapse all files",
             "◫ Split diff view",
             "↵ Disable line wrapping",
+            "⊢ Show file tree",
             "",
             "⌄ M big.json +12,000 -3",
             "The host withheld this file's changes.",
@@ -1164,6 +1178,7 @@ fn an_empty_or_unreadable_diff_says_so() {
             "⇈ Collapse all files",
             "◫ Split diff view",
             "↵ Disable line wrapping",
+            "⊢ Show file tree",
             "",
             "⌄ M a",
             note,
@@ -1224,6 +1239,7 @@ diff --git a/other b/other
             "⇊ Expand all files",
             "◫ Split diff view",
             "↵ Disable line wrapping",
+            "⊢ Show file tree",
             "",
             "› A link +1 -0",
             "",
@@ -1285,7 +1301,7 @@ fn every_row_fits_its_width_and_hostile_text_is_cleaned() {
     code.act(Control::Layout, &[]);
     let split = rows(&code, 32);
     assert_eq!(
-        split[8..13],
+        split[9..14],
         [
             "1       let x =│ 1       let x =",
             "     \"界界界界 │      \"界界界界",
@@ -1294,7 +1310,7 @@ fn every_row_fits_its_width_and_hostile_text_is_cleaned() {
             "    界界\";[2J  │     界界\";[2J",
         ]
     );
-    for row in &split[8..19] {
+    for row in &split[9..20] {
         let (left, _) = row.split_once('│').unwrap();
         assert_eq!(left.width(), 15, "{row:?}");
     }
@@ -1306,7 +1322,8 @@ fn every_row_fits_its_width_and_hostile_text_is_cleaned() {
     assert_eq!(targets[1], (4..6, Control::Folds));
     assert_eq!(targets[2], (6..8, Control::Layout));
     assert_eq!(targets[3], (8..11, Control::Wrap));
-    let (header, _) = &targets[4];
+    assert_eq!(targets[4], (11..13, Control::Tree));
+    let (header, _) = &targets[5];
     assert!(header.len() > 1, "{:?}", rows_of(&lines));
     assert_eq!(rows_of(&lines)[header.start], "⌄ M src/]8;;");
     // A line's rows after its first leave its number and mark blank.
@@ -1478,18 +1495,19 @@ fn review_threads_show_under_their_lines() {
     // The rest show above the files in a list that starts closed: one on a line no hunk has,
     // one on the file, and one on a file not in the diff.
     assert_eq!(
-        rows[1..8],
+        rows[1..9],
         [
             "¶ Show whitespace changes",
             "⇈ Collapse all files",
             "◫ Split diff view",
             "↵ Disable line wrapping",
+            "⊢ Show file tree",
             "",
             "› 3 conversations not on the current",
             "diff"
         ]
     );
-    assert_eq!(targets[4], (6..8, Control::OffDiff));
+    assert_eq!(targets[5], (7..9, Control::OffDiff));
     assert!(code.shows(Control::OffDiff, conversation.threads(), &shown));
     assert!(!code.shows(Control::Thread(4), conversation.threads(), &shown));
     shown.act(Control::OffDiff, &conversation);
@@ -1508,8 +1526,8 @@ fn review_threads_show_under_their_lines() {
     expected.extend([String::new(), "gone.rs".into(), "Line 1".into()]);
     expected.extend(open("Gone."));
     expected.push(String::new());
-    assert_eq!(rows[6..6 + expected.len()], expected);
-    assert_eq!(rows[6 + expected.len()], "› A docs/new.md +2 -0");
+    assert_eq!(rows[7..7 + expected.len()], expected);
+    assert_eq!(rows[7 + expected.len()], "› A docs/new.md +2 -0");
 
     // Opening the resolved thread shows its remark, and closing an open one hides its own.
     shown.act(Control::Thread(7), &conversation);
@@ -1584,6 +1602,7 @@ diff --git a/b b/b
         "⇈ Collapse all files".into(),
         "◫ Split diff view".into(),
         "↵ Disable line wrapping".into(),
+        "⊢ Show file tree".into(),
         String::new(),
         "› 1 conversation not on the current diff".into(),
         String::new(),
@@ -2215,7 +2234,7 @@ fn the_list_of_commits_picks_the_diff_the_tab_reads() {
     assert_eq!(code.take(3, Ok(slice(PATCH, None)), 10), Some(true));
     let (rows, _) = scoped(&code, &conversation, &shown, 40);
     assert_eq!(
-        rows[..8],
+        rows[..9],
         [
             "› Zone · bbbbbbb",
             "5 files",
@@ -2223,6 +2242,7 @@ fn the_list_of_commits_picks_the_diff_the_tab_reads() {
             "⇊ Expand all files",
             "◫ Split diff view",
             "↵ Disable line wrapping",
+            "⊢ Show file tree",
             "",
             "› 1 conversation not on the current diff"
         ]
@@ -2340,13 +2360,14 @@ fn the_list_shows_10_commits_at_a_time_and_a_rebase_takes_it_back_to_all() {
     assert_eq!(code.take(3, Ok(slice(ONE, None)), 10), Some(true));
     let (rows, targets) = scoped(&code, &none, &shown, 40);
     assert_eq!(
-        rows[..7],
+        rows[..8],
         [
             "1 file",
             "¶ Show whitespace changes",
             "⇊ Expand all files",
             "◫ Split diff view",
             "↵ Disable line wrapping",
+            "⊢ Show file tree",
             "",
             "› M a +1 -1"
         ]
@@ -2358,7 +2379,8 @@ fn the_list_shows_10_commits_at_a_time_and_a_rebase_takes_it_back_to_all() {
             (2..3, Control::Folds),
             (3..4, Control::Layout),
             (4..5, Control::Wrap),
-            (6..7, Control::File(0))
+            (5..6, Control::Tree),
+            (7..8, Control::File(0))
         ]
     );
 }
@@ -2499,6 +2521,7 @@ fn the_unchanged_lines_around_hunks_show_a_run_at_a_time() {
         "⇈ Collapse all files",
         "◫ Split diff view",
         "↵ Disable line wrapping",
+        "⊢ Show file tree",
         "",
         "⌄ M f.rs +3 -3",
     ]
@@ -2525,7 +2548,7 @@ fn the_unchanged_lines_around_hunks_show_a_run_at_a_time() {
         .into_iter()
         .map(|(place, row, _)| (place, row))
         .collect();
-    assert_eq!(counted, [(0, 7), (1, 10), (2, 13), (3, 16)]);
+    assert_eq!(counted, [(0, 8), (1, 11), (2, 14), (3, 17)]);
     for place in 0..4 {
         assert!(code.has(Control::Stretch(0, place), &[]), "{place}");
     }
@@ -2541,8 +2564,8 @@ fn the_unchanged_lines_around_hunks_show_a_run_at_a_time() {
     // rows laid out before go.
     code.prepare(80, &theme());
     assert!(!code.act(Control::Stretch(0, 1), &[]));
-    assert_eq!(rows(&code, 80)[10], "⋯ 250 unmodified lines · Reading…");
-    assert_eq!(rows(&code, 80)[7], "⋯ 2 unmodified lines");
+    assert_eq!(rows(&code, 80)[11], "⋯ 250 unmodified lines · Reading…");
+    assert_eq!(rows(&code, 80)[8], "⋯ 2 unmodified lines");
     let asked = code.ask_text(5);
     assert_eq!(
         asked,
@@ -2570,7 +2593,7 @@ fn the_unchanged_lines_around_hunks_show_a_run_at_a_time() {
         .into_iter()
         .map(|(place, row, _)| (place, row))
         .collect();
-    assert_eq!(counted, [(0, 7), (1, 110), (3, 216)]);
+    assert_eq!(counted, [(0, 8), (1, 111), (3, 217)]);
 
     // Before the first hunk, the lines nearest it show, and after the last, those nearest it.
     // With the text read, Enter shows them at once.
@@ -2578,7 +2601,7 @@ fn the_unchanged_lines_around_hunks_show_a_run_at_a_time() {
     code.act(Control::Stretch(0, 0), &[]);
     assert_eq!(code.ask_text(7), None);
     let rows_now = rows(&code, 80);
-    assert_eq!(rows_now[7..10], ["  1   l1", "  2   l2", "  3 - o3"]);
+    assert_eq!(rows_now[8..11], ["  1   l1", "  2   l2", "  3 - o3"]);
     assert!(!code.has(Control::Stretch(0, 0), &[]));
     code.prepare(80, &theme());
     code.act(Control::Stretch(0, 3), &[]);
@@ -2611,7 +2634,7 @@ fn the_unchanged_lines_around_hunks_show_a_run_at_a_time() {
     code.act(Control::File(0), &[]);
     assert!(!code.has(Control::Stretch(0, 1), &[]));
     code.act(Control::File(0), &[]);
-    assert_eq!(rows(&code, 80).len(), 7 + 403);
+    assert_eq!(rows(&code, 80).len(), 8 + 403);
 }
 
 #[test]
@@ -2669,10 +2692,10 @@ fn a_failed_read_says_why_and_enter_reads_again() {
         rows_now.last().unwrap(),
         "⋯ More unchanged context may be available"
     );
-    assert_eq!(rows_now[10], "⋯ 250 unmodified lines · Reading…");
+    assert_eq!(rows_now[11], "⋯ 250 unmodified lines · Reading…");
     assert!(code.ask_text(3).is_some());
     assert!(code.take_text(3, text(numbered(400))));
-    assert_eq!(rows(&code, 80)[110], "⋯ 50 unmodified lines");
+    assert_eq!(rows(&code, 80)[111], "⋯ 50 unmodified lines");
 }
 
 #[test]
@@ -2684,9 +2707,9 @@ fn text_that_doesnt_match_the_diff_shows_nothing_of_it() {
         assert!(code.ask_text(2).is_some());
         assert!(code.take_text(2, text(new)));
         let rows_now = rows(&code, 80);
-        let failed = rows_now[11].starts_with("This file's text doesn't match");
+        let failed = rows_now[12].starts_with("This file's text doesn't match");
         if failed {
-            assert_eq!(rows_now[10], "⋯ 250 unmodified lines");
+            assert_eq!(rows_now[11], "⋯ 250 unmodified lines");
         }
         failed
     };
@@ -2719,6 +2742,7 @@ fn text_that_doesnt_match_the_diff_shows_nothing_of_it() {
             "⇈ Collapse all files",
             "◫ Split diff view",
             "↵ Disable line wrapping",
+            "⊢ Show file tree",
             "",
             "⌄ M g +0 -2",
             "⋯ 2 unmodified lines",
@@ -2731,11 +2755,11 @@ fn text_that_doesnt_match_the_diff_shows_nothing_of_it() {
     assert!(code.ask_text(2).is_some());
     assert!(code.take_text(2, text("a\nb\n".into())));
     assert_eq!(
-        rows(&code, 80)[7..],
+        rows(&code, 80)[8..],
         ["⋯ 2 unmodified lines", "3 - x", "4 - y"]
     );
     code.act(Control::Stretch(0, 0), &[]);
-    assert_eq!(rows(&code, 80)[7..9], ["1   a", "2   b"]);
+    assert_eq!(rows(&code, 80)[8..10], ["1   a", "2   b"]);
     assert!(fits("a\n", removal, &patch::Patch::read(removal).files[0]).is_none());
 }
 
@@ -2849,7 +2873,7 @@ fn the_text_stays_while_the_hunks_do_and_goes_with_another_diff() {
         code.act(Control::Stretch(0, 1), &[]);
         assert!(code.ask_text(ticket).is_some());
         assert!(code.take_text(ticket, text(numbered(400))));
-        assert_eq!(rows(code, 80)[110], "⋯ 50 unmodified lines");
+        assert_eq!(rows(code, 80)[111], "⋯ 50 unmodified lines");
     };
     let mut code = read(slice(STRETCHED, None), 0);
     code.act(Control::File(0), &[]);
@@ -2859,14 +2883,14 @@ fn the_text_stays_while_the_hunks_do_and_goes_with_another_diff() {
     code.again();
     assert_eq!(code.ask(3), Some(None));
     assert_eq!(code.take(3, Ok(slice(STRETCHED, None)), 1), Some(true));
-    assert_eq!(rows(&code, 80)[110], "⋯ 50 unmodified lines");
+    assert_eq!(rows(&code, 80)[111], "⋯ 50 unmodified lines");
 
     // A change to a hunk takes the file back to its rows before the text came.
     let changed = STRETCHED.replace("-o256", "-p256");
     code.again();
     assert_eq!(code.ask(4), Some(None));
     assert_eq!(code.take(4, Ok(slice(&changed, None)), 2), Some(true));
-    assert_eq!(rows(&code, 80)[10], "⋯ 250 unmodified lines");
+    assert_eq!(rows(&code, 80)[11], "⋯ 250 unmodified lines");
     shown_after_read(&mut code, 5);
 
     // A file the first slice of a read again doesn't have keeps its text while slices are
@@ -2893,7 +2917,7 @@ fn the_text_stays_while_the_hunks_do_and_goes_with_another_diff() {
     code.again();
     assert_eq!(code.ask(9), Some(None));
     assert_eq!(code.take(9, Ok(slice(&changed, None)), 5), Some(true));
-    assert_eq!(rows(&code, 80)[10], "⋯ 250 unmodified lines");
+    assert_eq!(rows(&code, 80)[11], "⋯ 250 unmodified lines");
 
     // An answer for a file the diff no longer shows is dropped.
     code.act(Control::Stretch(0, 1), &[]);
@@ -2912,7 +2936,7 @@ fn the_text_stays_while_the_hunks_do_and_goes_with_another_diff() {
     assert_eq!(code.ask(3), Some(None));
     assert_eq!(code.take(3, Ok(slice(STRETCHED, None)), 1), Some(true));
     code.act(Control::File(0), &[]);
-    assert_eq!(rows(&code, 80)[10], "⋯ 250 unmodified lines");
+    assert_eq!(rows(&code, 80)[11], "⋯ 250 unmodified lines");
 }
 
 #[test]
@@ -2930,7 +2954,7 @@ fn a_files_text_goes_when_its_hunks_or_paths_change() {
     };
     let unread = |code: &Code, before: &str, between: &str| {
         let rows_now = rows(code, 80);
-        assert_eq!(rows_now[7], before, "{rows_now:#?}");
+        assert_eq!(rows_now[8], before, "{rows_now:#?}");
         assert!(rows_now.contains(&between.to_string()), "{rows_now:#?}");
         assert!(
             !rows_now.iter().any(|row| row.ends_with("   l4")),
@@ -3006,10 +3030,10 @@ fn a_run_shows_the_lines_nearest_its_hunk_and_widens_the_numbers() {
     assert!(code.ask_text(2).is_some());
     assert!(code.take_text(2, text(numbered(260))));
     let rows_now = rows(&code, 80);
-    assert_eq!(rows_now[7], "⋯ 150 unmodified lines");
-    assert_eq!(rows_now[8..108], unchanged(151..=250, 3));
+    assert_eq!(rows_now[8], "⋯ 150 unmodified lines");
+    assert_eq!(rows_now[9..109], unchanged(151..=250, 3));
     assert_eq!(
-        rows_now[108..],
+        rows_now[109..],
         ["251 - o251", "251 + l251", "⋯ 9 unmodified lines"]
     );
 
@@ -3017,16 +3041,16 @@ fn a_run_shows_the_lines_nearest_its_hunk_and_widens_the_numbers() {
     let early = "diff --git a/g.rs b/g.rs\n--- a/g.rs\n+++ b/g.rs\n@@ -98 +98 @@\n-o98\n+l98\n";
     let mut code = read(slice(early, None), 0);
     code.act(Control::File(0), &[]);
-    assert_eq!(rows(&code, 80)[8..10], ["98 - o98", "98 + l98"]);
+    assert_eq!(rows(&code, 80)[9..11], ["98 - o98", "98 + l98"]);
     code.act(Control::Stretch(0, 1), &[]);
     assert!(code.ask_text(2).is_some());
     assert!(code.take_text(2, text(numbered(150))));
     let rows_now = rows(&code, 80);
     assert_eq!(
-        rows_now[7..10],
+        rows_now[8..11],
         ["⋯ 97 unmodified lines", " 98 - o98", " 98 + l98"]
     );
-    assert_eq!(rows_now[10..], unchanged(99..=150, 3));
+    assert_eq!(rows_now[11..], unchanged(99..=150, 3));
 }
 
 #[test]
@@ -3216,6 +3240,7 @@ fn the_count_and_each_header_say_which_files_are_viewed() {
         "⇊ Expand all files",
         "◫ Split diff view",
         "↵ Disable line wrapping",
+        "⊢ Show file tree",
         "",
         "› A docs/new.md +2 -0",
         "",
@@ -3252,7 +3277,7 @@ fn the_count_and_each_header_say_which_files_are_viewed() {
 
     // An unfolded file keeps its mark, and the count counts the slices read so far.
     code.act(Control::File(3), &[]);
-    assert_eq!(kept(&code, host, 60)[12], "⌄ M src/lib.rs +2 -1 · ✓ Viewed");
+    assert_eq!(kept(&code, host, 60)[13], "⌄ M src/lib.rs +2 -1 · ✓ Viewed");
     let mut more = read(slice(PATCH, Some("2")), 0);
     assert!(more.ask_viewed(2));
     assert!(more.take_viewed(2, marks(&[("old.txt", Viewed)], false, false), 0));
@@ -3303,13 +3328,14 @@ fn the_marks_keep_through_a_commits_diff_and_a_failure() {
     let answer = marks(&[("src/lib.rs", Viewed)], false, false);
     assert!(code.take_viewed(3, answer, 0));
     assert_eq!(
-        kept(&code, host, 60)[..6],
+        kept(&code, host, 60)[..7],
         [
             "5 files · 1 / 5 viewed",
             "¶ Show whitespace changes",
             "⇊ Expand all files",
             "◫ Split diff view",
             "↵ Disable line wrapping",
+            "⊢ Show file tree",
             ""
         ]
     );
@@ -3356,7 +3382,7 @@ fn a_short_read_of_the_marks_says_the_count_is_short() {
     assert!(code.ask_viewed(2));
     assert!(code.take_viewed(2, marks(&[], true, false), 0));
     assert_eq!(
-        kept(&code, host, 60)[..7],
+        kept(&code, host, 60)[..8],
         [
             "5 files · 0 / 5 viewed",
             "This change has more files than the host reports viewed",
@@ -3365,6 +3391,7 @@ fn a_short_read_of_the_marks_says_the_count_is_short() {
             "⇊ Expand all files",
             "◫ Split diff view",
             "↵ Disable line wrapping",
+            "⊢ Show file tree",
         ]
     );
     let lines = kept_lines(&code, host, 60);
@@ -3436,6 +3463,26 @@ fn the_marks_are_read_once_at_a_time_and_again_when_stale() {
 }
 
 #[test]
+fn a_header_of_wide_characters_fits_every_width() {
+    let patch =
+        "diff --git a/漢字漢字 b/漢字漢字\n--- a/漢字漢字\n+++ b/漢字漢字\n@@ -1 +1 @@\n-a\n+b\n";
+    let code = read(slice(patch, None), 0);
+    for width in 1..=40 {
+        for row in rows(&code, width) {
+            assert!(row.width() <= width, "{width}: {row:?}");
+        }
+    }
+    // A path with two columns past its lead wraps a character to a row, and with one, a wide
+    // character shows as `…`.
+    let narrow = rows(&code, 6);
+    let at = narrow.iter().position(|row| row == "› M 漢").unwrap();
+    assert_eq!(narrow[at..], ["› M 漢", "    字", "    漢", "    字"]);
+    let narrow = rows(&code, 5);
+    let at = narrow.iter().position(|row| row == "› M …").unwrap();
+    assert_eq!(narrow[at..], ["› M …", "    …", "    …", "    …"]);
+}
+
+#[test]
 fn a_header_with_a_mark_fits_every_width() {
     use ViewedState::{Dismissed, Viewed};
     let host = Some(ViewedFilesStore::Host);
@@ -3472,7 +3519,7 @@ diff --git a/b.rs b/b.rs
     // Where the counts and the mark don't fit after the path, each takes a row of its own,
     // and a mark too long for one is cut.
     assert_eq!(
-        kept(&code, host, 24)[10..14],
+        kept(&code, host, 24)[11..15],
         [
             "› M src/a/rather/long/pa",
             "    th/to/a/file.rs",
@@ -3530,7 +3577,7 @@ fn lines_stack_at_first_and_one_row_sets_them_side_by_side() {
     let shown = rows_of(&lines);
     assert_eq!(shown[3], "◫ Split diff view");
     assert_eq!(
-        shown[8..13],
+        shown[9..14],
         [
             " 9   fn keep() {}",
             "10 - let a = 1;",
@@ -3557,6 +3604,7 @@ fn lines_stack_at_first_and_one_row_sets_them_side_by_side() {
         "⇈ Collapse all files",
         "⊟ Stacked diff view",
         "↵ Disable line wrapping",
+        "⊢ Show file tree",
         "",
         "⌄ M src/lib.rs +3 -4",
         "⋯ 8 unmodified lines",
@@ -3583,12 +3631,15 @@ fn lines_stack_at_first_and_one_row_sets_them_side_by_side() {
     code.prepare(40, &theme());
     assert_eq!(code.builds, builds + 1);
     // The column between the sides is muted, and each side keeps its colors.
-    assert_eq!(color_of(&lines[9..10], BETWEEN), Some(theme().muted));
+    assert_eq!(color_of(&lines[10..11], BETWEEN), Some(theme().muted));
     assert_eq!(
-        color_of(&lines[9..10], "let a = 1;"),
+        color_of(&lines[10..11], "let a = 1;"),
         Some(theme().error_fg)
     );
-    assert_eq!(color_of(&lines[9..10], "let b = 2;"), Some(theme().success));
+    assert_eq!(
+        color_of(&lines[10..11], "let b = 2;"),
+        Some(theme().success)
+    );
 
     // The patch lists the run changed as `-a +b -c -d +long`, and shown as it is, the run
     // pairs its lines the same way, as pierre takes any lines removed and added in a row as
@@ -3603,25 +3654,25 @@ fn lines_stack_at_first_and_one_row_sets_them_side_by_side() {
     // column goes to the right side.
     let numbered = rows(&code, 28);
     assert_eq!(
-        numbered[10..12],
+        numbered[11..13],
         ["10 - let a = │ 10 + let b =", "     1;      │      2;"]
     );
     let narrow = rows(&code, 27);
     assert_eq!(
-        narrow[10..12],
+        narrow[11..13],
         ["-let a = 1; │ +let b = 2;", "-let c = 3; │ +let long = \""]
     );
     let narrow = rows(&code, 26);
     assert_eq!(
-        narrow[10..12],
+        narrow[11..13],
         ["-let a = 1; │ +let b = 2;", "-let c = 3; │ +let long ="]
     );
     // A row too narrow for two sides with a column of text each shows the lines one under the
     // other.
-    assert_eq!(rows(&code, 6)[41..44], ["-l│ +l", " e│  e", " t│  t"]);
+    assert_eq!(rows(&code, 6)[44..47], ["-l│ +l", " e│  e", " t│  t"]);
     let one_under_the_other = rows(&code, 5);
     assert!(one_under_the_other.iter().all(|row| !row.contains('│')));
-    assert_eq!(one_under_the_other[42..45], ["-let", " a =", " 1;"]);
+    assert_eq!(one_under_the_other[46..49], ["-let", " a =", " 1;"]);
 
     // Stacked again, the rows are as before.
     code.act(Control::Layout, &[]);
@@ -3672,24 +3723,24 @@ fn threads_show_under_the_row_side_by_side_that_has_their_line() {
             format!("│   {text}"),
         ]
     };
-    assert_eq!(rows[10], "11 - let c = 3;    │ 11 + let long = \"a");
-    assert_eq!(rows[14], "                   │      ;");
-    assert_eq!(rows[15..18], card("Why c?"));
-    assert_eq!(rows[18], "");
-    assert_eq!(rows[19..22], card("Too long."));
-    assert_eq!(rows[22], "12 - let d = 4;    │");
-    assert_eq!(rows[23..26], card("Why d?"));
-    assert_eq!(rows[26], "13   fn end() {}   │ 12   fn end() {}");
-    assert_eq!(rows[27..30], card("Ends here."));
+    assert_eq!(rows[11], "11 - let c = 3;    │ 11 + let long = \"a");
+    assert_eq!(rows[15], "                   │      ;");
+    assert_eq!(rows[16..19], card("Why c?"));
+    assert_eq!(rows[19], "");
+    assert_eq!(rows[20..23], card("Too long."));
+    assert_eq!(rows[23], "12 - let d = 4;    │");
+    assert_eq!(rows[24..27], card("Why d?"));
+    assert_eq!(rows[27], "13   fn end() {}   │ 12   fn end() {}");
+    assert_eq!(rows[28..31], card("Ends here."));
     assert_eq!(
-        rows[30..33],
+        rows[31..34],
         [
             "14 - last          │ 13 + final",
             "     No newline at │",
             "     end of file   │"
         ]
     );
-    assert_eq!(rows[33..36], card("Last one."));
+    assert_eq!(rows[34..37], card("Last one."));
     let threads: Vec<_> = targets
         .iter()
         .filter(|(_, control)| matches!(control, Control::Thread(_)))
@@ -3698,11 +3749,11 @@ fn threads_show_under_the_row_side_by_side_that_has_their_line() {
     assert_eq!(
         threads,
         [
-            (15..16, Control::Thread(1)),
-            (19..20, Control::Thread(0)),
-            (23..24, Control::Thread(2)),
-            (27..28, Control::Thread(3)),
-            (33..34, Control::Thread(4)),
+            (16..17, Control::Thread(1)),
+            (20..21, Control::Thread(0)),
+            (24..25, Control::Thread(2)),
+            (28..29, Control::Thread(3)),
+            (34..35, Control::Thread(4)),
         ]
     );
 
@@ -3720,17 +3771,17 @@ fn threads_show_under_the_row_side_by_side_that_has_their_line() {
     );
     let rows = rows_of(&lines);
     assert_eq!(
-        rows[10],
+        rows[11],
         "11 - let c = 3;    │ 11 + let long = \"a line that runs on well past forty columns\";"
     );
-    assert_eq!(rows[11], "│ ⌄ Open · 1 comment");
+    assert_eq!(rows[12], "│ ⌄ Open · 1 comment");
     assert_eq!(
         slid.runs,
         [
-            (8..11, 5, Some(19)),
-            (18..19, 5, Some(19)),
-            (22..23, 5, Some(19)),
-            (26..28, 5, Some(19))
+            (9..12, 5, Some(19)),
+            (19..20, 5, Some(19)),
+            (23..24, 5, Some(19)),
+            (27..29, 5, Some(19))
         ]
     );
 }
@@ -3769,6 +3820,7 @@ fn unchanged_lines_side_by_side_show_their_number_on_each_side() {
         "⇈ Collapse all files",
         "⊟ Stacked diff view",
         "↵ Disable line wrapping",
+        "⊢ Show file tree",
         "",
         "⌄ M f.rs +3 -2",
     ]
@@ -3791,7 +3843,7 @@ fn unchanged_lines_side_by_side_show_their_number_on_each_side() {
     // room of the side whose text runs on.
     code.act(Control::Wrap, &[]);
     let slid = sideways(&code, 40).2;
-    assert_eq!(slid.runs, [(7..21, 5, Some(19))]);
+    assert_eq!(slid.runs, [(8..22, 5, Some(19))]);
     assert_eq!(slid.widest, "13   l14".width() + BETWEEN.width() + 19);
 }
 
@@ -3827,7 +3879,7 @@ fn the_numbers_side_by_side_fit_an_unchanged_line_s_old_place() {
         format!("{old:>2}   {:<14}│ {new:>2}   l{new}", format!("l{new}"))
     });
     assert_eq!(
-        rows(&code, 40)[7..],
+        rows(&code, 40)[8..],
         removed.chain(kept).collect::<Vec<_>>()
     );
     // Stacked, an unchanged line shows only its number after the change.
@@ -3835,7 +3887,7 @@ fn the_numbers_side_by_side_fit_an_unchanged_line_s_old_place() {
     let removed = (1..=5).map(|old| format!("{old} - o{old}"));
     let kept = (1..=5).map(|new| format!("{new}   l{new}"));
     assert_eq!(
-        rows(&code, 40)[7..],
+        rows(&code, 40)[8..],
         removed.chain(kept).collect::<Vec<_>>()
     );
 }
@@ -3849,7 +3901,7 @@ fn only_a_file_added_or_deleted_keeps_one_column_side_by_side() {
     // pierre shows them.
     let shown = rows(&code, 50);
     assert_eq!(
-        shown[6..18],
+        shown[7..19],
         [
             "⌄ A docs/new.md +2 -0",
             "1 + # New",
@@ -3866,7 +3918,7 @@ fn only_a_file_added_or_deleted_keeps_one_column_side_by_side() {
         ]
     );
     assert_eq!(
-        shown[18..],
+        shown[19..],
         [
             "⌄ M src/lib.rs +2 -1",
             " 1   use std::fmt;      │  1   use std::fmt;",
@@ -3889,10 +3941,10 @@ fn only_a_file_added_or_deleted_keeps_one_column_side_by_side() {
     assert_eq!(
         slid.runs,
         [
-            (7..10, 4, None),
-            (16..17, 4, None),
-            (19..22, 5, Some(24)),
-            (23..26, 5, Some(24))
+            (8..11, 4, None),
+            (17..18, 4, None),
+            (20..23, 5, Some(24)),
+            (24..27, 5, Some(24))
         ]
     );
     assert_eq!(
@@ -3915,7 +3967,7 @@ rename to new.rs
     code.act(Control::Folds, &[]);
     code.act(Control::Layout, &[]);
     assert_eq!(
-        rows(&code, 40)[6..8],
+        rows(&code, 40)[7..9],
         ["⌄ R old.rs → new.rs +1 -1", "1 - a              │ 1 + b"]
     );
 }
@@ -3948,11 +4000,11 @@ fn the_lines_side_by_side_stay_so_through_reads_and_commits() {
     assert_eq!(rows(&code, 40)[3], "⊟ Stacked diff view");
     code.act(Control::File(0), &[]);
     assert_eq!(
-        rows(&code, 40)[6..8],
+        rows(&code, 40)[7..9],
         ["⌄ M z +1 -1", "1 - a              │ 1 + b"]
     );
     code.act(Control::Layout, &[]);
-    assert_eq!(rows(&code, 40)[6..9], ["⌄ M z +1 -1", "1 - a", "1 + b"]);
+    assert_eq!(rows(&code, 40)[7..10], ["⌄ M z +1 -1", "1 - a", "1 + b"]);
 }
 
 #[test]
@@ -3980,7 +4032,7 @@ diff --git a/b.rs b/b.rs
     // side's, as pierre reads it.
     let shown = rows(&code, 40);
     assert_eq!(
-        shown[7..11],
+        shown[8..12],
         [
             "1 - x              │ 1 + y",
             "2   end            │ 2   end",
@@ -3989,7 +4041,7 @@ diff --git a/b.rs b/b.rs
         ]
     );
     assert_eq!(
-        shown[15..18],
+        shown[16..19],
         [
             "1 - x              │ 1 + y",
             "                   │     No newline at e",
@@ -4012,7 +4064,7 @@ fn the_side_whose_text_runs_furthest_sets_how_far_the_rows_scroll() {
     code.act(Control::Layout, &[]);
     // At 41 columns, the right side takes the column the two can't share.
     assert_eq!(
-        rows(&code, 41)[7..11],
+        rows(&code, 41)[8..12],
         [
             "1 - a line removed │ 1 + short",
             "    that runs on we│",
@@ -4026,7 +4078,460 @@ fn the_side_whose_text_runs_furthest_sets_how_far_the_rows_scroll() {
     code.act(Control::Wrap, &[]);
     let (lines, _, slid) = sideways(&code, 41);
     let long = "1 - a line removed that runs on well past its side";
-    assert_eq!(rows_of(&lines)[7], format!("{long}│ 1 + short"));
-    assert_eq!(slid.runs, [(7..8, 4, Some(19))]);
+    assert_eq!(rows_of(&lines)[8], format!("{long}│ 1 + short"));
+    assert_eq!(slid.runs, [(8..9, 4, Some(19))]);
     assert_eq!(slid.widest, long.width() + BETWEEN.width() + 20);
+}
+
+/// A later slice that adds a file to PATCH's `docs` folder.
+const MORE_DOCS: &str = "diff --git a/docs/more.md b/docs/more.md
+new file mode 100644
+--- /dev/null
++++ b/docs/more.md
+@@ -0,0 +1 @@
++more
+";
+
+/// The file tree's rows: from its count to the row before the files.
+fn tree_of(code: &Code) -> Vec<String> {
+    let rows = rows(code, 40);
+    let start = rows.iter().position(|row| row.starts_with("Files · "));
+    let rows = rows.into_iter().skip(start.expect("the tree"));
+    rows.take_while(|row| !row.is_empty()).collect()
+}
+
+#[test]
+fn a_row_shows_the_files_in_a_tree_of_their_folders() {
+    // No row shows before a slice, or with no files.
+    assert!(!Code::new().has(Control::Tree, &[]));
+    for empty in [slice("", None), slice("", Some("2"))] {
+        let code = read(empty, 0);
+        assert!(!code.has(Control::Tree, &[]));
+        assert!(!rows(&code, 40).contains(&TREE_HIDDEN.to_string()));
+    }
+    let mut code = read(slice(PATCH, Some("2")), 0);
+    let (lines, targets) = laid(&code, 40);
+    assert_eq!(rows_of(&lines)[5..7], [TREE_HIDDEN, ""]);
+    assert_eq!(targets[4], (5..6, Control::Tree));
+    assert_eq!(color_of(&lines, TREE_HIDDEN), Some(theme().fg));
+    assert_eq!(code.action(Control::Tree, &[]), "show file tree");
+    let tree = [
+        Control::Folders,
+        Control::Folder(0, 1),
+        Control::TreeFile(0),
+        Control::MoreFiles,
+    ];
+    for control in tree {
+        assert!(!code.has(control, &[]), "{control:?}");
+    }
+
+    // Shown, each folder comes before what it holds, and in the place of its first file, so
+    // the rows keep the order the files show in. A folder's files are indented under it. Then
+    // a row reads the next slice.
+    code.prepare(40, &theme());
+    let builds = code.builds;
+    assert!(!code.act(Control::Tree, &[]));
+    let (lines, targets) = laid(&code, 40);
+    assert_eq!(
+        rows_of(&lines)[5..18],
+        [
+            TREE_SHOWN,
+            "",
+            "Files · 5",
+            FOLDERS_OPEN,
+            "⌄ docs",
+            "  A new.md",
+            "M logo.png",
+            "D old.txt",
+            "⌄ src",
+            "  M lib.rs",
+            "R to.rs",
+            MORE_FILES,
+            "",
+        ]
+    );
+    assert_eq!(
+        targets[4..14],
+        [
+            (5..6, Control::Tree),
+            (8..9, Control::Folders),
+            (9..10, Control::Folder(0, 1)),
+            (10..11, Control::TreeFile(0)),
+            (11..12, Control::TreeFile(1)),
+            (12..13, Control::TreeFile(2)),
+            (13..14, Control::Folder(3, 1)),
+            (14..15, Control::TreeFile(3)),
+            (15..16, Control::TreeFile(4)),
+            (16..17, Control::MoreFiles),
+        ]
+    );
+    assert_eq!(targets[14], (18..19, Control::File(0)));
+    // The files' rows stay as they were.
+    code.prepare(40, &theme());
+    assert_eq!(code.builds, builds);
+    let theme = theme();
+    assert_eq!(color_of(&lines[7..8], "Files"), Some(theme.fg));
+    assert_eq!(color_of(&lines[7..8], "5"), Some(theme.muted));
+    assert_eq!(color_of(&lines, FOLDERS_OPEN), Some(theme.fg));
+    assert_eq!(color_of(&lines, "docs"), Some(theme.fg));
+    assert_eq!(color_of(&lines, "new.md"), Some(theme.success));
+    assert_eq!(color_of(&lines, MORE_FILES), Some(theme.fg));
+    for (control, action) in [
+        (Control::Tree, "hide file tree"),
+        (Control::Folders, "collapse all folders"),
+        (Control::Folder(0, 1), "collapse folder"),
+        (Control::TreeFile(4), "go to file"),
+        (Control::MoreFiles, "load more files"),
+    ] {
+        assert!(code.has(control, &[]), "{control:?}");
+        assert_eq!(code.action(control, &[]), action);
+    }
+    for control in [
+        Control::Folder(0, 2),
+        Control::Folder(1, 1),
+        Control::TreeFile(5),
+    ] {
+        assert!(!code.has(control, &[]), "{control:?}");
+    }
+
+    // A tree of files at the root alone has no row for its folders.
+    let mut flat = read(slice(ONE, None), 0);
+    flat.act(Control::Tree, &[]);
+    assert_eq!(tree_of(&flat), ["Files · 1", "M a"]);
+    assert!(!flat.has(Control::Folders, &[]));
+
+    // Hidden again, nothing of it shows.
+    code.act(Control::Tree, &[]);
+    assert_eq!(
+        rows(&code, 40)[5..8],
+        [TREE_HIDDEN, "", "› A docs/new.md +2 -0"]
+    );
+    for control in tree {
+        assert!(!code.has(control, &[]), "{control:?}");
+    }
+}
+
+#[test]
+fn a_folder_s_row_closes_it_and_one_row_closes_or_opens_them_all() {
+    let mut code = read(slice(PATCH, Some("2")), 0);
+    code.act(Control::Tree, &[]);
+    let open = tree_of(&code);
+    assert!(!code.act(Control::Folder(0, 1), &[]));
+    assert_eq!(
+        tree_of(&code),
+        [
+            "Files · 5",
+            FOLDERS_FOLDED,
+            "› docs",
+            "M logo.png",
+            "D old.txt",
+            "⌄ src",
+            "  M lib.rs",
+            "R to.rs",
+            MORE_FILES,
+        ]
+    );
+    assert_eq!(code.action(Control::Folder(0, 1), &[]), "expand folder");
+    assert_eq!(code.action(Control::Folders, &[]), "expand all folders");
+    assert!(!code.has(Control::TreeFile(0), &[]));
+    // While a folder is closed, the row opens them all, and while all are open, it closes
+    // them all.
+    code.act(Control::Folders, &[]);
+    assert_eq!(tree_of(&code), open);
+    code.act(Control::Folders, &[]);
+    let closed = [
+        "Files · 5",
+        FOLDERS_FOLDED,
+        "› docs",
+        "M logo.png",
+        "D old.txt",
+        "› src",
+        "R to.rs",
+        MORE_FILES,
+    ];
+    assert_eq!(tree_of(&code), closed);
+    code.act(Control::Folder(3, 1), &[]);
+    assert_eq!(tree_of(&code)[5..7], ["⌄ src", "  M lib.rs"]);
+    assert_eq!(tree_of(&code)[1], FOLDERS_FOLDED);
+    code.act(Control::Folder(0, 1), &[]);
+    assert_eq!(tree_of(&code), open);
+
+    // A later slice keeps them as they were, and a folder's row stays its own as the slice
+    // adds to it.
+    code.act(Control::Folder(0, 1), &[]);
+    code.near_end();
+    assert_eq!(code.ask(2), Some(Some("2".into())));
+    assert_eq!(code.take(2, Ok(slice(MORE_DOCS, None)), 0), Some(false));
+    assert_eq!(
+        tree_of(&code)[..4],
+        ["Files · 6", FOLDERS_FOLDED, "› docs", "M logo.png"]
+    );
+    code.act(Control::Folder(0, 1), &[]);
+    assert_eq!(
+        tree_of(&code)[2..5],
+        ["⌄ docs", "  A new.md", "  A more.md"]
+    );
+
+    // A read again keeps them too, where the tree hidden or another diff opens them all.
+    code.act(Control::Folder(0, 1), &[]);
+    code.again();
+    assert_eq!(code.ask(3), Some(None));
+    assert_eq!(code.take(3, Ok(slice(PATCH, None)), 0), Some(true));
+    assert_eq!(tree_of(&code)[2], "› docs");
+    code.act(Control::Tree, &[]);
+    code.act(Control::Tree, &[]);
+    assert_eq!(tree_of(&code)[2], "⌄ docs");
+    code.act(Control::Folder(0, 1), &[]);
+    assert!(code.show("abc1234".into()));
+    assert_eq!(code.ask(4), Some(None));
+    assert_eq!(code.take(4, Ok(slice(PATCH, None)), 0), Some(true));
+    assert_eq!(tree_of(&code)[2], "⌄ docs");
+}
+
+#[test]
+fn a_file_s_row_unfolds_it_and_leaves_one_unfolded_so() {
+    let mut code = read(slice(PATCH, None), 0);
+    code.act(Control::Tree, &[]);
+    assert!(!code.act(Control::TreeFile(3), &[]));
+    let shown = rows(&code, 40);
+    assert!(shown.contains(&"⌄ M src/lib.rs +2 -1".to_string()));
+    assert!(shown.contains(&"› M logo.png".to_string()));
+    // Again, it stays unfolded, as the desktop opens a file it reveals and leaves one open.
+    code.act(Control::TreeFile(3), &[]);
+    assert!(rows(&code, 40).contains(&"⌄ M src/lib.rs +2 -1".to_string()));
+    code.act(Control::Folds, &[]);
+    code.act(Control::Folds, &[]);
+    assert!(rows(&code, 40).contains(&"⌄ M logo.png".to_string()));
+    code.act(Control::TreeFile(1), &[]);
+    assert!(rows(&code, 40).contains(&"⌄ M logo.png".to_string()));
+    // A file the reader folded unfolds again.
+    code.act(Control::File(1), &[]);
+    code.act(Control::TreeFile(1), &[]);
+    assert!(rows(&code, 40).contains(&"⌄ M logo.png".to_string()));
+}
+
+#[test]
+fn the_tree_ends_with_a_row_that_reads_the_next_slice_or_reads_it_again() {
+    let mut code = read(slice(PATCH, Some("2")), 0);
+    code.act(Control::Tree, &[]);
+    let last = |code: &Code| tree_of(code).last().cloned().unwrap();
+    assert_eq!(last(&code), MORE_FILES);
+    assert!(!code.act(Control::MoreFiles, &[]));
+    assert!(code.due());
+    // While the slice is to be read and while it is read, the row says so and does nothing.
+    for asked in [false, true] {
+        let (lines, targets) = laid(&code, 40);
+        assert_eq!(rows_of(&lines)[16], LOADING_MORE);
+        assert_eq!(color_of(&lines[16..17], LOADING_MORE), Some(theme().muted));
+        assert!(!targets.iter().any(|(_, c)| *c == Control::MoreFiles));
+        assert!(!code.has(Control::MoreFiles, &[]));
+        if !asked {
+            assert_eq!(code.ask(2), Some(Some("2".into())));
+        }
+    }
+    // A failure offers to read it again, as the files' own row does.
+    assert_eq!(code.take(2, Err("T3 timed out.".into()), 0), Some(false));
+    assert_eq!(last(&code), "↻ Retry");
+    assert!(code.has(Control::MoreFiles, &[]));
+    assert_eq!(code.action(Control::MoreFiles, &[]), "retry");
+    code.act(Control::MoreFiles, &[]);
+    assert_eq!(code.ask(3), Some(Some("2".into())));
+    // Once every slice came, the tree ends with its files.
+    assert_eq!(code.take(3, Ok(slice(MORE_DOCS, None)), 0), Some(false));
+    assert_eq!(last(&code), "R to.rs");
+    assert!(!code.has(Control::MoreFiles, &[]));
+    code.act(Control::MoreFiles, &[]);
+    assert_eq!(code.ask(4), None);
+
+    // While the diff is read again after a failure, the row still offers to read the slice
+    // again, as the files' own row does.
+    let mut code = read(slice(PATCH, Some("2")), 0);
+    code.act(Control::Tree, &[]);
+    code.near_end();
+    assert_eq!(code.ask(2), Some(Some("2".into())));
+    assert_eq!(code.take(2, Err("T3 timed out.".into()), 0), Some(false));
+    code.again();
+    assert_eq!(code.ask(3), Some(None));
+    assert_eq!(last(&code), "↻ Retry");
+    assert!(code.has(Control::Retry, &[]));
+}
+
+#[test]
+fn a_path_two_slices_have_shows_once_in_the_tree() {
+    // A file whose type changed is its removal and then its addition, and the host's slices
+    // can part the two. The tree shows the path once, modified, where its first part shows.
+    let added = "diff --git a/old.txt b/old.txt
+new file mode 120000
+--- /dev/null
++++ b/old.txt
+@@ -0,0 +1 @@
++target
+";
+    let mut code = read(slice(PATCH, Some("2")), 0);
+    code.act(Control::Tree, &[]);
+    code.near_end();
+    assert_eq!(code.ask(2), Some(Some("2".into())));
+    assert_eq!(code.take(2, Ok(slice(added, None)), 0), Some(false));
+    let shown = rows(&code, 40);
+    assert!(
+        shown.contains(&"› D old.txt +0 -1".to_string()),
+        "{shown:#?}"
+    );
+    assert!(
+        shown.contains(&"› A old.txt +1 -0".to_string()),
+        "{shown:#?}"
+    );
+    assert_eq!(
+        tree_of(&code),
+        [
+            "Files · 5",
+            FOLDERS_OPEN,
+            "⌄ docs",
+            "  A new.md",
+            "M logo.png",
+            "M old.txt",
+            "⌄ src",
+            "  M lib.rs",
+            "R to.rs",
+        ]
+    );
+    let (lines, targets) = laid(&code, 40);
+    let row = rows_of(&lines).iter().position(|row| row == "M old.txt");
+    let control = targets.iter().find(|(rows, _)| Some(rows.start) == row);
+    assert_eq!(
+        control.map(|(_, control)| *control),
+        Some(Control::TreeFile(2))
+    );
+}
+
+#[test]
+fn a_folder_s_row_closes_that_folder_and_not_the_one_around_it() {
+    let patch = "diff --git a/src/a/x.rs b/src/a/x.rs
+--- a/src/a/x.rs
++++ b/src/a/x.rs
+@@ -1 +1 @@
+-a
++b
+diff --git a/src/b.rs b/src/b.rs
+--- a/src/b.rs
++++ b/src/b.rs
+@@ -1 +1 @@
+-a
++b
+";
+    let mut code = read(slice(patch, None), 0);
+    code.act(Control::Tree, &[]);
+    assert_eq!(
+        tree_of(&code)[2..],
+        ["⌄ src", "  ⌄ a", "    M x.rs", "  M b.rs"]
+    );
+    // `src` and `src/a` start at the same file, and the parts of a folder's path tell them
+    // apart.
+    code.act(Control::Folder(0, 2), &[]);
+    assert_eq!(tree_of(&code)[2..], ["⌄ src", "  › a", "  M b.rs"]);
+    assert_eq!(code.action(Control::Folder(0, 2), &[]), "expand folder");
+    assert_eq!(code.action(Control::Folder(0, 1), &[]), "collapse folder");
+}
+
+#[test]
+fn a_folder_closed_before_a_read_again_joins_it_to_another_stays_closed() {
+    let inner = "diff --git a/a/b/g.rs b/a/b/g.rs
+--- a/a/b/g.rs
++++ b/a/b/g.rs
+@@ -1 +1 @@
+-a
++b
+";
+    let both = format!(
+        "{inner}diff --git a/a/f.rs b/a/f.rs
+--- a/a/f.rs
++++ b/a/f.rs
+@@ -1 +1 @@
+-a
++b
+"
+    );
+    let again = |code: &mut Code, ticket: u64, patch: &str| {
+        code.again();
+        assert_eq!(code.ask(ticket), Some(None));
+        assert_eq!(code.take(ticket, Ok(slice(patch, None)), 0), Some(true));
+    };
+    let mut code = read(slice(&both, None), 0);
+    code.act(Control::Tree, &[]);
+    assert_eq!(
+        tree_of(&code)[2..],
+        ["⌄ a", "  ⌄ b", "    M g.rs", "  M f.rs"]
+    );
+    code.act(Control::Folder(0, 1), &[]);
+    // A read again whose `a` holds only `b` joins them on one row, which stays closed, and the
+    // row for every folder opens them.
+    again(&mut code, 2, inner);
+    assert_eq!(tree_of(&code)[1..], [FOLDERS_FOLDED, "› a/b"]);
+    assert_eq!(code.action(Control::Folders, &[]), "expand all folders");
+    code.act(Control::Folders, &[]);
+    assert_eq!(tree_of(&code)[1..], [FOLDERS_OPEN, "⌄ a/b", "  M g.rs"]);
+    // The joined row itself opens both folders.
+    again(&mut code, 3, &both);
+    code.act(Control::Folder(0, 1), &[]);
+    again(&mut code, 4, inner);
+    assert_eq!(tree_of(&code)[1..], [FOLDERS_FOLDED, "› a/b"]);
+    assert_eq!(code.action(Control::Folder(0, 2), &[]), "expand folder");
+    code.act(Control::Folder(0, 2), &[]);
+    assert_eq!(tree_of(&code)[1..], [FOLDERS_OPEN, "⌄ a/b", "  M g.rs"]);
+    // Closing it closes `b`, which stays closed once `a` has a file of its own again.
+    code.act(Control::Folder(0, 2), &[]);
+    again(&mut code, 5, &both);
+    assert_eq!(
+        tree_of(&code)[1..],
+        [FOLDERS_FOLDED, "⌄ a", "  › b", "  M f.rs"]
+    );
+}
+
+#[test]
+fn the_tree_fits_every_width_and_cleans_hostile_paths() {
+    let patch = "diff --git a/src/\u{1b}]8;;evil\u{7}very/long/path/漢字漢字/name.rs b/src/\u{1b}]8;;evil\u{7}very/long/path/漢字漢字/name.rs
+--- a/src/\u{1b}]8;;evil\u{7}very/long/path/漢字漢字/name.rs
++++ b/src/\u{1b}]8;;evil\u{7}very/long/path/漢字漢字/name.rs
+@@ -1 +1 @@
+-a
++b
+diff --git a/src/b.rs b/src/b.rs
+--- a/src/b.rs
++++ b/src/b.rs
+@@ -1 +1 @@
+-a
++b
+";
+    let mut code = read(slice(patch, Some("2")), 0);
+    code.act(Control::Tree, &[]);
+    for width in 1..=80 {
+        let (lines, targets) = laid(&code, width);
+        for line in &lines {
+            let text = line.to_string();
+            assert!(text.width() <= width, "{width}: {text:?}");
+            assert!(
+                !text.contains(|c: char| c.is_control()),
+                "{width}: {text:?}"
+            );
+        }
+        assert!(targets.iter().all(|(rows, _)| rows.end <= lines.len()));
+        assert!(
+            targets
+                .windows(2)
+                .all(|pair| pair[0].0.end <= pair[1].0.start),
+            "{width}: {targets:?}"
+        );
+    }
+    assert_eq!(
+        tree_of(&code),
+        [
+            "Files · 2",
+            FOLDERS_OPEN,
+            "⌄ src",
+            "  M b.rs",
+            "  ⌄ ]8;;evilvery/long/path/漢字漢字",
+            "    M name.rs",
+            MORE_FILES,
+        ]
+    );
 }

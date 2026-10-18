@@ -14460,13 +14460,14 @@ mod tests {
         let rows = body_after(&mut app, 200, 50);
         let text: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
         assert_eq!(
-            text[4..11],
+            text[4..12],
             [
                 "1 file",
                 "¶ Show whitespace changes",
                 "⇊ Expand all files",
                 "◫ Split diff view",
                 "↵ Disable line wrapping",
+                "⊢ Show file tree",
                 "",
                 "› M src/lib.rs +1 -1"
             ]
@@ -14488,11 +14489,14 @@ mod tests {
         assert!(shown.contains("Enter disable line wrapping · "), "{shown}");
         press(&mut app, KeyCode::Down);
         let shown = status(&mut app);
+        assert!(shown.contains("Enter show file tree · "), "{shown}");
+        press(&mut app, KeyCode::Down);
+        let shown = status(&mut app);
         assert!(shown.contains("Enter expand file · "), "{shown}");
         press(&mut app, KeyCode::Enter);
         let rows = body_after(&mut app, 200, 50);
         let text: Vec<&str> = rows.iter().map(|row| row.trim()).collect();
-        assert_eq!(text[10..13], ["⌄ M src/lib.rs +1 -1", "1 - old", "1 + new"]);
+        assert_eq!(text[11..14], ["⌄ M src/lib.rs +1 -1", "1 - old", "1 + new"]);
         press(&mut app, KeyCode::Right);
         assert_eq!(app.details.pulls.tabs(), Some(Tab::Code));
         assert_eq!(*diffs.borrow(), [named, again]);
@@ -15045,7 +15049,7 @@ mod tests {
         // The panel enters here without the keys, which would send each read.
         let enter_on = |app: &mut App, action: &str| {
             app.details.pulls.home();
-            for _ in 0..10 {
+            for _ in 0..20 {
                 cells(app, 200, 50);
                 if app.details.pulls.action().as_deref() == Some(action) {
                     app.details.pulls.enter();

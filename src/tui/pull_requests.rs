@@ -1461,6 +1461,9 @@ pub(super) struct PullRequests {
     /// The control in the Comments section or the Timeline that ↑ and ↓ chose, which Enter
     /// acts on.
     pick: Option<Control>,
+    /// The control whose first row the next frame of the Code tab shows at the top of the
+    /// details, as a file picked from the file tree shows.
+    reveal: Option<Control>,
     /// The tab of a link's details that shows while they have tabs, which starts over at the
     /// Summary each time they open.
     tab: Tab,
@@ -1807,6 +1810,12 @@ impl PullRequests {
                 Control::MoreCommits if !code.has(control, &commits) => {
                     Some(Control::Commit(listed))
                 }
+                // A file picked from the tree is chosen where it shows, at the top of the
+                // details, as the desktop scrolls the diff to it.
+                Control::TreeFile(at) => {
+                    self.reveal = Some(Control::File(at));
+                    Some(Control::File(at))
+                }
                 _ => Some(control),
             }
             .filter(|control| code.has(*control, &commits));
@@ -1994,6 +2003,7 @@ impl PullRequests {
             // link, the width and the minute are the same.
             self.shown = Shown::default();
             self.pick = None;
+            self.reveal = None;
             self.relay();
         }
     }
@@ -2705,6 +2715,15 @@ impl PullRequests {
         let (mut scroll, mut across) = (0, 0);
         if self.viewing {
             let total = self.prepare_detail(width, now, theme);
+            let reveal = self.reveal.take();
+            let targets = self.detail.as_ref().map(|detail| &detail.targets);
+            let rows = targets
+                .into_iter()
+                .flatten()
+                .find(|(_, control)| Some(*control) == reveal);
+            if let Some((rows, _)) = rows {
+                self.scroll = Offset::Top(rows.start);
+            }
             // The row back to the list comes first.
             let last = total.saturating_sub(height.saturating_sub(1));
             scroll = match self.scroll {
@@ -6805,6 +6824,8 @@ mod tests {
         pulls.step(true);
         assert_eq!(pulls.action().as_deref(), Some("disable line wrapping"));
         pulls.step(true);
+        assert_eq!(pulls.action().as_deref(), Some("show file tree"));
+        pulls.step(true);
         assert_eq!(pulls.action().as_deref(), Some("expand file"));
         pulls.enter();
         let unfolded = |pulls: &mut PullRequests| {
@@ -7393,6 +7414,8 @@ mod tests {
         pulls.step(true);
         assert_eq!(pulls.pick, Some(Control::Wrap));
         pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::Tree));
+        pulls.step(true);
         assert_eq!(pulls.pick, Some(Control::File(0)));
         assert_eq!(pulls.action().as_deref(), Some("expand file"));
         pulls.enter();
@@ -7455,6 +7478,85 @@ mod tests {
     }
 
     #[test]
+    fn a_file_picked_from_the_tree_unfolds_and_shows_at_the_top() {
+        let theme = theme();
+        let mut pulls = on_code();
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
+        assert!(pulls.answer_diff(2, Ok(added(0, 30, None)), now()));
+        pulls.page(40, 20, now(), true, &theme);
+        for _ in 0..5 {
+            pulls.step(true);
+        }
+        assert_eq!(pulls.pick, Some(Control::Tree));
+        pulls.enter();
+        assert_eq!(pulls.pick, Some(Control::Tree));
+        assert_eq!(pulls.action().as_deref(), Some("hide file tree"));
+        pulls.page(40, 20, now(), true, &theme);
+        // ↓ goes on to the tree's files, each at the root.
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::TreeFile(0)));
+        assert_eq!(pulls.action().as_deref(), Some("go to file"));
+
+        // Enter unfolds the file and chooses its header, at the top of the details. The files
+        // show in the order of their paths, so the 21st is f27.rs.
+        pulls.pick = Some(Control::TreeFile(20));
+        pulls.enter();
+        assert_eq!(pulls.pick, Some(Control::File(20)));
+        assert_eq!(pulls.action().as_deref(), Some("collapse file"));
+        let page = pulls.page(40, 20, now(), true, &theme);
+        assert_eq!(
+            rows_of(&page.lines[1..3]),
+            ["⌄ A f27.rs +1 -0", "1 + line 27"]
+        );
+        // The next frame keeps the scroll.
+        let top = pulls.scroll;
+        pulls.page(40, 20, now(), true, &theme);
+        assert_eq!(pulls.scroll, top);
+
+        // A click on a file's row does the same.
+        pulls.home();
+        let page = pulls.page(40, 20, now(), true, &theme);
+        let spot = Some(Spot::Control(Control::TreeFile(3)));
+        let row = page.rows.iter().position(|row| *row == spot).unwrap();
+        assert!(pulls.click(4, row));
+        assert_eq!(pulls.pick, Some(Control::File(3)));
+        let page = pulls.page(40, 20, now(), true, &theme);
+        assert_eq!(
+            rows_of(&page.lines[1..3]),
+            ["⌄ A f11.rs +1 -0", "1 + line 11"]
+        );
+
+        // A file near the end shows as high as the last page lets it.
+        pulls.home();
+        pulls.pick = Some(Control::TreeFile(29));
+        pulls.enter();
+        let page = pulls.page(40, 20, now(), true, &theme);
+        let rows = rows_of(&page.lines);
+        assert_eq!(rows[rows.len() - 2..], ["⌄ A f9.rs +1 -0", "1 + line 9"]);
+
+        // A frame of another tab drops the reveal, so the Code shows again where it was.
+        pulls.home();
+        pulls.pick = Some(Control::TreeFile(10));
+        pulls.enter();
+        assert!(pulls.back());
+        pulls.page(40, 20, now(), true, &theme);
+        assert!(pulls.forward());
+        pulls.page(40, 20, now(), true, &theme);
+        assert_eq!(pulls.scroll, Offset::Top(0));
+
+        // So do the details shown again before a frame, which start over from the top.
+        pulls.pick = Some(Control::TreeFile(10));
+        pulls.enter();
+        pulls.toggle();
+        pulls.toggle();
+        assert!(pulls.forward());
+        assert!(pulls.forward());
+        pulls.page(40, 20, now(), true, &theme);
+        assert_eq!(pulls.tabs(), Some(Tab::Code));
+        assert_eq!(pulls.scroll, Offset::Top(0));
+    }
+
+    #[test]
     fn the_code_shows_review_threads_that_enter_opens_and_closes() {
         let theme = theme();
         let remark = |id: &str, body: &str| {
@@ -7488,6 +7590,8 @@ mod tests {
         assert_eq!(pulls.pick, Some(Control::Layout));
         pulls.step(true);
         assert_eq!(pulls.pick, Some(Control::Wrap));
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::Tree));
         pulls.step(true);
         assert_eq!(pulls.pick, Some(Control::OffDiff));
         assert_eq!(
@@ -7634,7 +7738,7 @@ mod tests {
         pulls.page(60, 40, now(), true, &theme);
         let rows = detail_rows(&pulls);
         assert_eq!(
-            rows[at..at + 8],
+            rows[at..at + 9],
             [
                 "› Commit 0 · 0000000",
                 "1 file",
@@ -7642,6 +7746,7 @@ mod tests {
                 "⇊ Expand all files",
                 "◫ Split diff view",
                 "↵ Disable line wrapping",
+                "⊢ Show file tree",
                 "",
                 "› 1 conversation not on the current diff"
             ]
@@ -7716,7 +7821,7 @@ mod tests {
         assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
         assert!(pulls.answer_diff(2, Ok(added(0, 1, None)), now()));
         pulls.page(60, 40, now(), true, &theme);
-        for _ in 0..5 {
+        for _ in 0..6 {
             pulls.step(true);
         }
         assert_eq!(pulls.pick, Some(Control::File(0)));
@@ -8003,7 +8108,7 @@ mod tests {
         assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
         assert!(pulls.answer_diff(2, Ok(diff()), now()));
         pulls.page(60, 40, now(), true, &theme);
-        for _ in 0..5 {
+        for _ in 0..6 {
             pulls.step(true);
         }
         assert_eq!(pulls.pick, Some(Control::File(0)));
