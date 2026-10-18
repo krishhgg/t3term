@@ -15,8 +15,8 @@ from collections import Counter
 
 from .server import FixtureBase
 from .text import cells, iso, now_ms, safe
-from .world import (ACTIVE, DOTS, INSTANCE, LABEL_PRESETS, NOT_RUNNING, RUN_STATUSES, SHELL_FAILURE, SHELL_REFUSAL,
-                    Thread, label_value, provider_entity, shown_label)
+from .world import (ACTIVE, DOTS, INSTANCE, LABEL_PRESETS, NOT_RUNNING, RUN_STATUSES, SETUP_PHASES, SHELL_FAILURE,
+                    SHELL_REFUSAL, Thread, label_value, provider_entity, setup_snapshot, shown_label)
 
 ORCHESTRATION_THREAD = re.compile(r'/api/orchestration/threads/([A-Za-z0-9_-]+)(/bounded)?')
 # The frames `t3v frame` sends, as (opcode, payload, what to call it). The text frame's \uZZZZ is
@@ -46,6 +46,8 @@ class Orchestration(FixtureBase):
         self.interrupted = []  # (connection, request id, thread id) of thread streams t3term let go
         self.config_streams = []  # (connection, request id)
         self.setup_streams = []  # (connection, request id, thread id)
+        self.setups = {}  # thread id -> the setup snapshot `t3v setup` serves, absent for null
+        self.setup_changes = Counter()  # thread id -> the snapshots `t3v setup` made, its sequence
         self.history = []  # shell events after the snapshot, for resubscribes
         self.thread_history = []  # (thread id, thread stream item), for resubscribes
         self.shell_hold_until = 0  # subscribeShell waits until this wall-clock millisecond
@@ -389,6 +391,21 @@ class Orchestration(FixtureBase):
                     self.watches[tid] = 'closed'
                 note = (f'failed {len(streams)} open and {len(held)} held subscribeThread stream(s) for {tid}, '
                         f'{delivered} of them on an open socket')
+            elif action == 'setup':
+                phase = request.get('phase')
+                if phase not in SETUP_PHASES:
+                    return None, f'setup takes {", ".join(SETUP_PHASES)}'
+                if not isinstance(thread.watched.get('worktreePath'), str):
+                    return None, f'{tid} has no worktree, so t3term watches no setup for it'
+                if phase == 'none':
+                    self.setups.pop(tid, None)
+                else:
+                    self.setup_changes[tid] += 1
+                    self.setups[tid] = setup_snapshot(thread, phase, self.setup_changes[tid], now_ms())
+                streams = [(c, r) for c, r, t in self.setup_streams if t == tid]
+                for connection, request_id in streams:
+                    connection.chunk(request_id, 'setup', [copy.deepcopy(self.setups.get(tid))], tid)
+                note = f'{tid} setup is {phase}, on {len(streams)} setup stream(s)'
             elif action == 'gone':
                 if tid in self.removed:
                     return None, f'the shell already leaves {tid} out; `t3v back {tid}` lists it again'
@@ -732,8 +749,8 @@ class Orchestration(FixtureBase):
                 connection.chunk(request_id, 'thread', [{'kind': 'synchronized'}], tid)
 
     def subscribe_setup(self, connection, request_id: str, payload: dict):
-        """t3term asks for a thread whose worktree path is a string. T3's answer for a thread
-        with no setup is null, and the stream stays open."""
+        """t3term asks for a thread whose worktree path is a string. T3 answers with the
+        thread's setup, which is null until `t3v setup` serves one, and the stream stays open."""
         tid = payload.get('threadId')
         with self.lock:
             self.counts['setup.request'] += 1
@@ -741,7 +758,7 @@ class Orchestration(FixtureBase):
                      threadId=tid if isinstance(tid, str) else None)
             connection.streams[request_id] = 'subscribeWorktreeSetup'
             self.setup_streams.append((connection, request_id, str(tid)))
-            connection.chunk(request_id, 'setup', [None], str(tid))
+            connection.chunk(request_id, 'setup', [copy.deepcopy(self.setups.get(str(tid)))], str(tid))
 
     def subscribe_config(self, connection, request_id: str):
         """T3's config subscription: a snapshot of the whole config, and another after `label`."""

@@ -394,16 +394,24 @@ impl Environments {
 
     /// `probe` of every saved environment, in name order, with at most `MAX_PROBES` at once.
     /// A saved name that breaks the naming rule is Blocked with the error `probe` gives.
+    ///
+    /// Each probe takes its name as its own copy. With a borrowed name, rustc can't show that
+    /// the future is `Send` for every lifetime of that borrow, so the TUI couldn't run the
+    /// check on a task of its own.
     pub async fn probe_all(&self) -> Vec<Probe> {
-        at_most(MAX_PROBES, self.environments.keys(), |name| async move {
-            match self.probe(name).await {
-                Ok(probe) => probe,
-                Err(error) => {
-                    let default = self.default.as_deref() == Some(name.as_str());
-                    Probe::new(name, default, Err(error))
+        at_most(
+            MAX_PROBES,
+            self.environments.keys().cloned(),
+            |name| async move {
+                match self.probe(&name).await {
+                    Ok(probe) => probe,
+                    Err(error) => {
+                        let default = self.default.as_deref() == Some(name.as_str());
+                        Probe::new(&name, default, Err(error))
+                    }
                 }
-            }
-        })
+            },
+        )
         .await
     }
 }
@@ -1104,6 +1112,16 @@ mod tests {
             self.held.lock().unwrap().released.push(index);
             self.changed.notify_all();
         }
+    }
+
+    /// The TUI checks the environments on a task of its own, which needs the check's future
+    /// to be `Send`. It fails to build, rather than to run, when that breaks.
+    #[test]
+    fn a_check_of_every_environment_can_run_on_another_thread() {
+        fn sendable<T: Send>(_: T) {}
+        let saved = Environments::default();
+        sendable(saved.probe_all());
+        sendable(async move { saved.probe_all().await });
     }
 
     #[tokio::test]
