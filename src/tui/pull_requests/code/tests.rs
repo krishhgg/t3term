@@ -1267,6 +1267,44 @@ fn pages_go_with_their_thread_when_the_conversation_is_read_again() {
 }
 
 #[test]
+fn a_new_theme_restyles_the_threads() {
+    let mut conversation = conversation(vec![thread(
+        "on",
+        "src/lib.rs",
+        Some(2),
+        "right",
+        false,
+        &["Body text."],
+    )]);
+    let mut code = read(slice(PATCH, None), 0);
+    let lib = (0..code.files.len())
+        .find(|&at| code.file(at).unwrap().1.path() == "src/lib.rs")
+        .unwrap();
+    code.act(Control::File(lib), &[]);
+    let shown = Shown::default();
+    // The color of the remark's text, laid out at one width as the panel lays it out.
+    let body = |conversation: &mut Conversation, theme: &Theme| {
+        let showing = code.threads_shown(conversation.threads(), &shown);
+        conversation.lay_out_threads(&showing, 40, theme);
+        let (lines, _) = code.lay_out(conversation.threads(), &[], &shown, 40, NOW, theme);
+        lines.iter().find_map(|line| {
+            let span = line
+                .spans
+                .iter()
+                .find(|span| span.content.contains("Body"))?;
+            line.style.patch(span.style).fg
+        })
+    };
+    let dark = theme();
+    let light = Theme::light(Depth::TrueColor);
+    assert_ne!(dark.fg, light.fg);
+    assert_eq!(body(&mut conversation, &dark), Some(dark.fg));
+    // Another theme at the same width lays the text out again in its colors.
+    conversation.restyle();
+    assert_eq!(body(&mut conversation, &light), Some(light.fg));
+}
+
+#[test]
 fn threads_fit_every_width_and_hostile_text_is_cleaned() {
     let path = "src/\u{1b}]8;;evil\u{7}name.rs";
     let patch = format!(
