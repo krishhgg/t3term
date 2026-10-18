@@ -281,6 +281,22 @@ fn hunks_past_the_steps_left_show_as_the_patch_has_them() {
 }
 
 #[test]
+fn no_hunk_is_read_once_the_steps_run_out() {
+    // h is compared, then f, and g runs out of steps partway, so i, larger than each, isn't
+    // read at all.
+    let mut patch = rewritten("f", 1_500);
+    patch.push_str(&rewritten("g", 1_500));
+    patch.push_str(&rewritten("h", 2));
+    patch.push_str(&rewritten("i", 1_600));
+    let read = Patch::read(&patch);
+    READ.set(0);
+    let hidden = hide(&patch, &read.files);
+    assert_eq!(hidden.kept, 2);
+    assert_eq!(hidden.files[3], read.files[3]);
+    assert_eq!(READ.get(), 3);
+}
+
+#[test]
 fn a_file_past_the_bound_keeps_the_counts_of_the_hunks_left_out() {
     let patch = patch_of("@@ -1,2 +1,2 @@", &["-a", "-b", "+ a", "+c"]);
     let mut read = Patch::read(&patch);
