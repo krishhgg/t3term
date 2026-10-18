@@ -292,36 +292,35 @@ def setup_snapshot(thread: Thread, phase: str, sequence: int, now: int) -> dict:
     checked out, no submodules, and the setup script `npm install` started 6 seconds before `now`.
     `running` leaves the script and the setup going, so the card's clocks read 6 s and 9 s on.
     `done` ends both now and starts the agent. `failed` ends the script with exit 1 and the setup
-    with T3's error."""
+    with T3's error. Every field the contract has is there, null where it says nullable, as T3
+    encodes it: a stage that hasn't started or ended has null times, and the stages but the script
+    have no percent, detail or tail."""
     def at(seconds: float) -> str:
         return iso(now - int(seconds * 1000))
 
+    def stage(stage_id: str, status: str, started: str | None = None, ended: str | None = None,
+              tail: list[str] | None = None) -> dict:
+        return {'id': stage_id, 'status': status, 'startedAt': started, 'endedAt': ended, 'percent': None,
+                'detail': None, 'tail': tail or []}
+
     ended = None if phase == 'running' else at(0)
-    script = {'id': 'setup-script', 'status': phase, 'startedAt': at(6),
-              'tail': ['added 312 packages in 3s', '41 packages are looking for funding',
-                       '  run `npm fund` for details']}
-    if ended:
-        script['endedAt'] = ended
+    tail = ['added 312 packages in 3s', '41 packages are looking for funding', '  run `npm fund` for details']
     if phase == 'failed':
-        script['tail'] = script['tail'][:2] + ['npm ERR! code ELIFECYCLE']
-    agent = {'id': 'agent', 'status': 'pending'}
-    if phase == 'done':
-        agent = {'id': 'agent', 'status': 'done', 'startedAt': ended, 'endedAt': ended}
-    snapshot = {
-        'threadId': thread.tid, 'phase': phase, 'sequence': sequence, 'startedAt': at(9),
+        tail = tail[:2] + ['npm ERR! code ELIFECYCLE']
+    agent = stage('agent', 'done', ended, ended) if phase == 'done' else stage('agent', 'pending')
+    return {
+        'threadId': thread.tid, 'phase': phase, 'startedAt': at(9), 'endedAt': ended,
         'branch': thread.watched.get('branch'), 'baseRef': 'main',
         'worktreePath': thread.watched.get('worktreePath'),
-        'setupScript': {'name': 'Install', 'command': 'npm install'},
+        # T3 runs a new worktree's setup script in the terminal `setup-<script id>`.
+        'setupScript': {'name': 'Install', 'command': 'npm install', 'terminalId': 'setup-install'},
         'stages': [
-            {'id': 'fetch', 'status': 'done', 'startedAt': at(9), 'endedAt': at(8)},
-            {'id': 'checkout', 'status': 'done', 'startedAt': at(8), 'endedAt': at(6)},
-            {'id': 'submodules', 'status': 'skipped'},
-            script,
+            stage('fetch', 'done', at(9), at(8)),
+            stage('checkout', 'done', at(8), at(6)),
+            stage('submodules', 'skipped'),
+            stage('setup-script', phase, at(6), ended, tail),
             agent,
         ],
+        'error': 'The setup script exited with code 1.' if phase == 'failed' else None,
+        'sequence': sequence,
     }
-    if ended:
-        snapshot['endedAt'] = ended
-    if phase == 'failed':
-        snapshot['error'] = 'The setup script exited with code 1.'
-    return snapshot
