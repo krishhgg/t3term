@@ -1842,8 +1842,6 @@ fn the_unchanged_lines_around_hunks_show_a_run_at_a_time() {
         Some((ChangeType::Change, "f.rs".into(), "f.rs".into()))
     );
     assert_eq!(code.ask_text(6), None);
-    code.act(Control::Stretch(0, 1), &[]);
-    assert_eq!(code.ask_text(6), None, "one read at a time");
     assert!(!code.take_text(4, text(numbered(400))));
 
     // Once it came, the run shows 100 lines at each end, and a run of one line shows whole.
@@ -1907,6 +1905,32 @@ fn the_unchanged_lines_around_hunks_show_a_run_at_a_time() {
     assert!(!code.has(Control::Stretch(0, 1), &[]));
     code.act(Control::File(0), &[]);
     assert_eq!(rows(&code, 80).len(), 3 + 403);
+}
+
+#[test]
+fn each_press_while_the_text_is_read_counts_once_it_comes() {
+    let mut code = read(slice(STRETCHED, None), 0);
+    code.act(Control::File(0), &[]);
+    code.act(Control::Stretch(0, 1), &[]);
+    code.act(Control::Stretch(0, 3), &[]);
+    // Both runs say the read is under way, and the second press asks for nothing more.
+    let rows_now = rows(&code, 80);
+    assert_eq!(rows_now[6], "⋯ 250 unmodified lines · Reading…");
+    assert_eq!(
+        rows_now.last().unwrap(),
+        "⋯ More unchanged context may be available · Reading…"
+    );
+    assert!(code.ask_text(2).is_some());
+    assert_eq!(code.ask_text(3), None);
+    code.act(Control::Stretch(0, 3), &[]);
+    assert_eq!(code.ask_text(4), None, "one read at a time");
+
+    // As on the desktop, each press shows 100 more lines: the run after the last hunk twice.
+    assert!(code.take_text(2, text(numbered(400))));
+    let rows_now = rows(&code, 80);
+    assert_eq!(rows_now[106], "⋯ 50 unmodified lines");
+    assert_eq!(rows_now.last().unwrap(), "400   l400");
+    assert!(!code.has(Control::Stretch(0, 3), &[]));
 }
 
 #[test]
