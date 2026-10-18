@@ -200,7 +200,7 @@ fn rebuilt(patch: &str, hunk: &Hunk, left: &mut usize) -> Option<Rebuilt> {
 
 /// Whether `c` is whitespace to JavaScript's `\s`: its white space and line terminators, which
 /// take in U+FEFF and leave out U+0085, unlike `char::is_whitespace`.
-fn js_space(c: char) -> bool {
+pub(super) fn js_space(c: char) -> bool {
     matches!(
         c,
         '\t' | '\n' | '\u{b}' | '\u{c}' | '\r' | ' ' | '\u{a0}' | '\u{1680}' | '\u{2000}'

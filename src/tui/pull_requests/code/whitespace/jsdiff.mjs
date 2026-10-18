@@ -7,8 +7,8 @@
 //   node --preserve-symlinks jsdiff.mjs SEED CASES MOST_LINES > jsdiff.json
 //
 // jsdiff.json was written with SEED 42, CASES 80 and MOST_LINES 10. The runs of change the
-// desktop splits by likeness (utils/realignChangeContent.js) are joined again, as t3term keeps
-// each run whole.
+// desktop splits by likeness (utils/realignChangeContent.js) are joined again, as t3term's
+// `hide` keeps each run whole and `align` splits it after, which align/pierre.mjs checks.
 import { parsePatchFiles } from "./node_modules/@pierre/diffs/dist/utils/parsePatchFiles.js";
 import { parseDiffFromFile } from "./node_modules/@pierre/diffs/dist/utils/parseDiffFromFile.js";
 
