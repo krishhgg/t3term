@@ -327,10 +327,12 @@ struct Context {
     old_path: String,
     new_path: String,
     text: Text,
-    /// The run Enter was last pressed on, which says that the read is under way or why it
-    /// failed, and shows more lines once the text comes.
+    /// The run Enter was last pressed on, under which a failed read says why.
     pressed: usize,
-    /// How many lines of each run show from its start and from its end, by its place.
+    /// How many lines of each run show from its start and from its end, by its place. Each
+    /// press of Enter counts at once, as each click does in the desktop's diff library
+    /// (@pierre/diffs 1.5.2, DiffHunksRenderer.js:185), so every run pressed while the text is
+    /// read shows more once it comes.
     shown: HashMap<usize, (u64, u64)>,
 }
 
@@ -808,8 +810,8 @@ impl Code {
     }
 
     /// Shows more of the run of unchanged lines at `place` around the hunks of the file at
-    /// `at` among those shown, or wants the file's text read first where it isn't. While a
-    /// read is under way, the run notes that it is.
+    /// `at` among those shown, at once or once the file's text is read. While a read is under
+    /// way, each run pressed notes that it is.
     fn widen(&mut self, at: usize, place: usize) {
         let offered = self.rest(at, place).is_some_and(|rest| rest != Rest::None);
         let Some(&(slice, index)) = self.files.get(at).filter(|_| offered) else {
@@ -829,14 +831,13 @@ impl Code {
         match found {
             Some(context) => {
                 context.pressed = place;
-                match context.text {
-                    Text::Read { .. } => context.widen(place, last),
-                    Text::Failed(_) => context.text = Text::Wanted,
-                    Text::Wanted | Text::Asked(_) => {}
+                if let Text::Failed(_) = context.text {
+                    context.text = Text::Wanted;
                 }
+                context.widen(place, last);
             }
             None => {
-                let context = Context {
+                let mut context = Context {
                     path: path.clone(),
                     print,
                     change,
@@ -846,6 +847,7 @@ impl Code {
                     pressed: place,
                     shown: HashMap::new(),
                 };
+                context.widen(place, last);
                 if self.contexts.len() >= MOST_TEXTS {
                     let first = self.contexts.remove(0);
                     self.unlay(&first.path);
@@ -876,9 +878,9 @@ impl Code {
     }
 
     /// Takes the answer to read `ticket` of a file's text, or why it failed. Text that matches
-    /// the file's hunks shows more of the run Enter was pressed on. Says whether what the tab
-    /// shows changed. An answer to a read the tab no longer wants, as for a file the diff no
-    /// longer shows, is dropped.
+    /// the file's hunks shows more of each run Enter was pressed on while it was read, and a
+    /// failed read drops those presses. Says whether what the tab shows changed. An answer to a
+    /// read the tab no longer wants, as for a file the diff no longer shows, is dropped.
     pub(super) fn take_text(
         &mut self,
         ticket: u64,
@@ -902,7 +904,6 @@ impl Code {
             self.contexts.remove(found);
             return false;
         };
-        let last = file.hunks.len();
         let text = match answer {
             Ok(contents) => match fits(&contents.new, patch, file) {
                 Some(count) => Text::Read {
@@ -914,10 +915,10 @@ impl Code {
             Err(failure) => Text::Failed(bounded(&failure, FAILURE)),
         };
         let context = &mut self.contexts[found];
-        context.text = text;
-        if matches!(context.text, Text::Read { .. }) {
-            context.widen(context.pressed, last);
+        if let Text::Failed(_) = text {
+            context.shown.clear();
         }
+        context.text = text;
         let path = context.path.clone();
         self.unlay(&path);
         true
@@ -1823,7 +1824,6 @@ fn body(
         };
         let end = stretch.first + showing.head + showing.tail + rest(showing.rest);
         unchanged(lines, stretch.first..stretch.first + showing.head);
-        let pressed = context.filter(|context| context.pressed == place);
         let mut note = match showing.rest {
             Rest::None => None,
             Rest::Count(count) => {
@@ -1833,13 +1833,17 @@ fn body(
             Rest::Unknown => Some(format!("⋯ {MORE_CONTEXT}")),
         };
         if let Some(note) = &mut note {
-            if pressed.is_some_and(|context| matches!(context.text, Text::Wanted | Text::Asked(_)))
-            {
+            let reading = context.is_some_and(|context| {
+                matches!(context.text, Text::Wanted | Text::Asked(_))
+                    && context.shown.contains_key(&place)
+            });
+            if reading {
                 note.push_str(&format!(" · {READING}"));
             }
             let start = lines.len();
             lines.extend(whole(note, width, muted));
             counted.push((start..lines.len(), place));
+            let pressed = context.filter(|context| context.pressed == place);
             if let Some(Text::Failed(failure)) = pressed.map(|context| &context.text) {
                 lines.extend(whole(failure, width, muted));
             }

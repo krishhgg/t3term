@@ -843,7 +843,11 @@ impl Conversation {
     /// Drops each remark's text laid out in the old colors, after the theme changed.
     pub(super) fn restyle(&mut self) {
         let remarks = self.active.iter_mut().chain(&mut self.bots);
-        for remark in remarks.chain(&mut self.finished) {
+        let threads = self
+            .threads
+            .iter_mut()
+            .flat_map(|thread| &mut thread.remarks);
+        for remark in remarks.chain(&mut self.finished).chain(threads) {
             remark.laid_out = None;
         }
     }
