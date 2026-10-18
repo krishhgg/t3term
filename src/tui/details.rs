@@ -975,6 +975,19 @@ impl Details {
         }
     }
 
+    /// Takes a slice of a pull request's diff, or why reading it failed, for the Code tab of
+    /// the details that asked for it with `ticket`.
+    pub fn answer_diff(
+        &mut self,
+        ticket: u64,
+        answer: Result<Box<crate::pull_request::Diff>, String>,
+        now: i64,
+    ) {
+        if self.pulls.answer_diff(ticket, answer, now) {
+            self.moved = true;
+        }
+    }
+
     /// Enter on the thread's tab hands back the Lineage row ↑ and ↓ chose, for the caller to
     /// act on. On the pull requests' tab it does what the control ↑ and ↓ chose in a pull
     /// request's details does, or else shows the selected one's details in the list's place,
@@ -1100,13 +1113,14 @@ impl Details {
     }
 
     /// The keys of `keys` for a tab with no Lineage rows to choose. A pull request's details
-    /// offer → to the Timeline from the Summary, and ← back to the Summary from it, once they
-    /// have tabs.
+    /// offer → to the Timeline from the Summary and to the Code from the Timeline where they
+    /// have it, and ← back a tab, once they have tabs.
     fn plain_keys(&self, modal: bool) -> &'static [&'static str] {
         let pulls = match (self.pulls.viewing(), self.pulls.tabs()) {
             (false, _) => None,
             (true, tab) => Some(tab),
         };
+        let code = self.pulls.offers_code();
         match (self.tab, pulls, modal) {
             (Tab::Thread, _, true) => &[
                 "↑↓/PgUp scroll · Esc close · → pull requests",
@@ -1162,6 +1176,20 @@ impl Details {
                 "Esc leave · ← list",
                 "Esc leave",
             ],
+            (Tab::PullRequests, Some(Some(PullTab::Timeline)), true) if code => &[
+                "↑↓/PgUp scroll · → code · ← summary · Esc close",
+                "↑↓ scroll · → code · ← summary · Esc close",
+                "→ code · ← summary · Esc close",
+                "Esc close · ← summary",
+                "Esc close",
+            ],
+            (Tab::PullRequests, Some(Some(PullTab::Timeline)), false) if code => &[
+                "↑↓/PgUp scroll · → code · ← summary · Esc leave · Alt+B close · Tab focus",
+                "↑↓ scroll · → code · ← summary · Esc leave · Alt+B close",
+                "→ code · ← summary · Esc leave",
+                "Esc leave · ← summary",
+                "Esc leave",
+            ],
             (Tab::PullRequests, Some(Some(PullTab::Timeline)), true) => &[
                 "↑↓/PgUp scroll · ← summary · Esc close",
                 "↑↓ scroll · ← summary · Esc close",
@@ -1172,6 +1200,18 @@ impl Details {
                 "↑↓/PgUp scroll · ← summary · Esc leave · Alt+B close · Tab focus",
                 "↑↓ scroll · ← summary · Esc leave · Alt+B close",
                 "Esc leave · ← summary",
+                "Esc leave",
+            ],
+            (Tab::PullRequests, Some(Some(PullTab::Code)), true) => &[
+                "↑↓/PgUp scroll · ← timeline · Esc close",
+                "↑↓ scroll · ← timeline · Esc close",
+                "Esc close · ← timeline",
+                "Esc close",
+            ],
+            (Tab::PullRequests, Some(Some(PullTab::Code)), false) => &[
+                "↑↓/PgUp scroll · ← timeline · Esc leave · Alt+B close · Tab focus",
+                "↑↓ scroll · ← timeline · Esc leave · Alt+B close",
+                "Esc leave · ← timeline",
                 "Esc leave",
             ],
         }

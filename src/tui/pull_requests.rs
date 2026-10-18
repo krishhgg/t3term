@@ -3,8 +3,9 @@
 //! the repository and its branches under them. Enter or a second click shows a link's details
 //! in the list's place, its whole URL among them as plain text, and they scroll. ←, Enter or
 //! a click on the row above them goes back to the list. Once the host's detail of the pull
-//! request came, that row names two tabs, the Summary and the Timeline, which →, ← and clicks
-//! switch between. t3term opens no browser and changes nothing: the list only reads.
+//! request came, that row names its tabs, the Summary, the Timeline and, where the host gives a
+//! diff, the Code, which →, ← and clicks switch between. t3term opens no browser and changes
+//! nothing: the list only reads.
 //!
 //! The links come from the thread's record that the details already hold, as the desktop's
 //! `ThreadPullRequestsPanel` (apps/web/src/components/pullRequest/ThreadPullRequestsPanel.tsx
@@ -42,8 +43,10 @@ use super::{clip, row, with_bg};
 use crate::pull_request::{self, BaseComparison, CheckStatus, Mergeability};
 use crate::transcript::without_controls;
 
+mod code;
 mod conversation;
 
+use code::Code;
 use conversation::{Control, Conversation, Lifecycle, Reviewer, Shown, Targets};
 
 /// The most links read from a thread's record. The rest are counted and left unread.
@@ -807,24 +810,45 @@ struct Shape {
     focused: bool,
     /// The tab of the details that shows, while they have tabs.
     tabs: Option<Tab>,
+    /// Whether the details offer the Code tab.
+    code: bool,
 }
 
 /// A tab of a link's details, as the desktop's pull request panel has them once the host's
-/// detail of the pull request came. The desktop's third, Code, has no counterpart here.
+/// detail of the pull request came. The Code tab shows only where the detail's
+/// `capabilities.diff` says the host gives a diff, as the desktop hides it otherwise
+/// (PullRequestDetailPanel.tsx:1444-1455).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub(super) enum Tab {
     #[default]
     Summary,
     Timeline,
+    Code,
 }
 
 impl Tab {
-    const ALL: [Tab; 2] = [Tab::Summary, Tab::Timeline];
+    /// The tabs the details offer, in order, with the Code tab where `code` says.
+    fn offered(code: bool) -> &'static [Tab] {
+        match code {
+            true => &[Tab::Summary, Tab::Timeline, Tab::Code],
+            false => &[Tab::Summary, Tab::Timeline],
+        }
+    }
 
     fn name(self) -> &'static str {
         match self {
             Tab::Summary => "Summary",
             Tab::Timeline => "Timeline",
+            Tab::Code => "Code",
+        }
+    }
+
+    /// Its place among the tabs, which keeps its scroll while another shows.
+    fn place(self) -> usize {
+        match self {
+            Tab::Summary => 0,
+            Tab::Timeline => 1,
+            Tab::Code => 2,
         }
     }
 }
@@ -901,6 +925,18 @@ pub(super) struct Ask {
     pub stack: bool,
 }
 
+/// What reading a slice of a link's pull request's diff names: the link's host, repository and
+/// number as T3 sent them, the cursor of the slice, or None for the first, and the ticket its
+/// answer comes back with.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub(super) struct DiffAsk {
+    pub ticket: u64,
+    pub host: String,
+    pub repository: String,
+    pub number: u64,
+    pub cursor: Option<String>,
+}
+
 /// Part of what a host said of a pull request. A read sends its detail, its conversation and,
 /// where the host keeps stacks, its stack, as each arrives, then `Done`.
 pub(super) enum Part {
@@ -963,6 +999,8 @@ struct Read {
     /// Set when the read again that `again` wants reads the stack too, though it only keeps
     /// the details current.
     stack_due: bool,
+    /// What the Code tab read of the diff, once it showed.
+    code: Option<Code>,
 }
 
 /// A read under way to replace a read's answers. It holds each answer until both came, so the
@@ -1022,6 +1060,7 @@ impl Read {
             stack_failed: false,
             stack_at: None,
             stack_due: false,
+            code: None,
         }
     }
 
@@ -1058,6 +1097,15 @@ impl Read {
             !matches!(next.answer, Some(Ok(_))) || matches!(next.conversation, Some(Err(_)));
         match next.answer {
             Some(Ok(summary)) => {
+                // A pull request that changed has a diff that may have, as the desktop's
+                // refresh token moves with `updatedAt` (PullRequestDetailPanel.tsx:836-847).
+                let changed = match &self.answer {
+                    Answer::Read(shown) => shown.updated != summary.updated,
+                    _ => true,
+                };
+                if let Some(code) = self.code.as_mut().filter(|_| changed) {
+                    code.again();
+                }
                 self.answer = Answer::Read(summary);
                 self.at = next.at;
             }
@@ -1093,13 +1141,16 @@ impl Read {
         }
     }
 
-    /// Drops the description and the remarks laid out in the old colors.
+    /// Drops the description, the remarks and the Code tab's files laid out in the old colors.
     fn restyle(&mut self) {
         if let Answer::Read(summary) = &mut self.answer {
             summary.laid_out = None;
         }
         if let Answer::Read(conversation) = &mut self.conversation {
             conversation.restyle();
+        }
+        if let Some(code) = self.code.as_mut() {
+            code.restyle();
         }
     }
 }
@@ -1133,6 +1184,8 @@ struct Summary {
     updated: String,
     /// Whether the host keeps stacks, as the detail's `capabilities.stacks` says.
     stacks: bool,
+    /// Whether the host gives a diff, as the detail's `capabilities.diff` says.
+    diff: bool,
 }
 
 /// One check on the pull request's head.
@@ -1178,6 +1231,7 @@ impl Summary {
             lifecycle: Lifecycle::of(detail),
             updated: detail.updated_at.clone(),
             stacks: detail.capabilities.stacks,
+            diff: detail.capabilities.diff,
         }
     }
 
@@ -1351,8 +1405,15 @@ pub(super) struct PullRequests {
     /// The tab of a link's details that shows while they have tabs, which starts over at the
     /// Summary each time they open.
     tab: Tab,
-    /// The other tab's scroll, which it shows at again when the reader goes back to it.
-    other: Offset,
+    /// Each tab's scroll, by its place, which it shows at again when the reader goes back to
+    /// it. The one that shows is `scroll`.
+    kept: [Offset; 3],
+    /// Set each time the Code tab shows, until the next frame asks for its diff, which reads
+    /// it from the first slice where it came a minute or more before or failed. The desktop's
+    /// tab reads a stale diff when it mounts, and stays mounted to follow refreshes while
+    /// another tab shows (PullRequestDetailPanel.tsx:525-539). t3term reads only while the
+    /// Code shows, so it checks each time instead.
+    mount: bool,
     /// How many times the links were worked out and a page laid out, so the tests can tell
     /// what a frame or an event did.
     #[cfg(test)]
@@ -1382,7 +1443,8 @@ impl PullRequests {
         self.shown = Shown::default();
         self.pick = None;
         self.tab = Tab::Summary;
-        self.other = Offset::Top(0);
+        self.kept = Default::default();
+        self.mount = false;
     }
 
     /// Drops the page, the details and the host's answer laid out in the old colors, after the
@@ -1458,23 +1520,39 @@ impl PullRequests {
         (self.viewing && read).then_some(self.tab)
     }
 
-    /// → in a link's details: shows the Timeline in the Summary's place. Says whether it did.
+    /// Whether the details offer the Code tab: they have tabs, and the host gives a diff.
+    pub fn offers_code(&self) -> bool {
+        self.tabs().is_some()
+            && self
+                .read
+                .as_ref()
+                .is_some_and(|read| matches!(&read.answer, Answer::Read(summary) if summary.diff))
+    }
+
+    /// → in a link's details: shows the next tab, the Timeline after the Summary and the Code
+    /// after the Timeline. Says whether it did.
     pub fn forward(&mut self) -> bool {
-        if self.tabs() != Some(Tab::Summary) {
-            return false;
-        }
-        self.switch(Tab::Timeline);
+        let next = match self.tabs() {
+            Some(Tab::Summary) => Tab::Timeline,
+            Some(Tab::Timeline) if self.offers_code() => Tab::Code,
+            _ => return false,
+        };
+        self.switch(next);
         true
     }
 
     /// Shows `tab` of the details, at the scroll it had when the reader left it, with no
-    /// control chosen. Each tab keeps its own scroll while the other shows.
+    /// control chosen. Each tab keeps its own scroll while another shows.
     fn switch(&mut self, tab: Tab) {
         if self.tab == tab {
             return;
         }
+        self.kept[self.tab.place()] = self.scroll;
+        self.scroll = self.kept[tab.place()];
         self.tab = tab;
-        std::mem::swap(&mut self.scroll, &mut self.other);
+        if tab == Tab::Code {
+            self.mount = true;
+        }
         self.pick = None;
         self.relay();
     }
@@ -1592,9 +1670,24 @@ impl PullRequests {
     /// keep their scroll, so what it shows comes in where the reader is, as in a browser, and
     /// the control may move out of view.
     fn act(&mut self, control: Control) {
-        let Some(read) = self.read.as_ref().filter(|read| self.reads_selected(read)) else {
+        if !self
+            .read
+            .as_ref()
+            .is_some_and(|read| self.reads_selected(read))
+        {
             return;
-        };
+        }
+        if let Control::File(_) | Control::Retry = control {
+            let read = self.read.as_mut().expect("the shown read");
+            let Some(code) = read.code.as_mut().filter(|code| code.has(control)) else {
+                return;
+            };
+            code.act(control);
+            self.pick = Some(control).filter(|control| code.has(*control));
+            self.relay();
+            return;
+        }
+        let read = self.read.as_ref().expect("the shown read");
         let Answer::Read(conversation) = &read.conversation else {
             return;
         };
@@ -1623,6 +1716,9 @@ impl PullRequests {
             .read
             .as_ref()
             .filter(|read| self.reads_selected(read))?;
+        if let Control::File(_) | Control::Retry = pick {
+            return read.code.as_ref().map(|code| code.action(pick));
+        }
         match &read.conversation {
             Answer::Read(conversation) => Some(conversation.action(pick, &self.shown)),
             _ => None,
@@ -1700,7 +1796,8 @@ impl PullRequests {
             self.viewing = true;
             self.scroll = Offset::Top(0);
             self.tab = Tab::Summary;
-            self.other = Offset::Top(0);
+            self.kept = Default::default();
+            self.mount = false;
             self.current = false;
             self.asking = true;
             // What was opened starts over, so the rows laid out for it go too, even where the
@@ -1843,6 +1940,9 @@ impl PullRequests {
         }
         read.again = true;
         read.live = false;
+        if let Some(code) = read.code.as_mut() {
+            code.again();
+        }
         if showing {
             self.relay();
         }
@@ -1864,6 +1964,10 @@ impl PullRequests {
             read.again = true;
             read.live = false;
             read.invalidate = true;
+            // The desktop's Refresh reads the diff again too (PullRequestDetailPanel.tsx:832).
+            if let Some(code) = read.code.as_mut() {
+                code.again();
+            }
         } else {
             // Nothing came to show meanwhile, so it reads as the details' first read does.
             let entry = &entries_of(self.list.as_ref())[self.selected];
@@ -2046,10 +2150,73 @@ impl PullRequests {
             conversation.follow(&summary.lifecycle);
             self.shown.prune(conversation);
         }
+        // A detail that says the host gives no diff takes the Code tab away, and the Summary
+        // shows in its place, as the desktop's panel moves the reader (1444-1455).
+        if self.tabs() == Some(Tab::Code) && !self.offers_code() {
+            self.switch(Tab::Summary);
+        }
         // The rows move, so no control stays chosen.
         self.pick = None;
         self.relay();
         true
+    }
+
+    /// The read of a slice of the diff that the Code tab wants, as `Code::ask` says: the first
+    /// slice once the tab shows for the first time since the details opened, or again where
+    /// it is stale when the tab shows, and the next once the end of the files comes near. None unless `enabled`
+    /// and the tab shows. After a read that sends `pullRequests.invalidate`, the diff waits
+    /// until T3's refresh number moves or that read is done, so T3 has forgotten its cached
+    /// diff before the read asks for it.
+    pub fn take_diff_ask(&mut self, enabled: bool, now: i64) -> Option<DiffAsk> {
+        if !enabled || !self.showing_read() || self.tabs() != Some(Tab::Code) {
+            return None;
+        }
+        let mount = std::mem::take(&mut self.mount);
+        let ticket = self.tickets + 1;
+        let read = self.read.as_mut().expect("the shown read");
+        let code = read.code.get_or_insert_with(Code::new);
+        if mount && code.stale(now) {
+            code.again();
+        }
+        if read.invalidate || read.echo {
+            return None;
+        }
+        let cursor = read.code.as_mut().expect("made above").ask(ticket)?;
+        self.tickets = ticket;
+        Some(DiffAsk {
+            ticket,
+            host: read.host.clone(),
+            repository: read.repository.clone(),
+            number: read.number,
+            cursor,
+        })
+    }
+
+    /// Takes the answer to read `ticket` of a slice of the diff, which came at `now`, or why it
+    /// failed. Says whether what the details show changed. A first slice replaces the files
+    /// shown, so no control stays chosen. An answer to another read is dropped.
+    pub fn answer_diff(
+        &mut self,
+        ticket: u64,
+        answer: Result<Box<pull_request::Diff>, String>,
+        now: i64,
+    ) -> bool {
+        let code = self.read.as_mut().and_then(|read| read.code.as_mut());
+        let Some(first) = code.and_then(|code| code.take(ticket, answer, now)) else {
+            return false;
+        };
+        if first {
+            self.pick = None;
+        }
+        self.relay();
+        true
+    }
+
+    /// Whether the Code tab wants its next slice read, as the last frame found the end of its
+    /// files within a page of the view.
+    pub fn code_due(&self) -> bool {
+        let code = self.read.as_ref().and_then(|read| read.code.as_ref());
+        code.is_some_and(Code::due)
     }
 
     /// Notes that the details' rows changed, so the next frame lays them out again and a click
@@ -2060,14 +2227,17 @@ impl PullRequests {
         self.current = false;
     }
 
-    /// ← in a link's details: shows the Summary in the Timeline's place, or else the list
-    /// again. Says whether the details showed.
+    /// ← in a link's details: shows the tab before the one that shows, the Timeline before the
+    /// Code and the Summary before the Timeline, or else the list again. Says whether the
+    /// details showed.
     pub fn back(&mut self) -> bool {
-        if self.tabs() == Some(Tab::Timeline) {
-            self.switch(Tab::Summary);
-            return true;
-        }
-        self.show_list()
+        let before = match self.tabs() {
+            Some(Tab::Code) => Tab::Timeline,
+            Some(Tab::Timeline) => Tab::Summary,
+            _ => return self.show_list(),
+        };
+        self.switch(before);
+        true
     }
 
     /// Shows the list again in place of a link's details, with that link still selected. Says
@@ -2141,12 +2311,16 @@ impl PullRequests {
                         if let (Tab::Summary, Answer::Read(summary)) = (tab, &mut read.answer) {
                             summary.lay_out(width, theme);
                         }
+                        if let (Tab::Code, Some(code)) = (tab, &mut read.code) {
+                            code.prepare(width, theme);
+                        }
                         if let Answer::Read(conversation) = &mut read.conversation {
                             match tab {
                                 Tab::Summary => conversation.lay_out(width, theme, &self.shown),
                                 Tab::Timeline => {
                                     conversation.lay_out_timeline(width, theme, &self.shown);
                                 }
+                                Tab::Code => {}
                             }
                         }
                     }
@@ -2188,6 +2362,13 @@ impl PullRequests {
                 Offset::End(up) => last - up.min(last),
             };
             self.scroll = Offset::Top(scroll);
+            // The Code tab reads its next slice once the end of its files is within a page of
+            // the view, as the desktop's sentinel loads it 240 pixels ahead.
+            let room = height.saturating_sub(1);
+            let near = self.tabs() == Some(Tab::Code) && scroll + 2 * room >= total;
+            if near && let Some(code) = self.read.as_mut().and_then(|read| read.code.as_mut()) {
+                code.near_end();
+            }
         }
         let shape = Shape {
             width,
@@ -2200,6 +2381,7 @@ impl PullRequests {
             pick: self.pick.filter(|_| self.viewing),
             focused,
             tabs: self.tabs(),
+            code: self.offers_code(),
         };
         if self.page.as_ref().map(|page| page.shape) != Some(shape) {
             #[cfg(test)]
@@ -2310,7 +2492,7 @@ fn view(list: Option<&List>, detail: Option<&Detail>, shape: Shape, theme: &Them
     if let Some(shown) = shape.tabs {
         let active = back.add_modifier(Modifier::UNDERLINED);
         let muted = Style::new().fg(theme.muted);
-        for tab in Tab::ALL {
+        for &tab in Tab::offered(shape.code) {
             let start = spans_width(&left);
             let style = if tab == shown { active } else { muted };
             left.push(Span::raw("  "));
@@ -2738,9 +2920,9 @@ fn branches(repository: &str, head: &str, base: &str, room: usize) -> String {
 /// and the lines it changes. On the Summary, what its host said of it when the details read
 /// it follows, then each under its label its URL, whole as plain text to copy, its repository,
 /// its branches, its author, and who linked it and when it last changed and synced, then what
-/// watching it does and the stack it heads. On the Timeline, the Timeline follows. Each value
-/// wraps to every row it takes, so the reader can scroll to all of it, and each was bounded
-/// when it was read.
+/// watching it does and the stack it heads. On the Timeline, the Timeline follows, and on the
+/// Code, the diff's files. Each value wraps to every row it takes, so the reader can scroll to
+/// all of it, and each was bounded when it was read.
 fn detail_lines(
     entry: &Entry,
     read: Option<&Read>,
@@ -2774,6 +2956,19 @@ fn detail_lines(
                 .into_iter()
                 .map(|(rows, c)| (moved(rows), c)),
         );
+        return (lines, targets);
+    }
+    if let (Tab::Code, Some(read)) = (tab, read) {
+        lines.push(Line::default());
+        let at = lines.len();
+        // Until the tab asks for its first slice, it shows as it does while that read runs.
+        let (code, controls) = match &read.code {
+            Some(code) => code.lay_out(width, theme),
+            None => Code::new().lay_out(width, theme),
+        };
+        lines.extend(code);
+        let moved = |rows: Range<usize>| rows.start + at..rows.end + at;
+        targets.extend(controls.into_iter().map(|(rows, c)| (moved(rows), c)));
         return (lines, targets);
     }
     if let Some(read) = read {
@@ -5545,12 +5740,17 @@ mod tests {
 
     /// One link whose host answered with `bare_detail` and `activity`, its details open.
     fn conversing(activity: Value) -> PullRequests {
+        conversing_on(&bare_detail(), activity)
+    }
+
+    /// One link whose host answered with `detail` and `activity`, its details open.
+    fn conversing_on(detail: &Value, activity: Value) -> PullRequests {
         let mut pulls = PullRequests::default();
         let pull = link("krishhgg/t3term", 31, "a", "b");
         pulls.set(list_of(&thread(vec![pull])));
         pulls.toggle();
         let ask = pulls.take_ask(true, now()).expect("a read");
-        let detail = Part::Detail(Ok(read_detail(&bare_detail())));
+        let detail = Part::Detail(Ok(read_detail(detail)));
         assert!(pulls.answer(ask.ticket, detail, now()));
         let activity = pull_request::Activity::read(&activity).unwrap();
         let activity = Part::Activity(Ok(Box::new(activity)));
@@ -5814,11 +6014,13 @@ mod tests {
         assert!(pulls.answer(ask.ticket, detail, now()));
         assert_eq!(pulls.tabs(), Some(Tab::Summary));
         let (row, tabs) = head(&mut pulls, 40);
-        assert_eq!(
-            row,
-            format!("← List  Summary  Timeline{}1 of 1", " ".repeat(9))
-        );
-        assert_eq!(tabs, [(6..15, Tab::Summary), (15..25, Tab::Timeline)]);
+        assert_eq!(row, "← List  Summary  Timeline  Code   1 of 1");
+        let three = [
+            (6..15, Tab::Summary),
+            (15..25, Tab::Timeline),
+            (25..31, Tab::Code),
+        ];
+        assert_eq!(tabs, three);
         let page = pulls.page(40, 6, now(), true, &theme);
         let underlined = |name: &str| {
             let span = page.lines[0].spans.iter().find(|span| span.content == name);
@@ -5827,7 +6029,7 @@ mod tests {
                 .add_modifier
                 .contains(Modifier::UNDERLINED)
         };
-        assert!(underlined("Summary") && !underlined("Timeline"));
+        assert!(underlined("Summary") && !underlined("Timeline") && !underlined("Code"));
         // The Timeline waits for the conversation.
         assert!(pulls.forward());
         assert_eq!(pulls.tabs(), Some(Tab::Timeline));
@@ -5866,7 +6068,18 @@ mod tests {
         head(&mut pulls, 40);
         assert!(pulls.forward());
         assert_eq!(pulls.scroll, Offset::Top(2));
+        // The Code comes last, and ← from it shows the Timeline where it was.
+        assert!(pulls.forward());
+        assert_eq!(
+            (pulls.tabs(), pulls.scroll),
+            (Some(Tab::Code), Offset::Top(0))
+        );
         assert!(!pulls.forward());
+        assert!(pulls.back());
+        assert_eq!(
+            (pulls.tabs(), pulls.scroll),
+            (Some(Tab::Timeline), Offset::Top(2))
+        );
 
         // A click on a tab's name shows it, and one on the rest of the row leads straight back
         // to the list.
@@ -5879,6 +6092,9 @@ mod tests {
         assert!(pulls.click(20, 0));
         assert_eq!(pulls.tabs(), Some(Tab::Timeline));
         head(&mut pulls, 40);
+        assert!(pulls.click(28, 0));
+        assert_eq!(pulls.tabs(), Some(Tab::Code));
+        head(&mut pulls, 40);
         assert!(pulls.click(36, 0));
         assert!(!pulls.viewing());
 
@@ -5886,8 +6102,8 @@ mod tests {
         pulls.toggle();
         assert_eq!(pulls.tabs(), Some(Tab::Summary));
         assert_eq!(
-            (pulls.scroll, pulls.other),
-            (Offset::Top(0), Offset::Top(0))
+            (pulls.scroll, pulls.kept),
+            (Offset::Top(0), [Offset::Top(0); 3])
         );
         assert!(pulls.forward());
         assert_eq!(pulls.scroll, Offset::Top(0));
@@ -5954,18 +6170,28 @@ mod tests {
 
     #[test]
     fn the_row_above_a_links_details_drops_where_it_is_then_cuts_the_tab_names() {
-        let mut pulls = conversing(remarks(1));
         let theme = theme();
         let both = vec![(6..15, Tab::Summary), (15..25, Tab::Timeline)];
+        let three = || {
+            let mut tabs = both.clone();
+            tabs.push((25..31, Tab::Code));
+            tabs
+        };
+        let cut = vec![(6..15, Tab::Summary), (15..20, Tab::Timeline)];
+        let short = vec![(6..9, Tab::Summary)];
+        // A host that gives a diff has the Code tab last.
+        let mut pulls = conversing(remarks(1));
         let cases = [
-            (33, "← List  Summary  Timeline  1 of 1", both.clone()),
-            (32, "← List  Summary  Timeline", both),
-            (
-                20,
-                "← List  Summary  Ti…",
-                vec![(6..15, Tab::Summary), (15..20, Tab::Timeline)],
-            ),
-            (9, "← List  …", vec![(6..9, Tab::Summary)]),
+            (39, "← List  Summary  Timeline  Code  1 of 1", three()),
+            (38, "← List  Summary  Timeline  Code", three()),
+            (28, "← List  Summary  Timeline  …", {
+                let mut tabs = both.clone();
+                tabs.push((25..28, Tab::Code));
+                tabs
+            }),
+            (27, "← List  Summary  Timeline", both.clone()),
+            (20, "← List  Summary  Ti…", cut.clone()),
+            (9, "← List  …", short.clone()),
             (8, "← List", vec![]),
         ];
         for (width, row, tabs) in cases {
@@ -5973,5 +6199,365 @@ mod tests {
             assert_eq!(rows_of(&page.lines[..1]), [row], "{width}");
             assert_eq!(page.tabs, tabs, "{width}");
         }
+        // One that gives none has the Timeline last.
+        let mut detail = bare_detail();
+        detail["capabilities"]["diff"] = json!(false);
+        let mut pulls = conversing_on(&detail, remarks(1));
+        let cases = [
+            (33, "← List  Summary  Timeline  1 of 1", both.clone()),
+            (32, "← List  Summary  Timeline", both),
+            (20, "← List  Summary  Ti…", cut),
+            (9, "← List  …", short),
+            (8, "← List", vec![]),
+        ];
+        for (width, row, tabs) in cases {
+            let page = pulls.page(width, 6, now(), true, &theme);
+            assert_eq!(rows_of(&page.lines[..1]), [row], "{width}");
+            assert_eq!(page.tabs, tabs, "{width}");
+        }
+    }
+
+    /// A slice of a diff that adds `files` files, `f{from}.rs` on, of a line each, and whose
+    /// next slice is `next`.
+    fn added(from: usize, files: usize, next: Option<&str>) -> Box<pull_request::Diff> {
+        let patch: String = (from..from + files)
+            .map(|n| {
+                format!(
+                    "diff --git a/f{n}.rs b/f{n}.rs\nnew file mode 100644\n--- /dev/null\n\
+                     +++ b/f{n}.rs\n@@ -0,0 +1 @@\n+line {n}\n"
+                )
+            })
+            .collect();
+        Box::new(pull_request::Diff {
+            patch,
+            truncated: false,
+            next_cursor: next.map(str::to_string),
+            omitted: Vec::new(),
+            omitted_cut: false,
+        })
+    }
+
+    /// The read of the diff of `bare_detail`'s pull request with `ticket`, for the slice at
+    /// `cursor`.
+    fn diff_ask(ticket: u64, cursor: Option<&str>) -> DiffAsk {
+        DiffAsk {
+            ticket,
+            host: "github.com".into(),
+            repository: "krishhgg/t3term".into(),
+            number: 31,
+            cursor: cursor.map(str::to_string),
+        }
+    }
+
+    /// `conversing`'s details on the Code tab, their read done.
+    fn on_code() -> PullRequests {
+        let mut pulls = conversing(remarks(1));
+        assert!(!pulls.answer(1, Part::Done, now()));
+        assert!(pulls.forward() && pulls.forward());
+        assert_eq!(pulls.tabs(), Some(Tab::Code));
+        pulls
+    }
+
+    #[test]
+    fn the_code_reads_its_first_slice_once_it_shows_and_the_next_near_the_end() {
+        let theme = theme();
+        // Nothing asks for the diff while the Summary or the Timeline shows.
+        let mut pulls = conversing(remarks(1));
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        assert!(pulls.forward());
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        assert!(pulls.forward());
+        // The Code asks for the first slice once it shows, unless reads are off, and once.
+        assert_eq!(pulls.take_diff_ask(false, now()), None);
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        pulls.page(40, 6, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert_eq!(rows[rows.len() - 2..], ["", "Loading pull request diff…"]);
+        assert!(!pulls.code_due());
+
+        // An answer to another read is dropped. The first slice shows its files, and the end
+        // of them coming within two pages of the view reads the next.
+        assert!(!pulls.answer_diff(3, Ok(added(0, 20, Some("c2"))), now()));
+        assert!(pulls.answer_diff(2, Ok(added(0, 20, Some("c2"))), now()));
+        pulls.page(40, 6, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert_eq!(rows[rows.len() - 2..], ["", "Loading more files…"]);
+        assert!(rows.contains(&"20 files+".to_string()), "{rows:#?}");
+        assert!(!pulls.code_due());
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        // With 5 rows in view, the end within 10 rows of the view's top reads the next.
+        let lines = rows.len();
+        pulls.move_by(lines as isize - 11);
+        pulls.page(40, 6, now(), true, &theme);
+        assert!(!pulls.code_due());
+        pulls.move_by(1);
+        pulls.page(40, 6, now(), true, &theme);
+        assert!(pulls.code_due());
+        assert_eq!(
+            pulls.take_diff_ask(true, now()),
+            Some(diff_ask(3, Some("c2")))
+        );
+        assert!(!pulls.code_due());
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+
+        // The last slice adds its files to the others, and no more are read.
+        assert!(pulls.answer_diff(3, Ok(added(20, 2, None)), now()));
+        pulls.page(40, 6, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(rows.contains(&"22 files".to_string()), "{rows:#?}");
+        assert!(rows[rows.len() - 1].contains("f21.rs"), "{rows:#?}");
+        pulls.move_by(100);
+        pulls.page(40, 6, now(), true, &theme);
+        assert!(!pulls.code_due());
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+
+        // Leaving the Code and coming back within a minute reads nothing again.
+        assert!(pulls.back() && pulls.forward());
+        assert_eq!(pulls.take_diff_ask(true, now() + FRESH - 1), None);
+        // Coming back a minute or more after the first slice came reads it again.
+        let later = now() + FRESH;
+        assert_eq!(pulls.take_diff_ask(true, later), None);
+        assert!(pulls.back() && pulls.forward());
+        assert_eq!(pulls.take_diff_ask(true, later), Some(diff_ask(4, None)));
+        // A first slice that failed is read again each time the Code shows.
+        assert!(pulls.answer_diff(4, Err("timed out".into()), later));
+        assert_eq!(pulls.take_diff_ask(true, later), None);
+        assert!(pulls.back() && pulls.forward());
+        assert_eq!(pulls.take_diff_ask(true, later), Some(diff_ask(5, None)));
+    }
+
+    #[test]
+    fn the_code_reads_its_diff_again_where_it_may_have_changed() {
+        let theme = theme();
+        let mut pulls = on_code();
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
+        assert!(pulls.answer_diff(2, Ok(added(0, 2, None)), now()));
+        // The first file unfolds, and stays so through the reads again.
+        pulls.page(40, 30, now(), true, &theme);
+        pulls.step(true);
+        assert_eq!(pulls.action().as_deref(), Some("expand file"));
+        pulls.enter();
+        let unfolded = |pulls: &mut PullRequests| {
+            pulls.page(40, 30, now(), true, &theme);
+            let rows = detail_rows(pulls);
+            rows.contains(&"⌄ A f0.rs +1 -0".to_string()) && rows.contains(&"1 + line 0".into())
+        };
+        assert!(unfolded(&mut pulls));
+        // The file unfolded is laid out once, and not again when the minute changes.
+        let builds = |pulls: &PullRequests| {
+            let code = pulls.read.as_ref().and_then(|read| read.code.as_ref());
+            code.map(|code| code.builds)
+        };
+        assert_eq!(builds(&pulls), Some(1));
+        pulls.page(40, 30, now() + 60_000, true, &theme);
+        assert_eq!(builds(&pulls), Some(1));
+        let answer = |pulls: &mut PullRequests, ticket, detail: &Value, conversation| {
+            let detail = Part::Detail(Ok(read_detail(detail)));
+            assert!(!pulls.answer(ticket, detail, now()));
+            if conversation {
+                let activity = pull_request::Activity::read(&remarks(1)).unwrap();
+                assert!(!pulls.answer(ticket, Part::Activity(Ok(Box::new(activity))), now()));
+            }
+            pulls.answer(ticket, Part::Done, now());
+        };
+
+        // A refresh number reads the diff again along with the detail. The files that come
+        // replace the others, so the file chosen goes.
+        assert!(pulls.refresh());
+        assert_eq!(pulls.take_ask(true, now()).map(|ask| ask.ticket), Some(3));
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(4, None)));
+        assert_eq!(pulls.pick, Some(Control::File(0)));
+        assert!(pulls.answer_diff(4, Ok(added(5, 1, None)), now()));
+        assert_eq!(pulls.pick, None);
+        pulls.page(40, 30, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(rows.contains(&"› A f5.rs +1 -0".to_string()), "{rows:#?}");
+        assert!(!rows.iter().any(|row| row.contains("f0.rs")), "{rows:#?}");
+        // Nor does an answer to an earlier read, or a second to the same.
+        assert!(!pulls.answer_diff(2, Ok(added(0, 2, None)), now()));
+        assert!(!pulls.answer_diff(4, Ok(added(0, 2, None)), now()));
+        // A detail that stayed the same reads nothing more.
+        answer(&mut pulls, 3, &bare_detail(), true);
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+
+        // `r` reads it again once the read that sent `pullRequests.invalidate` is done, so
+        // T3 forgot the diff it held.
+        assert!(pulls.reload(now()));
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        let ask = pulls.take_ask(true, now()).expect("the read again");
+        assert!(ask.invalidate);
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        let detail = Part::Detail(Ok(read_detail(&bare_detail())));
+        assert!(!pulls.answer(ask.ticket, detail, now()));
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        let activity = pull_request::Activity::read(&remarks(1)).unwrap();
+        pulls.answer(ask.ticket, Part::Activity(Ok(Box::new(activity))), now());
+        pulls.answer(ask.ticket, Part::Done, now());
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(6, None)));
+        assert!(pulls.answer_diff(6, Ok(added(0, 2, None)), now()));
+        assert!(unfolded(&mut pulls));
+        // Or once T3's refresh number moves, which the invalidate moves after T3 forgot the
+        // diff, while the read that sent it is still under way.
+        assert!(pulls.reload(now()));
+        let ask = pulls.take_ask(true, now()).expect("the read again");
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        assert!(!pulls.refresh());
+        let ticket = ask.ticket + 1;
+        assert_eq!(
+            pulls.take_diff_ask(true, now()),
+            Some(diff_ask(ticket, None))
+        );
+        assert!(pulls.answer_diff(ticket, Ok(added(0, 2, None)), now()));
+        answer(&mut pulls, ask.ticket, &bare_detail(), true);
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        assert!(unfolded(&mut pulls));
+
+        // A read that keeps the details current reads it again where `updatedAt` moved.
+        let at = now() + SOONEST;
+        assert!(pulls.arrive(at));
+        let ask = pulls.take_ask(true, at).expect("a live read");
+        answer(&mut pulls, ask.ticket, &bare_detail(), false);
+        assert_eq!(pulls.take_diff_ask(true, at), None);
+        let at = at + SOONEST;
+        assert!(pulls.arrive(at));
+        let ask = pulls.take_ask(true, at).expect("a live read");
+        let mut moved = bare_detail();
+        moved["updatedAt"] = json!("2026-10-13T12:00:00Z");
+        answer(&mut pulls, ask.ticket, &moved, true);
+        let ticket = ask.ticket + 1;
+        assert_eq!(pulls.take_diff_ask(true, at), Some(diff_ask(ticket, None)));
+        assert!(pulls.answer_diff(ticket, Ok(added(0, 2, None)), at));
+
+        // Opening the details again reads the diff again once the Code shows, where it came a
+        // minute or more before, as the desktop's query reads a stale diff when it mounts.
+        let reopen = |pulls: &mut PullRequests, at: i64| {
+            pulls.back();
+            pulls.back();
+            pulls.back();
+            pulls.toggle();
+            let ask = pulls.take_ask(true, at).expect("a read on arrival");
+            answer(pulls, ask.ticket, &moved, false);
+            assert_eq!(pulls.take_diff_ask(true, at), None);
+            assert!(pulls.forward() && pulls.forward());
+            pulls.take_diff_ask(true, at)
+        };
+        assert_eq!(reopen(&mut pulls, at + FRESH - 1), None);
+        let again = reopen(&mut pulls, at + FRESH);
+        assert_eq!(again, Some(diff_ask(pulls.tickets, None)));
+    }
+
+    #[test]
+    fn enter_or_a_click_unfolds_a_file_and_a_slice_that_failed_reads_again() {
+        let theme = theme();
+        let mut pulls = on_code();
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
+        // A first slice that failed says why, with nothing to choose, as the desktop does.
+        let failed = "Couldn't read this diff: timed out";
+        assert!(pulls.answer_diff(2, Err(failed.into()), now()));
+        pulls.page(40, 30, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert_eq!(rows[rows.len() - 2..], ["", failed]);
+        pulls.step(true);
+        assert_eq!((pulls.pick, pulls.action()), (None, None));
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        // `r` reads it again.
+        assert!(pulls.reload(now()));
+        let ask = pulls.take_ask(true, now()).expect("the read again");
+        pulls.answer(ask.ticket, Part::Done, now());
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(4, None)));
+        assert!(pulls.answer_diff(4, Ok(added(0, 2, Some("c2"))), now()));
+
+        // ↓ chooses a file, and Enter unfolds and folds it.
+        let page = pulls.page(40, 30, now(), true, &theme);
+        let at = |page: &Page, control| {
+            let spot = Some(Spot::Control(control));
+            page.rows
+                .iter()
+                .position(|row| *row == spot)
+                .expect("the row")
+        };
+        let second = at(page, Control::File(1));
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::File(0)));
+        assert_eq!(pulls.action().as_deref(), Some("expand file"));
+        pulls.enter();
+        assert_eq!(pulls.pick, Some(Control::File(0)));
+        assert_eq!(pulls.action().as_deref(), Some("collapse file"));
+        pulls.page(40, 30, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(rows.contains(&"1 + line 0".to_string()), "{rows:#?}");
+        pulls.enter();
+        pulls.page(40, 30, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(!rows.contains(&"1 + line 0".to_string()), "{rows:#?}");
+        // A click on a file's row unfolds it too.
+        assert!(pulls.click(4, second));
+        let page = pulls.page(40, 30, now(), true, &theme);
+        assert_eq!(rows_of(&page.lines[second + 1..second + 2]), ["1 + line 1"]);
+
+        // A later slice that failed offers Retry, which reads it again.
+        assert!(pulls.code_due());
+        assert_eq!(
+            pulls.take_diff_ask(true, now()),
+            Some(diff_ask(5, Some("c2")))
+        );
+        assert!(pulls.answer_diff(5, Err("timed out".into()), now()));
+        let page = pulls.page(40, 30, now(), true, &theme);
+        let retry = at(page, Control::Retry);
+        let rows = detail_rows(&pulls);
+        let failure = [
+            "",
+            "t3term couldn't read the rest of this",
+            "diff.",
+            "timed out",
+            "↻ Retry",
+        ];
+        assert_eq!(rows[rows.len() - 5..], failure);
+        assert!(!pulls.code_due());
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
+        // The click chose the second file, and ↓ from it chooses Retry.
+        assert_eq!(pulls.pick, Some(Control::File(1)));
+        pulls.step(true);
+        assert_eq!(pulls.action().as_deref(), Some("retry"));
+        pulls.enter();
+        assert_eq!(pulls.pick, None);
+        assert_eq!(
+            pulls.take_diff_ask(true, now()),
+            Some(diff_ask(6, Some("c2")))
+        );
+        assert!(pulls.answer_diff(6, Err("timed out".into()), now()));
+        pulls.page(40, 30, now(), true, &theme);
+        assert!(pulls.click(2, retry));
+        assert_eq!(
+            pulls.take_diff_ask(true, now()),
+            Some(diff_ask(7, Some("c2")))
+        );
+        assert!(pulls.answer_diff(7, Ok(added(2, 1, None)), now()));
+        pulls.page(40, 30, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(rows.contains(&"3 files".to_string()), "{rows:#?}");
+        assert!(!rows.iter().any(|row| row.contains("Retry")), "{rows:#?}");
+    }
+
+    #[test]
+    fn the_code_goes_where_the_host_stops_giving_a_diff() {
+        let mut pulls = on_code();
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
+        assert!(pulls.reload(now()));
+        let ask = pulls.take_ask(true, now()).expect("the read again");
+        let mut detail = bare_detail();
+        detail["capabilities"]["diff"] = json!(false);
+        let detail = Part::Detail(Ok(read_detail(&detail)));
+        pulls.answer(ask.ticket, detail, now());
+        let activity = pull_request::Activity::read(&remarks(1)).unwrap();
+        pulls.answer(ask.ticket, Part::Activity(Ok(Box::new(activity))), now());
+        assert_eq!(pulls.tabs(), Some(Tab::Code));
+        pulls.answer(ask.ticket, Part::Done, now());
+        // The reader sees the Summary, and the Timeline is the last tab.
+        assert_eq!(pulls.tabs(), Some(Tab::Summary));
+        assert!(!pulls.offers_code());
+        assert!(pulls.forward() && !pulls.forward());
+        assert_eq!(pulls.take_diff_ask(true, now()), None);
     }
 }
