@@ -50,7 +50,7 @@ rm "$RUN/diff-slow"
 C=$($T3V capture files-100x30); S=$(echo "$C" | grep 'ans$'); T=$(echo "$C" | grep 'txt$')
 # Each slice in reading order: source by path, as none imports another, then the test, then the second slice.
 [ "$(grep -o '› [AMDR] [^ ]*' "$T" | head -6 | paste -sd' ' -)" = '› M assets/config-flow.png › M src/config/reader.rs › M src/config/schema.rs › R src/config/source.rs › A tests/config_reload.rs › M docs/config.md' ]
-grep -q '38;2;255;185;0mM.\[38;2;245;245;245m src/config/reader.rs .\[38;2;0;212;146m+7.\[38;2;245;245;245m .\[38;2;255;100;103m-5' "$S" && grep -q '38;2;43;127;255mR.\[38;2;245;245;245m src/config/source.rs → src/config/sources.rs' "$S" && grep -q '38;2;0;212;146mA.\[38;2;245;245;245m tests/config_reload.rs' "$S" && grep -q '38;2;255;185;0mThe host withheld part' "$S"
+grep -q '38;2;255;185;0mM.\[38;2;245;245;245m src/config/reader.rs.\[38;2;129;129;129m .\[38;2;0;212;146m+7.\[38;2;245;245;245m .\[38;2;255;100;103m-5' "$S" && grep -q '38;2;43;127;255mR.\[38;2;245;245;245m src/config/source.rs → src/config/sources.rs' "$S" && grep -q '38;2;0;212;146mA.\[38;2;245;245;245m tests/config_reload.rs' "$S" && grep -q '38;2;255;185;0mThe host withheld part' "$S"
 
 # ↓ chooses the commits row, ↓ again the first file, the binary, and ↓ once more the reader. Enter unfolds it: numbers in grey, removed lines red, added green.
 $T3V keys Down Down Down && $T3V wait --text "Enter expand file"
@@ -63,7 +63,7 @@ $T3V keys Home && $T3V keys Down Down Down && $T3V wait --text "Enter collapse f
 $T3V keys Enter && $T3V wait --text "› M src/config/reader.rs +7 -5" --gone "⋯ 14 unmodified lines"
 
 # A click unfolds the others: the binary, the rename and the new file with its tabs.
-$T3V click --text "tests/config_reload.rs" && $T3V wait --text "⌄ A tests/config_reload.rs +8 -0" --text "3 + #[test]"
+$T3V click --text "tests/config_reload.rs" && $T3V wait --text "⌄ A tests/config_reload.rs +8 -0" --text "1 + use fixture_config::Reader;"
 $T3V click --text "src/config/source.rs" && $T3V wait --text "⌄ R src/config/source.rs → src/config/sources.rs" --text "1 - /// Where a config comes from." --text "1 + /// Where a config comes from: a file, the envir"
 $T3V click --text "assets/config-flow.png" && $T3V wait --text "⌄ M assets/config-flow.png" --text "A binary file, whose changes have no lines to show."
 $T3V capture kinds-100x30

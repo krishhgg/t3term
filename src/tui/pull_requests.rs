@@ -2303,10 +2303,11 @@ impl PullRequests {
 
     /// The read of a slice of the diff that the Code tab wants, as `Code::ask` says: the first
     /// slice once the tab shows for the first time since the details opened, or again where
-    /// it is stale when the tab shows, and the next once the end of the files comes near. None unless `enabled`
-    /// and the tab shows. After a read that sends `pullRequests.invalidate`, the diff waits
-    /// until T3's refresh number moves or that read is done, so T3 has forgotten its cached
-    /// diff before the read asks for it.
+    /// it is stale when the tab shows, and the next once the end of the files comes near. None
+    /// unless `enabled` and the tab shows. Showing the tab also wants the marks on files viewed
+    /// again where `Code::viewed_stale` says they are stale. After a read that sends
+    /// `pullRequests.invalidate`, the diff waits until T3's refresh number moves or that read
+    /// is done, so T3 has forgotten its cached diff before the read asks for it.
     pub fn take_diff_ask(&mut self, enabled: bool, now: i64) -> Option<DiffAsk> {
         if !enabled || !self.showing_read() || self.tabs() != Some(Tab::Code) {
             return None;
