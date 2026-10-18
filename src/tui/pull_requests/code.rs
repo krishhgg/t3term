@@ -17,6 +17,12 @@
 //! or before it for a removed line, as the desktop's stacked view has, and the unchanged lines
 //! between two hunks are counted on a row of their own.
 //!
+//! The review threads the conversation read show under the lines they are on, in the files
+//! unfolded, as the desktop's annotations do. A thread shows under a line only where a line of
+//! the file's hunks has its number on its side, as `isLineInFileDiff` asks
+//! (pullRequestDiff.logic.ts:12-22). The rest, on a line the diff doesn't show, on a file or on
+//! a file not read yet, show above the files in a list that starts closed, by file.
+//!
 //! Only the files unfolded are laid out, each once for each width. Each line of them is cleaned
 //! of control characters, its tabs set every `TAB` columns, and cut at `LINE` characters as it
 //! is.
@@ -30,9 +36,9 @@ use unicode_width::UnicodeWidthChar;
 use super::super::clip;
 use super::super::setup::bounded;
 use super::super::theme::Theme;
-use super::conversation::{Control, Targets};
+use super::conversation::{Control, Shown, Targets, Thread};
 use super::{FAILURE, FRESH, grouped, whole};
-use crate::pull_request::{self, patch};
+use crate::pull_request::{self, Side, patch};
 use crate::transcript::clusters;
 
 /// The columns between two tab stops in a line of the diff.
@@ -90,6 +96,25 @@ struct Body {
     /// Whether the host withheld part of the file, which adds a note.
     withheld: bool,
     lines: Vec<Line<'static>>,
+    marks: Vec<Mark>,
+}
+
+/// Where a line of the diff ends among its file's rows, with its numbers before and after the
+/// change, so the review threads on it show under it.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct Mark {
+    old: Option<u64>,
+    new: Option<u64>,
+    /// The row after the line's last, and after the note that it has no line end.
+    end: usize,
+}
+
+/// Where the review threads show, each by its place among them.
+struct Placed {
+    /// Those on a line of a file shown, by the file's place among those shown.
+    on: HashMap<usize, Vec<usize>>,
+    /// The rest, which show in the list of those off the diff.
+    off: Vec<usize>,
 }
 
 /// A read of a slice under way.
@@ -303,6 +328,84 @@ impl Code {
         Some((&slice.diff.patch, &slice.patch.files[file]))
     }
 
+    /// Whether the tab lists files, rather than saying it has none: some slice came, and it
+    /// has files or more are to be read.
+    fn lists_files(&self) -> bool {
+        !self.slices.is_empty() && (!self.files.is_empty() || self.next_cursor().is_some())
+    }
+
+    /// Where each of `threads` shows: under a line of each file shown with its path whose
+    /// hunks have a line with its number on its side, or else in the list of those off the
+    /// diff.
+    fn place(&self, threads: &[Thread]) -> Placed {
+        let mut by_path: HashMap<&str, Vec<usize>> = HashMap::new();
+        for at in 0..self.files.len() {
+            let (_, file) = self.file(at).expect("a file shown");
+            by_path.entry(file.path()).or_default().push(at);
+        }
+        let mut on: HashMap<usize, Vec<usize>> = HashMap::new();
+        let mut off = Vec::new();
+        for (index, thread) in threads.iter().enumerate() {
+            let mut placed = false;
+            if let Some(line) = thread.line {
+                for &at in by_path.get(thread.path.as_str()).into_iter().flatten() {
+                    let (_, file) = self.file(at).expect("a file shown");
+                    if has_line(file, thread.side, line) {
+                        on.entry(at).or_default().push(index);
+                        placed = true;
+                    }
+                }
+            }
+            if !placed {
+                off.push(index);
+            }
+        }
+        Placed { on, off }
+    }
+
+    /// The places among `threads` of those that show their remarks: those open on a line of a
+    /// file unfolded, and while the list of those off the diff is open, those open in it.
+    pub(super) fn threads_shown(&self, threads: &[Thread], shown: &Shown) -> Vec<usize> {
+        if !self.lists_files() {
+            return Vec::new();
+        }
+        let placed = self.place(threads);
+        let mut showing = Vec::new();
+        for (&at, on) in &placed.on {
+            let (_, file) = self.file(at).expect("a file shown");
+            if self.open.contains(file.path()) {
+                showing.extend(on);
+            }
+        }
+        if shown.off_diff_open() {
+            showing.extend(&placed.off);
+        }
+        showing.retain(|&index| shown.thread_open(&threads[index]));
+        showing.sort_unstable();
+        showing.dedup();
+        showing
+    }
+
+    /// Whether `control`, one of a thread's or the list of those off the diff, shows among
+    /// `threads` while the reader opened what `shown` says.
+    pub(super) fn shows(&self, control: Control, threads: &[Thread], shown: &Shown) -> bool {
+        if !self.lists_files() {
+            return false;
+        }
+        let placed = self.place(threads);
+        match control {
+            Control::Thread(index) => {
+                let on_open = placed.on.iter().any(|(&at, on)| {
+                    let (_, file) = self.file(at).expect("a file shown");
+                    on.contains(&index) && self.open.contains(file.path())
+                });
+                on_open || (shown.off_diff_open() && placed.off.contains(&index))
+            }
+            Control::OffDiff => !placed.off.is_empty(),
+            _ => false,
+        }
+    }
+
     /// Lays out at `width` the lines of each unfolded file not yet laid out for it, and forgets
     /// those of the files folded, so `lay_out` builds only the files that changed.
     pub(super) fn prepare(&mut self, width: usize, theme: &Theme) {
@@ -324,10 +427,12 @@ impl Code {
                     {
                         self.builds += 1;
                     }
+                    let (lines, marks) = body(&slice.diff.patch, file, withheld, width, theme);
                     Body {
                         width,
                         withheld,
-                        lines: body(&slice.diff.patch, file, withheld, width, theme),
+                        lines,
+                        marks,
                     }
                 }
             };
@@ -336,11 +441,21 @@ impl Code {
         self.bodies = bodies;
     }
 
-    /// The tab's rows at `width`, with the rows of each file's header and of Retry. Until the
-    /// first slice came, or when its read failed, it says so. Then the count of files, `+`
-    /// while more are to be read, and a note when the host withheld part of the diff. Then each
-    /// file, and at the end `Loading more files…`, or Retry once that failed.
-    pub(super) fn lay_out(&self, width: usize, theme: &Theme) -> (Vec<Line<'static>>, Targets) {
+    /// The tab's rows at `width`, with the rows of each file's header, of each review thread's
+    /// first row, of the list of those off the diff, and of Retry. Until the first slice came,
+    /// or when its read failed, it says so. Then the count of files, `+` while more are to be
+    /// read, and a note when the host withheld part of the diff. Then the list of `threads` off
+    /// the diff, then each file with the threads on its lines, and at the end `Loading more
+    /// files…`, or Retry once that failed. `shown` says which threads and whether the list are
+    /// open.
+    pub(super) fn lay_out(
+        &self,
+        threads: &[Thread],
+        shown: &Shown,
+        width: usize,
+        now: i64,
+        theme: &Theme,
+    ) -> (Vec<Line<'static>>, Targets) {
         let muted = Style::new().fg(theme.muted);
         let mut lines = Vec::new();
         let mut targets = Vec::new();
@@ -383,11 +498,66 @@ impl Code {
             );
             lines.extend(whole(&note, width, muted));
         }
-        if self.files.is_empty() && self.next_cursor().is_none() {
+        if !self.lists_files() {
             lines.push(Line::default());
             let text = if unread { UNREAD } else { EMPTY };
             lines.extend(whole(text, width, muted));
             return (lines, targets);
+        }
+        let placed = self.place(threads);
+        // A thread, open as the reader left it, with its first row as the target that opens
+        // and closes it.
+        let card = |lines: &mut Vec<Line<'static>>, targets: &mut Targets, index: usize| {
+            let thread: &Thread = &threads[index];
+            let (rows, header) = thread.lines(shown.thread_open(thread), width, now, theme);
+            targets.push((lines.len()..lines.len() + header, Control::Thread(index)));
+            lines.extend(rows);
+        };
+        if !placed.off.is_empty() {
+            lines.push(Line::default());
+            let start = lines.len();
+            let open = shown.off_diff_open();
+            let chevron = if open { "⌄" } else { "›" };
+            let count = placed.off.len();
+            let noun = if count == 1 {
+                "conversation"
+            } else {
+                "conversations"
+            };
+            // While slices are left, a thread may be on a file not read yet.
+            let diff = match self.next_cursor() {
+                Some(_) => "the diff read so far",
+                None => "the current diff",
+            };
+            let label = format!("{chevron} {} {noun} not on {diff}", grouped(count as u64));
+            lines.extend(whole(&label, width, Style::new().fg(theme.fg)));
+            targets.push((start..lines.len(), Control::OffDiff));
+            if open {
+                // A file with several shows once, where its first is.
+                let mut paths: Vec<&str> = Vec::new();
+                let mut by_path: HashMap<&str, Vec<usize>> = HashMap::new();
+                for &index in &placed.off {
+                    let path = threads[index].path.as_str();
+                    by_path.entry(path).or_insert_with(|| {
+                        paths.push(path);
+                        Vec::new()
+                    });
+                    by_path.get_mut(path).expect("just added").push(index);
+                }
+                for path in paths {
+                    lines.push(Line::default());
+                    lines.extend(whole(&bounded(path, PATH), width, muted));
+                    for (place, &index) in by_path[path].iter().enumerate() {
+                        if place > 0 {
+                            lines.push(Line::default());
+                        }
+                        if let Some(line) = threads[index].line {
+                            lines.extend(whole(&format!("Line {line}"), width, muted));
+                        }
+                        card(&mut lines, &mut targets, index);
+                    }
+                }
+            }
         }
         for at in 0..self.files.len() {
             let (text, file) = self.file(at).expect("a file shown");
@@ -402,12 +572,44 @@ impl Code {
             targets.push((start..lines.len(), Control::File(at)));
             if open {
                 let withheld = self.omitted.contains_key(file.path());
-                match self.bodies.get(&self.files[at]) {
+                let fresh;
+                let (rows, marks) = match self.bodies.get(&self.files[at]) {
                     Some(laid) if laid.width == width && laid.withheld == withheld => {
-                        lines.extend(laid.lines.iter().cloned());
+                        (&laid.lines, &laid.marks)
                     }
-                    _ => lines.extend(body(text, file, withheld, width, theme)),
+                    _ => {
+                        fresh = body(text, file, withheld, width, theme);
+                        (&fresh.0, &fresh.1)
+                    }
+                };
+                // The threads on each line, those on its number before the change first, as
+                // the desktop's stacked view puts them, then in the order T3 sent them.
+                let mut on: HashMap<(Side, u64), Vec<usize>> = HashMap::new();
+                for &index in placed.on.get(&at).into_iter().flatten() {
+                    let thread = &threads[index];
+                    let line = thread.line.expect("a thread on a line");
+                    on.entry((thread.side, line)).or_default().push(index);
                 }
+                let mut from = 0;
+                for mark in marks.iter().filter(|_| !on.is_empty()) {
+                    let left = mark.old.and_then(|line| on.get(&(Side::Left, line)));
+                    let right = mark.new.and_then(|line| on.get(&(Side::Right, line)));
+                    let here: Vec<usize> =
+                        left.into_iter().chain(right).flatten().copied().collect();
+                    if here.is_empty() {
+                        continue;
+                    }
+                    lines.extend(rows[from..mark.end].iter().cloned());
+                    from = mark.end;
+                    // A blank row keeps two threads on one line apart.
+                    for (place, index) in here.into_iter().enumerate() {
+                        if place > 0 {
+                            lines.push(Line::default());
+                        }
+                        card(&mut lines, &mut targets, index);
+                    }
+                }
+                lines.extend(rows[from..].iter().cloned());
             }
         }
         if self.next_cursor().is_some() && !self.failed.as_ref().is_some_and(|(_, first)| *first) {
@@ -520,9 +722,10 @@ fn body(
     withheld: bool,
     width: usize,
     theme: &Theme,
-) -> Vec<Line<'static>> {
+) -> (Vec<Line<'static>>, Vec<Mark>) {
     let muted = Style::new().fg(theme.muted);
     let mut lines = Vec::new();
+    let mut marks: Vec<Mark> = Vec::new();
     // A file past the bound or with a broken hunk header can have no hunks, and its notes
     // below say why.
     if file.hunks.is_empty() && !file.lines_cut && !file.unreadable {
@@ -533,7 +736,7 @@ fn body(
         } else {
             "No lines changed."
         };
-        return whole(note, width, muted);
+        return (whole(note, width, muted), marks);
     }
     let last = file
         .hunks
@@ -569,6 +772,16 @@ fn body(
         after = first + hunk.old_count;
         for line in &hunk.lines {
             lines.extend(line_rows(text, line, gutter, width, theme));
+            let end = lines.len();
+            match (line.kind, marks.last_mut()) {
+                (patch::Kind::NoNewline, Some(last)) => last.end = end,
+                (patch::Kind::NoNewline, None) => {}
+                _ => marks.push(Mark {
+                    old: line.old,
+                    new: line.new,
+                    end,
+                }),
+            }
         }
     }
     if file.lines_cut {
@@ -585,7 +798,25 @@ fn body(
             muted,
         ));
     }
-    lines
+    (lines, marks)
+}
+
+/// Whether a line of `file`'s hunks has the number `line` on `side`. The desktop's
+/// `isLineInFileDiff` asks only whether a hunk's header counts it, and a line in a hunk cut
+/// short has none to show under, so its thread goes to the list of those off the diff. Only
+/// the hunks whose headers count it are searched.
+fn has_line(file: &patch::File, side: Side, line: u64) -> bool {
+    file.hunks.iter().any(|hunk| {
+        let (start, count) = match side {
+            Side::Left => (hunk.old_start, hunk.old_count),
+            Side::Right => (hunk.new_start, hunk.new_count),
+        };
+        (start..start.saturating_add(count)).contains(&line)
+            && hunk.lines.iter().any(|read| match side {
+                Side::Left => read.old == Some(line),
+                Side::Right => read.new == Some(line),
+            })
+    })
 }
 
 /// A line of a hunk on as many rows as its text takes at `width`: its number in `digits`

@@ -1,6 +1,11 @@
+use super::super::conversation::Conversation;
 use super::*;
 use crate::tui::theme::Depth;
+use serde_json::{Value, json};
 use unicode_width::UnicodeWidthStr;
+
+/// Five minutes after the review threads' remarks were written.
+const NOW: i64 = 1_792_058_400_000 + 5 * 60_000;
 
 fn theme() -> Theme {
     Theme::new(Depth::TrueColor)
@@ -14,9 +19,14 @@ fn rows_of(lines: &[Line]) -> Vec<String> {
         .collect()
 }
 
+/// The tab's rows and targets at `width`, with no review threads.
+fn laid(code: &Code, width: usize) -> (Vec<Line<'static>>, Targets) {
+    code.lay_out(&[], &Shown::default(), width, 0, &theme())
+}
+
 /// The tab's rows at `width`.
 fn rows(code: &Code, width: usize) -> Vec<String> {
-    rows_of(&code.lay_out(width, &theme()).0)
+    rows_of(&laid(code, width).0)
 }
 
 /// A slice of a diff as T3 sends it, with the cursor of the next where `next` says.
@@ -98,7 +108,7 @@ fn files_show_folded_and_each_unfolds_into_its_hunks() {
             "› R from.rs → to.rs",
         ]
     );
-    let (_, targets) = code.lay_out(40, &theme());
+    let (_, targets) = laid(&code, 40);
     let files: Vec<_> = (0..5).map(Control::File).collect();
     assert_eq!(
         targets,
@@ -146,7 +156,7 @@ fn files_show_folded_and_each_unfolds_into_its_hunks() {
             "No lines changed.",
         ]
     );
-    let (_, targets) = code.lay_out(40, &theme());
+    let (_, targets) = laid(&code, 40);
     assert_eq!(targets[1], (7..8, Control::File(1)));
     code.act(Control::File(0));
     assert_eq!(rows(&code, 40)[2..4], ["› A docs/new.md +2 -0", ""]);
@@ -286,7 +296,7 @@ fn a_failure_says_why_and_a_later_slice_s_offers_retry() {
         rows(&code, 40),
         ["Couldn't read this diff: [31mGitHub said", "no"]
     );
-    assert!(code.lay_out(40, &theme()).1.is_empty());
+    assert!(laid(&code, 40).1.is_empty());
     assert!(!code.has(Control::Retry));
     assert_eq!(code.ask(2), None, "a failure isn't read again by itself");
     assert!(code.stale(0), "showing the tab again reads it");
@@ -313,7 +323,7 @@ fn a_failure_says_why_and_a_later_slice_s_offers_retry() {
             "↻ Retry",
         ]
     );
-    let (_, targets) = code.lay_out(40, &theme());
+    let (_, targets) = laid(&code, 40);
     assert_eq!(targets[1], (7..8, Control::Retry));
     assert!(code.has(Control::Retry));
     assert_eq!(code.action(Control::Retry), "retry");
@@ -635,7 +645,7 @@ fn every_row_fits_its_width_and_hostile_text_is_cleaned() {
     let mut code = read(slice(patch, Some("2")), 0);
     code.act(Control::File(0));
     for width in 1..=80 {
-        let (lines, targets) = code.lay_out(width, &theme());
+        let (lines, targets) = laid(&code, width);
         for line in &lines {
             let text = line.to_string();
             assert!(text.width() <= width, "{width}: {text:?}");
@@ -647,7 +657,7 @@ fn every_row_fits_its_width_and_hostile_text_is_cleaned() {
         assert!(targets.iter().all(|(rows, _)| rows.end <= lines.len()));
     }
     // Every row of a header leads to the file.
-    let (lines, targets) = code.lay_out(12, &theme());
+    let (lines, targets) = laid(&code, 12);
     let (header, _) = &targets[0];
     assert!(header.len() > 1, "{:?}", rows_of(&lines));
     assert_eq!(rows_of(&lines)[header.start], "⌄ M src/]8;;");
@@ -664,4 +674,408 @@ fn every_row_fits_its_width_and_hostile_text_is_cleaned() {
     // A pane too narrow for the numbers leaves them out and keeps the marks.
     assert!(rows(&code, 12).contains(&"2 - old line".to_string()));
     assert!(rows(&code, 11).contains(&"-old line t".to_string()));
+}
+
+/// A review thread `id` on `path` at `line` on `side`, with a remark by mona for each of
+/// `bodies`.
+fn thread(
+    id: &str,
+    path: &str,
+    line: Option<u64>,
+    side: &str,
+    resolved: bool,
+    bodies: &[&str],
+) -> Value {
+    let comments: Vec<Value> = bodies
+        .iter()
+        .enumerate()
+        .map(|(at, body)| {
+            json!({"id": format!("{id}-{at}"), "author": {"login": "mona", "name": null},
+                "body": body, "createdAt": "2026-10-15T10:00:00Z", "url": null})
+        })
+        .collect();
+    json!({"id": id, "path": path, "line": line, "side": side, "isResolved": resolved,
+        "isOutdated": false, "comments": comments})
+}
+
+/// A conversation with `threads` and no other remarks.
+fn conversation(threads: Vec<Value>) -> Conversation {
+    let activity = json!({"comments": [], "commentCount": 0, "commentsTruncated": false,
+        "reviewThreads": threads, "commits": []});
+    Conversation::of(&pull_request::Activity::read(&activity).unwrap())
+}
+
+/// The tab's rows and targets at `width` with `conversation`'s threads, their remarks laid out
+/// as the panel lays them out first.
+fn with_threads(
+    code: &Code,
+    conversation: &mut Conversation,
+    shown: &Shown,
+    width: usize,
+) -> (Vec<String>, Targets) {
+    let showing = code.threads_shown(conversation.threads(), shown);
+    conversation.lay_out_threads(&showing, width, &theme());
+    let (lines, targets) = code.lay_out(conversation.threads(), shown, width, NOW, &theme());
+    (rows_of(&lines), targets)
+}
+
+#[test]
+fn review_threads_show_under_their_lines() {
+    let mut conversation = conversation(vec![
+        thread("new", "src/lib.rs", Some(2), "right", false, &["New name."]),
+        thread("old", "src/lib.rs", Some(2), "left", false, &["Old name."]),
+        thread(
+            "kept-right",
+            "src/lib.rs",
+            Some(3),
+            "right",
+            false,
+            &["Right."],
+        ),
+        thread(
+            "kept-left",
+            "src/lib.rs",
+            Some(3),
+            "left",
+            false,
+            &["Left."],
+        ),
+        thread(
+            "between",
+            "src/lib.rs",
+            Some(5),
+            "right",
+            false,
+            &["Between."],
+        ),
+        thread(
+            "file",
+            "src/lib.rs",
+            None,
+            "right",
+            false,
+            &["On the file."],
+        ),
+        thread("gone", "gone.rs", Some(1), "right", false, &["Gone."]),
+        thread("done", "src/lib.rs", Some(11), "right", true, &["Done."]),
+    ]);
+    let mut code = read(slice(PATCH, None), 0);
+    let lib = (0..code.files.len())
+        .find(|&at| code.file(at).unwrap().1.path() == "src/lib.rs")
+        .unwrap();
+    code.act(Control::File(lib));
+    let mut shown = Shown::default();
+    let (rows, targets) = with_threads(&code, &mut conversation, &shown, 40);
+    let at = rows
+        .iter()
+        .position(|row| row == "⌄ M src/lib.rs +2 -1")
+        .unwrap();
+    // A thread on a removed line shows under it, one on a line before and after the change
+    // under it on either side, its side before the change first, and a resolved one closed.
+    let open = |text: &str| {
+        [
+            "│ ⌄ Open · 1 comment".to_string(),
+            "│ mona                            5m ago".to_string(),
+            format!("│   {text}"),
+        ]
+    };
+    let mut expected = vec![
+        " 1   use std::fmt;".to_string(),
+        " 2 - fn old() {}".to_string(),
+    ];
+    expected.extend(open("Old name."));
+    expected.push(" 2 + fn new() {}".into());
+    expected.extend(open("New name."));
+    expected.push(" 3   fn keep() {}".into());
+    expected.extend(open("Left."));
+    expected.push(String::new());
+    expected.extend(open("Right."));
+    expected.extend(
+        [
+            "⋯ 6 unmodified lines",
+            "10   fn a() {}",
+            "11 + fn b() {}",
+            "│ › Resolved · 1 comment",
+            "12   fn c() {}",
+        ]
+        .map(String::from),
+    );
+    assert_eq!(rows[at + 1..at + 1 + expected.len()], expected);
+    let threads: Vec<_> = targets
+        .iter()
+        .filter(|(_, control)| matches!(control, Control::Thread(_)))
+        .map(|(rows, control)| (rows.start - at, *control))
+        .collect();
+    assert_eq!(
+        threads,
+        [
+            (3, Control::Thread(1)),
+            (7, Control::Thread(0)),
+            (11, Control::Thread(3)),
+            (15, Control::Thread(2)),
+            (21, Control::Thread(7)),
+        ]
+    );
+    assert_eq!(
+        code.threads_shown(conversation.threads(), &shown),
+        [0, 1, 2, 3]
+    );
+
+    // The rest show above the files in a list that starts closed: one on a line no hunk has,
+    // one on the file, and one on a file not in the diff.
+    assert_eq!(
+        rows[1..4],
+        ["", "› 3 conversations not on the current", "diff"]
+    );
+    assert_eq!(targets[0], (2..4, Control::OffDiff));
+    assert!(code.shows(Control::OffDiff, conversation.threads(), &shown));
+    assert!(!code.shows(Control::Thread(4), conversation.threads(), &shown));
+    shown.act(Control::OffDiff, &conversation);
+    assert!(code.shows(Control::Thread(4), conversation.threads(), &shown));
+    let (rows, _) = with_threads(&code, &mut conversation, &shown, 40);
+    let mut expected = vec![
+        "⌄ 3 conversations not on the current".to_string(),
+        "diff".into(),
+        String::new(),
+        "src/lib.rs".into(),
+        "Line 5".into(),
+    ];
+    expected.extend(open("Between."));
+    expected.push(String::new());
+    expected.extend(open("On the file."));
+    expected.extend([String::new(), "gone.rs".into(), "Line 1".into()]);
+    expected.extend(open("Gone."));
+    expected.push(String::new());
+    assert_eq!(rows[2..2 + expected.len()], expected);
+    assert_eq!(rows[2 + expected.len()], "› A docs/new.md +2 -0");
+
+    // Opening the resolved thread shows its remark, and closing an open one hides its own.
+    shown.act(Control::Thread(7), &conversation);
+    shown.act(Control::Thread(0), &conversation);
+    assert_eq!(
+        code.threads_shown(conversation.threads(), &shown),
+        [1, 2, 3, 4, 5, 6, 7]
+    );
+    let (rows, _) = with_threads(&code, &mut conversation, &shown, 40);
+    let at = rows.iter().position(|row| row == "11 + fn b() {}").unwrap();
+    assert_eq!(rows[at + 1], "│ ⌄ Resolved · 1 comment");
+    assert_eq!(rows[at + 3], "│   Done.");
+    let at = rows
+        .iter()
+        .position(|row| row == " 2 + fn new() {}")
+        .unwrap();
+    assert_eq!(
+        rows[at + 1..at + 3],
+        ["│ › Open · 1 comment", " 3   fn keep() {}"]
+    );
+
+    // Folding the file takes its threads away, with their controls.
+    code.act(Control::File(lib));
+    assert!(!code.shows(Control::Thread(0), conversation.threads(), &shown));
+    assert_eq!(
+        code.threads_shown(conversation.threads(), &shown),
+        [4, 5, 6]
+    );
+    let (rows, _) = with_threads(&code, &mut conversation, &shown, 40);
+    assert!(!rows.iter().any(|row| row.contains("Done.")));
+}
+
+#[test]
+fn a_thread_shows_after_a_line_s_end_note_and_off_a_hunk_cut_short() {
+    let patch = "diff --git a/a b/a
+--- a/a
++++ b/a
+@@ -1 +1 @@
+-old
+\\ No newline at end of file
++new
+\\ No newline at end of file
+diff --git a/b b/b
+--- a/b
++++ b/b
+@@ -1,3 +1,3 @@
+ one
+-two
++deux
+";
+    let mut conversation = conversation(vec![
+        thread("old", "a", Some(1), "left", false, &["Old."]),
+        thread("new", "a", Some(1), "right", false, &["New."]),
+        thread("deux", "b", Some(2), "right", false, &["Deux."]),
+        // The hunk's header counts a third line, which never came.
+        thread("short", "b", Some(3), "right", false, &["Short."]),
+    ]);
+    let mut code = read(slice(patch, None), 0);
+    code.act(Control::File(0));
+    code.act(Control::File(1));
+    let (rows, _) = with_threads(&code, &mut conversation, &Shown::default(), 40);
+    let card = |text: &str| {
+        [
+            "│ ⌄ Open · 1 comment".to_string(),
+            "│ mona                            5m ago".to_string(),
+            format!("│   {text}"),
+        ]
+    };
+    let mut expected = vec![
+        "2 files".to_string(),
+        String::new(),
+        "› 1 conversation not on the current diff".into(),
+        String::new(),
+        "⌄ M a +1 -1".into(),
+        "1 - old".into(),
+        "    No newline at end of file".into(),
+    ];
+    expected.extend(card("Old."));
+    expected.extend(["1 + new".into(), "    No newline at end of file".into()]);
+    expected.extend(card("New."));
+    assert_eq!(rows[..expected.len()], expected[..], "{rows:#?}");
+    let at = rows.iter().position(|row| row == "2 + deux").unwrap();
+    assert_eq!(rows[at + 3], "│   Deux.");
+    assert_eq!(rows[at + 4], "t3term couldn't read some lines of this");
+    assert!(code.shows(Control::OffDiff, conversation.threads(), &Shown::default()));
+    let on_lines = self::conversation(vec![thread("old", "a", Some(1), "left", false, &["Old."])]);
+    assert!(!code.shows(Control::OffDiff, on_lines.threads(), &Shown::default()));
+
+    // Before a slice comes, no thread shows, nor does the list.
+    let mut shown = Shown::default();
+    shown.act(Control::OffDiff, &conversation);
+    let none = Code::new();
+    assert!(!none.shows(Control::OffDiff, conversation.threads(), &shown));
+    assert!(!none.shows(Control::Thread(3), conversation.threads(), &shown));
+    assert!(
+        none.threads_shown(conversation.threads(), &shown)
+            .is_empty()
+    );
+}
+
+#[test]
+fn what_the_reader_opened_of_threads_goes_with_them() {
+    let with = conversation(vec![thread("t", "a", Some(1), "right", false, &["A."])]);
+    let without = conversation(Vec::new());
+    let mut shown = Shown::default();
+    shown.act(Control::Thread(0), &with);
+    shown.prune(&with);
+    assert_ne!(shown, Shown::default());
+    shown.prune(&without);
+    assert_eq!(shown, Shown::default());
+}
+
+#[test]
+fn a_new_theme_restyles_the_threads() {
+    let mut conversation = conversation(vec![thread(
+        "on",
+        "src/lib.rs",
+        Some(2),
+        "right",
+        false,
+        &["Body text."],
+    )]);
+    let mut code = read(slice(PATCH, None), 0);
+    let lib = (0..code.files.len())
+        .find(|&at| code.file(at).unwrap().1.path() == "src/lib.rs")
+        .unwrap();
+    code.act(Control::File(lib));
+    let shown = Shown::default();
+    // The color of the remark's text, laid out at one width as the panel lays it out.
+    let body = |conversation: &mut Conversation, theme: &Theme| {
+        let showing = code.threads_shown(conversation.threads(), &shown);
+        conversation.lay_out_threads(&showing, 40, theme);
+        let (lines, _) = code.lay_out(conversation.threads(), &shown, 40, NOW, theme);
+        lines.iter().find_map(|line| {
+            let span = line
+                .spans
+                .iter()
+                .find(|span| span.content.contains("Body"))?;
+            line.style.patch(span.style).fg
+        })
+    };
+    let dark = theme();
+    let light = Theme::light(Depth::TrueColor);
+    assert_ne!(dark.fg, light.fg);
+    assert_eq!(body(&mut conversation, &dark), Some(dark.fg));
+    // Another theme at the same width lays the text out again in its colors.
+    conversation.restyle();
+    assert_eq!(body(&mut conversation, &light), Some(light.fg));
+}
+
+#[test]
+fn threads_fit_every_width_and_hostile_text_is_cleaned() {
+    let path = "src/\u{1b}]8;;evil\u{7}name.rs";
+    let patch = format!(
+        "diff --git a/{path} b/{path}
+--- a/{path}
++++ b/{path}
+@@ -1 +1 @@
+-old line
++new line
+"
+    );
+    let hostile = "Look \u{1b}[2J here, at a remark long enough to wrap at every width.";
+    let mut threads = vec![
+        thread("on", path, Some(1), "right", false, &[hostile, "Second."]),
+        thread(
+            "off",
+            &format!("{path}x"),
+            Some(7),
+            "left",
+            false,
+            &[hostile],
+        ),
+    ];
+    threads[0]["comments"][0]["author"]["login"] = json!("ev\u{1b}]0;il");
+    threads[0]["isOutdated"] = json!(true);
+    threads[0]["commentCount"] = json!(12_000);
+    let mut conversation = conversation(threads);
+    let mut code = read(slice(&patch, None), 0);
+    code.act(Control::File(0));
+    let mut shown = Shown::default();
+    shown.act(Control::OffDiff, &conversation);
+    for width in 1..=80 {
+        let showing = code.threads_shown(conversation.threads(), &shown);
+        assert_eq!(showing, [0, 1]);
+        conversation.lay_out_threads(&showing, width, &theme());
+        let (lines, targets) = code.lay_out(conversation.threads(), &shown, width, NOW, &theme());
+        for line in &lines {
+            let text = line.to_string();
+            // The Markdown renderer keeps 8 columns for text beside the bar's 2, and the
+            // details' page cuts what is wider than it shows.
+            assert!(text.width() <= width.max(10), "{width}: {text:?}");
+            assert!(
+                !text.contains(|c: char| c.is_control()),
+                "{width}: {text:?}"
+            );
+        }
+        assert!(targets.iter().all(|(rows, _)| rows.end <= lines.len()));
+        let header = |index| {
+            let (rows, _) = targets
+                .iter()
+                .find(|(_, control)| *control == Control::Thread(index))
+                .unwrap();
+            rows.len()
+        };
+        assert!(header(0) >= 1 && header(1) >= 1, "{width}");
+    }
+    // A first row that wraps opens and closes the thread on every row it takes.
+    let (rows, targets) = with_threads(&code, &mut conversation, &shown, 12);
+    let (header, _) = targets
+        .iter()
+        .find(|(_, control)| *control == Control::Thread(0))
+        .unwrap();
+    assert!(header.len() > 1, "{rows:#?}");
+    assert_eq!(rows[header.start], "│ ⌄ Open");
+    assert!(rows[header.end].starts_with("│ ev]0;il"), "{rows:#?}");
+    // A pane too narrow for the bar leaves it out.
+    let (rows, _) = with_threads(&code, &mut conversation, &shown, 2);
+    assert!(rows.iter().all(|row| !row.starts_with('│')), "{rows:#?}");
+    let (rows, _) = with_threads(&code, &mut conversation, &shown, 50);
+    assert!(rows.contains(&"│ ⌄ Open · 12,000 comments · outdated".to_string()));
+    assert!(rows.contains(&"│ 11,998 more comments on the host.".to_string()));
+    assert!(
+        rows.contains(&"src/]8;;evilname.rsx".to_string()),
+        "{rows:#?}"
+    );
+    // A blank row keeps a thread's remarks apart.
+    let at = rows.iter().position(|row| row == "│   Second.").unwrap();
+    assert_eq!(rows[at - 2], "│");
+    assert!(rows[at - 1].starts_with("│ mona"));
 }

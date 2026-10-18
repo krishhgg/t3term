@@ -1687,6 +1687,20 @@ impl PullRequests {
             self.relay();
             return;
         }
+        if let Control::Thread(_) | Control::OffDiff = control {
+            let read = self.read.as_ref().expect("the shown read");
+            let (Some(code), Answer::Read(conversation)) = (&read.code, &read.conversation) else {
+                return;
+            };
+            let threads = conversation.threads();
+            if !code.shows(control, threads, &self.shown) {
+                return;
+            }
+            self.shown.act(control, conversation);
+            self.pick = Some(control).filter(|control| code.shows(*control, threads, &self.shown));
+            self.relay();
+            return;
+        }
         let read = self.read.as_ref().expect("the shown read");
         let Answer::Read(conversation) = &read.conversation else {
             return;
@@ -2320,7 +2334,14 @@ impl PullRequests {
                                 Tab::Timeline => {
                                     conversation.lay_out_timeline(width, theme, &self.shown);
                                 }
-                                Tab::Code => {}
+                                Tab::Code => {
+                                    let code = read.code.as_ref();
+                                    let threads = conversation.threads();
+                                    let showing = code.map_or_else(Vec::new, |code| {
+                                        code.threads_shown(threads, &self.shown)
+                                    });
+                                    conversation.lay_out_threads(&showing, width, theme);
+                                }
                             }
                         }
                     }
@@ -2961,10 +2982,15 @@ fn detail_lines(
     if let (Tab::Code, Some(read)) = (tab, read) {
         lines.push(Line::default());
         let at = lines.len();
+        // The review threads come with the conversation, and none show until it came.
+        let threads = match &read.conversation {
+            Answer::Read(conversation) => conversation.threads(),
+            _ => &[],
+        };
         // Until the tab asks for its first slice, it shows as it does while that read runs.
         let (code, controls) = match &read.code {
-            Some(code) => code.lay_out(width, theme),
-            None => Code::new().lay_out(width, theme),
+            Some(code) => code.lay_out(threads, shown, width, now, theme),
+            None => Code::new().lay_out(threads, shown, width, now, theme),
         };
         lines.extend(code);
         let moved = |rows: Range<usize>| rows.start + at..rows.end + at;
@@ -6538,6 +6564,101 @@ mod tests {
         let rows = detail_rows(&pulls);
         assert!(rows.contains(&"3 files".to_string()), "{rows:#?}");
         assert!(!rows.iter().any(|row| row.contains("Retry")), "{rows:#?}");
+    }
+
+    #[test]
+    fn the_code_shows_review_threads_that_enter_opens_and_closes() {
+        let theme = theme();
+        let remark = |id: &str, body: &str| {
+            json!({"id": id, "author": {"login": "mona", "name": null}, "body": body,
+                "createdAt": "2026-10-13T00:30:00Z", "url": null})
+        };
+        let mut activity = remarks(1);
+        activity["reviewThreads"] = json!([
+            {"id": "t0", "path": "f0.rs", "line": 1, "side": "right", "isResolved": false,
+                "isOutdated": true, "commentCount": 3,
+                "comments": [remark("t0c", "Rename **this**.")]},
+            {"id": "t1", "path": "f1.rs", "line": 1, "side": "right", "isResolved": false,
+                "isOutdated": false, "comments": [remark("t1c", "Later file.")]},
+        ]);
+        let mut pulls = conversing(activity);
+        assert!(!pulls.answer(1, Part::Done, now()));
+        assert!(pulls.forward() && pulls.forward());
+        assert_eq!(pulls.take_diff_ask(true, now()), Some(diff_ask(2, None)));
+        assert!(pulls.answer_diff(2, Ok(added(0, 1, Some("c2"))), now()));
+        pulls.page(60, 40, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        let label = "› 1 conversation not on the diff read so far";
+        assert!(rows.contains(&label.to_string()), "{rows:#?}");
+
+        // The list opens, and its thread shows its remark, laid out for the frame.
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::OffDiff));
+        assert_eq!(
+            pulls.action().as_deref(),
+            Some("show conversations off the diff")
+        );
+        pulls.enter();
+        assert_eq!(pulls.pick, Some(Control::OffDiff));
+        pulls.page(60, 40, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        let at = rows
+            .iter()
+            .position(|row| row == "f1.rs")
+            .expect("the list");
+        assert_eq!(rows[at + 1..at + 3], ["Line 1", "│ ⌄ Open · 1 comment"]);
+        assert_eq!(rows[at + 4], "│   Later file.");
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::Thread(1)));
+        assert_eq!(pulls.action().as_deref(), Some("hide conversation"));
+        pulls.enter();
+        pulls.page(60, 40, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert_eq!(rows[at + 2..at + 4], ["│ › Open · 1 comment", ""]);
+
+        // Unfolding the file shows the thread under its line, outdated, with the remarks T3
+        // didn't send counted.
+        pulls.step(true);
+        assert_eq!(pulls.pick, Some(Control::File(0)));
+        pulls.enter();
+        pulls.page(60, 40, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        let at = rows
+            .iter()
+            .position(|row| row == "1 + line 0")
+            .expect("the line");
+        assert_eq!(
+            rows[at + 1..at + 5],
+            [
+                "│ ⌄ Open · 3 comments · outdated",
+                "│ mona                                               11h ago",
+                "│   Rename this.",
+                "│ 2 more comments on the host.",
+            ]
+        );
+
+        // A thread whose file folds is no longer one Enter can open or close.
+        pulls.enter();
+        let before = pulls.shown.clone();
+        pulls.pick = Some(Control::Thread(0));
+        pulls.enter();
+        assert_eq!(pulls.shown, before);
+
+        // The thread's file comes in the next slice, which the end in view asked for, so the
+        // list goes.
+        assert!(pulls.code_due());
+        assert_eq!(
+            pulls.take_diff_ask(true, now()),
+            Some(diff_ask(3, Some("c2")))
+        );
+        assert!(pulls.answer_diff(3, Ok(added(1, 1, None)), now()));
+        pulls.page(60, 40, now(), true, &theme);
+        let rows = detail_rows(&pulls);
+        assert!(
+            !rows.iter().any(|row| row.contains("not on the")),
+            "{rows:#?}"
+        );
+        assert!(rows.contains(&"› A f1.rs +1 -0".to_string()), "{rows:#?}");
     }
 
     #[test]

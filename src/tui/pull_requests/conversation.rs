@@ -17,6 +17,10 @@
 //! The same remarks, with the commits and the pull request's opening, merge or close, make up
 //! the Timeline, which `timeline` lays out.
 //!
+//! The review threads, each a conversation on a line of the diff, show on the Code tab, which
+//! places them. Each is a `Thread` of remarks, open unless resolved until the reader opens or
+//! closes it, as the desktop's `ReviewThreadCard` starts.
+//!
 //! What shows is cleaned and bounded once, when the answer arrives. Each remark's Markdown is
 //! laid out once for each width, and only while it shows.
 
@@ -33,10 +37,12 @@ use super::super::theme::{Theme, age, parse_iso_ms};
 use super::super::{clip, row};
 use super::{Answer, NAME, flowed, grouped, whole};
 use crate::pull_request::{
-    self, Actor, Comment, CommentKind, Commit, Reaction, ReactionContent, ReviewThread,
+    self, Actor, Comment, CommentKind, Commit, Reaction, ReactionContent, ReviewThread, Side,
+    ThreadComment,
 };
 use crate::transcript::without_controls;
 
+mod thread;
 mod timeline;
 
 use timeline::Timeline;
@@ -73,6 +79,11 @@ pub(super) struct Shown {
     timeline_oldest_first: bool,
     /// The Timeline's runs of remarks that are open, by `Timeline::key`.
     runs_open: HashSet<String>,
+    /// The review threads the reader opened or closed on the Code tab, by id, and whether
+    /// they are open. The others are open unless resolved.
+    threads: HashMap<String, bool>,
+    /// The Code tab's list of the conversations off the diff is open.
+    off_diff_open: bool,
 }
 
 impl Default for Shown {
@@ -86,6 +97,8 @@ impl Default for Shown {
             opened: HashSet::new(),
             timeline_oldest_first: false,
             runs_open: HashSet::new(),
+            threads: HashMap::new(),
+            off_diff_open: false,
         }
     }
 }
@@ -117,8 +130,28 @@ impl Shown {
                     self.runs_open.insert(key.to_string());
                 }
             }
+            Control::Thread(at) => {
+                if let Some(thread) = conversation.threads.get(at) {
+                    let open = self.thread_open(thread);
+                    self.threads.insert(thread.id.clone(), !open);
+                }
+            }
+            Control::OffDiff => self.off_diff_open = !self.off_diff_open,
             Control::File(_) | Control::Retry => {}
         }
+    }
+
+    /// Whether `thread` shows its remarks: as the reader left it, or else unless resolved.
+    pub(super) fn thread_open(&self, thread: &Thread) -> bool {
+        self.threads
+            .get(&thread.id)
+            .copied()
+            .unwrap_or(!thread.resolved)
+    }
+
+    /// Whether the Code tab's list of the conversations off the diff is open.
+    pub(super) fn off_diff_open(&self) -> bool {
+        self.off_diff_open
     }
 
     /// Forgets the finished remarks and the Timeline's runs that were open and that
@@ -134,6 +167,12 @@ impl Shown {
         if let Some(timeline) = conversation.timeline.as_ref() {
             self.runs_open.retain(|key| timeline.has_key(key));
         }
+        let threads: HashSet<&str> = conversation
+            .threads
+            .iter()
+            .map(|thread| thread.id.as_str())
+            .collect();
+        self.threads.retain(|id, _| threads.contains(id.as_str()));
     }
 }
 
@@ -171,6 +210,11 @@ pub(super) enum Control {
     File(usize),
     /// Reads again the slice of the diff whose read failed, at the end of the Code tab.
     Retry,
+    /// Opens or closes a review thread on the Code tab, by its place among the threads as T3
+    /// sent them.
+    Thread(usize),
+    /// Opens or closes the Code tab's list of the conversations off the diff.
+    OffDiff,
 }
 
 impl Control {
@@ -284,6 +328,25 @@ enum Said {
     Verdict(Outcome),
     /// `CHANGES_REQUESTED` reads as `Changes requested`, as `reviewStateLabel` writes it.
     State(String),
+}
+
+/// A review thread: a conversation on a line of the diff, or on a file, cleaned and bounded.
+/// `PullRequestReviewThread`, as the desktop's `ReviewThreadCard` shows it.
+pub(super) struct Thread {
+    id: String,
+    /// The file it is on, as the host names it, which is how the diff names it too.
+    pub(super) path: String,
+    /// `None` where the host anchors it to the file rather than a line.
+    pub(super) line: Option<u64>,
+    /// Whether `line` counts lines before the change or after it.
+    pub(super) side: Side,
+    resolved: bool,
+    /// The line it was written on is no longer in the diff.
+    outdated: bool,
+    /// How many remarks the host counts, at least as many as `remarks` holds.
+    count: u64,
+    /// Oldest first, as T3 sends them.
+    remarks: Vec<Remark>,
 }
 
 /// One remark, cleaned and bounded.
@@ -434,6 +497,8 @@ pub(super) struct Conversation {
     author: Option<String>,
     /// The Timeline, once the pull request's detail came too.
     timeline: Option<Timeline>,
+    /// The review threads, in the order T3 sent them.
+    threads: Vec<Thread>,
 }
 
 /// Where a remark is among a conversation's groups.
@@ -500,6 +565,24 @@ impl Conversation {
                 .as_ref()
                 .map(|actor| bounded(&actor.login, NAME)),
             timeline: None,
+            threads: activity.threads.iter().map(Thread::of).collect(),
+        }
+    }
+
+    /// The review threads, in the order T3 sent them.
+    pub(super) fn threads(&self) -> &[Thread] {
+        &self.threads
+    }
+
+    /// Lays the text of each remark of the threads at `at` out at `width`, unless it already
+    /// is. The Code tab says which threads show.
+    pub(super) fn lay_out_threads(&mut self, at: &[usize], width: usize, theme: &Theme) {
+        for &at in at {
+            if let Some(thread) = self.threads.get_mut(at) {
+                for remark in &mut thread.remarks {
+                    remark.lay_out(thread::inner(width), theme);
+                }
+            }
         }
     }
 
@@ -576,7 +659,11 @@ impl Conversation {
     /// Drops each remark's text laid out in the old colors, after the theme changed.
     pub(super) fn restyle(&mut self) {
         let remarks = self.active.iter_mut().chain(&mut self.bots);
-        for remark in remarks.chain(&mut self.finished) {
+        let threads = self
+            .threads
+            .iter_mut()
+            .flat_map(|thread| &mut thread.remarks);
+        for remark in remarks.chain(&mut self.finished).chain(threads) {
             remark.laid_out = None;
         }
     }
@@ -597,7 +684,7 @@ impl Conversation {
             Control::Remark(at) => shown.finished_open && at < self.finished.len(),
             Control::TimelineOrder => self.timeline.is_some(),
             Control::Run(at) => self.timeline.as_ref().is_some_and(|t| at < t.runs()),
-            Control::File(_) | Control::Retry => false,
+            Control::File(_) | Control::Retry | Control::Thread(_) | Control::OffDiff => false,
         }
     }
 
@@ -632,12 +719,46 @@ impl Conversation {
                 let open = self.timeline.as_ref().is_some_and(|t| t.open(at, shown));
                 toggle(open, "comments")
             }
+            Control::Thread(at) => {
+                let open = self
+                    .threads
+                    .get(at)
+                    .is_some_and(|thread| shown.thread_open(thread));
+                toggle(open, "conversation")
+            }
+            Control::OffDiff => toggle(shown.off_diff_open, "conversations off the diff"),
             Control::File(_) | Control::Retry => String::new(),
         }
     }
 }
 
 impl Remark {
+    /// The remark `comment` in a review thread, which the thread's card shows under the line
+    /// it is on.
+    fn of_thread(comment: &ThreadComment) -> Remark {
+        let clean = without_controls(&comment.body.text);
+        let text = without_html_comments(&clean);
+        let text = text.trim();
+        Remark {
+            id: comment.id.clone(),
+            review: false,
+            author: comment
+                .author
+                .as_ref()
+                .map_or_else(|| "ghost".to_string(), |actor| bounded(&actor.login, NAME)),
+            at: instant(&comment.created_at),
+            said: None,
+            location: None,
+            outdated: false,
+            body: (!text.is_empty()).then(|| text.to_string()),
+            body_cut: comment.body.cut,
+            resolved: false,
+            preview: String::new(),
+            reactions: comment.reactions.iter().flatten().map(Pill::of).collect(),
+            laid_out: None,
+        }
+    }
+
     /// The remark `comment`, on review thread `thread` where it is on one. Only a `finished`
     /// one keeps its text on one row as well.
     fn of(comment: &Comment, thread: Option<&ReviewThread>, finished: bool) -> Remark {
