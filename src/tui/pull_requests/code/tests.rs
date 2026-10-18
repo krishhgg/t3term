@@ -751,15 +751,14 @@ fn a_hunk_that_removes_nothing_after_the_highest_line_unfolds() {
 ";
     let mut code = read(slice(patch, None), 0);
     code.act(Control::File(0), &[]);
+    // The toolbar's rows come first, so the file is found by its header.
     let rows = rows(&code, 60);
+    let at = rows.iter().position(|row| row == "⌄ M a +1 -0").unwrap();
     assert_eq!(
-        rows[2..4],
-        [
-            "⌄ M a +1 -0",
-            "⋯ 18,446,744,073,709,551,614 unmodified lines"
-        ]
+        rows[at + 1],
+        "⋯ 18,446,744,073,709,551,614 unmodified lines"
     );
-    assert_eq!(rows[4].trim_start(), "1 + added");
+    assert_eq!(rows[at + 2].trim_start(), "1 + added");
 }
 
 #[test]
